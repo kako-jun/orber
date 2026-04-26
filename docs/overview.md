@@ -7,11 +7,11 @@
 ```
 input image / video
   ├─ (video only) extract representative frames via ffmpeg
-  ├─ extract color clusters       → N representative colors
-  ├─ place orbs                   → position, size, base color per orb
-  ├─ render frame(s)              → PNG buffer with circular blur
+  ├─ extract color clusters       → N representative colors  [implemented]
+  ├─ place orbs                   → position, size, base color per orb  [implemented for static PNG]
+  ├─ render frame(s)              → RGBA buffer with radial-gradient orbs  [implemented via tiny-skia]
   ├─ (animated) interpolate       → frame sequence over time t
-  └─ encode                       → PNG / MP4 / WebM / SVG / CSS
+  └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG implemented]
 ```
 
 ## Output formats

@@ -2,7 +2,7 @@
 
 Turn photos and videos into abstract **orb mood** output — colorful, blurry light spheres drifting slowly. Useful as video backgrounds, streaming wait screens, social story backgrounds, wallpapers, or just to obfuscate a personal photo into a vibe.
 
-> **Status:** prototype. CLI scaffold only — rendering not yet implemented.
+> **Status:** prototype. PNG output works end-to-end (color clustering + static orb render). Animated and vector outputs are still placeholders.
 
 ## Concept
 
@@ -22,14 +22,16 @@ Input image / video
 | **Style**    | CSS gradient                 | CSS gradient + `@keyframes`    |
 | **Vector**   | SVG                          | —                              |
 
-## Usage (planned)
+## Usage
+
+PNG output is implemented and produces a 1080×1920 vertical orb image:
 
 ```bash
 orber --input photo.jpg --output orb.png
-orber --input photo.jpg --output orb.mp4 --seed 42
+orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 1.4
 ```
 
-The output format is inferred from the extension (`png`, `webp`, `mp4`, `webm`, `svg`, `css`). CLI flags cover orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, and clip duration. See all flags via `orber --help`.
+Other formats (`webp`, `mp4`, `webm`, `svg`, `css`) are accepted by the CLI but not yet rendered — they exit with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, and clip duration. See all flags via `orber --help`.
 
 ## Build
 
