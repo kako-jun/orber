@@ -24,15 +24,17 @@ input image / video
 
 CSS / SVG output is attractive because it is essentially zero-byte, infinitely loopable, resolution-independent, and cheap to render in a browser compared to a video element.
 
-## Parameters (planned)
+## Parameters
 
-- orb size (small = many tiny orbs, large = few soft blobs)
-- blur intensity (sharp ↔ fully diffused)
-- motion speed (still ↔ leisurely ↔ lively)
-- orb shape (circle / aquarelle bleed)
-- saturation and brightness adjustment
-- clip duration (animated outputs)
-- random seed for reproducibility
+The CLI exposes the following flags (run `orber --help` for the authoritative list):
+
+- `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
+- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused)
+- `--motion` — `still` / `slow` / `lively` drift speed
+- `--shape` — `circle` or `aquarelle` (watercolor bleed)
+- `--saturation` — saturation multiplier
+- `--duration-ms` — clip duration for animated outputs
+- `--seed` — random seed for reproducibility
 
 ## Use cases
 
