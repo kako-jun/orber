@@ -19,6 +19,8 @@ clap = { version = "4.5", features = ["derive"] }
 image = "0.25"
 kmeans_colors = { version = "0.7", default-features = false, features = ["palette_color"] }
 palette = "0.7"
+rand = "0.8"
+rand_chacha = "0.3"
 tiny-skia = "0.11"
 
 [dev-dependencies]
