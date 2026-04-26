@@ -1,0 +1,26 @@
+[package]
+name = "orber"
+version = "0.1.0"
+edition = "2021"
+authors = ["kako-jun"]
+license = "MIT"
+description = "Turn photos and videos into abstract orb mood images and short-form vertical videos"
+homepage = "https://github.com/kako-jun/orber"
+repository = "https://github.com/kako-jun/orber"
+documentation = "https://docs.rs/orber"
+readme = "README.md"
+keywords = ["image", "video", "abstract", "orb", "mood"]
+categories = ["command-line-utilities", "graphics", "multimedia"]
+exclude = [".github/", "target/"]
+rust-version = "1.78.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
