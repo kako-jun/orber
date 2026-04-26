@@ -97,6 +97,8 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             GradientStop::new(1.0, edge_color),
         ];
 
+        // fall-through guard: radius==0 ケースは上で先に弾いているので、ここに来るのは
+        // tiny-skia 内部でグラデーション構築に失敗した場合のみ。
         let Some(shader) = RadialGradient::new(
             Point::from_xy(cx, cy),
             Point::from_xy(cx, cy),
@@ -105,7 +107,6 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             SpreadMode::Pad,
             Transform::identity(),
         ) else {
-            // 想定外（半径 0 等）。スキップ。
             continue;
         };
 
@@ -154,6 +155,10 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
 }
 
 /// sRGB 0-255 を HSL に変換し、彩度を `factor` 倍してから sRGB に戻す。
+///
+/// 彩度調整は HSL 経路で行う。cluster 抽出は LAB（知覚距離）を使うが、
+/// 彩度のフラグは「CSS 的な見た目の彩度」に合わせるほうが UI 直感に近いため、
+/// 意図的に色空間を分けている。
 fn adjust_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
     if (factor - 1.0).abs() < f32::EPSILON {
         return rgb;
@@ -272,5 +277,81 @@ mod tests {
             assert_eq!(px[2], 0);
             assert_eq!(px[3], 255);
         }
+    }
+
+    #[test]
+    fn saturation_zero_produces_grayscale_center() {
+        // saturation=0.0 で中心ピクセルは R==G==B（グレースケール）になるはず。
+        let opts = RenderOptions {
+            width: 100,
+            height: 100,
+            blur: 0.5,
+            saturation: 0.0,
+            orb_size: 1.0,
+        };
+        let img = render_static(&[cluster([220, 30, 40], 0.5, 0.5, 1.0)], &opts);
+        let center = img.get_pixel(50, 50);
+        let r = center[0] as i32;
+        let g = center[1] as i32;
+        let b = center[2] as i32;
+        assert!(
+            (r - g).abs() <= 2 && (g - b).abs() <= 2 && (r - b).abs() <= 2,
+            "saturation=0 should produce grayscale, got R={} G={} B={}",
+            r,
+            g,
+            b
+        );
+    }
+
+    #[test]
+    fn blur_one_softens_edge_more_than_blur_zero() {
+        // 同じ cluster で blur=0.0 と blur=1.0 を render。
+        // 中心からある程度離れた位置（半径の約 50%）で、blur=1.0 の方が
+        // より中間的（中心色から遠い）な値になっていることを確認する。
+        // blur=0 → 中心の不透明領域が広い → 中心と同じ赤に近い
+        // blur=1 → 中心の不透明領域が点 → サンプル位置はもっと暗い／黒寄り
+        let base = RenderOptions {
+            width: 100,
+            height: 100,
+            saturation: 1.0,
+            orb_size: 1.0,
+            blur: 0.0,
+        };
+        let opts_sharp = RenderOptions {
+            blur: 0.0,
+            ..base.clone()
+        };
+        let opts_blurred = RenderOptions {
+            blur: 1.0,
+            ..base.clone()
+        };
+        let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
+        let img_sharp = render_static(&[c.clone()], &opts_sharp);
+        let img_blurred = render_static(&[c], &opts_blurred);
+
+        // orb 半径 = min(w,h)*0.25*orb_size*sqrt(weight) = 100*0.25 = 25
+        // 半径の 50% = 12.5px。中心 (50,50) から x 方向に 13px ずらした位置をサンプル。
+        let sx = 63u32;
+        let sy = 50u32;
+        let p_sharp = img_sharp.get_pixel(sx, sy);
+        let p_blurred = img_blurred.get_pixel(sx, sy);
+
+        // blur=0 ではこの位置はまだ不透明領域内に近く、赤が強く残る。
+        // blur=1 では中心の不透明領域がほぼ点なので、この位置の赤は急峻に減衰している。
+        assert!(
+            p_sharp[0] > p_blurred[0],
+            "blur=0 should keep red stronger at edge sample than blur=1, sharp R={} blurred R={}",
+            p_sharp[0],
+            p_blurred[0]
+        );
+    }
+
+    #[test]
+    fn renders_at_default_resolution() {
+        // RenderOptions::default() のサイズ（1080x1920）で実走できることを確認する。
+        let opts = RenderOptions::default();
+        let img = render_static(&[cluster([100, 150, 200], 0.5, 0.5, 1.0)], &opts);
+        assert_eq!(img.width(), 1080);
+        assert_eq!(img.height(), 1920);
     }
 }

@@ -107,6 +107,7 @@ fn render_png(cli: &Cli) -> ExitCode {
     };
 
     // 3. 描画オプション構築（解像度はデフォルトの縦長 1080x1920）。
+    // width/height は当面デフォルト固定。CLI フラグ化は将来 Issue で対応する。
     let opts = RenderOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
@@ -127,4 +128,24 @@ fn render_png(cli: &Cli) -> ExitCode {
     }
     eprintln!("orber: wrote {}", cli.output.display());
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_match_render_options_defaults() {
+        // CLI のデフォルト値（clap の default_value_t）が RenderOptions::default() と
+        // 一致していることを保証する。SoT が将来統一されるまでの回帰防止 assert。
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        let defaults = RenderOptions::default();
+        assert_eq!(cli.orb_size, defaults.orb_size, "orb_size default mismatch");
+        assert_eq!(cli.blur, defaults.blur, "blur default mismatch");
+        assert_eq!(
+            cli.saturation, defaults.saturation,
+            "saturation default mismatch"
+        );
+        // duration_ms は RenderOptions に対応フィールドが無いので対象外。
+    }
 }
