@@ -3,19 +3,34 @@
 //! LAB 色空間で k-means を回し、各クラスタについて代表色（sRGB）、
 //! 重心位置（正規化座標）、占有比を返す。後続の orb 配置（#3 以降）に
 //! 渡せるデータ構造として `Cluster` を提供する。
+//!
+//! # 設計メモ
+//!
+//! - 色空間は LAB 固定。RGB 切り替えオプションは現時点では用意しない
+//!   （知覚的に近い色をまとめたいので LAB が妥当、という方針）。
+//! - `k > 実色数` の場合は実 k に縮約され、結果クラスタ数は要求未満になる。
+//!   呼び出し側で警告を出すかどうかは #3 以降で判断する（このモジュールでは
+//!   ただ縮約して返す）。
 
 use image::RgbImage;
 use kmeans_colors::{get_kmeans_hamerly, Kmeans};
 use palette::cast::from_component_slice;
 use palette::{FromColor, IntoColor, Lab, Srgb};
 
+/// クラスタ重心の正規化座標 ∈ [0, 1]^2。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Centroid {
+    pub x: f32,
+    pub y: f32,
+}
+
 /// 1 個の色クラスタ。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cluster {
     /// 代表色（sRGB の 0-255）
     pub color: [u8; 3],
-    /// クラスタ重心の正規化座標 (x, y) ∈ [0, 1]^2
-    pub centroid: (f32, f32),
+    /// クラスタ重心の正規化座標
+    pub centroid: Centroid,
     /// 全ピクセルに対する占有比 [0, 1]
     pub weight: f32,
 }
@@ -29,9 +44,21 @@ pub enum ClusterError {
     KZero,
 }
 
+impl std::fmt::Display for ClusterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyImage => write!(f, "input image is empty (0x0)"),
+            Self::KZero => write!(f, "k must be at least 1"),
+        }
+    }
+}
+
+impl std::error::Error for ClusterError {}
+
 /// k-means の内部パラメータ。
 const KMEANS_RUNS: usize = 3;
 const KMEANS_MAX_ITER: usize = 20;
+/// 収束判定の閾値（LAB ΔE のおおよそのスケール）。
 const KMEANS_CONVERGE: f32 = 5.0;
 const KMEANS_SEED: u64 = 0;
 
@@ -59,6 +86,7 @@ pub fn extract_clusters(img: &RgbImage, k: usize) -> Result<Vec<Cluster>, Cluste
     let effective_k = k.min(lab.len());
 
     // 複数 run のうちベストスコアを採用（k-means++ 初期化のばらつき対策）。
+    // Kmeans::new() は score=f32::MAX で初期化されるため、1 回目の run は必ず best として採用される。
     let mut best = Kmeans::new();
     for i in 0..KMEANS_RUNS {
         let run = get_kmeans_hamerly(
@@ -113,12 +141,14 @@ pub fn extract_clusters(img: &RgbImage, k: usize) -> Result<Vec<Cluster>, Cluste
             let cy = (mean_y / denom_y).clamp(0.0, 1.0) as f32;
 
             // LAB centroid を sRGB(u8) に戻す。
-            let srgb: Srgb = Srgb::from_linear(Srgb::from_color(*lab_centroid).into_linear());
+            // palette 0.7 の `Srgb` は non-linear (gamma-encoded) sRGB の型エイリアスなので、
+            // `from_color` で既に gamma-encoded が得られている。
+            let srgb: Srgb = Srgb::from_color(*lab_centroid);
             let rgb_u8: Srgb<u8> = srgb.into_format();
 
             Some(Cluster {
                 color: [rgb_u8.red, rgb_u8.green, rgb_u8.blue],
-                centroid: (cx, cy),
+                centroid: Centroid { x: cx, y: cy },
                 weight: (count as f64 / total_pixels as f64) as f32,
             })
         })
@@ -152,13 +182,13 @@ mod tests {
         let clusters = extract_clusters(&img, 1).expect("clusters");
         assert_eq!(clusters.len(), 1);
         let c = clusters[0];
-        // 色: 真っ赤に近い（LAB 経由なので多少ズレる可能性に備えて ±10）。
-        approx(c.color[0] as f32, 255.0, 10.0, "color.r");
-        approx(c.color[1] as f32, 0.0, 10.0, "color.g");
-        approx(c.color[2] as f32, 0.0, 10.0, "color.b");
+        // 色: 真っ赤に近い（LAB 往復の丸め誤差のみなので ±2 で締める）。
+        approx(c.color[0] as f32, 255.0, 2.0, "color.r");
+        approx(c.color[1] as f32, 0.0, 2.0, "color.g");
+        approx(c.color[2] as f32, 0.0, 2.0, "color.b");
         // 重心: 中心。
-        approx(c.centroid.0, 0.5, 0.05, "centroid.x");
-        approx(c.centroid.1, 0.5, 0.05, "centroid.y");
+        approx(c.centroid.x, 0.5, 0.05, "centroid.x");
+        approx(c.centroid.y, 0.5, 0.05, "centroid.y");
         // 占有比: 100%。
         approx(c.weight, 1.0, 1e-4, "weight");
     }
@@ -185,20 +215,43 @@ mod tests {
             .find(|c| c.color[2] > c.color[0])
             .expect("blue cluster");
 
-        // 色が ±15 で赤・青に近い。
-        approx(red.color[0] as f32, 255.0, 15.0, "red.color.r");
-        approx(red.color[2] as f32, 0.0, 15.0, "red.color.b");
-        approx(blue.color[0] as f32, 0.0, 15.0, "blue.color.r");
-        approx(blue.color[2] as f32, 255.0, 15.0, "blue.color.b");
+        // 色が ±2 で赤・青に近い（LAB 往復の丸め誤差のみ）。
+        approx(red.color[0] as f32, 255.0, 2.0, "red.color.r");
+        approx(red.color[2] as f32, 0.0, 2.0, "red.color.b");
+        approx(blue.color[0] as f32, 0.0, 2.0, "blue.color.r");
+        approx(blue.color[2] as f32, 255.0, 2.0, "blue.color.b");
+
+        // x 軸はどちらも画像中央付近に収束する（上半分赤・下半分青なので左右対称）。
+        approx(red.centroid.x, 0.5, 0.05, "red.centroid.x");
+        approx(blue.centroid.x, 0.5, 0.05, "blue.centroid.x");
 
         // 上半分の赤の y 重心 ≈ 0.25（0..49 の平均は 24.5、99 で割って ≈ 0.247）。
-        approx(red.centroid.1, 0.247, 0.05, "red.centroid.y");
+        approx(red.centroid.y, 0.247, 0.05, "red.centroid.y");
         // 下半分の青の y 重心 ≈ 0.75（50..99 の平均は 74.5、99 で割って ≈ 0.752）。
-        approx(blue.centroid.1, 0.752, 0.05, "blue.centroid.y");
+        approx(blue.centroid.y, 0.752, 0.05, "blue.centroid.y");
 
         // 占有比は両方 ≈ 0.5。
         approx(red.weight, 0.5, 0.02, "red.weight");
         approx(blue.weight, 0.5, 0.02, "blue.weight");
+    }
+
+    #[test]
+    fn single_pixel_image_k1() {
+        // 1x1 画像は denom = (1-1).max(1) = 1、x=y=0 なので centroid = (0.0, 0.0)。
+        // divide-by-zero せず 1 クラスタが返ることを確認。
+        let img: RgbImage = ImageBuffer::from_fn(1, 1, |_, _| Rgb([128u8, 64, 200]));
+        let clusters = extract_clusters(&img, 1).expect("clusters");
+        assert_eq!(clusters.len(), 1);
+        let c = clusters[0];
+        // 1px しかないので centroid は (0.0, 0.0)。
+        approx(c.centroid.x, 0.0, 1e-6, "centroid.x");
+        approx(c.centroid.y, 0.0, 1e-6, "centroid.y");
+        // 占有比は 100%。
+        approx(c.weight, 1.0, 1e-4, "weight");
+        // 色は概ね入力に近い（LAB 往復の丸めのみ）。
+        approx(c.color[0] as f32, 128.0, 2.0, "color.r");
+        approx(c.color[1] as f32, 64.0, 2.0, "color.g");
+        approx(c.color[2] as f32, 200.0, 2.0, "color.b");
     }
 
     #[test]
