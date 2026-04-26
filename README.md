@@ -29,7 +29,7 @@ orber --input photo.jpg --output orb.png
 orber --input photo.jpg --output orb.mp4 --seed 42
 ```
 
-CLI flags will grow to control orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, and clip duration.
+The output format is inferred from the extension (`png`, `webp`, `mp4`, `webm`, `svg`, `css`). CLI flags cover orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, and clip duration. See all flags via `orber --help`.
 
 ## Build
 

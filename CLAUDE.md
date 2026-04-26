@@ -30,8 +30,9 @@ cargo fmt --check
 
 ```
 src/
-├── main.rs         # CLI パース（clap）
+├── main.rs         # CLI パース（clap）。Cli / Motion / Shape enum はここ
 ├── lib.rs          # モジュール宣言
+├── output_mode.rs  # 出力拡張子 → OutputMode 判定（png/webp/mp4/webm/svg/css）
 ├── cluster.rs      # 入力画像 → 代表色クラスタ抽出
 ├── orb.rs          # orb 1 個の描画（円形ぼかし）
 ├── animate.rs      # 時間 t におけるフレーム生成
