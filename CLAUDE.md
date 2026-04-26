@@ -52,6 +52,7 @@ src/
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
 - **`Motion` / `Shape` enum は当面 `main.rs` に置く** — `animate.rs`（#4）で必要になった時点で `pub mod` に昇格させる。今は CLI パース直後にしか使わないので main.rs ローカルで十分
 - **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
+- **描画バックエンドは tiny-skia** — pure Rust で外部 C ライブラリ不要、`RadialGradient` をネイティブで持っており orb 表現に向く。`Pixmap` は **premultiplied alpha** なので、`RgbaImage` (straight alpha) に変換する際は un-premultiply が必要
 
 ## 関連プロジェクト
 
