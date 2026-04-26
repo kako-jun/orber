@@ -1,4 +1,6 @@
 use clap::{Parser, ValueEnum};
+use orber::cluster::extract_clusters;
+use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -76,20 +78,53 @@ fn main() -> ExitCode {
         }
     };
 
-    // TODO(#2): replace this debug dump with the real pipeline dispatch
-    eprintln!(
-        "orber: input={} output={} mode={:?} seed={:?} orb_size={} blur={} motion={:?} shape={:?} saturation={} duration_ms={}",
-        cli.input.display(),
-        cli.output.display(),
-        mode,
-        cli.seed,
-        cli.orb_size,
-        cli.blur,
-        cli.motion,
-        cli.shape,
-        cli.saturation,
-        cli.duration_ms,
-    );
-    eprintln!("not yet implemented");
-    ExitCode::from(1)
+    match mode {
+        OutputMode::Png => render_png(&cli),
+        _ => {
+            eprintln!("orber: output mode {mode:?} is not yet implemented");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn render_png(cli: &Cli) -> ExitCode {
+    // 1. 入力画像を読み込み RGB8 に正規化。
+    let img = match image::open(&cli.input) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => {
+            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    // 2. 代表色クラスタ抽出（k=6 固定。後の Issue で CLI 化検討）。
+    let clusters = match extract_clusters(&img, 6) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 3. 描画オプション構築（解像度はデフォルトの縦長 1080x1920）。
+    let opts = RenderOptions {
+        orb_size: cli.orb_size,
+        blur: cli.blur,
+        saturation: cli.saturation,
+        ..RenderOptions::default()
+    };
+
+    // 4. 静的描画。
+    let out = render_static(&clusters, &opts);
+
+    // 5. 保存。
+    if let Err(e) = out.save(&cli.output) {
+        eprintln!(
+            "orber: failed to write output {}: {e}",
+            cli.output.display()
+        );
+        return ExitCode::from(2);
+    }
+    eprintln!("orber: wrote {}", cli.output.display());
+    ExitCode::SUCCESS
 }
