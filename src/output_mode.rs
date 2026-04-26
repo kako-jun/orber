@@ -61,8 +61,7 @@ impl OutputMode {
             "svg" => Ok(OutputMode::Svg),
             "css" => Ok(OutputMode::Css),
             other => Err(format!(
-                "unsupported output extension {:?}; expected one of png, webp, mp4, webm, svg, css",
-                other
+                "unsupported output extension {other}; expected one of png, webp, mp4, webm, svg, css"
             )),
         }
     }
@@ -138,12 +137,10 @@ mod tests {
 
     #[test]
     fn trailing_dot() {
-        // "foo." has an empty extension which is not in the supported set.
+        // "foo." yields Some("") from Path::extension(), so it falls through
+        // to the unsupported branch (not the missing-extension branch).
         let err = OutputMode::from_path("foo.").unwrap_err();
-        assert!(
-            err.contains("no extension") || err.contains("unsupported"),
-            "got: {err}"
-        );
+        assert!(err.contains("unsupported"), "got: {err}");
     }
 
     #[test]
