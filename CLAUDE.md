@@ -53,6 +53,8 @@ src/
 - **`Motion` / `Shape` enum は当面 `main.rs` に置く** — `animate.rs`（#4）で必要になった時点で `pub mod` に昇格させる。今は CLI パース直後にしか使わないので main.rs ローカルで十分
 - **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
 - **描画バックエンドは tiny-skia** — pure Rust で外部 C ライブラリ不要、`RadialGradient` をネイティブで持っており orb 表現に向く。`Pixmap` は **premultiplied alpha** なので、`RgbaImage` (straight alpha) に変換する際は un-premultiply が必要
+- **アニメーション軌道はリサジュー曲線** — `animate.rs` の `render_frame` は `(sin(2π·a·t·s + φx), sin(2π·b·t·s + φy))` を採用。周波数比 `(a, b)` は整数比候補 `[(1,2),(2,3),(3,4),(1,3),(2,5)]` から `seed` で決定的に選ぶ。`(a · t · s).fract()` で位相を巻き戻すことで、t=0 と t=1 のフレームが浮動小数点誤差なく完全一致する（ループ性保証）。色揺らぎは HSL の S/L に追加倍率として乗せ、`saturation` フラグの倍率と二重掛けにならないよう独立させる
+- **`animate.rs` は `orb::render_static` を再利用** — 位置と色を変調した `Cluster` 列を作って渡すだけ。orb 側に新 API を増やさない
 
 ## 関連プロジェクト
 
