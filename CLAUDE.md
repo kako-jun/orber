@@ -30,7 +30,7 @@ cargo fmt --check
 
 ```
 src/
-├── main.rs         # CLI パース（clap）。Cli / Motion / Shape enum はここ
+├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
 ├── lib.rs          # モジュール宣言
 ├── output_mode.rs  # 出力拡張子 → OutputMode 判定（png/webp/mp4/webm/svg/css）
 ├── cluster.rs      # 入力画像 → 代表色クラスタ抽出
@@ -50,6 +50,8 @@ src/
 - **動画書き出しは ffmpeg 子プロセス呼び出し** — 自前エンコードはやらない
 - **動画入力対応も ffmpeg でフレーム抽出** — 抽出後は静止画パイプラインに合流させる
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
+- **`Motion` / `Shape` enum は当面 `main.rs` に置く** — `animate.rs`（#4）で必要になった時点で `pub mod` に昇格させる。今は CLI パース直後にしか使わないので main.rs ローカルで十分
+- **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
 
 ## 関連プロジェクト
 

@@ -23,7 +23,7 @@ enum Shape {
     Aquarelle,
 }
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "orber")]
 #[command(version)]
 #[command(about = "Turn photos and videos into abstract orb mood output")]
@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         }
     };
 
+    // TODO(#2): replace this debug dump with the real pipeline dispatch
     eprintln!(
         "orber: input={} output={} mode={:?} seed={:?} orb_size={} blur={} motion={:?} shape={:?} saturation={} duration_ms={}",
         cli.input.display(),

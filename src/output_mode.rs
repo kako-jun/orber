@@ -31,6 +31,15 @@ impl OutputMode {
     /// Matching is case-insensitive. Returns an `Err` describing the
     /// problem if the extension is missing or not one of the supported
     /// formats.
+    ///
+    /// ```
+    /// use orber::output_mode::OutputMode;
+    /// use std::path::Path;
+    ///
+    /// assert_eq!(OutputMode::from_path(Path::new("clip.mp4")).unwrap(), OutputMode::Mp4);
+    /// assert!(OutputMode::from_path(Path::new(".png")).is_err()); // hidden file: extension is None
+    /// assert!(OutputMode::from_path(Path::new("noext")).is_err());
+    /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
         let ext = path
@@ -38,7 +47,7 @@ impl OutputMode {
             .and_then(|e| e.to_str())
             .ok_or_else(|| {
                 format!(
-                    "output path {:?} has no extension; expected one of png, webp, mp4, webm, svg, css",
+                    "output path {} has no extension; expected one of png, webp, mp4, webm, svg, css",
                     path.display()
                 )
             })?
@@ -119,5 +128,28 @@ mod tests {
             OutputMode::from_path("dir/sub/clip.MP4"),
             Ok(OutputMode::Mp4)
         );
+    }
+
+    #[test]
+    fn nested_path_no_extension() {
+        let err = OutputMode::from_path("dir/sub/clip").unwrap_err();
+        assert!(err.contains("no extension"), "got: {err}");
+    }
+
+    #[test]
+    fn trailing_dot() {
+        // "foo." has an empty extension which is not in the supported set.
+        let err = OutputMode::from_path("foo.").unwrap_err();
+        assert!(
+            err.contains("no extension") || err.contains("unsupported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_dot_unsupported_extension() {
+        // Only the final ".bak" counts as the extension.
+        let err = OutputMode::from_path("foo.PNG.bak").unwrap_err();
+        assert!(err.contains("bak"), "error should mention bak: {err}");
     }
 }
