@@ -658,22 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn breathe_changes_frame_over_time() {
-        // 全 orb 共通の呼吸揺らぎ（半径 ±10%）が効いていることを、
-        // 進行方向に動かない y 座標を持つ orb で間接的に確認する。
-        // t=0 と t=0.25 では breath_phase が異なるので weight も異なり、フレームも異なる。
-        // （Top/Bottom 方向ではないので x も動くが、半径も変わる）
-        let clusters = sample_clusters();
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::VerySlow);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.25);
-        assert!(
-            !pixels_equal(&a, &b),
-            "breathing modulation must produce different frames over time"
-        );
-    }
-
-    #[test]
     fn cycle_count_matches_speed() {
         // 速度の cycle_count が仕様通りであることを保証する回帰テスト。
         assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
@@ -712,14 +696,19 @@ mod tests {
     #[test]
     fn style_is_mixed_across_orbs() {
         // 多めの orb を生成すると Rim と Soft が両方出現する。
-        // 50:50 程度に振っているので、64 個も引けば両方が必ず出る（確率的に
-        // 1 種類しか出ない確率は (0.5)^64 ≈ 5.4e-20）。
+        // 50:50 程度に振っているので、64 サンプルなら両方とも 20..=44 の範囲に
+        // 収まることをチェック（理論期待値 32、片側に大きく寄ると分布が壊れている
+        // サインなので緩めに 20..=44 で監視）。
         let p = generate_orb_params(7, 64, &[1.0]);
         let n_rim = p.iter().filter(|q| q.style == OrbStyle::Rim).count();
         let n_soft = p.iter().filter(|q| q.style == OrbStyle::Soft).count();
         assert!(
-            n_rim > 0 && n_soft > 0,
-            "expected both Rim and Soft to appear; got rim={n_rim} soft={n_soft}"
+            (20..=44).contains(&n_rim),
+            "Rim count out of expected band 20..=44; got rim={n_rim} soft={n_soft}"
+        );
+        assert!(
+            (20..=44).contains(&n_soft),
+            "Soft count out of expected band 20..=44; got rim={n_rim} soft={n_soft}"
         );
     }
 
@@ -748,15 +737,18 @@ mod tests {
 
     #[test]
     fn speed_mult_distribution() {
-        // 30 個の orb を引けば 1/2 が両方出現する。
-        // 全部同じ値になる確率は (1/2)^29 * 2 ≈ 3.7e-9 で実質 0。
-        let p = generate_orb_params(99, 30, &[1.0]);
+        // 64 サンプルで 1x / 2x の出現数が 20..=44 のバンドに収まること。
+        // 理論期待値 32（50:50）。片側に大きく偏ると分布が壊れているサイン。
+        let p = generate_orb_params(99, 64, &[1.0]);
         let n1 = p.iter().filter(|q| q.speed_mult == 1).count();
         let n2 = p.iter().filter(|q| q.speed_mult == 2).count();
-        let kinds = [n1, n2].iter().filter(|&&n| n > 0).count();
         assert!(
-            kinds == 2,
-            "expected both speed_mult values to appear; got n1={n1}, n2={n2}"
+            (20..=44).contains(&n1),
+            "speed_mult=1 count out of expected band 20..=44; got n1={n1}, n2={n2}"
+        );
+        assert!(
+            (20..=44).contains(&n2),
+            "speed_mult=2 count out of expected band 20..=44; got n1={n1}, n2={n2}"
         );
         // 全 orb が {1, 2} の範囲内であることも確認。
         for q in &p {
@@ -769,20 +761,60 @@ mod tests {
     }
 
     #[test]
-    fn breath_axes_each_drive_visible_change_in_isolation() {
-        // 3 軸独立揺らぎが効いていることの間接確認。
-        // 64 個の orb を散らせて、t=0 と t=0.5 のフレームに差があることを確認する
-        // （位置 + breath の両方が乗るので必ず差が出る）。中央ピクセル単発では
-        // 画面外バッファ wrap で orb が center を通らない可能性があるため、
-        // 全画面でいずれかのピクセルに差があることを見る。
-        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::VerySlow);
-        opts.count = Some(64);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.5);
+    fn breath_phases_are_seeded_per_orb_and_per_axis() {
+        // breath 機能の検証は OrbParams の位相分布だけでやる。
+        // - 同じ orb 内では radius / blur / opacity の 3 軸が異なる位相
+        // - orb 間でも同じ軸の位相が散らばっている（どれか 1 軸でも全 orb 一致は許さない）
+        //
+        // 旧 breath テストはどちらも LeftToRight + t!=0 で「pixels_equal にならない」
+        // ことを主張していたが、orb は LR 移動するので breath を OFF にしても
+        // 通ってしまう（=何も検証していない）。位相分布チェックに置き換える。
+        let p = generate_orb_params(42, 16, &[1.0]);
+        // 3 軸が同一位相の orb が 1 つでもあったらアウト。
+        for op in &p {
+            assert!(
+                (op.phi_radius - op.phi_blur).abs() > 1e-6
+                    || (op.phi_blur - op.phi_opacity).abs() > 1e-6,
+                "breath axes must not all share the same phase: phi_radius={} phi_blur={} phi_opacity={}",
+                op.phi_radius,
+                op.phi_blur,
+                op.phi_opacity
+            );
+        }
+        // orb 間でも各軸の位相が散らばっていること（最小値と最大値が十分離れている）。
+        // f32 の位相が完全一致する確率は実質 0 だが、念のため幅を見る。
+        let mut min_r = f32::INFINITY;
+        let mut max_r = f32::NEG_INFINITY;
+        let mut min_b = f32::INFINITY;
+        let mut max_b = f32::NEG_INFINITY;
+        let mut min_o = f32::INFINITY;
+        let mut max_o = f32::NEG_INFINITY;
+        for op in &p {
+            min_r = min_r.min(op.phi_radius);
+            max_r = max_r.max(op.phi_radius);
+            min_b = min_b.min(op.phi_blur);
+            max_b = max_b.max(op.phi_blur);
+            min_o = min_o.min(op.phi_opacity);
+            max_o = max_o.max(op.phi_opacity);
+        }
+        // TAU ≈ 6.28 のうち、16 サンプルあれば spread が 1.0 以上は固い。
         assert!(
-            !pixels_equal(&a, &b),
-            "breath axes should produce visible difference between t=0 and t=0.5"
+            max_r - min_r > 1.0,
+            "phi_radius spread too narrow ({} .. {})",
+            min_r,
+            max_r
+        );
+        assert!(
+            max_b - min_b > 1.0,
+            "phi_blur spread too narrow ({} .. {})",
+            min_b,
+            max_b
+        );
+        assert!(
+            max_o - min_o > 1.0,
+            "phi_opacity spread too narrow ({} .. {})",
+            min_o,
+            max_o
         );
     }
 
