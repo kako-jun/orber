@@ -109,12 +109,25 @@ fn parse_f32_in_range(min: f32, max: f32) -> impl Fn(&str) -> Result<f32, String
 fn parse_orb_size(s: &str) -> Result<f32, String> {
     parse_f32_in_range(0.0, 10.0)(s)
 }
+fn parse_variations_n(s: &str) -> Result<usize, String> {
+    // --variations 0 は「該当無し」エラーで誤解を招くので、value parser で
+    // 1.. を強制する（preset 上限の 10 はメッセージで伝えるため弾かない）。
+    let v: usize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if v == 0 {
+        return Err("must be >= 1 (use --variations N with N >= 1)".to_string());
+    }
+    Ok(v)
+}
+
 fn parse_count(s: &str) -> Result<usize, String> {
     let v: usize = s
         .parse()
         .map_err(|e: std::num::ParseIntError| e.to_string())?;
-    if !(1..=200).contains(&v) {
-        return Err(format!("must be in 1..=200, got {v}"));
+    // ライブラリ層の MAX_ORB_COUNT (1024) と揃える。
+    if !(1..=1024).contains(&v) {
+        return Err(format!("must be in 1..=1024, got {v}"));
     }
     Ok(v)
 }
@@ -140,9 +153,9 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Generate N variations of the input under --output-dir instead of a single file.
-    /// Requires --output-dir. Variations are picked from a curated preset table
-    /// (4 still snapshots + 6 mp4 flows = up to 10).
-    #[arg(long)]
+    /// Requires --output-dir (N >= 1). Variations are picked from a curated preset
+    /// table (4 still snapshots + 6 mp4 flows = up to 10).
+    #[arg(long, value_parser = parse_variations_n)]
     variations: Option<usize>,
 
     /// Output directory for --variations mode. Created if it does not exist.
@@ -153,9 +166,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliVariationMode::Mixed)]
     variations_mode: CliVariationMode,
 
-    /// Random seed for reproducible output.
-    #[arg(long)]
-    seed: Option<u64>,
+    /// Random seed for reproducible output (default 0).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
 
     /// Orb size as a relative multiplier (0.0..=10.0; 1.0 = default).
     #[arg(long, default_value_t = 1.0, value_parser = parse_orb_size)]
@@ -173,7 +186,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
     speed: CliSpeed,
 
-    /// Number of orbs visible on screen at once (1..=200, default 20).
+    /// Number of orbs visible on screen at once (1..=1024, default 20).
     /// Clusters are expanded to this count by weight-proportional color sampling
     /// and per-orb scattering on the cross axis. Higher count fills more of the
     /// frame; ~20 fills roughly 70% on the default size.
@@ -371,7 +384,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         saturation: cli.saturation,
         direction,
         speed,
-        seed: cli.seed.unwrap_or(0),
+        seed: cli.seed,
         count: Some(cli.count),
         background,
         shape: cli.orb_shape(),
@@ -424,7 +437,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         saturation: cli.saturation,
         direction,
         speed,
-        seed: cli.seed.unwrap_or(0),
+        seed: cli.seed,
         count: Some(cli.count),
         background,
         shape: cli.orb_shape(),
@@ -670,11 +683,11 @@ mod tests {
     #[test]
     fn count_out_of_range_rejected() {
         assert!(try_parse(&["--count", "0"]).is_err());
-        assert!(try_parse(&["--count", "201"]).is_err());
+        assert!(try_parse(&["--count", "1025"]).is_err());
         assert!(try_parse(&["--count", "abc"]).is_err());
         assert!(try_parse(&["--count", "1"]).is_ok());
         assert!(try_parse(&["--count", "20"]).is_ok());
-        assert!(try_parse(&["--count", "200"]).is_ok());
+        assert!(try_parse(&["--count", "1024"]).is_ok());
     }
 
     #[test]

@@ -80,7 +80,10 @@ pub enum MotionSpeed {
 
 impl MotionSpeed {
     /// 動画全体での横断回数。整数なので `t=0` と `t=1` で進行量が完全一致する。
-    pub(crate) fn cycle_count(self) -> u32 {
+    ///
+    /// `MotionSpeed` 自体が `pub` なので、外部利用者が enum 各 variant の意味
+    /// （何回画面を横断するか）を introspect できるよう `pub` にしている。
+    pub fn cycle_count(self) -> u32 {
         match self {
             MotionSpeed::VerySlow => 1,
             MotionSpeed::Slow => 2,
