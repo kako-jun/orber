@@ -160,6 +160,28 @@ pub fn extract_clusters(img: &RgbImage, k: usize) -> Result<Vec<Cluster>, Cluste
     Ok(clusters)
 }
 
+/// クラスタ列から背景 RGBA を派生する。
+///
+/// 最大 weight のクラスタの色（sRGB 8bit）を取り、alpha=255 を付けて返す。
+/// クラスタが空の場合は黒 `[0, 0, 0, 255]`。
+///
+/// # 設計メモ
+///
+/// 入力写真のドミナント色をそのまま背景にする。`extract_clusters` の戻り値は
+/// weight 降順にソート済みなので「先頭」が最大 weight だが、この関数は順序に
+/// 依存せず `max_by` で明示的に最大を取り直す（呼び出し側がソート済みを
+/// 保証しなくても動くようにするため）。
+pub fn derive_background_rgba(clusters: &[Cluster]) -> [u8; 4] {
+    clusters
+        .iter()
+        .max_by(|a, b| a.weight.total_cmp(&b.weight))
+        .map(|c| {
+            let [r, g, b] = c.color;
+            [r, g, b, 255]
+        })
+        .unwrap_or([0, 0, 0, 255])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +292,52 @@ mod tests {
             Err(ClusterError::KZero) => {}
             other => panic!("expected KZero, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn derive_background_picks_max_weight_cluster() {
+        // 最大 weight のクラスタの色が alpha=255 で返ることを確認。
+        let clusters = vec![
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.7,
+            },
+            Cluster {
+                color: [0, 0, 0],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.1,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn derive_background_unsorted_input() {
+        // weight 降順でなくても max_by で最大を引けることを確認。
+        let clusters = vec![
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.7,
+            },
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn derive_background_empty_clusters_yields_black() {
+        let clusters: Vec<Cluster> = vec![];
+        assert_eq!(derive_background_rgba(&clusters), [0, 0, 0, 255]);
     }
 }
