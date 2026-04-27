@@ -261,18 +261,17 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
                     (amp_pos * scale_x * v, amp_pos * scale_y * v, 1.0)
                 }
                 MotionShape::Breathe => {
-                    // 半径を ±(2 * amp_pos) の範囲で呼吸させる（位置基準の amp_pos を流用）。
-                    // amp_pos=0.06 なら半径は 0.88..1.12 倍で揺らぐ。
+                    // 半径を ±(5 * amp_pos) の範囲で呼吸させる（v0.2.0 までは ±2 だったが弱かった）。
+                    // amp_pos=0.06 (Subtle) で 0.7..1.3 倍、amp_pos=0.15 (Slow) で 0.25..1.75 倍。
                     let phase = sin_loop(1, t, freq_scale, p.phi_color);
-                    let r = (1.0 + 2.0 * amp_pos * phase).max(0.0);
+                    let r = (1.0 + 5.0 * amp_pos * phase).max(0.0);
                     (0.0, 0.0, r)
                 }
                 MotionShape::Twinkle => {
-                    // 半径と明度を sin で同期して揺らす。amp_pos=0.06 なら半径は 0.7..1.3 倍。
-                    // 「瞬き」感を出すため Breathe より振幅を大きめに、freq_scale も 2 倍する。
-                    let phase = sin_loop(2, t, freq_scale, p.phi_color);
-                    let r = (1.0 + 5.0 * amp_pos * phase).max(0.0);
-                    (0.0, 0.0, r)
+                    // v0.3.0: 「瞬き」感を出すため、位置と半径は不変、明度のみ大きく揺らす。
+                    // 半径を揺らすと点が膨張収縮して見えてしまい、「ふわっと点いて消える」
+                    // 感が出ない。半径不変・明度のみで明滅を表現する。
+                    (0.0, 0.0, 1.0)
                 }
             };
 
@@ -284,10 +283,12 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
             let new_y = (c.centroid.y + dy).rem_euclid(1.0);
 
             // 色揺らぎ: HSL の S と L を 1 ± amp_color の範囲で振る。
-            // Twinkle は明度の振れ幅を倍にして「瞬き」感を強める。
+            // Twinkle は明滅モードなので、半径ではなく明度の振れ幅を大きく取る。
+            // v0.3.0 では Twinkle 用の sin に Breathe と同じ周波数 1 を使う
+            // （以前は 2 倍にしていたが、明滅は遅めの方が自然）。
             let color_phase = sin_loop(1, t, freq_scale, p.phi_color);
             let l_amp = match opts.motion_shape {
-                MotionShape::Twinkle => amp_color,
+                MotionShape::Twinkle => amp_color * 6.0,
                 _ => amp_color * 0.5,
             };
             let s_factor = 1.0 + amp_color * color_phase;
@@ -510,7 +511,7 @@ mod tests {
     #[test]
     fn all_shape_speed_combinations_loop_closed() {
         // 全 shape × 全 speed で t=0 と t=1 が完全一致することを検証する。
-        // Twinkle は freq_scale を内部で 2 倍するが、整数演算のままなので閉じる。
+        // 全 shape の sin に整数 frequency を渡しているのでループ性は保たれる。
         let clusters = sample_clusters();
         for shape in [
             MotionShape::Still,
