@@ -78,6 +78,8 @@ pub struct VideoOptions {
     pub saturation: f32,
     pub motion: MotionPreset,
     pub seed: u64,
+    /// 背景 RGBA。動画は yuv420p 制約で alpha 不可なので呼び出し側で透過を弾くこと。
+    pub background: [u8; 4],
 }
 
 impl Default for VideoOptions {
@@ -89,6 +91,7 @@ impl Default for VideoOptions {
             saturation: a.saturation,
             motion: a.motion,
             seed: a.seed,
+            background: a.background,
         }
     }
 }
@@ -190,6 +193,7 @@ pub fn render_video(
         saturation: opts.saturation,
         motion: opts.motion,
         seed: opts.seed,
+        background: opts.background,
     };
 
     let temp_dir = tempfile::TempDir::new()?;
