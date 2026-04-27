@@ -1,10 +1,11 @@
 use clap::{Parser, ValueEnum};
 use orber::animate::{MotionPreset, MotionShape, MotionSpeed};
 use orber::background::{resolve as resolve_background, Background};
-use orber::cluster::extract_clusters;
+use orber::cluster::{extract_clusters, Cluster};
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
+use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use orber::video::{render_video, VideoCodec, VideoOptions};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -64,6 +65,24 @@ enum CliMotionSpeed {
     Lively,
 }
 
+/// `--variations-mode` の選択肢。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliVariationMode {
+    Still,
+    Video,
+    Mixed,
+}
+
+impl From<CliVariationMode> for VariationMode {
+    fn from(m: CliVariationMode) -> Self {
+        match m {
+            CliVariationMode::Still => VariationMode::Still,
+            CliVariationMode::Video => VariationMode::Video,
+            CliVariationMode::Mixed => VariationMode::Mixed,
+        }
+    }
+}
+
 impl From<CliMotionSpeed> for MotionSpeed {
     fn from(s: CliMotionSpeed) -> Self {
         match s {
@@ -93,8 +112,23 @@ struct Cli {
     input: PathBuf,
 
     /// Output file. Format inferred from extension: png, webp, mp4, webm, svg, css.
+    /// Required for the single-output mode (omitted when --variations is set).
     #[arg(short, long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
+
+    /// Generate N variations of the input under --output-dir instead of a single file.
+    /// Requires --output-dir. Variations are picked from a curated preset table
+    /// (still ×3, drift ×4, breathe ×1, lissajous ×2 = up to 10).
+    #[arg(long)]
+    variations: Option<usize>,
+
+    /// Output directory for --variations mode. Created if it does not exist.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Filter for --variations: only stills, only videos, or mixed (default).
+    #[arg(long, value_enum, default_value_t = CliVariationMode::Mixed)]
+    variations_mode: CliVariationMode,
 
     /// Random seed for reproducible output.
     #[arg(long)]
@@ -145,16 +179,28 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let mode = match OutputMode::from_path(&cli.output) {
-        Ok(m) => m,
+    let bg: Background = match cli.background.parse() {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("orber: {e}");
             return ExitCode::from(2);
         }
     };
 
-    let bg: Background = match cli.background.parse() {
-        Ok(b) => b,
+    if let Some(n) = cli.variations {
+        return render_variations(&cli, n, bg);
+    }
+
+    let output = match &cli.output {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("orber: either --output FILE or --variations N --output-dir DIR is required");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mode = match OutputMode::from_path(&output) {
+        Ok(m) => m,
         Err(e) => {
             eprintln!("orber: {e}");
             return ExitCode::from(2);
@@ -168,12 +214,12 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        return render_video_path(&cli, codec, bg);
+        return render_video_path(&cli, &output, codec, bg);
     }
 
     match mode {
-        OutputMode::Png => render_png(&cli, bg),
-        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, mode, bg),
+        OutputMode::Png => render_png(&cli, &output, bg),
+        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, &output, mode, bg),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
@@ -196,7 +242,7 @@ fn resolve_motion(cli: &Cli) -> (MotionShape, MotionSpeed) {
     (shape, speed)
 }
 
-fn render_style_path(cli: &Cli, mode: OutputMode, bg: Background) -> ExitCode {
+fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -230,18 +276,15 @@ fn render_style_path(cli: &Cli, mode: OutputMode, bg: Background) -> ExitCode {
         _ => unreachable!("render_style_path called with non-style mode {mode:?}"),
     };
 
-    if let Err(e) = std::fs::write(&cli.output, content) {
-        eprintln!(
-            "orber: failed to write output {}: {e}",
-            cli.output.display()
-        );
+    if let Err(e) = std::fs::write(output, content) {
+        eprintln!("orber: failed to write output {}: {e}", output.display());
         return ExitCode::from(2);
     }
-    eprintln!("orber: wrote {}", cli.output.display());
+    eprintln!("orber: wrote {}", output.display());
     ExitCode::SUCCESS
 }
 
-fn render_video_path(cli: &Cli, codec: VideoCodec, bg: Background) -> ExitCode {
+fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -273,15 +316,15 @@ fn render_video_path(cli: &Cli, codec: VideoCodec, bg: Background) -> ExitCode {
     };
 
     // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
-    if let Err(e) = render_video(&clusters, &opts, &cli.output, cli.duration_ms, codec) {
+    if let Err(e) = render_video(&clusters, &opts, output, cli.duration_ms, codec) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
     }
-    eprintln!("orber: wrote {}", cli.output.display());
+    eprintln!("orber: wrote {}", output.display());
     ExitCode::SUCCESS
 }
 
-fn render_png(cli: &Cli, bg: Background) -> ExitCode {
+fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -314,15 +357,120 @@ fn render_png(cli: &Cli, bg: Background) -> ExitCode {
     let out = render_static(&clusters, &opts);
 
     // 5. 保存。
-    if let Err(e) = out.save(&cli.output) {
+    if let Err(e) = out.save(output) {
+        eprintln!("orber: failed to write output {}: {e}", output.display());
+        return ExitCode::from(2);
+    }
+    eprintln!("orber: wrote {}", output.display());
+    ExitCode::SUCCESS
+}
+
+/// `--variations` 経路。`output_dir` を作って各 spec で逐次書き出す。
+fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
+    let dir = match &cli.output_dir {
+        Some(d) => d.clone(),
+        None => {
+            eprintln!("orber: --variations requires --output-dir DIR");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("orber: failed to create output dir {}: {e}", dir.display());
+        return ExitCode::from(2);
+    }
+
+    // 入力 + クラスタは全 spec で共有。
+    let img = match image::open(&cli.input) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => {
+            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            return ExitCode::from(2);
+        }
+    };
+    let clusters = match extract_clusters(&img, 6) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let resolved_bg = resolve_background(&img, bg);
+
+    let specs = select_specs(n, cli.variations_mode.into());
+    if specs.is_empty() {
         eprintln!(
-            "orber: failed to write output {}: {e}",
-            cli.output.display()
+            "orber: no variations matched (requested n={n}, mode={:?})",
+            cli.variations_mode
         );
         return ExitCode::from(2);
     }
-    eprintln!("orber: wrote {}", cli.output.display());
+
+    let total = specs.len();
+    if total < n {
+        eprintln!(
+            "orber: only {total} variation(s) available for mode {:?} (requested {n})",
+            cli.variations_mode
+        );
+    }
+
+    for (i, spec) in specs.iter().enumerate() {
+        let idx = i + 1;
+        let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
+        let out_path = dir.join(&filename);
+        eprintln!("orber: variation {idx}/{total} ({filename})");
+        // 動画 + 透過は不可（yuv420p）。bg が transparent なら black に置換して進める。
+        let spec_bg = if spec.kind == VariationKind::Mp4 && resolved_bg[3] == 0 {
+            [0, 0, 0, 255]
+        } else {
+            resolved_bg
+        };
+        let result = render_one_variation(&clusters, spec, &out_path, spec_bg);
+        if let Err(msg) = result {
+            eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
+            return ExitCode::from(2);
+        }
+    }
     ExitCode::SUCCESS
+}
+
+fn render_one_variation(
+    clusters: &[Cluster],
+    spec: &VariationSpec,
+    out_path: &std::path::Path,
+    bg_rgba: [u8; 4],
+) -> Result<(), String> {
+    match spec.kind {
+        VariationKind::Png => {
+            let opts = RenderOptions {
+                orb_size: spec.orb_size,
+                blur: spec.blur,
+                saturation: spec.saturation,
+                background: bg_rgba,
+                ..RenderOptions::default()
+            };
+            let img = render_static(clusters, &opts);
+            img.save(out_path).map_err(|e| e.to_string())
+        }
+        VariationKind::Mp4 => {
+            let opts = VideoOptions {
+                orb_size: spec.orb_size,
+                blur: spec.blur,
+                saturation: spec.saturation,
+                motion_shape: spec.shape,
+                motion_speed: spec.speed,
+                seed: spec.seed,
+                background: bg_rgba,
+            };
+            render_video(
+                clusters,
+                &opts,
+                out_path,
+                spec.duration_ms,
+                VideoCodec::H264,
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
