@@ -3,6 +3,7 @@ use orber::animate::{MotionPreset, MotionShape, MotionSpeed};
 use orber::aquarelle::AquarelleParams;
 use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::{extract_clusters, Cluster};
+use orber::color_mod::apply_color_mod;
 use orber::orb::{render_static, OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
@@ -450,18 +451,12 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // 入力 + クラスタは全 spec で共有。
+    // 入力画像は全 spec で共有。クラスタ抽出は spec.cluster_count に依存するので
+    // spec ごとにキャッシュ付きで行う（cluster_count が同じなら使い回し）。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
             eprintln!("orber: failed to read input {}: {e}", cli.input.display());
-            return ExitCode::from(2);
-        }
-    };
-    let clusters = match extract_clusters(&img, 6) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("orber: cluster extraction failed: {e}");
             return ExitCode::from(2);
         }
     };
@@ -485,18 +480,39 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
     }
 
     let orb_shape = cli.orb_shape();
+    // cluster_count → base clusters のキャッシュ。同じ k は再計算せずに使い回す。
+    let mut cluster_cache: Vec<(usize, Vec<Cluster>)> = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
+
+        let base_clusters = match cluster_cache.iter().find(|(k, _)| *k == spec.cluster_count) {
+            Some((_, c)) => c.clone(),
+            None => match extract_clusters(&img, spec.cluster_count) {
+                Ok(c) => {
+                    cluster_cache.push((spec.cluster_count, c.clone()));
+                    c
+                }
+                Err(e) => {
+                    eprintln!("orber: cluster extraction failed: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+        };
+        // spec の色軸（hue / lightness / saturation / dominant_rotation）を適用する。
+        // saturation は ColorMod 経由で HSL に乗るため、render 側に渡す saturation は
+        // 1.0 に固定する（二重に saturation がかからないように）。
+        let modulated = apply_color_mod(base_clusters, &spec.color_mod());
+
         // 動画 + 透過は不可（yuv420p）。bg が transparent なら black に置換して進める。
         let spec_bg = if spec.kind == VariationKind::Mp4 && resolved_bg[3] == 0 {
             [0, 0, 0, 255]
         } else {
             resolved_bg
         };
-        let result = render_one_variation(&clusters, spec, &out_path, spec_bg, orb_shape);
+        let result = render_one_variation(&modulated, spec, &out_path, spec_bg, orb_shape);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -512,12 +528,14 @@ fn render_one_variation(
     bg_rgba: [u8; 4],
     orb_shape: OrbShape,
 ) -> Result<(), String> {
+    // 彩度は ColorMod 経由で HSL に既に乗っているので、render 側では 1.0 固定にする。
+    // saturation を二重にかけると意図しない色破綻が起きる。
     match spec.kind {
         VariationKind::Png => {
             let opts = RenderOptions {
                 orb_size: spec.orb_size,
                 blur: spec.blur,
-                saturation: spec.saturation,
+                saturation: 1.0,
                 background: bg_rgba,
                 shape: orb_shape,
                 ..RenderOptions::default()
@@ -529,7 +547,7 @@ fn render_one_variation(
             let opts = VideoOptions {
                 orb_size: spec.orb_size,
                 blur: spec.blur,
-                saturation: spec.saturation,
+                saturation: 1.0,
                 motion_shape: spec.shape,
                 motion_speed: spec.speed,
                 seed: spec.seed,

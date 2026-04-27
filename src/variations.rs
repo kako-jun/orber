@@ -53,6 +53,9 @@ impl VariationMode {
 }
 
 /// 1 つのバリエーション案。
+///
+/// 色まわりは 4 軸（hue / lightness / saturation / dominant_rotation）で動かし、
+/// クラスタ数は spec ごとに変える（少なめだと 1 色が支配的、多めだと粒立った印象）。
 #[derive(Debug, Clone, Copy)]
 pub struct VariationSpec {
     pub label: &'static str,
@@ -63,10 +66,31 @@ pub struct VariationSpec {
     pub speed: MotionSpeed,
     pub orb_size: f32,
     pub blur: f32,
+    /// HSL 彩度倍率（既存）。`ColorMod::saturation` に渡される。
     pub saturation: f32,
+    /// 色相回転（度）。`ColorMod::hue_shift_deg` に渡される。
+    pub hue_shift_deg: f32,
+    /// HSL 明度に対する加算バイアス（-0.5..0.5 想定）。`ColorMod::lightness_bias`。
+    pub lightness_bias: f32,
+    /// k-means クラスタ数。少ないほどベタ寄り、多いほど粒立つ。
+    pub cluster_count: usize,
+    /// 支配色ローテーション（weight 降順 cluster の右回転 N）。
+    pub dominant_rotation: usize,
     pub seed: u64,
     /// 動画用の長さ（ms）。Png では参照されない。
     pub duration_ms: u64,
+}
+
+impl VariationSpec {
+    /// この spec から色モジュレーション設定を取り出す。
+    pub fn color_mod(&self) -> crate::color_mod::ColorMod {
+        crate::color_mod::ColorMod {
+            hue_shift_deg: self.hue_shift_deg,
+            lightness_bias: self.lightness_bias,
+            saturation: self.saturation,
+            dominant_rotation: self.dominant_rotation,
+        }
+    }
 }
 
 /// デフォルト 10 案セット。
@@ -82,6 +106,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.0,
         blur: 0.5,
         saturation: 1.2,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 1,
         duration_ms: 4000,
     },
@@ -93,6 +121,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.2,
         blur: 0.7,
         saturation: 0.8,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 2,
         duration_ms: 4000,
     },
@@ -104,6 +136,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 0.8,
         blur: 0.3,
         saturation: 1.5,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 3,
         duration_ms: 4000,
     },
@@ -115,6 +151,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.2,
         blur: 0.6,
         saturation: 1.0,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 4,
         duration_ms: 4000,
     },
@@ -126,6 +166,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.0,
         blur: 0.5,
         saturation: 1.0,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 5,
         duration_ms: 4000,
     },
@@ -137,6 +181,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.1,
         blur: 0.5,
         saturation: 1.1,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 6,
         duration_ms: 4000,
     },
@@ -148,6 +196,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.0,
         blur: 0.5,
         saturation: 1.0,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 7,
         duration_ms: 4000,
     },
@@ -159,6 +211,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.0,
         blur: 0.5,
         saturation: 1.0,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 8,
         duration_ms: 4000,
     },
@@ -170,6 +226,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 1.0,
         blur: 0.5,
         saturation: 1.1,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 9,
         duration_ms: 4000,
     },
@@ -181,6 +241,10 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 0.9,
         blur: 0.4,
         saturation: 1.2,
+        hue_shift_deg: 0.0,
+        lightness_bias: 0.0,
+        cluster_count: 6,
+        dominant_rotation: 0,
         seed: 10,
         duration_ms: 4000,
     },
