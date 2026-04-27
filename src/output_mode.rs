@@ -6,7 +6,8 @@
 //! user gets immediate feedback instead of running a full render and
 //! producing a file the rest of the toolchain cannot consume.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 /// Output rendering mode inferred from the output file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +26,29 @@ pub enum OutputMode {
     Css,
 }
 
+const SUPPORTED_EXTS: &str = "png, webp, mp4, webm, svg, css";
+
+/// Errors returned by [`OutputMode::from_path`].
+///
+/// Carrying the offending value (path / extension) instead of a free-form
+/// `String` lets call sites pattern-match on the failure mode rather than
+/// scraping error messages.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OutputModeError {
+    /// Path has no usable extension at all (e.g. `"noext"`, `".png"` hidden
+    /// files where `Path::extension()` returns `None`).
+    #[error("output path {} has no extension; expected one of {SUPPORTED_EXTS}", path.display())]
+    MissingExtension { path: PathBuf },
+    /// Extension is present but does not match a supported output format.
+    #[error("unsupported output extension {ext}; expected one of {SUPPORTED_EXTS}")]
+    UnsupportedExtension { ext: String },
+}
+
 impl OutputMode {
     /// Infer the [`OutputMode`] from a file path's extension.
     ///
-    /// Matching is case-insensitive. Returns an `Err` describing the
-    /// problem if the extension is missing or not one of the supported
-    /// formats.
+    /// Matching is case-insensitive. Returns [`OutputModeError`] if the
+    /// extension is missing or not one of the supported formats.
     ///
     /// ```
     /// use orber::output_mode::OutputMode;
@@ -40,16 +58,13 @@ impl OutputMode {
     /// assert!(OutputMode::from_path(Path::new(".png")).is_err()); // hidden file: extension is None
     /// assert!(OutputMode::from_path(Path::new("noext")).is_err());
     /// ```
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, OutputModeError> {
         let path = path.as_ref();
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .ok_or_else(|| {
-                format!(
-                    "output path {} has no extension; expected one of png, webp, mp4, webm, svg, css",
-                    path.display()
-                )
+            .ok_or_else(|| OutputModeError::MissingExtension {
+                path: path.to_path_buf(),
             })?
             .to_ascii_lowercase();
 
@@ -60,9 +75,9 @@ impl OutputMode {
             "webm" => Ok(OutputMode::Webm),
             "svg" => Ok(OutputMode::Svg),
             "css" => Ok(OutputMode::Css),
-            other => Err(format!(
-                "unsupported output extension {other}; expected one of png, webp, mp4, webm, svg, css"
-            )),
+            other => Err(OutputModeError::UnsupportedExtension {
+                ext: other.to_string(),
+            }),
         }
     }
 }
@@ -109,16 +124,21 @@ mod tests {
     #[test]
     fn unsupported_extension() {
         let err = OutputMode::from_path("a.gif").unwrap_err();
-        assert!(
-            err.contains("gif"),
-            "error should mention the bad ext: {err}"
-        );
+        match err {
+            OutputModeError::UnsupportedExtension { ext } => assert_eq!(ext, "gif"),
+            other => panic!("expected UnsupportedExtension, got {other:?}"),
+        }
     }
 
     #[test]
     fn missing_extension() {
         let err = OutputMode::from_path("noext").unwrap_err();
-        assert!(err.contains("no extension"), "got: {err}");
+        match err {
+            OutputModeError::MissingExtension { path } => {
+                assert_eq!(path.to_str().unwrap(), "noext");
+            }
+            other => panic!("expected MissingExtension, got {other:?}"),
+        }
     }
 
     #[test]
@@ -132,21 +152,40 @@ mod tests {
     #[test]
     fn nested_path_no_extension() {
         let err = OutputMode::from_path("dir/sub/clip").unwrap_err();
-        assert!(err.contains("no extension"), "got: {err}");
+        assert!(matches!(err, OutputModeError::MissingExtension { .. }));
     }
 
     #[test]
     fn trailing_dot() {
         // "foo." yields Some("") from Path::extension(), so it falls through
-        // to the unsupported branch (not the missing-extension branch).
+        // to the UnsupportedExtension branch (not MissingExtension).
         let err = OutputMode::from_path("foo.").unwrap_err();
-        assert!(err.contains("unsupported"), "got: {err}");
+        match err {
+            OutputModeError::UnsupportedExtension { ext } => assert_eq!(ext, ""),
+            other => panic!("expected UnsupportedExtension, got {other:?}"),
+        }
     }
 
     #[test]
     fn multi_dot_unsupported_extension() {
         // Only the final ".bak" counts as the extension.
         let err = OutputMode::from_path("foo.PNG.bak").unwrap_err();
-        assert!(err.contains("bak"), "error should mention bak: {err}");
+        match err {
+            OutputModeError::UnsupportedExtension { ext } => assert_eq!(ext, "bak"),
+            other => panic!("expected UnsupportedExtension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_messages_remain_user_facing() {
+        // ユーザー向けメッセージが拡張子と「expected one of ...」を含むことを保証する
+        // （main.rs での表示と互換）。
+        let missing = OutputMode::from_path("noext").unwrap_err().to_string();
+        assert!(missing.contains("no extension"), "got: {missing}");
+        assert!(missing.contains("png"), "should list supported: {missing}");
+
+        let bad = OutputMode::from_path("a.gif").unwrap_err().to_string();
+        assert!(bad.contains("gif"), "got: {bad}");
+        assert!(bad.contains("png"), "should list supported: {bad}");
     }
 }
