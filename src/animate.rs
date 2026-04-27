@@ -123,6 +123,7 @@ impl Default for AnimateOptions {
 ///
 /// `phase` は 0..1 の初期位置オフセット。`phi_radius` / `phi_blur` / `phi_opacity` は
 /// 3 軸独立の呼吸位相シフト（radius は ±10%、blur は ±15%、opacity は ±5%）。
+/// `style` は orb ごとの描画スタイル（Rim / Soft）で、フレーム内に混在させる。
 /// 速度ジッタは入れない（ループ性が崩れるため。代わりに phase で散らばらせる）。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
@@ -134,17 +135,34 @@ struct OrbParams {
     phi_blur: f32,
     /// opacity 呼吸 sin の位相シフト。3 軸を独立に。
     phi_opacity: f32,
+    /// 描画スタイル（Rim / Soft）。seed 由来でほぼ 50:50 に振る。
+    style: OrbStyle,
 }
 
 /// `seed` から各 orb のパラメータを決定的に生成する。
+///
+/// `style` は内部で u32 を引いて偶奇で Rim / Soft に振り分ける。f32 の連続値だと
+/// 「丸めて 0/1」の分布が偏る可能性があるため、整数 1 ステップを別に消費する。
 fn generate_orb_params(seed: u64, n_orbs: usize) -> Vec<OrbParams> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     (0..n_orbs)
-        .map(|_| OrbParams {
-            phase: rng.gen_range(0.0..1.0),
-            phi_radius: rng.gen_range(0.0..TAU),
-            phi_blur: rng.gen_range(0.0..TAU),
-            phi_opacity: rng.gen_range(0.0..TAU),
+        .map(|_| {
+            let phase = rng.gen_range(0.0..1.0);
+            let phi_radius = rng.gen_range(0.0..TAU);
+            let phi_blur = rng.gen_range(0.0..TAU);
+            let phi_opacity = rng.gen_range(0.0..TAU);
+            let style = if rng.gen::<u32>() & 1 == 0 {
+                OrbStyle::Rim
+            } else {
+                OrbStyle::Soft
+            };
+            OrbParams {
+                phase,
+                phi_radius,
+                phi_blur,
+                phi_opacity,
+                style,
+            }
         })
         .collect()
 }
@@ -236,16 +254,8 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
         let opacity = opacity_factor.clamp(0.0, 1.0);
 
-        // C16 時点では全 orb Rim 固定。Soft 混在は C17 で導入する。
-        render_one_orb(
-            &mut pixmap,
-            (cx, cy),
-            radius,
-            rgb,
-            blur,
-            opacity,
-            OrbStyle::Rim,
-        );
+        // 各 orb のスタイル（Rim / Soft）を seed 由来で振り分け、フレーム内に混在させる。
+        render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
     }
 
     finalize_pixmap(pixmap, width, height)
@@ -574,6 +584,20 @@ mod tests {
         assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
         assert_eq!(MotionSpeed::Slow.cycle_count(), 2);
         assert_eq!(MotionSpeed::Medium.cycle_count(), 3);
+    }
+
+    #[test]
+    fn style_is_mixed_across_orbs() {
+        // 多めの orb を生成すると Rim と Soft が両方出現する。
+        // 50:50 程度に振っているので、64 個も引けば両方が必ず出る（確率的に
+        // 1 種類しか出ない確率は (0.5)^64 ≈ 5.4e-20）。
+        let p = generate_orb_params(7, 64);
+        let n_rim = p.iter().filter(|q| q.style == OrbStyle::Rim).count();
+        let n_soft = p.iter().filter(|q| q.style == OrbStyle::Soft).count();
+        assert!(
+            n_rim > 0 && n_soft > 0,
+            "expected both Rim and Soft to appear; got rim={n_rim} soft={n_soft}"
+        );
     }
 
     #[test]
