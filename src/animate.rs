@@ -27,10 +27,10 @@
 //! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
 //!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
 //!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
-//! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
-//!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
+//! - 速度ジッタは **整数倍** (1x / 2x) で導入する。orb ごとに seed 由来で
+//!   `speed_mult ∈ {1, 2}` を割り当て、進行量を `cycle * speed_mult * t` とする。
 //!   両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
-//!   Slow / Medium と組み合わせると実効周回数は {1, 2, 3, 4, 6, 9} に変化に富む。
+//!   Slow と組み合わせると実効周回数は {1, 2, 4} に変化に富む。
 //! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
 //!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
@@ -63,20 +63,18 @@ pub enum MotionDirection {
     BottomToTop,
 }
 
-/// 流れの速さ。動画全体（duration）で何回画面を横断するかを整数 3 段階で表す。
+/// 流れの速さ。動画全体（duration）で何回画面を横断するかを整数 2 段階で表す。
 ///
 /// 整数横断回数にすることで `t=0` と `t=1` のフレームが完全一致する（ループ性）。
-/// 8 秒クリップで VerySlow なら 8 秒で 1 回横断、Slow なら 4 秒で 1 回横断、
-/// Medium なら 2.7 秒で 1 回横断。実時間で「ずっと遅い」感を出すには、長め
-/// の `duration_ms`（6000〜10000 ms 程度）と組み合わせること。
+/// 8 秒クリップで VerySlow なら 8 秒で 1 回横断、Slow なら 4 秒で 1 回横断。
+/// 実時間で「ずっと遅い」感を出すには、長めの `duration_ms`（6000〜10000 ms 程度）
+/// と組み合わせること。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionSpeed {
     /// 動画全体で画面 1 回横断（最も穏やか、既定相当）。
     VerySlow,
     /// 動画全体で画面 2 回横断（既定）。
     Slow,
-    /// 動画全体で画面 3 回横断（少し速め）。
-    Medium,
 }
 
 impl MotionSpeed {
@@ -85,7 +83,6 @@ impl MotionSpeed {
         match self {
             MotionSpeed::VerySlow => 1,
             MotionSpeed::Slow => 2,
-            MotionSpeed::Medium => 3,
         }
     }
 }
@@ -140,7 +137,7 @@ impl Default for AnimateOptions {
 /// `cluster_idx` はこの orb の色とサイズを取ってくる元クラスタの index（重み比例で抽選）。
 /// `cross_axis` は進行方向と直交する軸の正規化座標 0..1。orb をクラスタ重心に固定
 /// せず、画面全体に散らせるためのオフセット。
-/// `speed_mult` は整数倍速度 (1 / 2 / 3)。`cycle_count * speed_mult` も整数なので
+/// `speed_mult` は整数倍速度 (1 / 2)。`cycle_count * speed_mult` も整数なので
 /// `t=1` でループが閉じる。視覚的なバラつきの主因。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
@@ -158,7 +155,7 @@ struct OrbParams {
     cluster_idx: usize,
     /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
     cross_axis: f32,
-    /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
+    /// 整数倍速度 (1 / 2)。MotionSpeed の cycle_count と掛け合わせて使う。
     speed_mult: u32,
 }
 
@@ -549,11 +546,7 @@ mod tests {
             MotionDirection::TopToBottom,
             MotionDirection::BottomToTop,
         ] {
-            for speed in [
-                MotionSpeed::VerySlow,
-                MotionSpeed::Slow,
-                MotionSpeed::Medium,
-            ] {
+            for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
                 let opts = opts_with(dir, speed);
                 let a = render_frame(&clusters, &opts, 0.0);
                 let b = render_frame(&clusters, &opts, 1.0);
@@ -650,11 +643,7 @@ mod tests {
         // 1 周期分進んだ orb は元の位置に戻ってくる（rem_euclid による wrap）。
         // 既に t_zero_and_t_one_match で確認済みだが、Slow 以外も含めて再確認する。
         let clusters = sample_clusters();
-        for speed in [
-            MotionSpeed::VerySlow,
-            MotionSpeed::Slow,
-            MotionSpeed::Medium,
-        ] {
+        for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
             let opts = opts_with(MotionDirection::LeftToRight, speed);
             let a = render_frame(&clusters, &opts, 0.0);
             let b = render_frame(&clusters, &opts, 1.0);
@@ -686,7 +675,6 @@ mod tests {
         // 速度の cycle_count が仕様通りであることを保証する回帰テスト。
         assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
         assert_eq!(MotionSpeed::Slow.cycle_count(), 2);
-        assert_eq!(MotionSpeed::Medium.cycle_count(), 3);
     }
 
     #[test]
@@ -866,7 +854,7 @@ mod tests {
         // 既存 all_direction_speed_combinations_loop_closed でカバーしているが、
         // count=64 で speed_mult のばらつきが必ず起きるケースで明示的に再検証する。
         let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Medium);
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         opts.count = Some(64);
         let a = render_frame(&clusters, &opts, 0.0);
         let b = render_frame(&clusters, &opts, 1.0);

@@ -34,15 +34,13 @@ impl From<CliDirection> for MotionDirection {
     }
 }
 
-/// Conveyor-belt speed (`--speed`). Coarse 3-step preset; per-orb phase scatter is automatic.
+/// Conveyor-belt speed (`--speed`). Coarse 2-step preset; per-orb phase scatter is automatic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSpeed {
-    /// Half a screen-cross over the whole clip (most calm).
+    /// One screen-cross over the whole clip (most calm).
     VerySlow,
-    /// One screen-cross over the whole clip (default).
+    /// Two screen-crosses over the whole clip (default).
     Slow,
-    /// 1.5 screen-crosses over the whole clip (a bit brisk).
-    Medium,
 }
 
 impl From<CliSpeed> for MotionSpeed {
@@ -50,7 +48,6 @@ impl From<CliSpeed> for MotionSpeed {
         match s {
             CliSpeed::VerySlow => MotionSpeed::VerySlow,
             CliSpeed::Slow => MotionSpeed::Slow,
-            CliSpeed::Medium => MotionSpeed::Medium,
         }
     }
 }
@@ -172,7 +169,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliDirection::Lr)]
     direction: CliDirection,
 
-    /// Conveyor-belt speed. Coarse 3-step preset over the whole clip.
+    /// Conveyor-belt speed. Coarse 2-step preset over the whole clip.
     #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
     speed: CliSpeed,
 

@@ -60,7 +60,7 @@ impl VariationMode {
 
 /// 1 つのバリエーション案。
 ///
-/// 差別化軸は方向 4 / 速度 3 / count / orb_size / blur のみ。色は spec 内に持たない
+/// 差別化軸は方向 4 / 速度 2 / count / orb_size / blur のみ。色は spec 内に持たない
 /// （入力画像の kmeans 結果をそのまま使う）。
 #[derive(Debug, Clone, Copy)]
 pub struct VariationSpec {
@@ -81,7 +81,7 @@ pub struct VariationSpec {
 
 /// デフォルト 10 案セット (v0.3.0 preset)。
 ///
-/// 構成: 静止 4 + 動画 6。差別化軸は方向 4 / 速度 3 / count / orb_size / blur のみ。
+/// 構成: 静止 4 + 動画 6。差別化軸は方向 4 / 速度 2 / count / orb_size / blur のみ。
 /// 色は入力画像から拾った kmeans 結果をそのまま使い、preset では一切改変しない。
 /// ラベルは `kind_direction_特徴` 形式（snapshot_* / flow_* prefix）。warm / cool /
 /// aurora / dream / hi_key / dark_mood のような色ラベルは廃止。
@@ -177,13 +177,13 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "flow_lr_medium",
+        label: "flow_lr_slow_v2",
         kind: VariationKind::Mp4,
         direction: MotionDirection::LeftToRight,
-        speed: MotionSpeed::Medium,
+        speed: MotionSpeed::Slow,
         count: 22,
-        orb_size: 3.0,
-        blur: 0.5,
+        orb_size: 3.2,
+        blur: 0.55,
         seed: 9,
         duration_ms: 8000,
     },
