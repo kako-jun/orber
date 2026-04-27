@@ -177,13 +177,16 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "flow_lr_slow_v2",
+        // 「小粒・高密度・LR」の特徴的な spec。flow_lr_slow (count 20 / size 3.0
+        // / blur 0.5) との差別化を強めるため、count を倍以上に増やし orb サイズ
+        // と blur を半分に絞った別物にする。
+        label: "flow_lr_dense_small",
         kind: VariationKind::Mp4,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Slow,
-        count: 22,
-        orb_size: 3.2,
-        blur: 0.55,
+        count: 50,
+        orb_size: 1.5,
+        blur: 0.3,
         seed: 9,
         duration_ms: 8000,
     },
@@ -287,11 +290,12 @@ mod tests {
 
     #[test]
     fn count_is_in_screen_filling_range() {
-        // 「画面を 7 割埋める」狙い。10..=30 のレンジに収めて運用する。
+        // 「画面を 7 割埋める」狙いをデフォルトとしつつ、特徴的な spec は
+        // 50 個の小粒・高密度なども許容する。10..=50 のレンジで運用する。
         for s in DEFAULT_VARIATIONS {
             assert!(
-                (10..=30).contains(&s.count),
-                "spec {:?} has count {} outside the 10..=30 range",
+                (10..=50).contains(&s.count),
+                "spec {:?} has count {} outside the 10..=50 range",
                 s.label,
                 s.count
             );

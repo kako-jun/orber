@@ -21,7 +21,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - **BREAKING**: New `MotionDirection` enum (`LeftToRight`, `RightToLeft`, `TopToBottom`, `BottomToTop`) added.
 - **BREAKING**: CLI flags `--motion`, `--motion-shape`, `--motion-speed` are **removed** and replaced with `--direction <lr|rl|tb|bt>` and `--speed <very-slow|slow>`.
 - **BREAKING**: Animation boundary mode switched from `clamp` to wrap (`rem_euclid`).
-- **BREAKING**: `DEFAULT_VARIATIONS` preset rebuilt around direction × speed × `count` × `orb_size` × `blur` (color is no longer a preset axis). Output filenames change to `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`, `snapshot_bt_blurry`, `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`, `flow_bt_blurry`, `flow_lr_slow_v2`, `flow_rl_huge`. (#41)
+- **BREAKING**: `DEFAULT_VARIATIONS` preset rebuilt around direction × speed × `count` × `orb_size` × `blur` (color is no longer a preset axis). Output filenames change to `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`, `snapshot_bt_blurry`, `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`, `flow_bt_blurry`, `flow_lr_dense_small`, `flow_rl_huge`. (#41)
 - **BREAKING**: `VariationSpec` now carries `count: usize` instead of the old color/cluster fields. `VariationSpec.shape` / `VariationSpec.speed` (old types) replaced with `direction` and the new `speed`.
 - PNG single-output path now goes through `animate::render_frame(t=0)` instead of `render_static` so `--count` takes effect for stills as well as videos.
 - Animated variation duration extended from 4000 ms to 8000 ms so the slow conveyor pacing reads as gentle.

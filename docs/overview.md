@@ -132,7 +132,7 @@ all ten outputs. Differentiation comes from layout (count / size / blur) and mot
 - 4 stills: `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`,
   `snapshot_bt_blurry`
 - 6 animations (8 s each): `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`,
-  `flow_bt_blurry`, `flow_lr_slow_v2`, `flow_rl_huge`
+  `flow_bt_blurry`, `flow_lr_dense_small`, `flow_rl_huge`
 
 Stills are not pure `render_static` snapshots — they are the `t = 0` frame of the
 conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fraction
