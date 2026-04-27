@@ -35,6 +35,19 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
+- `--variations N --output-dir DIR` — emit a curated set of N alternate looks for the same input (color-shifted, motion-shaped, cluster-count-varied)
+
+## Variation preset (v0.3.0)
+
+The `--variations` mode draws from a 10-entry hand-tuned preset that combines four
+independent axes — hue shift, lightness bias, k-means cluster count, and motion shape —
+so the same input can yield ten visibly distinct outputs:
+
+- 4 stills: `warm_glow`, `cool_mist`, `hi_key`, `dark_mood`
+- 6 animations (6 s each): `drift_diagonal`, `breathe_deep`, `twinkle`, `wander_warm`, `aurora`, `dream`
+
+Animation orbs use a wrap (toroidal) boundary, so they exit one edge and reenter the opposite
+edge rather than sticking to the frame.
 
 ## Use cases
 

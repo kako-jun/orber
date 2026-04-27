@@ -36,6 +36,16 @@ orber --input photo.jpg --output orb.svg --background transparent
 
 Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, clip duration, and background color (`black` / `white` / `auto` / `transparent` / `#RRGGBB[AA]`; default `auto` picks a dimmed average color of the input image). See all flags via `orber --help`.
 
+To explore looks for a single input, batch out a curated set of 10 alternates:
+
+```bash
+orber --input photo.jpg --variations 10 --output-dir out/
+```
+
+Each preset varies hue, lightness, k-means cluster count, and motion shape so the
+ten outputs are visibly distinct (4 stills + 6 animations). Use `--variations-mode still`
+or `--variations-mode video` to filter.
+
 ## Build
 
 ```bash
