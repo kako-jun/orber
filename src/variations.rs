@@ -14,8 +14,11 @@
 //! - 出力ファイル名は `{idx:02}_{label}.{ext}` 形式。label は ASCII / underscore
 //!   のみで構成し、シェル安全に保つ
 //! - **色は変えない**。同じ入力画像から作る複数バリエーションでは入力色をそのまま
-//!   使う（warm / cool 等の色ラベル軸は廃止）。差別化軸は方向 4 / 速度 3 /
-//!   orb_size / blur のみ（次の commit で count を追加する）。
+//!   使う（warm / cool 等の色ラベル軸は廃止）。差別化軸は方向 4 / 速度 3 / count /
+//!   orb_size / blur のみ。
+//! - クラスタ数（kmeans の K）は呼び出し側で 5 固定（`main.rs` の
+//!   `VARIATIONS_KMEANS_K`）。spec ごとに動かさない（パレット汚しを避けるため）。
+//!   `count` は K 色を **N 個に展開** する数で、画面の約 7 割を埋めるのが狙い。
 
 use crate::animate::{MotionDirection, MotionSpeed};
 
@@ -78,57 +81,59 @@ pub struct VariationSpec {
 
 /// デフォルト 10 案セット (v0.3.0 preset)。
 ///
-/// 構成: 静止 4 + 動画 6。動きは 4 方向 × 3 速度で散らす。色は入力画像から拾った
-/// kmeans 結果をそのまま使い、preset では改変しない。
+/// 構成: 静止 4 + 動画 6。差別化軸は方向 4 / 速度 3 / count / orb_size / blur のみ。
+/// 色は入力画像から拾った kmeans 結果をそのまま使い、preset では一切改変しない。
+/// ラベルは `kind_direction_特徴` 形式（snapshot_* / flow_* prefix）。warm / cool /
+/// aurora / dream / hi_key / dark_mood のような色ラベルは廃止。
 ///
 /// 各 spec の数値根拠は GitHub Issue #41 の preset 表を参照。
 pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
     VariationSpec {
-        label: "warm_glow_lr",
+        label: "snapshot_lr_dense",
         kind: VariationKind::Png,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Slow,
-        count: 20,
+        count: 25,
         orb_size: 3.0,
         blur: 0.5,
         seed: 1,
         duration_ms: 6000,
     },
     VariationSpec {
-        label: "cool_mist_rl",
+        label: "snapshot_rl_huge",
         kind: VariationKind::Png,
         direction: MotionDirection::RightToLeft,
         speed: MotionSpeed::VerySlow,
-        count: 20,
-        orb_size: 3.5,
+        count: 12,
+        orb_size: 4.5,
         blur: 0.6,
         seed: 2,
         duration_ms: 6000,
     },
     VariationSpec {
-        label: "hi_key_tb",
+        label: "snapshot_tb_fine",
         kind: VariationKind::Png,
         direction: MotionDirection::TopToBottom,
         speed: MotionSpeed::Slow,
-        count: 20,
-        orb_size: 2.8,
+        count: 30,
+        orb_size: 2.5,
         blur: 0.4,
         seed: 3,
         duration_ms: 6000,
     },
     VariationSpec {
-        label: "dark_mood_bt",
+        label: "snapshot_bt_blurry",
         kind: VariationKind::Png,
         direction: MotionDirection::BottomToTop,
         speed: MotionSpeed::VerySlow,
         count: 20,
-        orb_size: 3.2,
-        blur: 0.6,
+        orb_size: 3.5,
+        blur: 0.8,
         seed: 4,
         duration_ms: 6000,
     },
     VariationSpec {
-        label: "drift_lr_slow",
+        label: "flow_lr_slow",
         kind: VariationKind::Mp4,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Slow,
@@ -139,57 +144,57 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "drift_rl_very_slow",
+        label: "flow_rl_very_slow",
         kind: VariationKind::Mp4,
         direction: MotionDirection::RightToLeft,
         speed: MotionSpeed::VerySlow,
-        count: 20,
-        orb_size: 4.0,
+        count: 15,
+        orb_size: 3.8,
         blur: 0.6,
         seed: 6,
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "drift_tb_slow",
+        label: "flow_tb_dense",
         kind: VariationKind::Mp4,
         direction: MotionDirection::TopToBottom,
         speed: MotionSpeed::Slow,
-        count: 20,
+        count: 28,
         orb_size: 2.8,
-        blur: 0.4,
+        blur: 0.5,
         seed: 7,
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "drift_bt_slow",
+        label: "flow_bt_blurry",
         kind: VariationKind::Mp4,
         direction: MotionDirection::BottomToTop,
-        speed: MotionSpeed::Slow,
-        count: 20,
-        orb_size: 3.2,
-        blur: 0.5,
+        speed: MotionSpeed::VerySlow,
+        count: 18,
+        orb_size: 3.5,
+        blur: 0.7,
         seed: 8,
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "aurora_rl",
+        label: "flow_lr_medium",
         kind: VariationKind::Mp4,
-        direction: MotionDirection::RightToLeft,
-        speed: MotionSpeed::VerySlow,
-        count: 20,
-        orb_size: 3.5,
-        blur: 0.7,
+        direction: MotionDirection::LeftToRight,
+        speed: MotionSpeed::Medium,
+        count: 22,
+        orb_size: 3.0,
+        blur: 0.5,
         seed: 9,
         duration_ms: 8000,
     },
     VariationSpec {
-        label: "dream_lr",
+        label: "flow_rl_huge",
         kind: VariationKind::Mp4,
-        direction: MotionDirection::LeftToRight,
-        speed: MotionSpeed::Medium,
-        count: 20,
-        orb_size: 2.8,
-        blur: 0.5,
+        direction: MotionDirection::RightToLeft,
+        speed: MotionSpeed::Slow,
+        count: 10,
+        orb_size: 5.0,
+        blur: 0.6,
         seed: 10,
         duration_ms: 8000,
     },
@@ -251,6 +256,46 @@ mod tests {
         assert!(seen_rl, "RightToLeft not represented");
         assert!(seen_tb, "TopToBottom not represented");
         assert!(seen_bt, "BottomToTop not represented");
+    }
+
+    #[test]
+    fn labels_have_no_color_axis() {
+        // warm / cool / aurora / dream / hi_key / dark_mood / drift / glow / mist 等の
+        // 旧色ラベル / 旧 prefix が残っていないことを保証する。差別化軸は kind /
+        // direction / 特徴量のみ。
+        const FORBIDDEN: &[&str] = &[
+            "warm",
+            "cool",
+            "aurora",
+            "dream",
+            "hi_key",
+            "dark_mood",
+            "drift",
+            "glow",
+            "mist",
+        ];
+        for s in DEFAULT_VARIATIONS {
+            for tag in FORBIDDEN {
+                assert!(
+                    !s.label.contains(tag),
+                    "label {:?} contains forbidden color/legacy tag {tag:?}",
+                    s.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_is_in_screen_filling_range() {
+        // 「画面を 7 割埋める」狙い。10..=30 のレンジに収めて運用する。
+        for s in DEFAULT_VARIATIONS {
+            assert!(
+                (10..=30).contains(&s.count),
+                "spec {:?} has count {} outside the 10..=30 range",
+                s.label,
+                s.count
+            );
+        }
     }
 
     #[test]
