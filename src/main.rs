@@ -3,7 +3,6 @@ use orber::animate::{MotionDirection, MotionSpeed};
 use orber::aquarelle::AquarelleParams;
 use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::{extract_clusters, Cluster};
-use orber::color_mod::apply_color_mod;
 use orber::orb::{render_static, OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
@@ -443,31 +442,22 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
     }
 
     let orb_shape = cli.orb_shape();
-    // cluster_count → base clusters のキャッシュ。同じ k は再計算せずに使い回す。
-    let mut cluster_cache: Vec<(usize, Vec<Cluster>)> = Vec::new();
+    // クラスタ抽出は preset 全 spec で 1 回だけ（K は VARIATIONS_KMEANS_K で固定）。
+    // パレットを spec ごとに変えると入力画像の色が崩れるので、ここはキャッシュではなく
+    // 単一パレットを使い回す方針。
+    let base_clusters = match extract_clusters(&img, VARIATIONS_KMEANS_K) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
-
-        let base_clusters = match cluster_cache.iter().find(|(k, _)| *k == spec.cluster_count) {
-            Some((_, c)) => c.clone(),
-            None => match extract_clusters(&img, spec.cluster_count) {
-                Ok(c) => {
-                    cluster_cache.push((spec.cluster_count, c.clone()));
-                    c
-                }
-                Err(e) => {
-                    eprintln!("orber: cluster extraction failed: {e}");
-                    return ExitCode::from(2);
-                }
-            },
-        };
-        // spec の色軸（hue / lightness / saturation / dominant_rotation）を適用する。
-        // saturation は ColorMod 経由で HSL に乗るため、render 側に渡す saturation は
-        // 1.0 に固定する（二重に saturation がかからないように）。
-        let modulated = apply_color_mod(base_clusters, &spec.color_mod());
 
         // 動画 + 透過は不可（yuv420p）。bg が transparent なら black に置換して進める。
         let spec_bg = if spec.kind == VariationKind::Mp4 && resolved_bg[3] == 0 {
@@ -475,7 +465,7 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         } else {
             resolved_bg
         };
-        let result = render_one_variation(&modulated, spec, &out_path, spec_bg, orb_shape);
+        let result = render_one_variation(&base_clusters, spec, &out_path, spec_bg, orb_shape);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -484,6 +474,12 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--variations` 経路で使うクラスタ数（kmeans の K）。spec ごとには変えない。
+///
+/// 5 個に固定すると主要色が拾え、かつパレットが崩れにくい。後で動かしたくなったら
+/// `VariationSpec` に `palette_k` フィールドを足す形で復活させる。
+const VARIATIONS_KMEANS_K: usize = 5;
+
 fn render_one_variation(
     clusters: &[Cluster],
     spec: &VariationSpec,
@@ -491,8 +487,8 @@ fn render_one_variation(
     bg_rgba: [u8; 4],
     orb_shape: OrbShape,
 ) -> Result<(), String> {
-    // 彩度は ColorMod 経由で HSL に既に乗っているので、render 側では 1.0 固定にする。
-    // saturation を二重にかけると意図しない色破綻が起きる。
+    // saturation は preset で揺らさない（同一画像から作る複数バリエーションでは
+    // 入力色をそのまま使う方針）。CLI の単発経路と揃えるため 1.0 固定。
     match spec.kind {
         VariationKind::Png => {
             // 静止画は「コンベアベルトの一瞬」。t=0 のフレームを 1 枚だけレンダリングする。

@@ -6,7 +6,6 @@ pub mod animate;
 pub mod aquarelle;
 pub mod background;
 pub mod cluster;
-pub mod color_mod;
 pub mod orb;
 pub mod output_mode;
 pub mod style;

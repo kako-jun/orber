@@ -13,6 +13,9 @@
 //!   絞り込む。`mixed` がデフォルト
 //! - 出力ファイル名は `{idx:02}_{label}.{ext}` 形式。label は ASCII / underscore
 //!   のみで構成し、シェル安全に保つ
+//! - **色は変えない**。同じ入力画像から作る複数バリエーションでは入力色をそのまま
+//!   使う（warm / cool 等の色ラベル軸は廃止）。差別化軸は方向 4 / 速度 3 /
+//!   orb_size / blur のみ（次の commit で count を追加する）。
 
 use crate::animate::{MotionDirection, MotionSpeed};
 
@@ -54,9 +57,8 @@ impl VariationMode {
 
 /// 1 つのバリエーション案。
 ///
-/// 色まわりは 4 軸（hue / lightness / saturation / dominant_rotation）で動かし、
-/// クラスタ数は spec ごとに変える（少なめだと 1 色が支配的、多めだと粒立った印象）。
-/// 動きは direction（4 方向）× speed（VerySlow/Slow/Medium）の組で表現する。
+/// 差別化軸は方向 4 / 速度 3 / orb_size / blur のみ。色は spec 内に持たない
+/// （入力画像の kmeans 結果をそのまま使う）。
 #[derive(Debug, Clone, Copy)]
 pub struct VariationSpec {
     pub label: &'static str,
@@ -67,38 +69,15 @@ pub struct VariationSpec {
     pub speed: MotionSpeed,
     pub orb_size: f32,
     pub blur: f32,
-    /// HSL 彩度倍率（既存）。`ColorMod::saturation` に渡される。
-    pub saturation: f32,
-    /// 色相回転（度）。`ColorMod::hue_shift_deg` に渡される。
-    pub hue_shift_deg: f32,
-    /// HSL 明度に対する加算バイアス（-0.5..0.5 想定）。`ColorMod::lightness_bias`。
-    pub lightness_bias: f32,
-    /// k-means クラスタ数。少ないほどベタ寄り、多いほど粒立つ。
-    pub cluster_count: usize,
-    /// 支配色ローテーション（weight 降順 cluster の右回転 N）。
-    pub dominant_rotation: usize,
     pub seed: u64,
     /// 動画用の長さ（ms）。Png では参照されない。
     pub duration_ms: u64,
 }
 
-impl VariationSpec {
-    /// この spec から色モジュレーション設定を取り出す。
-    pub fn color_mod(&self) -> crate::color_mod::ColorMod {
-        crate::color_mod::ColorMod {
-            hue_shift_deg: self.hue_shift_deg,
-            lightness_bias: self.lightness_bias,
-            saturation: self.saturation,
-            dominant_rotation: self.dominant_rotation,
-        }
-    }
-}
-
 /// デフォルト 10 案セット (v0.3.0 preset)。
 ///
-/// 構成: 静止 4 + 動画 6。動きは「左→右」「右→左」「上→下」「下→上」の 4 方向を
-/// 散らし、速度は VerySlow / Slow / Medium で散らす。色は hue_shift × lightness_bias ×
-/// saturation × cluster_count の 4 軸で散らし、同じ入力でも 10 通りの異なる印象を作る。
+/// 構成: 静止 4 + 動画 6。動きは 4 方向 × 3 速度で散らす。色は入力画像から拾った
+/// kmeans 結果をそのまま使い、preset では改変しない。
 ///
 /// 各 spec の数値根拠は GitHub Issue #41 の preset 表を参照。
 pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
@@ -109,11 +88,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Slow,
         orb_size: 3.0,
         blur: 0.5,
-        saturation: 1.4,
-        hue_shift_deg: 25.0,
-        lightness_bias: 0.05,
-        cluster_count: 4,
-        dominant_rotation: 0,
         seed: 1,
         duration_ms: 6000,
     },
@@ -124,11 +98,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::VerySlow,
         orb_size: 3.5,
         blur: 0.6,
-        saturation: 1.0,
-        hue_shift_deg: -35.0,
-        lightness_bias: -0.05,
-        cluster_count: 4,
-        dominant_rotation: 1,
         seed: 2,
         duration_ms: 6000,
     },
@@ -139,11 +108,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Slow,
         orb_size: 2.8,
         blur: 0.4,
-        saturation: 1.4,
-        hue_shift_deg: 0.0,
-        lightness_bias: 0.20,
-        cluster_count: 4,
-        dominant_rotation: 2,
         seed: 3,
         duration_ms: 6000,
     },
@@ -154,11 +118,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::VerySlow,
         orb_size: 3.2,
         blur: 0.6,
-        saturation: 0.7,
-        hue_shift_deg: 0.0,
-        lightness_bias: -0.20,
-        cluster_count: 4,
-        dominant_rotation: 0,
         seed: 4,
         duration_ms: 6000,
     },
@@ -169,11 +128,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Slow,
         orb_size: 3.0,
         blur: 0.5,
-        saturation: 1.1,
-        hue_shift_deg: 10.0,
-        lightness_bias: 0.0,
-        cluster_count: 4,
-        dominant_rotation: 1,
         seed: 5,
         duration_ms: 8000,
     },
@@ -184,11 +138,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::VerySlow,
         orb_size: 4.0,
         blur: 0.6,
-        saturation: 1.2,
-        hue_shift_deg: 0.0,
-        lightness_bias: 0.0,
-        cluster_count: 3,
-        dominant_rotation: 2,
         seed: 6,
         duration_ms: 8000,
     },
@@ -199,11 +148,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Slow,
         orb_size: 2.8,
         blur: 0.4,
-        saturation: 1.3,
-        hue_shift_deg: -20.0,
-        lightness_bias: 0.0,
-        cluster_count: 5,
-        dominant_rotation: 0,
         seed: 7,
         duration_ms: 8000,
     },
@@ -214,11 +158,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Slow,
         orb_size: 3.2,
         blur: 0.5,
-        saturation: 1.0,
-        hue_shift_deg: 20.0,
-        lightness_bias: 0.0,
-        cluster_count: 4,
-        dominant_rotation: 1,
         seed: 8,
         duration_ms: 8000,
     },
@@ -229,11 +168,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::VerySlow,
         orb_size: 3.5,
         blur: 0.7,
-        saturation: 1.3,
-        hue_shift_deg: -25.0,
-        lightness_bias: 0.05,
-        cluster_count: 4,
-        dominant_rotation: 2,
         seed: 9,
         duration_ms: 8000,
     },
@@ -244,11 +178,6 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         speed: MotionSpeed::Medium,
         orb_size: 2.8,
         blur: 0.5,
-        saturation: 0.9,
-        hue_shift_deg: 40.0,
-        lightness_bias: 0.10,
-        cluster_count: 5,
-        dominant_rotation: 0,
         seed: 10,
         duration_ms: 8000,
     },
