@@ -200,9 +200,9 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
                 OrbStyle::Soft
             };
             let cluster_idx = pick_weighted(&mut rng, cluster_weights, total_w);
-            // 整数倍速度。1/2/3 を均等に割り当て。整数 × 整数の cycle_count なので
+            // 整数倍速度。1/2 を均等に割り当て。整数 × 整数の cycle_count なので
             // t=1 で fract が 0 になりループ性は保たれる。
-            let speed_mult = rng.gen_range(1..=3);
+            let speed_mult = rng.gen_range(1..=2);
             OrbParams {
                 phase,
                 phi_radius,
@@ -745,22 +745,21 @@ mod tests {
 
     #[test]
     fn speed_mult_distribution() {
-        // 30 個の orb を引けば 1/2/3 のうち少なくとも 2 種類は出現する。
-        // 全部同じ値になる確率は (1/3)^29 * 3 ≈ 1.5e-13 で実質 0。
+        // 30 個の orb を引けば 1/2 が両方出現する。
+        // 全部同じ値になる確率は (1/2)^29 * 2 ≈ 3.7e-9 で実質 0。
         let p = generate_orb_params(99, 30, &[1.0]);
         let n1 = p.iter().filter(|q| q.speed_mult == 1).count();
         let n2 = p.iter().filter(|q| q.speed_mult == 2).count();
-        let n3 = p.iter().filter(|q| q.speed_mult == 3).count();
-        let kinds = [n1, n2, n3].iter().filter(|&&n| n > 0).count();
+        let kinds = [n1, n2].iter().filter(|&&n| n > 0).count();
         assert!(
-            kinds >= 2,
-            "expected at least 2 distinct speed_mult values; got n1={n1}, n2={n2}, n3={n3}"
+            kinds == 2,
+            "expected both speed_mult values to appear; got n1={n1}, n2={n2}"
         );
-        // 全 orb が {1, 2, 3} の範囲内であることも確認。
+        // 全 orb が {1, 2} の範囲内であることも確認。
         for q in &p {
             assert!(
-                (1..=3).contains(&q.speed_mult),
-                "speed_mult must be 1, 2, or 3; got {}",
+                (1..=2).contains(&q.speed_mult),
+                "speed_mult must be 1 or 2; got {}",
                 q.speed_mult
             );
         }
@@ -850,7 +849,7 @@ mod tests {
 
     #[test]
     fn loop_continuity_at_t1_with_speed_mult() {
-        // 速度倍数 (1/2/3) を含めても t=0 と t=1 が完全一致することを再確認。
+        // 速度倍数 (1/2) を含めても t=0 と t=1 が完全一致することを再確認。
         // 既存 all_direction_speed_combinations_loop_closed でカバーしているが、
         // count=64 で speed_mult のばらつきが必ず起きるケースで明示的に再検証する。
         let clusters = sample_clusters();
