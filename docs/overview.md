@@ -30,13 +30,14 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 
 - `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
 - `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused)
+- `--count` — orbs visible on screen at once (1..=200, default 20)
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `medium` (cross counts per clip)
 - `--shape` — `circle` or `aquarelle` (watercolor bleed)
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
-- `--variations N --output-dir DIR` — emit a curated set of N alternate looks for the same input (color-shifted, direction-varied, cluster-count-varied)
+- `--variations N --output-dir DIR` — emit a curated set of N alternate looks for the same input (direction × speed × count × size × blur combinations)
 
 ## Motion model (v0.3.0)
 
@@ -44,23 +45,50 @@ Animated outputs use a **one-way conveyor belt**. The whole clip flows in exactl
 direction (`lr` / `rl` / `tb` / `bt`); orbs do not reflect, oscillate, or return to
 their start. When an orb exits one edge, a fresh orb enters from the opposite edge
 (toroidal wrap). Each orb has a randomized initial phase so the field looks scattered
-rather than synchronized. A baseline ±10% radius breathing is applied to every orb
-automatically — there is no opt-in flag for it.
+rather than synchronized.
+
+A baseline breathing is applied to every orb automatically — there is no opt-in flag.
+The breathing has **three independent axes**, each driven by its own seed-derived
+phase offset and looping once per clip duration:
+
+- radius: ±10%
+- blur: ±15%
+- opacity: ±5%
 
 `--speed` is expressed as integer screen-crosses per clip (1 / 2 / 3), keeping the
 loop pixel-exact at `t = 0 ≡ t = 1`. Real-time pacing is set by `--duration-ms`:
 `--speed slow --duration-ms 8000` means the conveyor crosses the screen twice in
 8 seconds (4 s/cross).
 
+## Orb count and visual mix (v0.3.0)
+
+The k-means palette gives K colors (5 in the variations path). `--count <N>`
+*expands* those K colors into N orbs by:
+
+1. weight-proportional color sampling (more dominant clusters spawn more orbs)
+2. per-orb cross-axis scattering (orbs spread across the full width/height instead of
+   sticking to cluster centroids)
+
+Each orb is also assigned one of two visual styles deterministically from the seed:
+
+- `Rim` — a mid stop drops the gradient to half-alpha, producing a ring-emphasized look
+- `Soft` — center → transparent monotonic fade with no mid stop
+
+The two styles mix roughly 50:50 inside a single frame, so some orbs look like
+ring-haloed lights and others like plain soft glows.
+
 ## Variation preset (v0.3.0)
 
 The `--variations` mode draws from a 10-entry hand-tuned preset that combines five
-independent axes — hue shift, lightness bias, k-means cluster count, conveyor
-direction, and speed — so the same input yields ten visibly distinct outputs:
+independent axes — conveyor direction, conveyor speed, orb count, orb size, and blur.
+Color is **not** an axis: the input image's k-means palette is used unchanged across
+all ten outputs. Differentiation comes from layout (count / size / blur) and motion
+(direction / speed).
 
-- 4 stills: `warm_glow_lr`, `cool_mist_rl`, `hi_key_tb`, `dark_mood_bt`
-- 6 animations (8 s each): `drift_lr_slow`, `drift_rl_very_slow`, `drift_tb_slow`,
-  `drift_bt_slow`, `aurora_rl`, `dream_lr`
+- 4 stills: `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`,
+  `snapshot_bt_blurry`
+- 6 animations (8 s each): `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`,
+  `flow_bt_blurry`, `flow_lr_medium`, `flow_rl_huge`
 
 Stills are not pure `render_static` snapshots — they are the `t = 0` frame of the
 conveyor, so orbs are phase-scattered and a few of them straddle the edges, matching

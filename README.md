@@ -50,8 +50,27 @@ orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --du
 
 `--speed` chooses how many full screen-crosses fit into the whole clip (1 / 2 / 3 for
 `very-slow` / `slow` / `medium`). Combined with a long `--duration-ms`, this gives the
-characteristic gentle drift. Every orb also gets a tiny breathing pulse (±10% radius)
-applied automatically — there is no opt-in flag for that.
+characteristic gentle drift. Every orb also gets three independent breathing pulses
+(radius ±10%, blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag
+for that.
+
+### Orb count
+
+Use `--count <N>` (1..=200, default 20) to control how many orbs are visible on screen
+at once. The K colors picked from the input image (by k-means) are *expanded* into N
+orbs by weight-proportional color sampling and per-orb scattering on the cross axis.
+Higher counts produce a denser, more screen-filling composition; lower counts leave
+more breathing room around each orb.
+
+```bash
+orber --input photo.jpg --output dense.png --count 40 --orb-size 2.5
+orber --input photo.jpg --output sparse.png --count 8 --orb-size 4.5
+```
+
+`--count` is purely a deterministic renderer knob; randomization (e.g. picking a
+random count in the GUI) is the caller's responsibility, not a CLI feature. Each orb
+is also assigned one of two visual styles (rim or soft) deterministically from the
+seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
 
 ### Variation preset
 
@@ -61,9 +80,10 @@ To explore looks for a single input, batch out a curated set of 10 alternates:
 orber --input photo.jpg --variations 10 --output-dir out/
 ```
 
-Each preset varies hue, lightness, k-means cluster count, conveyor direction, and
-speed so the ten outputs are visibly distinct (4 stills + 6 animations). Use
-`--variations-mode still` or `--variations-mode video` to filter.
+The preset table varies conveyor direction, speed, orb count, orb size, and blur to
+produce ten visibly distinct outputs (4 stills + 6 animations). Colors come straight
+from the k-means palette of the input image — variations never recolor the photo.
+Use `--variations-mode still` or `--variations-mode video` to filter the table.
 
 ## Build
 

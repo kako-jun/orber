@@ -7,9 +7,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [0.3.0] - 2026-04-28
 
 ### Added
-- `ColorMod` module: HSL-based color modulation with hue shift, lightness bias, saturation, and dominant cluster rotation (#41)
-- `VariationSpec` extended with `hue_shift_deg`, `lightness_bias`, `cluster_count`, and `dominant_rotation` fields (#41)
-- All-orb breathing modulation: every orb now subtly pulses (±10% radius) over the clip duration as a baseline ambient effect (#41)
+- New CLI flag `--count <N>` (1..=200, default 20) that controls how many orbs are visible on screen at once. The K colors picked by k-means are *expanded* into N orbs by weight-proportional color sampling and per-orb cross-axis scattering, so a single image can fill roughly 70% of the frame at the default count. (#41)
+- All-orb breathing modulation in **three independent axes**: radius ±10%, blur ±15%, opacity ±5%. Each orb's three axes are decorrelated by separate seed-derived phase offsets, and each axis loops once per clip duration. (#41)
+- `OrbStyle` enum (`Rim` / `Soft`) and `render_one_orb` per-orb rendering helper. Each orb is assigned a style deterministically from the seed (≈50:50), so a single frame mixes the rim-emphasized look with plain soft gradients. (#41)
 
 ### Changed
 - **BREAKING**: Motion model rebuilt as a one-way conveyor belt. Each clip flows in a single direction (left→right / right→left / top→bottom / bottom→top) with all orbs traveling the same way. Orbs no longer reflect or oscillate; they exit one edge and re-enter from the opposite edge (wrap loop). (#41)
@@ -18,11 +18,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - **BREAKING**: New `MotionDirection` enum (`LeftToRight`, `RightToLeft`, `TopToBottom`, `BottomToTop`) added.
 - **BREAKING**: CLI flags `--motion`, `--motion-shape`, `--motion-speed` are **removed** and replaced with `--direction <lr|rl|tb|bt>` and `--speed <very-slow|slow|medium>`.
 - **BREAKING**: Animation boundary mode switched from `clamp` to wrap (`rem_euclid`).
-- **BREAKING**: `DEFAULT_VARIATIONS` preset rebuilt to express direction × speed × color combinations. Output filenames change to `warm_glow_lr`, `cool_mist_rl`, `hi_key_tb`, `dark_mood_bt`, `drift_lr_slow`, `drift_rl_very_slow`, `drift_tb_slow`, `drift_bt_slow`, `aurora_rl`, `dream_lr`.
-- **BREAKING**: `VariationSpec.shape` / `VariationSpec.speed` (old types) replaced with `direction` and the new `speed`.
-- Orb size in `DEFAULT_VARIATIONS` increased to 2.8–4.0 so the largest orbs occupy roughly half the short screen edge. Cropping at the edges is part of the intended look.
+- **BREAKING**: `DEFAULT_VARIATIONS` preset rebuilt around direction × speed × `count` × `orb_size` × `blur` (color is no longer a preset axis). Output filenames change to `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`, `snapshot_bt_blurry`, `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`, `flow_bt_blurry`, `flow_lr_medium`, `flow_rl_huge`. (#41)
+- **BREAKING**: `VariationSpec` now carries `count: usize` instead of the old color/cluster fields. `VariationSpec.shape` / `VariationSpec.speed` (old types) replaced with `direction` and the new `speed`.
+- PNG single-output path now goes through `animate::render_frame(t=0)` instead of `render_static` so `--count` takes effect for stills as well as videos.
 - Animated variation duration extended from 4000 ms to 8000 ms so the slow conveyor pacing reads as gentle.
-- Still variations now render the `t = 0` frame of the conveyor (instead of `render_static` directly), so PNG outputs share the phase-scattered, edge-cropped composition of the videos.
+
+### Removed
+- **BREAKING**: `ColorMod` module is **deleted**. Hue shift, lightness bias, saturation modulation, and dominant cluster rotation are gone. The premise — that a single input photo should yield multiple recolored variations — was wrong: if you want different colors, feed in a different image. K-means palette colors are now used unmodified end-to-end. (#41)
+- **BREAKING**: `VariationSpec` fields `hue_shift_deg`, `lightness_bias`, `saturation`, `dominant_rotation`, and `cluster_count` are **removed**. The `VariationSpec::color_mod()` method is also gone. The k-means K used by the variations path is fixed internally at 5.
 
 ## [0.2.0] - 2026-04-27
 
