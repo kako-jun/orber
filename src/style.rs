@@ -17,9 +17,9 @@ use crate::cluster::Cluster;
 use crate::orb::adjust_saturation;
 
 /// SVG viewBox 幅。PNG / 動画と揃える。
-pub const STYLE_WIDTH: u32 = 1080;
+pub(crate) const STYLE_WIDTH: u32 = 1080;
 /// SVG viewBox 高さ。PNG / 動画と揃える。
-pub const STYLE_HEIGHT: u32 = 1920;
+pub(crate) const STYLE_HEIGHT: u32 = 1920;
 
 /// SVG / CSS 描画オプション。
 ///
@@ -68,9 +68,24 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
     ));
     s.push_str("  <rect width=\"100%\" height=\"100%\" fill=\"black\"/>\n");
 
-    // <defs> 内に gradient 定義。空 clusters の場合でも有効な SVG として残す。
+    // 描画対象 cluster だけ事前に絞り込んでから defs と circle の両方に使う。
+    // weight=0 の cluster で空の gradient ID が defs に残らないようにする。
+    let visible: Vec<(usize, &Cluster, f32)> = clusters
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let w = c.weight.max(0.0);
+            let r = base_radius_unit * w.sqrt();
+            if r > 0.0 {
+                Some((i, c, r))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     s.push_str("  <defs>\n");
-    for (i, cluster) in clusters.iter().enumerate() {
+    for (i, cluster, _) in &visible {
         let [r, g, b] = adjust_saturation(cluster.color, saturation);
         s.push_str(&format!(
             "    <radialGradient id=\"orb-{i}\" cx=\"50%\" cy=\"50%\" r=\"50%\">\n"
@@ -88,12 +103,7 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
     }
     s.push_str("  </defs>\n");
 
-    for (i, cluster) in clusters.iter().enumerate() {
-        let weight = cluster.weight.max(0.0);
-        let radius = base_radius_unit * weight.sqrt();
-        if radius <= 0.0 {
-            continue;
-        }
+    for (i, cluster, radius) in &visible {
         let cx = (cluster.centroid.x.clamp(0.0, 1.0) * width).round() as i32;
         let cy = (cluster.centroid.y.clamp(0.0, 1.0) * height).round() as i32;
         let r_px = radius.round() as i32;
@@ -116,8 +126,10 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
 
-    // mid stop の位置（%）: blur=0 で外寄り、blur=1 で中心寄り。SVG と同じ式。
-    let mid_pct = ((10.0 + blur * 40.0).clamp(1.0, 99.0)).round() as i32;
+    // mid_factor: PNG/SVG と同じ意味で「中間 stop が gradient 終端からどの程度内側か」。
+    // blur=0 → mid=end の 95% （中心の不透明領域が広い、急峻に縁が落ちる）
+    // blur=1 → mid=end の 20% （中心が点に近く、緩やかに減衰）
+    let mid_factor = (1.0 - blur * 0.8).clamp(0.05, 0.95);
 
     let mut s = String::new();
     s.push_str("/* orber-generated background.\n");
@@ -130,11 +142,10 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
     s.push_str("       }\n");
     s.push_str("   Generated as a CSS variable; reference with var(--orber-bg). */\n");
     s.push_str(":root {\n");
-    s.push_str("    --orber-bg:");
 
     // 有効な gradient だけ集めてから書き出す（最後のカンマを抑制するため）。
     let mut gradients: Vec<String> = Vec::new();
-    for cluster in clusters.iter() {
+    for cluster in clusters {
         let weight = cluster.weight.max(0.0);
         if weight <= 0.0 {
             continue;
@@ -142,29 +153,38 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
         let [r, g, b] = adjust_saturation(cluster.color, saturation);
         let x = (cluster.centroid.x.clamp(0.0, 1.0) * 100.0).round() as i32;
         let y = (cluster.centroid.y.clamp(0.0, 1.0) * 100.0).round() as i32;
-        // PNG 側 radius = min(W,H) * 0.25 * orb_size * sqrt(weight) → 画面短辺の最大 25%。
-        // CSS は背景全体に対する % 指定。短辺の 25% は viewBox 換算で約 12.5% 相当だが、
-        // gradient end は radial の半径終端で円が透明になる位置。視覚一致を狙って
-        // sqrt(weight) * 30% * orb_size を採用し、1..=100 で clamp する。
-        let end = (weight.sqrt() * 30.0 * orb_size).clamp(1.0, 100.0).round() as i32;
+        // PNG 側 radius = min(W,H) * 0.25 * orb_size * sqrt(weight)。
+        // CSS は背景全体に対する % 指定なので、視覚的に近づくよう
+        // sqrt(weight) * 30% * orb_size を採用。orb_size を大きくして 100% を超えると
+        // PNG ならキャンバス外まではみ出すが、CSS は背景比なので 100% で頭打ちになる。
+        let end_f = (weight.sqrt() * 30.0 * orb_size).clamp(2.0, 100.0);
+        let end_pct = end_f.round() as i32;
+        // mid_pct は end_pct の mid_factor 倍。round 後の衝突を最終ガードで防ぐ
+        // （mid_pct < end_pct を構造的に担保する）。
+        let mid_pct = (end_f * mid_factor).round() as i32;
+        let mid_pct = mid_pct.clamp(0, end_pct - 1);
         gradients.push(format!(
-            "radial-gradient(circle at {x}% {y}%, rgba({r},{g},{b},1) 0%, rgba({r},{g},{b},0.5) {mid_pct}%, rgba({r},{g},{b},0) {end}%)"
+            "radial-gradient(circle at {x}% {y}%, rgba({r},{g},{b},1) 0%, rgba({r},{g},{b},0.5) {mid_pct}%, rgba({r},{g},{b},0) {end_pct}%)"
         ));
     }
 
     if gradients.is_empty() {
-        // 空でも valid な CSS にする（": ;" は参照側で no-op になる）。
-        s.push(' ');
+        // 描画対象が無いときは `none` を明示する。`var(--orber-bg)` 参照側でも
+        // background-image: none と同義になり、空値プロパティ ": ;" 経由の
+        // IACVT フォールバックより意図が明確。
+        s.push_str("    --orber-bg: none;\n");
     } else {
+        s.push_str("    --orber-bg:\n");
         for (i, g) in gradients.iter().enumerate() {
-            s.push_str("\n        ");
+            s.push_str("        ");
             s.push_str(g);
             if i + 1 < gradients.len() {
-                s.push(',');
+                s.push_str(",\n");
+            } else {
+                s.push_str(";\n");
             }
         }
     }
-    s.push_str(";\n");
     s.push_str("}\n");
     s
 }
@@ -268,6 +288,93 @@ mod tests {
         assert!(found_gray, "saturation=0 should produce a grayscale stop");
     }
 
+    /// CSS の各 gradient から `0% / mid% / end%` の 3 stop を抽出する。
+    /// 各 stop は `rgba(...,A) N%` 形式で書かれているので、`A` の値ごとに
+    /// 後続の数値を拾う簡易パーサ。
+    fn extract_css_stops(css: &str) -> Vec<(i32, i32, i32)> {
+        fn read_pct_after(hay: &str, marker: &str, from: usize) -> Option<(i32, usize)> {
+            let pos = hay[from..].find(marker)? + from;
+            let after = pos + marker.len();
+            // skip spaces, read digits until '%'
+            let bytes = hay.as_bytes();
+            let mut i = after;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == start || i >= bytes.len() || bytes[i] != b'%' {
+                return None;
+            }
+            let n = hay[start..i].parse::<i32>().ok()?;
+            Some((n, i + 1))
+        }
+
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = css[cursor..].find("radial-gradient(") {
+            let base = cursor + rel + "radial-gradient(".len();
+            let (s0, p1) = match read_pct_after(css, ",1) ", base) {
+                Some(v) => v,
+                None => break,
+            };
+            let (mid, p2) = match read_pct_after(css, ",0.5) ", p1) {
+                Some(v) => v,
+                None => break,
+            };
+            let (end, p3) = match read_pct_after(css, ",0) ", p2) {
+                Some(v) => v,
+                None => break,
+            };
+            out.push((s0, mid, end));
+            cursor = p3;
+        }
+        out
+    }
+
+    #[test]
+    fn css_stops_strictly_monotonic_default() {
+        let css = render_css(&six_clusters(), &StyleOptions::default());
+        let stops = extract_css_stops(&css);
+        assert_eq!(stops.len(), 6);
+        for (s0, m, e) in stops {
+            assert_eq!(s0, 0, "first stop must be 0%");
+            assert!(m < e, "mid ({m}) < end ({e}) must hold");
+            assert!(m >= 0, "mid ({m}) must be >= 0");
+        }
+    }
+
+    #[test]
+    fn css_stops_strictly_monotonic_boundary_values() {
+        // weight=1.0 / blur=0.0 / orb_size=2.0 の極端なケースで mid/end の
+        // 衝突が起きないことを保証する。
+        let extreme_clusters = vec![
+            cluster([200, 100, 50], 0.5, 0.5, 1.0),   // 最大 weight
+            cluster([50, 200, 100], 0.5, 0.5, 0.001), // 微小 weight
+        ];
+        for blur in [0.0_f32, 0.5, 1.0] {
+            for orb_size in [0.1_f32, 1.0, 2.0, 4.0] {
+                let opts = StyleOptions {
+                    orb_size,
+                    blur,
+                    saturation: 1.0,
+                };
+                let css = render_css(&extreme_clusters, &opts);
+                let stops = extract_css_stops(&css);
+                assert!(!stops.is_empty(), "blur={blur} orb_size={orb_size}");
+                for (s0, m, e) in &stops {
+                    assert_eq!(*s0, 0);
+                    assert!(
+                        m < e,
+                        "monotonic stops violated at blur={blur} orb_size={orb_size}: 0/{m}/{e}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_clusters_produces_valid_svg() {
         let svg = render_svg(&[], &StyleOptions::default());
@@ -278,8 +385,7 @@ mod tests {
         assert_eq!(svg.matches("<circle ").count(), 0);
 
         let css = render_css(&[], &StyleOptions::default());
-        assert!(css.contains("--orber-bg:"));
-        assert!(css.contains(";"));
+        assert!(css.contains("--orber-bg: none"));
         assert_eq!(css.matches("radial-gradient(").count(), 0);
     }
 }
