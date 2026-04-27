@@ -30,42 +30,74 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::f32::consts::TAU;
 
-/// アニメーションの動きの強さ。
+/// 軌道形（位置・サイズの動きパターン）。速度（[`MotionSpeed`]）と直交する次元。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionPreset {
+pub enum MotionShape {
     /// 動かない（render_static と同じ結果）
     Still,
-    /// ゆったり（既定）
+    /// リサジュー曲線（互いに干渉する 2D 軌道、既定）
+    Lissajous,
+    /// 縦方向のみ往復
+    Vertical,
+    /// 横方向のみ往復
+    Horizontal,
+    /// 斜め往復（dx と dy が同位相）
+    Diagonal,
+    /// 中心固定で半径が膨張収縮（呼吸）
+    Breathe,
+    /// 中心固定で大きさと明度が微小に瞬く（瞬き）
+    Twinkle,
+}
+
+/// 動きの速度・振幅レベル。形（[`MotionShape`]）と直交する次元。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionSpeed {
+    /// 夜景向け微動（位置振幅 ~2%、freq_scale=1）
+    Subtle,
+    /// 既定（位置振幅 ~6%、freq_scale=1）
     Slow,
-    /// 活発
+    /// 活発（位置振幅 ~12%、freq_scale=2）
+    Lively,
+}
+
+impl MotionSpeed {
+    /// (位置振幅, 色振幅, 周波数倍率) を返す。
+    ///
+    /// - 位置振幅は短辺 `min(width, height)` に対する比（0.06 → 6%）。
+    /// - 色振幅は HSL の S/L にかかる加算的な揺らぎ係数。
+    /// - 周波数倍率は「t=1 で何周回るか」を制御する**整数限定**。`(a, b)` リサジュー比
+    ///   や shape 内部の整数 frequency と掛け合わせても整数のままなのでループ性は保たれる。
+    pub(crate) fn coefficients(self) -> (f32, f32, u32) {
+        match self {
+            MotionSpeed::Subtle => (0.02, 0.03, 1),
+            MotionSpeed::Slow => (0.06, 0.05, 1),
+            MotionSpeed::Lively => (0.12, 0.10, 2),
+        }
+    }
+}
+
+/// 後方互換の動きプリセット。CLI の `--motion <still|slow|lively>` 経由でのみ使う。
+///
+/// 内部処理は [`MotionShape`] と [`MotionSpeed`] の組に展開される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionPreset {
+    Still,
+    Slow,
     Lively,
 }
 
 impl MotionPreset {
-    /// motion preset から (位置振幅, 色振幅, 周波数倍率) を取り出す。
-    ///
-    /// - 位置振幅は短辺 `min(width, height)` に対する比（0.06 → 6%）。
-    /// - 色振幅は HSL の S/L にかかる加算的な揺らぎ係数。
-    /// - 周波数倍率は「t=1 で何周回るか」を制御する**整数限定**。リサジュー比
-    ///   (a, b) と掛け合わせても整数のままなのでループ性は保たれる。ここを
-    ///   非整数にすると `(a * t * scale).fract()` が t=1 で 0 にならず、
-    ///   t=0/t=1 のフレーム完全一致が崩れる。
-    // Still は amplitude=0 なので freq_scale の値は何でも結果が同じだが、
-    // 「動いていない」を表現するために 0 で揃える。
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn coefficients(self) -> (f32, f32, u32) {
+    /// 旧 preset を新しい (shape, speed) の組に展開する。
+    pub fn split(self) -> (MotionShape, MotionSpeed) {
         match self {
-            MotionPreset::Still => (0.0, 0.0, 0),
-            MotionPreset::Slow => (0.06, 0.05, 1),
-            MotionPreset::Lively => (0.12, 0.10, 2),
+            MotionPreset::Still => (MotionShape::Still, MotionSpeed::Slow),
+            MotionPreset::Slow => (MotionShape::Lissajous, MotionSpeed::Slow),
+            MotionPreset::Lively => (MotionShape::Lissajous, MotionSpeed::Lively),
         }
     }
 }
 
 /// アニメーション 1 フレーム描画のオプション。
-///
-/// CLI 側の `Motion` enum との橋渡しは #5 (動画出力結線) で行う。
-/// それまで MotionPreset は内部 enum として独立。
 #[derive(Debug, Clone)]
 pub struct AnimateOptions {
     pub width: u32,
@@ -73,7 +105,8 @@ pub struct AnimateOptions {
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
-    pub motion: MotionPreset,
+    pub motion_shape: MotionShape,
+    pub motion_speed: MotionSpeed,
     pub seed: u64,
     /// 背景 RGBA。alpha=0 で透過。
     pub background: [u8; 4],
@@ -87,7 +120,8 @@ impl Default for AnimateOptions {
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
-            motion: MotionPreset::Slow,
+            motion_shape: MotionShape::Lissajous,
+            motion_speed: MotionSpeed::Slow,
             seed: 0,
             background: [0, 0, 0, 255],
         }
@@ -175,14 +209,19 @@ fn modulate_color(rgb: [u8; 3], s_factor: f32, l_factor: f32) -> [u8; 3] {
 // TODO: weight ベースの振幅補正（小さい orb は小さく動く）は将来 Issue で検討。
 // 現状は全 orb 同振幅で軌道を描く。
 pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
-    let (amp_pos, amp_color, freq_scale) = opts.motion.coefficients();
+    // Still は速度に依存しないので、speed の係数を読まずに 0 を直接使う。
+    // それ以外の shape は speed から振幅と freq_scale を取り出す。
+    let (amp_pos, amp_color, freq_scale) = if opts.motion_shape == MotionShape::Still {
+        (0.0, 0.0, 0)
+    } else {
+        opts.motion_speed.coefficients()
+    };
     let params = generate_orbit_params(opts.seed, clusters.len());
 
     // amp_pos は短辺 (min(w, h)) 基準の振幅比。normalized 座標 [0, 1] に直接
     // 加算すると、render_static 側で x は width 倍・y は height 倍されて
     // 縦横比に歪んだ楕円になってしまう。axis-scale 補正で normalized 座標系
-    // における円軌道を保つ（実際のピクセル変位は dx_pixel = amp_pos*min_side*sin、
-    // dy_pixel も同じ）。
+    // における円軌道を保つ。
     let min_side = opts.width.min(opts.height) as f32;
     let scale_x = min_side / opts.width as f32; // <= 1.0
     let scale_y = min_side / opts.height as f32; // <= 1.0
@@ -191,25 +230,69 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         .iter()
         .zip(params.iter())
         .map(|(c, p)| {
-            // 位置: リサジュー軌道（短辺基準で円軌道を維持）
-            let dx = amp_pos * scale_x * sin_loop(p.a, t, freq_scale, p.phi_x);
-            let dy = amp_pos * scale_y * sin_loop(p.b, t, freq_scale, p.phi_y);
-            // 範囲外に出た場合は単純に clamp する。reflect / wrap のほうが見た目は滑らかだが、
-            // prototype 段階では clamp で十分（軌道半径は数% 程度なので長時間停滞は起きにくい）。
+            // shape ごとに位置オフセットと weight 倍率を決める。
+            // weight 倍率は radius = base * sqrt(weight) を介して半径を
+            // (sqrt(weight_scale)) 倍する。Breathe / Twinkle で半径を直接揺らす。
+            let (dx, dy, radius_factor) = match opts.motion_shape {
+                MotionShape::Still => (0.0, 0.0, 1.0),
+                MotionShape::Lissajous => (
+                    amp_pos * scale_x * sin_loop(p.a, t, freq_scale, p.phi_x),
+                    amp_pos * scale_y * sin_loop(p.b, t, freq_scale, p.phi_y),
+                    1.0,
+                ),
+                MotionShape::Vertical => (
+                    0.0,
+                    amp_pos * scale_y * sin_loop(1, t, freq_scale, p.phi_y),
+                    1.0,
+                ),
+                MotionShape::Horizontal => (
+                    amp_pos * scale_x * sin_loop(1, t, freq_scale, p.phi_x),
+                    0.0,
+                    1.0,
+                ),
+                MotionShape::Diagonal => {
+                    let v = sin_loop(1, t, freq_scale, p.phi_x);
+                    (amp_pos * scale_x * v, amp_pos * scale_y * v, 1.0)
+                }
+                MotionShape::Breathe => {
+                    // 半径を ±(2 * amp_pos) の範囲で呼吸させる（位置基準の amp_pos を流用）。
+                    // amp_pos=0.06 なら半径は 0.88..1.12 倍で揺らぐ。
+                    let phase = sin_loop(1, t, freq_scale, p.phi_color);
+                    let r = (1.0 + 2.0 * amp_pos * phase).max(0.0);
+                    (0.0, 0.0, r)
+                }
+                MotionShape::Twinkle => {
+                    // 半径と明度を sin で同期して揺らす。amp_pos=0.06 なら半径は 0.7..1.3 倍。
+                    // 「瞬き」感を出すため Breathe より振幅を大きめに、freq_scale も 2 倍する。
+                    let phase = sin_loop(2, t, freq_scale, p.phi_color);
+                    let r = (1.0 + 5.0 * amp_pos * phase).max(0.0);
+                    (0.0, 0.0, r)
+                }
+            };
+
+            // 範囲外に出た場合は clamp。軌道半径は数% 程度なので長時間停滞は起きにくい。
             let new_x = (c.centroid.x + dx).clamp(0.0, 1.0);
             let new_y = (c.centroid.y + dy).clamp(0.0, 1.0);
 
             // 色揺らぎ: HSL の S と L を 1 ± amp_color の範囲で振る。
-            // L は派手すぎないよう半振幅に。
+            // Twinkle は明度の振れ幅を倍にして「瞬き」感を強める。
             let color_phase = sin_loop(1, t, freq_scale, p.phi_color);
+            let l_amp = match opts.motion_shape {
+                MotionShape::Twinkle => amp_color,
+                _ => amp_color * 0.5,
+            };
             let s_factor = 1.0 + amp_color * color_phase;
-            let l_factor = 1.0 + (amp_color * 0.5) * color_phase;
+            let l_factor = 1.0 + l_amp * color_phase;
             let new_color = modulate_color(c.color, s_factor, l_factor);
+
+            // radius = base * sqrt(weight) なので、半径を radius_factor 倍するには
+            // weight を radius_factor^2 倍すれば良い。
+            let weight_scale = radius_factor * radius_factor;
 
             Cluster {
                 color: new_color,
                 centroid: Centroid { x: new_x, y: new_y },
-                weight: c.weight,
+                weight: (c.weight * weight_scale).max(0.0),
             }
         })
         .collect();
@@ -246,13 +329,29 @@ mod tests {
     }
 
     fn small_opts(motion: MotionPreset) -> AnimateOptions {
+        let (shape, speed) = motion.split();
         AnimateOptions {
             width: 64,
             height: 64,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
-            motion,
+            motion_shape: shape,
+            motion_speed: speed,
+            seed: 12345,
+            background: [0, 0, 0, 255],
+        }
+    }
+
+    fn opts_with(shape: MotionShape, speed: MotionSpeed) -> AnimateOptions {
+        AnimateOptions {
+            width: 64,
+            height: 64,
+            orb_size: 1.0,
+            blur: 0.5,
+            saturation: 1.0,
+            motion_shape: shape,
+            motion_speed: speed,
             seed: 12345,
             background: [0, 0, 0, 255],
         }
@@ -384,21 +483,101 @@ mod tests {
 
     #[test]
     fn freq_scale_combinations_have_integer_period() {
-        // すべての (a, b) × freq_scale で t=1 のとき位相が完全に閉じることを
-        // 数値レベルで検証。整数 a/b と整数 scale の積は常に整数なので
-        // fract() は 0.0 になるはず。
+        // すべての (a, b) × speed で t=1 のとき位相が完全に閉じる。
         for &(a, b) in FREQ_RATIOS {
-            for preset in [
-                MotionPreset::Still,
-                MotionPreset::Slow,
-                MotionPreset::Lively,
-            ] {
-                let (_, _, scale) = preset.coefficients();
+            for speed in [MotionSpeed::Subtle, MotionSpeed::Slow, MotionSpeed::Lively] {
+                let (_, _, scale) = speed.coefficients();
                 let prod_a = (a as f32 * 1.0 * scale as f32).fract();
                 let prod_b = (b as f32 * 1.0 * scale as f32).fract();
                 assert_eq!(prod_a, 0.0, "a={a} scale={scale}");
                 assert_eq!(prod_b, 0.0, "b={b} scale={scale}");
             }
         }
+    }
+
+    #[test]
+    fn all_shape_speed_combinations_loop_closed() {
+        // 全 shape × 全 speed で t=0 と t=1 が完全一致することを検証する。
+        // Twinkle は freq_scale を内部で 2 倍するが、整数演算のままなので閉じる。
+        let clusters = sample_clusters();
+        for shape in [
+            MotionShape::Still,
+            MotionShape::Lissajous,
+            MotionShape::Vertical,
+            MotionShape::Horizontal,
+            MotionShape::Diagonal,
+            MotionShape::Breathe,
+            MotionShape::Twinkle,
+        ] {
+            for speed in [MotionSpeed::Subtle, MotionSpeed::Slow, MotionSpeed::Lively] {
+                let opts = opts_with(shape, speed);
+                let a = render_frame(&clusters, &opts, 0.0);
+                let b = render_frame(&clusters, &opts, 1.0);
+                assert!(
+                    pixels_equal(&a, &b),
+                    "loop closure broken for shape={shape:?} speed={speed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vertical_does_not_move_horizontally() {
+        // Vertical では cluster の x 座標が変わらないので、横スキャンで非ゼロピクセルの
+        // 列範囲が t=0 と t=0.25 で同じになる。簡易チェックとして、最も明るいピクセルの
+        // x 座標が一致することを確認する。
+        let clusters = vec![cluster([255, 0, 0], 0.5, 0.3, 0.5)];
+        let opts = opts_with(MotionShape::Vertical, MotionSpeed::Lively);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 0.25);
+        let bright_x = |img: &RgbaImage| -> u32 {
+            let mut best = 0u32;
+            let mut best_v = 0u32;
+            for x in 0..img.width() {
+                let mut col_sum = 0u32;
+                for y in 0..img.height() {
+                    col_sum += img.get_pixel(x, y)[0] as u32;
+                }
+                if col_sum > best_v {
+                    best_v = col_sum;
+                    best = x;
+                }
+            }
+            best
+        };
+        assert_eq!(
+            bright_x(&a),
+            bright_x(&b),
+            "Vertical shape must not shift horizontally"
+        );
+    }
+
+    #[test]
+    fn breathe_keeps_center_changes_radius() {
+        // Breathe は位置不動・半径変動。t=0 と t=0.5 で違う絵になる（radius が違う）。
+        let clusters = sample_clusters();
+        let opts = opts_with(MotionShape::Breathe, MotionSpeed::Slow);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 0.5);
+        assert!(
+            !pixels_equal(&a, &b),
+            "Breathe must produce different frame at t=0 vs t=0.5 (radius modulation)"
+        );
+    }
+
+    #[test]
+    fn motion_preset_split_back_compat() {
+        assert_eq!(
+            MotionPreset::Still.split(),
+            (MotionShape::Still, MotionSpeed::Slow)
+        );
+        assert_eq!(
+            MotionPreset::Slow.split(),
+            (MotionShape::Lissajous, MotionSpeed::Slow)
+        );
+        assert_eq!(
+            MotionPreset::Lively.split(),
+            (MotionShape::Lissajous, MotionSpeed::Lively)
+        );
     }
 }
