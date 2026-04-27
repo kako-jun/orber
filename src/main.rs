@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use orber::animate::MotionPreset;
+use orber::animate::{MotionPreset, MotionShape, MotionSpeed};
 use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
@@ -9,14 +9,14 @@ use orber::video::{render_video, VideoCodec, VideoOptions};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Drift speed of orbs in animated outputs.
+/// Back-compat motion preset (`--motion`). Equivalent to a fixed (shape, speed) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Motion {
-    /// No movement.
+    /// No movement (shape=still).
     Still,
-    /// Slow, leisurely drift (default).
+    /// Slow Lissajous drift (default).
     Slow,
-    /// Lively, faster drift.
+    /// Lively Lissajous drift.
     Lively,
 }
 
@@ -26,6 +26,50 @@ impl From<Motion> for MotionPreset {
             Motion::Still => MotionPreset::Still,
             Motion::Slow => MotionPreset::Slow,
             Motion::Lively => MotionPreset::Lively,
+        }
+    }
+}
+
+/// Orbit shape (`--motion-shape`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliMotionShape {
+    Still,
+    Lissajous,
+    Vertical,
+    Horizontal,
+    Diagonal,
+    Breathe,
+    Twinkle,
+}
+
+impl From<CliMotionShape> for MotionShape {
+    fn from(s: CliMotionShape) -> Self {
+        match s {
+            CliMotionShape::Still => MotionShape::Still,
+            CliMotionShape::Lissajous => MotionShape::Lissajous,
+            CliMotionShape::Vertical => MotionShape::Vertical,
+            CliMotionShape::Horizontal => MotionShape::Horizontal,
+            CliMotionShape::Diagonal => MotionShape::Diagonal,
+            CliMotionShape::Breathe => MotionShape::Breathe,
+            CliMotionShape::Twinkle => MotionShape::Twinkle,
+        }
+    }
+}
+
+/// Motion speed (`--motion-speed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliMotionSpeed {
+    Subtle,
+    Slow,
+    Lively,
+}
+
+impl From<CliMotionSpeed> for MotionSpeed {
+    fn from(s: CliMotionSpeed) -> Self {
+        match s {
+            CliMotionSpeed::Subtle => MotionSpeed::Subtle,
+            CliMotionSpeed::Slow => MotionSpeed::Slow,
+            CliMotionSpeed::Lively => MotionSpeed::Lively,
         }
     }
 }
@@ -64,9 +108,20 @@ struct Cli {
     #[arg(long, default_value_t = 0.5)]
     blur: f32,
 
-    /// Drift speed for animated outputs.
+    /// Back-compat drift preset for animated outputs. Equivalent to a fixed
+    /// (motion-shape, motion-speed) pair: still→(still,slow), slow→(lissajous,slow),
+    /// lively→(lissajous,lively). Overridden if --motion-shape or --motion-speed
+    /// is also passed.
     #[arg(long, value_enum, default_value_t = Motion::Slow)]
     motion: Motion,
+
+    /// Orbit shape independent of speed. Overrides the shape implied by --motion.
+    #[arg(long, value_enum)]
+    motion_shape: Option<CliMotionShape>,
+
+    /// Motion speed/amplitude independent of shape. Overrides the speed implied by --motion.
+    #[arg(long, value_enum)]
+    motion_speed: Option<CliMotionSpeed>,
 
     /// Orb rendering shape.
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
@@ -124,6 +179,21 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--motion` の preset と `--motion-shape` / `--motion-speed` の上書きを統合する。
+///
+/// 個別フラグが指定されていればそちらを優先、なければ `--motion` 由来の組を使う。
+fn resolve_motion(cli: &Cli) -> (MotionShape, MotionSpeed) {
+    let preset: MotionPreset = cli.motion.into();
+    let (mut shape, mut speed) = preset.split();
+    if let Some(s) = cli.motion_shape {
+        shape = s.into();
+    }
+    if let Some(sp) = cli.motion_speed {
+        speed = sp.into();
+    }
+    (shape, speed)
 }
 
 fn render_style_path(cli: &Cli, mode: OutputMode, bg: Background) -> ExitCode {
@@ -191,11 +261,13 @@ fn render_video_path(cli: &Cli, codec: VideoCodec, bg: Background) -> ExitCode {
     };
 
     // 3. ビデオオプション構築。解像度は固定。
+    let (shape, speed) = resolve_motion(cli);
     let opts = VideoOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
-        motion: cli.motion.into(),
+        motion_shape: shape,
+        motion_speed: speed,
         seed: cli.seed.unwrap_or(0),
         background: resolve_background(&img, bg),
     };
@@ -281,8 +353,9 @@ mod tests {
         // ここで motion/orb_size/blur/saturation の SoT 一致を担保する。
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.mp4"]);
         let a = AnimateOptions::default();
-        let motion: MotionPreset = cli.motion.into();
-        assert_eq!(motion, a.motion, "motion default mismatch");
+        let (shape, speed) = resolve_motion(&cli);
+        assert_eq!(shape, a.motion_shape, "motion_shape default mismatch");
+        assert_eq!(speed, a.motion_speed, "motion_speed default mismatch");
         assert_eq!(cli.orb_size, a.orb_size, "orb_size default mismatch");
         assert_eq!(cli.blur, a.blur, "blur default mismatch");
         assert_eq!(cli.saturation, a.saturation, "saturation default mismatch");
