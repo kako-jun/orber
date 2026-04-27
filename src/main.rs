@@ -1,7 +1,9 @@
 use clap::{Parser, ValueEnum};
+use orber::animate::{AnimateOptions, MotionPreset};
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
+use orber::video::{render_video, VideoCodec};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -14,6 +16,16 @@ enum Motion {
     Slow,
     /// Lively, faster drift.
     Lively,
+}
+
+impl From<Motion> for MotionPreset {
+    fn from(m: Motion) -> Self {
+        match m {
+            Motion::Still => MotionPreset::Still,
+            Motion::Slow => MotionPreset::Slow,
+            Motion::Lively => MotionPreset::Lively,
+        }
+    }
 }
 
 /// Shape used to render each orb.
@@ -80,11 +92,52 @@ fn main() -> ExitCode {
 
     match mode {
         OutputMode::Png => render_png(&cli),
+        OutputMode::Mp4 => render_video_path(&cli, VideoCodec::H264),
+        OutputMode::Webm => render_video_path(&cli, VideoCodec::Vp9),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
         }
     }
+}
+
+fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
+    // 1. 入力画像を読み込み RGB8 に正規化。
+    let img = match image::open(&cli.input) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => {
+            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    // 2. 代表色クラスタ抽出（k=6 固定。後の Issue で CLI 化検討）。
+    let clusters = match extract_clusters(&img, 6) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 3. アニメーションオプションを構築。解像度は render_video 内で
+    //    VIDEO_WIDTH/HEIGHT に強制上書きされる。
+    let opts = AnimateOptions {
+        orb_size: cli.orb_size,
+        blur: cli.blur,
+        saturation: cli.saturation,
+        motion: cli.motion.into(),
+        seed: cli.seed.unwrap_or(0),
+        ..AnimateOptions::default()
+    };
+
+    // 4. 動画書き出し。
+    if let Err(e) = render_video(&clusters, &opts, &cli.output, cli.duration_ms, codec) {
+        eprintln!("orber: video render failed: {e}");
+        return ExitCode::from(2);
+    }
+    eprintln!("orber: wrote {}", cli.output.display());
+    ExitCode::SUCCESS
 }
 
 fn render_png(cli: &Cli) -> ExitCode {
