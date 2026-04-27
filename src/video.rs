@@ -57,10 +57,7 @@ pub enum VideoError {
     /// ffmpeg バイナリが見つからない。
     FfmpegNotFound,
     /// ffmpeg が非ゼロ終了した。
-    FfmpegFailed {
-        status: ExitStatus,
-        stderr: String,
-    },
+    FfmpegFailed { status: ExitStatus, stderr: String },
     /// I/O エラー（テンポラリディレクトリ作成失敗、PNG 書き出し失敗等）。
     Io(io::Error),
     /// duration_ms = 0 等で有効なフレーム数が算出できない。
@@ -137,10 +134,10 @@ pub fn render_video(
     for i in 0..total {
         let t = i as f32 / total as f32;
         let frame = render_frame(clusters, &video_opts, t);
-        let path = temp_dir.path().join(format!("frame_{:05}.png", i));
+        let path = temp_dir.path().join(format!("frame_{i:05}.png"));
         frame.save(&path).map_err(|e| {
             // image::ImageError -> io::Error の自然な変換は無いので Other で包む。
-            VideoError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            VideoError::Io(io::Error::other(e.to_string()))
         })?;
     }
 
