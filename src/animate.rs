@@ -50,28 +50,31 @@ pub enum MotionShape {
 }
 
 /// 動きの速度・振幅レベル。形（[`MotionShape`]）と直交する次元。
+///
+/// v0.3.0 で振幅を全レンジ拡大し、Lively の freq_scale を 2 → 1 に戻した。
+/// 4 秒の動画で 1〜2 周程度に収まるよう、目で動きが追える速度を優先する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionSpeed {
-    /// 夜景向け微動（位置振幅 ~2%、freq_scale=1）
+    /// 夜景向け微動（位置振幅 ~6%、freq_scale=1）
     Subtle,
-    /// 既定（位置振幅 ~6%、freq_scale=1）
+    /// 既定（位置振幅 ~15%、freq_scale=1）
     Slow,
-    /// 活発（位置振幅 ~12%、freq_scale=2）
+    /// 活発（位置振幅 ~25%、freq_scale=1）
     Lively,
 }
 
 impl MotionSpeed {
     /// (位置振幅, 色振幅, 周波数倍率) を返す。
     ///
-    /// - 位置振幅は短辺 `min(width, height)` に対する比（0.06 → 6%）。
+    /// - 位置振幅は短辺 `min(width, height)` に対する比（0.15 → 15%）。
     /// - 色振幅は HSL の S/L にかかる加算的な揺らぎ係数。
     /// - 周波数倍率は「t=1 で何周回るか」を制御する**整数限定**。`(a, b)` リサジュー比
     ///   や shape 内部の整数 frequency と掛け合わせても整数のままなのでループ性は保たれる。
     pub(crate) fn coefficients(self) -> (f32, f32, u32) {
         match self {
-            MotionSpeed::Subtle => (0.02, 0.03, 1),
-            MotionSpeed::Slow => (0.06, 0.05, 1),
-            MotionSpeed::Lively => (0.12, 0.10, 2),
+            MotionSpeed::Subtle => (0.06, 0.03, 1),
+            MotionSpeed::Slow => (0.15, 0.05, 1),
+            MotionSpeed::Lively => (0.25, 0.10, 1),
         }
     }
 }
