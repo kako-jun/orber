@@ -1,8 +1,9 @@
 use clap::{Parser, ValueEnum};
 use orber::animate::{MotionPreset, MotionShape, MotionSpeed};
+use orber::aquarelle::AquarelleParams;
 use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::{extract_clusters, Cluster};
-use orber::orb::{render_static, RenderOptions};
+use orber::orb::{render_static, OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
 use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
@@ -98,8 +99,17 @@ impl From<CliMotionSpeed> for MotionSpeed {
 enum Shape {
     /// Plain circular orb (default).
     Circle,
-    /// Watercolor-style irregular bleed.
+    /// Cel-painted nightscape texture set: bleed + bloom + offset + halo.
     Aquarelle,
+}
+
+impl Shape {
+    fn to_orb_shape(self, params: AquarelleParams) -> OrbShape {
+        match self {
+            Shape::Circle => OrbShape::Circle,
+            Shape::Aquarelle => OrbShape::Aquarelle(params),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -174,6 +184,37 @@ struct Cli {
     /// `transparent` is rejected for mp4/webm (yuv420p has no alpha).
     #[arg(long, default_value = "auto")]
     background: String,
+
+    /// Aquarelle: bleed strength (0.0..=1.0). Only used with --shape aquarelle.
+    #[arg(long, default_value_t = 0.5)]
+    aquarelle_bleed: f32,
+
+    /// Aquarelle: blown-out core strength (0.0..=1.0). Only used with --shape aquarelle.
+    #[arg(long, default_value_t = 0.5)]
+    aquarelle_bloom: f32,
+
+    /// Aquarelle: gradient center offset (0.0..=1.0). Only used with --shape aquarelle.
+    #[arg(long, default_value_t = 0.5)]
+    aquarelle_offset: f32,
+
+    /// Aquarelle: peripheral saturation (halo) (0.0..=1.0). Only used with --shape aquarelle.
+    #[arg(long, default_value_t = 0.5)]
+    aquarelle_halo: f32,
+}
+
+impl Cli {
+    fn aquarelle_params(&self) -> AquarelleParams {
+        AquarelleParams {
+            bleed: self.aquarelle_bleed,
+            bloom: self.aquarelle_bloom,
+            offset: self.aquarelle_offset,
+            halo: self.aquarelle_halo,
+        }
+    }
+
+    fn orb_shape(&self) -> OrbShape {
+        self.shape.to_orb_shape(self.aquarelle_params())
+    }
 }
 
 fn main() -> ExitCode {
@@ -313,6 +354,7 @@ fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Backgro
         motion_speed: speed,
         seed: cli.seed.unwrap_or(0),
         background: resolve_background(&img, bg),
+        shape: cli.orb_shape(),
     };
 
     // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -350,6 +392,7 @@ fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
         blur: cli.blur,
         saturation: cli.saturation,
         background: resolve_background(&img, bg),
+        shape: cli.orb_shape(),
         ..RenderOptions::default()
     };
 
@@ -413,6 +456,7 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         );
     }
 
+    let orb_shape = cli.orb_shape();
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
@@ -424,7 +468,7 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         } else {
             resolved_bg
         };
-        let result = render_one_variation(&clusters, spec, &out_path, spec_bg);
+        let result = render_one_variation(&clusters, spec, &out_path, spec_bg, orb_shape);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -438,6 +482,7 @@ fn render_one_variation(
     spec: &VariationSpec,
     out_path: &std::path::Path,
     bg_rgba: [u8; 4],
+    orb_shape: OrbShape,
 ) -> Result<(), String> {
     match spec.kind {
         VariationKind::Png => {
@@ -446,6 +491,7 @@ fn render_one_variation(
                 blur: spec.blur,
                 saturation: spec.saturation,
                 background: bg_rgba,
+                shape: orb_shape,
                 ..RenderOptions::default()
             };
             let img = render_static(clusters, &opts);
@@ -460,6 +506,7 @@ fn render_one_variation(
                 motion_speed: spec.speed,
                 seed: spec.seed,
                 background: bg_rgba,
+                shape: orb_shape,
             };
             render_video(
                 clusters,

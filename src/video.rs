@@ -16,6 +16,7 @@
 
 use crate::animate::{render_frame, AnimateOptions, MotionShape, MotionSpeed};
 use crate::cluster::Cluster;
+use crate::orb::OrbShape;
 use crate::output_mode::OutputMode;
 use std::io;
 use std::path::Path;
@@ -81,6 +82,8 @@ pub struct VideoOptions {
     pub seed: u64,
     /// 背景 RGBA。動画は yuv420p 制約で alpha 不可なので呼び出し側で透過を弾くこと。
     pub background: [u8; 4],
+    /// orb の描画形式。
+    pub shape: OrbShape,
 }
 
 impl Default for VideoOptions {
@@ -94,6 +97,7 @@ impl Default for VideoOptions {
             motion_speed: a.motion_speed,
             seed: a.seed,
             background: a.background,
+            shape: a.shape,
         }
     }
 }
@@ -197,6 +201,7 @@ pub fn render_video(
         motion_speed: opts.motion_speed,
         seed: opts.seed,
         background: opts.background,
+        shape: opts.shape,
     };
 
     let temp_dir = tempfile::TempDir::new()?;
