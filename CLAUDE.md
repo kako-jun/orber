@@ -37,7 +37,7 @@ src/
 ├── orb.rs          # orb 1 個の描画（円形ぼかし）
 ├── animate.rs      # 時間 t におけるフレーム生成
 ├── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
-├── style.rs        # CSS / SVG 静的書き出し
+├── style.rs        # CSS / SVG 静的書き出し（実装済み）
 └── aquarelle/      # にじみ形状の orb（将来別 crate に分離する境界）
     └── mod.rs
 ```

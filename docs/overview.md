@@ -11,7 +11,7 @@ input image / video
   ├─ place orbs                   → position, size, base color per orb  [implemented for static PNG]
   ├─ render frame(s)              → RGBA buffer with radial-gradient orbs  [implemented via tiny-skia]
   ├─ (animated) interpolate       → frame sequence over time t  [implemented]
-  └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG / MP4 / WebM implemented]
+  └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG / MP4 / WebM / SVG / CSS implemented]
 ```
 
 ## Output formats
@@ -19,8 +19,8 @@ input image / video
 |              | Static            | Animated                            |
 | ------------ | ----------------- | ----------------------------------- |
 | **Raster**   | PNG, WebP         | MP4, WebM (vertical 9:16 by default)|
-| **Style**    | CSS gradient      | CSS gradient + `@keyframes`         |
-| **Vector**   | SVG               | —                                   |
+| **Style**    | CSS gradient (implemented) | CSS gradient + `@keyframes` (planned) |
+| **Vector**   | SVG (implemented) | —                                   |
 
 CSS / SVG output is attractive because it is essentially zero-byte, infinitely loopable, resolution-independent, and cheap to render in a browser compared to a video element.
 
