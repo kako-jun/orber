@@ -15,6 +15,7 @@
 //!   blur=1 → 中心の不透明領域が点に近く、緩やかに減衰
 //! - 彩度調整は palette の HSL 経由
 
+use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
@@ -22,6 +23,29 @@ use tiny_skia::{
     Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode,
     Transform,
 };
+
+/// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
+/// 質感セット（[`crate::aquarelle`]）を有効にする。
+#[derive(Debug, Clone, Copy)]
+pub enum OrbShape {
+    Circle,
+    Aquarelle(AquarelleParams),
+}
+
+impl Default for OrbShape {
+    fn default() -> Self {
+        Self::Circle
+    }
+}
+
+impl PartialEq for OrbShape {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (OrbShape::Circle, OrbShape::Circle) | (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_))
+        )
+    }
+}
 
 /// 静的 orb 描画のオプション。
 #[derive(Debug, Clone)]
@@ -38,6 +62,8 @@ pub struct RenderOptions {
     pub saturation: f32,
     /// 背景 RGBA。alpha=0 で透過。デフォルトは黒不透明。
     pub background: [u8; 4],
+    /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
+    pub shape: OrbShape,
 }
 
 impl Default for RenderOptions {
@@ -49,6 +75,7 @@ impl Default for RenderOptions {
             blur: 0.5,
             saturation: 1.0,
             background: [0, 0, 0, 255],
+            shape: OrbShape::Circle,
         }
     }
 }
@@ -79,7 +106,7 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
 
     let base_radius_unit = (width.min(height) as f32) * 0.25 * orb_size;
 
-    for cluster in clusters {
+    for (i, cluster) in clusters.iter().enumerate() {
         // 半径 0 の orb は何も描画しないのでスキップ（0 半径の RadialGradient は tiny-skia で None になる）。
         let radius = base_radius_unit * cluster.weight.max(0.0).sqrt();
         if radius <= 0.0 {
@@ -90,6 +117,13 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
         let cy = cluster.centroid.y.clamp(0.0, 1.0) * height as f32;
 
         let [r, g, b] = adjust_saturation(cluster.color, saturation);
+
+        // Aquarelle は別モジュールへ委譲。同じ Pixmap に SourceOver で書き込む。
+        if let OrbShape::Aquarelle(params) = opts.shape {
+            // i (cluster index) を seed の差分にして orb 同士で異なるオフセットを得る。
+            render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
+            continue;
+        }
         let center_color = Color::from_rgba8(r, g, b, 255);
         // 中間 stop の半透明色は中心と同じ RGB で alpha だけ落とす。
         let mid_color = Color::from_rgba8(r, g, b, 128);

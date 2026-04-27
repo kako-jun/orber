@@ -23,7 +23,7 @@
 //!   と完全同一の結果を返す。
 
 use crate::cluster::{Centroid, Cluster};
-use crate::orb::{render_static, RenderOptions};
+use crate::orb::{render_static, OrbShape, RenderOptions};
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use rand::{Rng, SeedableRng};
@@ -110,6 +110,8 @@ pub struct AnimateOptions {
     pub seed: u64,
     /// 背景 RGBA。alpha=0 で透過。
     pub background: [u8; 4],
+    /// orb の描画形式。
+    pub shape: OrbShape,
 }
 
 impl Default for AnimateOptions {
@@ -124,6 +126,7 @@ impl Default for AnimateOptions {
             motion_speed: MotionSpeed::Slow,
             seed: 0,
             background: [0, 0, 0, 255],
+            shape: OrbShape::Circle,
         }
     }
 }
@@ -304,6 +307,7 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         blur: opts.blur,
         saturation: opts.saturation,
         background: opts.background,
+        shape: opts.shape,
     };
     render_static(&modulated, &render_opts)
 }
@@ -340,6 +344,7 @@ mod tests {
             motion_speed: speed,
             seed: 12345,
             background: [0, 0, 0, 255],
+            shape: OrbShape::Circle,
         }
     }
 
@@ -354,6 +359,7 @@ mod tests {
             motion_speed: speed,
             seed: 12345,
             background: [0, 0, 0, 255],
+            shape: OrbShape::Circle,
         }
     }
 

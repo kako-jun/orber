@@ -3,6 +3,7 @@
 // (color clustering, orb rendering, animation, video output, etc.).
 
 pub mod animate;
+pub mod aquarelle;
 pub mod background;
 pub mod cluster;
 pub mod orb;
