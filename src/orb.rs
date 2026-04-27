@@ -159,7 +159,7 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
 /// 彩度調整は HSL 経路で行う。cluster 抽出は LAB（知覚距離）を使うが、
 /// 彩度のフラグは「CSS 的な見た目の彩度」に合わせるほうが UI 直感に近いため、
 /// 意図的に色空間を分けている。
-fn adjust_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
+pub(crate) fn adjust_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
     if (factor - 1.0).abs() < f32::EPSILON {
         return rgb;
     }

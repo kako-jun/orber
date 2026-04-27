@@ -3,6 +3,7 @@ use orber::animate::MotionPreset;
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
+use orber::style::{render_css, render_svg, StyleOptions};
 use orber::video::{render_video, VideoCodec, VideoOptions};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -96,11 +97,56 @@ fn main() -> ExitCode {
 
     match mode {
         OutputMode::Png => render_png(&cli),
+        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, mode),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
         }
     }
+}
+
+fn render_style_path(cli: &Cli, mode: OutputMode) -> ExitCode {
+    // 1. 入力画像を読み込み RGB8 に正規化。
+    let img = match image::open(&cli.input) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => {
+            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    // 2. 代表色クラスタ抽出（k=6 固定。後の Issue で CLI 化検討）。
+    let clusters = match extract_clusters(&img, 6) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 3. style オプション構築。
+    let opts = StyleOptions {
+        orb_size: cli.orb_size,
+        blur: cli.blur,
+        saturation: cli.saturation,
+    };
+
+    // 4. mode で書き出しを分岐。
+    let content = match mode {
+        OutputMode::Svg => render_svg(&clusters, &opts),
+        OutputMode::Css => render_css(&clusters, &opts),
+        _ => unreachable!("render_style_path called with non-style mode {mode:?}"),
+    };
+
+    if let Err(e) = std::fs::write(&cli.output, content) {
+        eprintln!(
+            "orber: failed to write output {}: {e}",
+            cli.output.display()
+        );
+        return ExitCode::from(2);
+    }
+    eprintln!("orber: wrote {}", cli.output.display());
+    ExitCode::SUCCESS
 }
 
 fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {

@@ -6,4 +6,5 @@ pub mod animate;
 pub mod cluster;
 pub mod orb;
 pub mod output_mode;
+pub mod style;
 pub mod video;
