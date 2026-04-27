@@ -12,6 +12,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - `OrbStyle` enum (`Rim` / `Soft`) and `render_one_orb` per-orb rendering helper. Each orb is assigned a style deterministically from the seed (≈50:50), so a single frame mixes the rim-emphasized look with plain soft gradients. (#41)
 - Per-orb integer speed multipliers (`1x` / `2x`) assigned deterministically from the seed. Combined with the `MotionSpeed` cycle count (`VerySlow` / `Slow` = 1 / 2), effective traversal counts spread over `{1, 2, 4}` per clip — orbs visibly move at varied paces while pixel-exact loop closure at `t=0 ≡ t=1` is preserved (integer × integer cycles). (#41)
 - Off-screen wrap buffer: each orb's progress range is extended from `[0, 1]` to `[-r, 1+r]` (where `r` is its radius normalized by the progress-axis length). Orbs now spawn and despawn fully off-screen, so the wrap moment is invisible — the seam at `pos = 1+r → -r` happens beyond the canvas edges. (#41)
+- New cluster helpers `cluster::derive_background_rgba` and `cluster::drop_dominant`. The dominant (highest-weight) cluster becomes the canvas color and is dropped from the orb pool, so the input image's most prevalent color is no longer drawn as an orb on top of itself. (#41)
 
 ### Changed
 - **BREAKING**: Motion model rebuilt as a one-way conveyor belt. Each clip flows in a single direction (left→right / right→left / top→bottom / bottom→top) with all orbs traveling the same way. Orbs no longer reflect or oscillate; they exit one edge and re-enter from the opposite edge (wrap loop). (#41)
@@ -29,7 +30,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - **BREAKING**: `ColorMod` module is **deleted**. Hue shift, lightness bias, saturation modulation, and dominant cluster rotation are gone. The premise — that a single input photo should yield multiple recolored variations — was wrong: if you want different colors, feed in a different image. K-means palette colors are now used unmodified end-to-end. (#41)
 - **BREAKING**: `VariationSpec` fields `hue_shift_deg`, `lightness_bias`, `saturation`, `dominant_rotation`, and `cluster_count` are **removed**. The `VariationSpec::color_mod()` method is also gone. The k-means K used by the variations path is fixed internally at 5.
 - **BREAKING**: CLI flag `--background` is **removed**, along with the entire `background` module (`Background` enum, `resolve`, `BackgroundParseError`). The background color is now derived automatically from the input image: the dominant (highest-weight) k-means cluster becomes the canvas color, and the remaining clusters become the orb pool. A nightscape gives a black canvas with bright points; a daytime sky gives a sky-blue canvas with floating points; a beige interior gives a beige canvas with small accents. To change colors, change the input image. (#41)
-- **BREAKING**: New helpers `cluster::derive_background_rgba` and `cluster::drop_dominant` added; the `--background transparent` rejection branch for mp4/webm is gone (auto-derived backgrounds are always opaque). (#41)
+- The `--background transparent` rejection branch for mp4/webm is gone (auto-derived backgrounds are always opaque, so the rejection branch became unreachable). (#41)
 
 ## [0.2.0] - 2026-04-27
 
