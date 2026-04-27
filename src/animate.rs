@@ -86,6 +86,11 @@ impl MotionSpeed {
 }
 
 /// アニメーション 1 フレーム描画のオプション。
+///
+/// `count` は同時可視 orb の総数。`None` の場合は cluster 数と一致させる
+/// （後方互換）。`Some(n)` を指定すると、cluster K 色を seed 由来で N 個に
+/// **展開** する。色は weight 比例の重み付き抽選で割り当て、初期位相 / 縦軸
+/// オフセットは seed から決定的に振る。
 #[derive(Debug, Clone)]
 pub struct AnimateOptions {
     pub width: u32,
@@ -96,6 +101,8 @@ pub struct AnimateOptions {
     pub direction: MotionDirection,
     pub speed: MotionSpeed,
     pub seed: u64,
+    /// 同時可視 orb の総数。None → cluster 数。Some(n) → クラスタ展開。
+    pub count: Option<usize>,
     /// 背景 RGBA。alpha=0 で透過。
     pub background: [u8; 4],
     /// orb の描画形式。
@@ -113,6 +120,7 @@ impl Default for AnimateOptions {
             direction: MotionDirection::LeftToRight,
             speed: MotionSpeed::Slow,
             seed: 0,
+            count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
         }
@@ -124,6 +132,9 @@ impl Default for AnimateOptions {
 /// `phase` は 0..1 の初期位置オフセット。`phi_radius` / `phi_blur` / `phi_opacity` は
 /// 3 軸独立の呼吸位相シフト（radius は ±10%、blur は ±15%、opacity は ±5%）。
 /// `style` は orb ごとの描画スタイル（Rim / Soft）で、フレーム内に混在させる。
+/// `cluster_idx` はこの orb の色とサイズを取ってくる元クラスタの index（重み比例で抽選）。
+/// `cross_axis` は進行方向と直交する軸の正規化座標 0..1。orb をクラスタ重心に固定
+/// せず、画面全体に散らせるためのオフセット。
 /// 速度ジッタは入れない（ループ性が崩れるため。代わりに phase で散らばらせる）。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
@@ -137,31 +148,61 @@ struct OrbParams {
     phi_opacity: f32,
     /// 描画スタイル（Rim / Soft）。seed 由来でほぼ 50:50 に振る。
     style: OrbStyle,
+    /// この orb の色 / weight を借りてくる元クラスタの index。
+    cluster_idx: usize,
+    /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
+    cross_axis: f32,
+}
+
+/// 重み比例の 1 サンプルをもらう抽選器。
+///
+/// `weights` 全部の合計を 1 度だけ計算し、累積和上の二分探索で index を返す。
+/// 全 weight が 0 の場合は 0 を返す（呼び出し側で要素が無いケースを弾いていないと
+/// パニックするので注意）。
+fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
+    if total <= 0.0 || weights.is_empty() {
+        return 0;
+    }
+    let r = rng.gen::<f32>() * total;
+    let mut acc = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w.max(0.0);
+        if r <= acc {
+            return i;
+        }
+    }
+    weights.len() - 1
 }
 
 /// `seed` から各 orb のパラメータを決定的に生成する。
 ///
-/// `style` は内部で u32 を引いて偶奇で Rim / Soft に振り分ける。f32 の連続値だと
-/// 「丸めて 0/1」の分布が偏る可能性があるため、整数 1 ステップを別に消費する。
-fn generate_orb_params(seed: u64, n_orbs: usize) -> Vec<OrbParams> {
+/// `n_orbs` は要求される orb 数。`cluster_weights` は各クラスタの占有比で、
+/// orb の色割当（cluster_idx）に重み比例で使われる。`style` と `cluster_idx` は
+/// 整数を別途引いて分布の偏りを避ける。
+fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let total_w: f32 = cluster_weights.iter().map(|w| w.max(0.0)).sum();
     (0..n_orbs)
         .map(|_| {
             let phase = rng.gen_range(0.0..1.0);
             let phi_radius = rng.gen_range(0.0..TAU);
             let phi_blur = rng.gen_range(0.0..TAU);
             let phi_opacity = rng.gen_range(0.0..TAU);
+            let cross_axis = rng.gen_range(0.0..1.0);
             let style = if rng.gen::<u32>() & 1 == 0 {
                 OrbStyle::Rim
             } else {
                 OrbStyle::Soft
             };
+            let cluster_idx = pick_weighted(&mut rng, cluster_weights, total_w);
             OrbParams {
                 phase,
                 phi_radius,
                 phi_blur,
                 phi_opacity,
                 style,
+                cluster_idx,
+                cross_axis,
             }
         })
         .collect()
@@ -196,7 +237,15 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
 /// 消費するため、cluster 数や順序が変わると各 orb の phase / phi_breath も変わる。
 pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
     let cycle = opts.speed.cycle_count();
-    let params = generate_orb_params(opts.seed, clusters.len());
+    // count を解決。`None` なら cluster 数（後方互換）。
+    let n_orbs = opts
+        .count
+        .unwrap_or(clusters.len())
+        .min(MAX_ORB_COUNT)
+        .max(if clusters.is_empty() { 0 } else { 1 });
+
+    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
+    let params = generate_orb_params(opts.seed, n_orbs, &cluster_weights);
 
     let width = opts.width.max(1);
     let height = opts.height.max(1);
@@ -205,7 +254,7 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     // render_static + Cluster 列変調パスへフォールバックする（Aquarelle は
     // bleed/bloom/halo を内部で持っているので 3 軸揺らぎを足すと壊れる）。
     if let OrbShape::Aquarelle(_) = opts.shape {
-        return render_frame_aquarelle(clusters, opts, t);
+        return render_frame_aquarelle(clusters, opts, &params, t);
     }
 
     // Circle 経路: 自前で Pixmap を作って per-orb で render_one_orb を呼ぶ。
@@ -216,22 +265,30 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         pixmap.fill(Color::from_rgba8(br, bg, bb, ba));
     }
 
+    if clusters.is_empty() {
+        return finalize_pixmap(pixmap, width, height);
+    }
+
     let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
     let saturation = opts.saturation.max(0.0);
     let base_blur = opts.blur.clamp(0.0, 1.0);
 
-    for (c, p) in clusters.iter().zip(params.iter()) {
+    for p in params.iter() {
+        // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
+        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
+
         // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * t で進める。
-        // cycle が整数なので t=0 と t=1 では `phase` と `phase + cycle` が
-        // mod 1 で完全一致し、フレームがピクセル一致でループする。
         let advance = (cycle as f32 * t).fract();
         let progress = (p.phase + advance).rem_euclid(1.0);
 
+        // 直交軸は cluster 重心ではなく cross_axis（seed 由来 0..1）で散らせる。
+        // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
+        // なるので、画面全体に散布するため orb 個別のオフセットを使う。
         let (nx, ny) = match opts.direction {
-            MotionDirection::LeftToRight => (progress, c.centroid.y),
-            MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
-            MotionDirection::TopToBottom => (c.centroid.x, progress),
-            MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
+            MotionDirection::LeftToRight => (progress, p.cross_axis),
+            MotionDirection::RightToLeft => (1.0 - progress, p.cross_axis),
+            MotionDirection::TopToBottom => (p.cross_axis, progress),
+            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - progress),
         };
 
         // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
@@ -261,16 +318,25 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     finalize_pixmap(pixmap, width, height)
 }
 
+/// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
+const MAX_ORB_COUNT: usize = 1024;
+
 /// Aquarelle shape は既存の render_static フォールバック経路。
 ///
 /// Aquarelle は内部で bleed / bloom / halo を持っているため、per-orb の独立揺らぎを
 /// 足すと質感セットが壊れる。半径だけの呼吸を従来どおり cluster.weight に乗せる。
-fn render_frame_aquarelle(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
+/// count による展開は Aquarelle では行わない（質感セットが orb ごとに重い）。
+/// 受け取った `params` の先頭から cluster 数だけ消費する。
+fn render_frame_aquarelle(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    params: &[OrbParams],
+    t: f32,
+) -> RgbaImage {
     use crate::cluster::Centroid;
     use crate::orb::{render_static, RenderOptions};
 
     let cycle = opts.speed.cycle_count();
-    let params = generate_orb_params(opts.seed, clusters.len());
 
     let modulated: Vec<Cluster> = clusters
         .iter()
@@ -359,6 +425,7 @@ mod tests {
             direction,
             speed,
             seed: 12345,
+            count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
         }
@@ -587,11 +654,40 @@ mod tests {
     }
 
     #[test]
+    fn count_expands_orb_pool_beyond_clusters() {
+        // count を None で渡すと cluster 数（3）と同じ orb が描かれる。
+        // count = Some(40) を指定すると 40 個に展開される。展開した方が画面の
+        // 平均明度（R チャネルの平均）が大きくなることで「より多くの orb が描かれた」
+        // ことを間接確認する。
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.count = None;
+        let img_default = render_frame(&clusters, &opts, 0.0);
+
+        opts.count = Some(40);
+        let img_expanded = render_frame(&clusters, &opts, 0.0);
+
+        let mean_r = |img: &RgbaImage| -> f64 {
+            let mut s = 0u64;
+            for px in img.pixels() {
+                s += px[0] as u64;
+            }
+            s as f64 / (img.width() as f64 * img.height() as f64)
+        };
+        let m_def = mean_r(&img_default);
+        let m_exp = mean_r(&img_expanded);
+        assert!(
+            m_exp > m_def + 0.5,
+            "expanding count should increase mean brightness; default={m_def}, expanded={m_exp}"
+        );
+    }
+
+    #[test]
     fn style_is_mixed_across_orbs() {
         // 多めの orb を生成すると Rim と Soft が両方出現する。
         // 50:50 程度に振っているので、64 個も引けば両方が必ず出る（確率的に
         // 1 種類しか出ない確率は (0.5)^64 ≈ 5.4e-20）。
-        let p = generate_orb_params(7, 64);
+        let p = generate_orb_params(7, 64, &[1.0]);
         let n_rim = p.iter().filter(|q| q.style == OrbStyle::Rim).count();
         let n_soft = p.iter().filter(|q| q.style == OrbStyle::Soft).count();
         assert!(
@@ -605,7 +701,7 @@ mod tests {
         // 3 軸（radius / blur / opacity）の位相が seed から独立に生成されていること。
         // 同じ seed で同じインデックスの OrbParams が phi_radius / phi_blur /
         // phi_opacity 3 つとも同じ値になっているとアウト（同期している）。
-        let p = generate_orb_params(42, 16);
+        let p = generate_orb_params(42, 16, &[1.0]);
         let mut all_three_same = 0;
         for op in &p {
             // 3 つが完全一致しているケースを数える。0 件であることを期待する

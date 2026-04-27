@@ -3,7 +3,7 @@ use orber::animate::{MotionDirection, MotionSpeed};
 use orber::aquarelle::AquarelleParams;
 use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::{extract_clusters, Cluster};
-use orber::orb::{render_static, OrbShape, RenderOptions};
+use orber::orb::{OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
 use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
@@ -113,6 +113,15 @@ fn parse_f32_in_range(min: f32, max: f32) -> impl Fn(&str) -> Result<f32, String
 fn parse_orb_size(s: &str) -> Result<f32, String> {
     parse_f32_in_range(0.0, 10.0)(s)
 }
+fn parse_count(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if !(1..=200).contains(&v) {
+        return Err(format!("must be in 1..=200, got {v}"));
+    }
+    Ok(v)
+}
 fn parse_unit_interval(s: &str) -> Result<f32, String> {
     parse_f32_in_range(0.0, 1.0)(s)
 }
@@ -167,6 +176,13 @@ struct Cli {
     /// Conveyor-belt speed. Coarse 3-step preset over the whole clip.
     #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
     speed: CliSpeed,
+
+    /// Number of orbs visible on screen at once (1..=200, default 20).
+    /// Clusters are expanded to this count by weight-proportional color sampling
+    /// and per-orb scattering on the cross axis. Higher count fills more of the
+    /// frame; ~20 fills roughly 70% on the default size.
+    #[arg(long, default_value_t = 20, value_parser = parse_count)]
+    count: usize,
 
     /// Orb rendering shape.
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
@@ -344,6 +360,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background
         direction,
         speed,
         seed: cli.seed.unwrap_or(0),
+        count: Some(cli.count),
         background: resolve_background(&img, bg),
         shape: cli.orb_shape(),
     };
@@ -376,21 +393,27 @@ fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
         }
     };
 
-    // 3. 描画オプション構築（解像度はデフォルトの縦長 1080x1920）。
-    // width/height は当面デフォルト固定。CLI フラグ化は将来 Issue で対応する。
-    let opts = RenderOptions {
+    // 3. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
+    //    描画する。これで --count による orb 数の展開が単発出力でも効く。
+    //    （render_static は count を解釈しないので、count=clusters.len() に固定された
+    //     旧経路にしないよう animate::render_frame を一律に使う。）
+    let (direction, speed) = resolve_motion(cli);
+    let frame_opts = orber::animate::AnimateOptions {
+        width: RenderOptions::default().width,
+        height: RenderOptions::default().height,
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
+        direction,
+        speed,
+        seed: cli.seed.unwrap_or(0),
+        count: Some(cli.count),
         background: resolve_background(&img, bg),
         shape: cli.orb_shape(),
-        ..RenderOptions::default()
     };
+    let out = orber::animate::render_frame(&clusters, &frame_opts, 0.0);
 
-    // 4. 静的描画。
-    let out = render_static(&clusters, &opts);
-
-    // 5. 保存。
+    // 4. 保存。
     if let Err(e) = out.save(output) {
         eprintln!("orber: failed to write output {}: {e}", output.display());
         return ExitCode::from(2);
@@ -502,6 +525,7 @@ fn render_one_variation(
                 direction: spec.direction,
                 speed: spec.speed,
                 seed: spec.seed,
+                count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
             };
@@ -516,6 +540,7 @@ fn render_one_variation(
                 direction: spec.direction,
                 speed: spec.speed,
                 seed: spec.seed,
+                count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
             };
@@ -623,6 +648,22 @@ mod tests {
         assert!(try_parse(&["--duration-ms", "600001"]).is_err());
         assert!(try_parse(&["--duration-ms", "1000"]).is_ok());
         assert!(try_parse(&["--duration-ms", "600000"]).is_ok());
+    }
+
+    #[test]
+    fn count_out_of_range_rejected() {
+        assert!(try_parse(&["--count", "0"]).is_err());
+        assert!(try_parse(&["--count", "201"]).is_err());
+        assert!(try_parse(&["--count", "abc"]).is_err());
+        assert!(try_parse(&["--count", "1"]).is_ok());
+        assert!(try_parse(&["--count", "20"]).is_ok());
+        assert!(try_parse(&["--count", "200"]).is_ok());
+    }
+
+    #[test]
+    fn count_default_is_twenty() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        assert_eq!(cli.count, 20);
     }
 
     #[test]

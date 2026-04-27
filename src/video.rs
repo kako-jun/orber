@@ -80,6 +80,8 @@ pub struct VideoOptions {
     pub direction: MotionDirection,
     pub speed: MotionSpeed,
     pub seed: u64,
+    /// 同時可視 orb 数。None なら cluster 数（後方互換）。
+    pub count: Option<usize>,
     /// 背景 RGBA。動画は yuv420p 制約で alpha 不可なので呼び出し側で透過を弾くこと。
     pub background: [u8; 4],
     /// orb の描画形式。
@@ -96,6 +98,7 @@ impl Default for VideoOptions {
             direction: a.direction,
             speed: a.speed,
             seed: a.seed,
+            count: a.count,
             background: a.background,
             shape: a.shape,
         }
@@ -200,6 +203,7 @@ pub fn render_video(
         direction: opts.direction,
         speed: opts.speed,
         seed: opts.seed,
+        count: opts.count,
         background: opts.background,
         shape: opts.shape,
     };

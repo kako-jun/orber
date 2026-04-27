@@ -57,7 +57,7 @@ impl VariationMode {
 
 /// 1 つのバリエーション案。
 ///
-/// 差別化軸は方向 4 / 速度 3 / orb_size / blur のみ。色は spec 内に持たない
+/// 差別化軸は方向 4 / 速度 3 / count / orb_size / blur のみ。色は spec 内に持たない
 /// （入力画像の kmeans 結果をそのまま使う）。
 #[derive(Debug, Clone, Copy)]
 pub struct VariationSpec {
@@ -67,6 +67,8 @@ pub struct VariationSpec {
     pub direction: MotionDirection,
     /// 動画用の速度（Png でも phase 散らばりに使われるが、cycle 自体は t=0 で意味なし）。
     pub speed: MotionSpeed,
+    /// 同時可視 orb の総数。クラスタ K 色を N 個に展開する数（画面を約 7 割埋める）。
+    pub count: usize,
     pub orb_size: f32,
     pub blur: f32,
     pub seed: u64,
@@ -86,6 +88,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Png,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Slow,
+        count: 20,
         orb_size: 3.0,
         blur: 0.5,
         seed: 1,
@@ -96,6 +99,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Png,
         direction: MotionDirection::RightToLeft,
         speed: MotionSpeed::VerySlow,
+        count: 20,
         orb_size: 3.5,
         blur: 0.6,
         seed: 2,
@@ -106,6 +110,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Png,
         direction: MotionDirection::TopToBottom,
         speed: MotionSpeed::Slow,
+        count: 20,
         orb_size: 2.8,
         blur: 0.4,
         seed: 3,
@@ -116,6 +121,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Png,
         direction: MotionDirection::BottomToTop,
         speed: MotionSpeed::VerySlow,
+        count: 20,
         orb_size: 3.2,
         blur: 0.6,
         seed: 4,
@@ -126,6 +132,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Slow,
+        count: 20,
         orb_size: 3.0,
         blur: 0.5,
         seed: 5,
@@ -136,6 +143,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::RightToLeft,
         speed: MotionSpeed::VerySlow,
+        count: 20,
         orb_size: 4.0,
         blur: 0.6,
         seed: 6,
@@ -146,6 +154,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::TopToBottom,
         speed: MotionSpeed::Slow,
+        count: 20,
         orb_size: 2.8,
         blur: 0.4,
         seed: 7,
@@ -156,6 +165,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::BottomToTop,
         speed: MotionSpeed::Slow,
+        count: 20,
         orb_size: 3.2,
         blur: 0.5,
         seed: 8,
@@ -166,6 +176,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::RightToLeft,
         speed: MotionSpeed::VerySlow,
+        count: 20,
         orb_size: 3.5,
         blur: 0.7,
         seed: 9,
@@ -176,6 +187,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         kind: VariationKind::Mp4,
         direction: MotionDirection::LeftToRight,
         speed: MotionSpeed::Medium,
+        count: 20,
         orb_size: 2.8,
         blur: 0.5,
         seed: 10,
