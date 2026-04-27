@@ -26,16 +26,11 @@ use tiny_skia::{
 
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
 /// 質感セット（[`crate::aquarelle`]）を有効にする。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum OrbShape {
+    #[default]
     Circle,
     Aquarelle(AquarelleParams),
-}
-
-impl Default for OrbShape {
-    fn default() -> Self {
-        Self::Circle
-    }
 }
 
 impl PartialEq for OrbShape {
@@ -371,7 +366,7 @@ mod tests {
             ..base.clone()
         };
         let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
-        let img_sharp = render_static(&[c.clone()], &opts_sharp);
+        let img_sharp = render_static(std::slice::from_ref(&c), &opts_sharp);
         let img_blurred = render_static(&[c], &opts_blurred);
 
         // orb 半径 = min(w,h)*0.25*orb_size*sqrt(weight) = 100*0.25 = 25

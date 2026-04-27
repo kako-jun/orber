@@ -8,7 +8,7 @@ use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
 use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use orber::video::{render_video, VideoCodec, VideoOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Back-compat motion preset (`--motion`). Equivalent to a fixed (shape, speed) pair.
@@ -311,7 +311,7 @@ fn resolve_motion(cli: &Cli) -> (MotionShape, MotionSpeed) {
     (shape, speed)
 }
 
-fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Background) -> ExitCode {
+fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -353,7 +353,7 @@ fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Backgrou
     ExitCode::SUCCESS
 }
 
-fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Background) -> ExitCode {
+fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -394,7 +394,7 @@ fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Backgro
     ExitCode::SUCCESS
 }
 
-fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
+fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
