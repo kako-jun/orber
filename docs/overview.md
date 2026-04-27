@@ -71,8 +71,10 @@ Auto-derived backgrounds are always opaque (alpha = 255), so animated outputs
 Animated outputs use a **one-way conveyor belt**. The whole clip flows in exactly one
 direction (`lr` / `rl` / `tb` / `bt`); orbs do not reflect, oscillate, or return to
 their start. When an orb exits one edge, a fresh orb enters from the opposite edge
-(toroidal wrap). Each orb has a randomized initial phase so the field looks scattered
-rather than synchronized.
+— but the seam happens **fully off-screen**: each orb's progress range is `[-r, 1+r]`
+where `r` is its radius normalized by the progress-axis length, so orbs spawn and
+despawn beyond the canvas edge and never visibly pop in or out. Each orb has a
+randomized initial phase so the field looks scattered rather than synchronized.
 
 A baseline breathing is applied to every orb automatically — there is no opt-in flag.
 The breathing has **three independent axes**, each driven by its own seed-derived
@@ -82,10 +84,17 @@ phase offset and looping once per clip duration:
 - blur: ±15%
 - opacity: ±5%
 
-`--speed` is expressed as integer screen-crosses per clip (1 / 2 / 3), keeping the
-loop pixel-exact at `t = 0 ≡ t = 1`. Real-time pacing is set by `--duration-ms`:
-`--speed slow --duration-ms 8000` means the conveyor crosses the screen twice in
-8 seconds (4 s/cross).
+Each orb is also assigned an integer **speed multiplier** (`1x` / `2x` / `3x`)
+deterministically from the seed, so individual orbs visibly travel at different
+paces inside the same clip. Combined with the global `--speed` cycle count
+(`very-slow` / `slow` / `medium` = 1 / 2 / 3), per-orb effective traversal counts
+spread over `{1, 2, 3, 4, 6, 9}` per clip. Because every factor is an integer, the
+loop closure at `t = 0 ≡ t = 1` remains pixel-exact.
+
+`--speed` itself is the global cycle count (1 / 2 / 3 screen-crosses per clip for
+the slowest orbs). Real-time pacing is set by `--duration-ms`: `--speed slow
+--duration-ms 8000` means the slowest orbs cross the screen twice in 8 seconds
+(4 s/cross), with `2x` and `3x` orbs proportionally faster.
 
 ## Orb count and visual mix (v0.3.0)
 
@@ -118,8 +127,9 @@ all ten outputs. Differentiation comes from layout (count / size / blur) and mot
   `flow_bt_blurry`, `flow_lr_medium`, `flow_rl_huge`
 
 Stills are not pure `render_static` snapshots — they are the `t = 0` frame of the
-conveyor, so orbs are phase-scattered and a few of them straddle the edges, matching
-the visual language of the videos.
+conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fraction
+of the requested `--count` will sit just outside the visible area, matching the
+visual language of the videos.
 
 ## Use cases
 

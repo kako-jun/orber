@@ -41,20 +41,26 @@ The background color is **derived automatically from the input image**: the domi
 ### Motion model
 
 Animated outputs use a **one-way conveyor belt**: every orb in a clip drifts in the
-same direction, exits one edge, and re-enters from the opposite edge (toroidal wrap).
-A single clip flows in exactly one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the
-direction and pace with:
+same direction, exits one edge, and re-enters from the opposite edge. The seam happens
+**fully off-screen** — each orb's wrap range is `[-r, 1+r]` (where `r` is its radius
+normalized by the progress-axis length), so orbs are spawned and despawned beyond the
+canvas edge instead of popping in or out at the edge. A single clip flows in exactly
+one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace with:
 
 ```bash
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
 ```
 
-`--speed` chooses how many full screen-crosses fit into the whole clip (1 / 2 / 3 for
-`very-slow` / `slow` / `medium`). Combined with a long `--duration-ms`, this gives the
-characteristic gentle drift. Every orb also gets three independent breathing pulses
-(radius ±10%, blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag
-for that.
+`--speed` is the **global** cycle count (1 / 2 / 3 screen-crosses per clip for the
+slowest orbs). Each orb also gets a per-orb integer **speed multiplier** (`1x` / `2x` /
+`3x`) assigned deterministically from the seed, so individual orbs visibly travel at
+different paces inside the same clip — effective traversal counts spread over
+`{1, 2, 3, 4, 6, 9}` per clip. All factors are integers, so the loop closure at
+`t = 0 ≡ t = 1` stays pixel-exact. Combined with a long `--duration-ms`, this gives
+the characteristic gentle, layered drift. Every orb also gets three independent
+breathing pulses (radius ±10%, blur ±15%, opacity ±5%) applied automatically — there
+is no opt-in flag for that.
 
 ### Orb count
 
