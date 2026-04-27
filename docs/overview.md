@@ -39,6 +39,33 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--seed` — random seed for reproducibility
 - `--variations N --output-dir DIR` — emit a curated set of N alternate looks for the same input (direction × speed × count × size × blur combinations)
 
+Background color is not a CLI flag — it is derived from the input image (see "Background derivation" below).
+
+## Background derivation (v0.3.0)
+
+There is no `--background` flag. The background color is **derived automatically**
+from the k-means clusters of the input image:
+
+- the dominant cluster (highest weight) becomes the canvas color (alpha = 255)
+- the remaining K − 1 clusters become the orb pool
+- if k-means returns zero clusters (degenerate input), the canvas falls back to
+  opaque black
+
+Concretely:
+
+- a nightscape (mostly dark sky) → black canvas + bright neon points
+- a daytime sky → sky-blue canvas + clouds / silhouettes drifting on it
+- a beige interior → beige canvas + small accent-color orbs
+
+The dominant color is the most "this is what the photo looks like" channel, so
+making it the canvas and letting the sub-colors float as orbs produces a
+composition that already feels right without parameter tuning. To get a
+different canvas, feed in a different image — the design intentionally has no
+override path.
+
+Auto-derived backgrounds are always opaque (alpha = 255), so animated outputs
+(`mp4` / `webm`) never collide with `yuv420p`'s lack of alpha.
+
 ## Motion model (v0.3.0)
 
 Animated outputs use a **one-way conveyor belt**. The whole clip flows in exactly one

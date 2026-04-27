@@ -29,12 +29,14 @@ PNG output is implemented and produces a 1080×1920 vertical orb image:
 ```bash
 orber --input photo.jpg --output orb.png
 orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 1.4
-orber --input white_paper.jpg --output orb.png --background auto
-orber --input photo.jpg --output orb.png --background "#1a1a1a"
-orber --input photo.jpg --output orb.svg --background transparent
+orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed), saturation, clip duration, and background color (`black` / `white` / `auto` / `transparent` / `#RRGGBB[AA]`; default `auto` picks a dimmed average color of the input image). See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed), saturation, and clip duration. See all flags via `orber --help`.
+
+### Background color
+
+The background color is **derived automatically from the input image**: the dominant (highest-weight) k-means cluster becomes the canvas color, and the remaining clusters become the orb pool. A nightscape gives a black canvas with bright points; a daytime sky gives a sky-blue canvas with floating points; a beige interior gives a beige canvas with small accents. There is no `--background` flag — to change colors, change the input image.
 
 ### Motion model
 

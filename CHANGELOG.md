@@ -26,6 +26,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Removed
 - **BREAKING**: `ColorMod` module is **deleted**. Hue shift, lightness bias, saturation modulation, and dominant cluster rotation are gone. The premise — that a single input photo should yield multiple recolored variations — was wrong: if you want different colors, feed in a different image. K-means palette colors are now used unmodified end-to-end. (#41)
 - **BREAKING**: `VariationSpec` fields `hue_shift_deg`, `lightness_bias`, `saturation`, `dominant_rotation`, and `cluster_count` are **removed**. The `VariationSpec::color_mod()` method is also gone. The k-means K used by the variations path is fixed internally at 5.
+- **BREAKING**: CLI flag `--background` is **removed**, along with the entire `background` module (`Background` enum, `resolve`, `BackgroundParseError`). The background color is now derived automatically from the input image: the dominant (highest-weight) k-means cluster becomes the canvas color, and the remaining clusters become the orb pool. A nightscape gives a black canvas with bright points; a daytime sky gives a sky-blue canvas with floating points; a beige interior gives a beige canvas with small accents. To change colors, change the input image. (#41)
+- **BREAKING**: New helpers `cluster::derive_background_rgba` and `cluster::drop_dominant` added; the `--background transparent` rejection branch for mp4/webm is gone (auto-derived backgrounds are always opaque). (#41)
 
 ## [0.2.0] - 2026-04-27
 
