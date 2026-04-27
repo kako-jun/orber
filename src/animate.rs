@@ -75,6 +75,8 @@ pub struct AnimateOptions {
     pub saturation: f32,
     pub motion: MotionPreset,
     pub seed: u64,
+    /// 背景 RGBA。alpha=0 で透過。
+    pub background: [u8; 4],
 }
 
 impl Default for AnimateOptions {
@@ -87,6 +89,7 @@ impl Default for AnimateOptions {
             saturation: 1.0,
             motion: MotionPreset::Slow,
             seed: 0,
+            background: [0, 0, 0, 255],
         }
     }
 }
@@ -217,6 +220,7 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         orb_size: opts.orb_size,
         blur: opts.blur,
         saturation: opts.saturation,
+        background: opts.background,
     };
     render_static(&modulated, &render_opts)
 }
@@ -250,6 +254,7 @@ mod tests {
             saturation: 1.0,
             motion,
             seed: 12345,
+            background: [0, 0, 0, 255],
         }
     }
 

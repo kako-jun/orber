@@ -32,6 +32,8 @@ pub struct StyleOptions {
     pub blur: f32,
     /// 彩度倍率（1.0 = unchanged）
     pub saturation: f32,
+    /// 背景 RGBA。alpha=0 で透過 SVG / `background-color: transparent`。
+    pub background: [u8; 4],
 }
 
 impl Default for StyleOptions {
@@ -40,6 +42,7 @@ impl Default for StyleOptions {
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
+            background: [0, 0, 0, 255],
         }
     }
 }
@@ -66,7 +69,19 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
     s.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {STYLE_WIDTH} {STYLE_HEIGHT}\" width=\"{STYLE_WIDTH}\" height=\"{STYLE_HEIGHT}\">\n"
     ));
-    s.push_str("  <rect width=\"100%\" height=\"100%\" fill=\"black\"/>\n");
+    let [bg_r, bg_g, bg_b, bg_a] = opts.background;
+    if bg_a > 0 {
+        if bg_a == 255 {
+            s.push_str(&format!(
+                "  <rect width=\"100%\" height=\"100%\" fill=\"rgb({bg_r},{bg_g},{bg_b})\"/>\n"
+            ));
+        } else {
+            let opacity = bg_a as f32 / 255.0;
+            s.push_str(&format!(
+                "  <rect width=\"100%\" height=\"100%\" fill=\"rgb({bg_r},{bg_g},{bg_b})\" fill-opacity=\"{opacity:.3}\"/>\n"
+            ));
+        }
+    }
 
     // 描画対象 cluster だけ事前に絞り込んでから defs と circle の両方に使う。
     // weight=0 の cluster で空の gradient ID が defs に残らないようにする。
@@ -131,17 +146,28 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
     // blur=1 → mid=end の 20% （中心が点に近く、緩やかに減衰）
     let mid_factor = (1.0 - blur * 0.8).clamp(0.05, 0.95);
 
+    let [bg_r, bg_g, bg_b, bg_a] = opts.background;
+    let bg_css = if bg_a == 0 {
+        "transparent".to_string()
+    } else if bg_a == 255 {
+        format!("rgb({bg_r}, {bg_g}, {bg_b})")
+    } else {
+        let opacity = bg_a as f32 / 255.0;
+        format!("rgba({bg_r}, {bg_g}, {bg_b}, {opacity:.3})")
+    };
+
     let mut s = String::new();
     s.push_str("/* orber-generated background.\n");
     s.push_str("   Apply to <body> or any block element:\n");
     s.push_str("       body {\n");
     s.push_str("           margin: 0;\n");
     s.push_str("           min-height: 100vh;\n");
-    s.push_str("           background-color: black;\n");
+    s.push_str("           background-color: var(--orber-bg-color);\n");
     s.push_str("           background-image: var(--orber-bg);\n");
     s.push_str("       }\n");
-    s.push_str("   Generated as a CSS variable; reference with var(--orber-bg). */\n");
+    s.push_str("   Generated as CSS variables; reference with var(--orber-bg) and var(--orber-bg-color). */\n");
     s.push_str(":root {\n");
+    s.push_str(&format!("    --orber-bg-color: {bg_css};\n"));
 
     // 有効な gradient だけ集めてから書き出す（最後のカンマを抑制するため）。
     let mut gradients: Vec<String> = Vec::new();
@@ -219,7 +245,7 @@ mod tests {
         assert_eq!(svg.matches("<radialGradient").count(), 6);
         assert_eq!(svg.matches("<circle ").count(), 6);
         assert!(svg.contains("viewBox=\"0 0 1080 1920\""));
-        assert!(svg.contains("<rect width=\"100%\" height=\"100%\" fill=\"black\""));
+        assert!(svg.contains("<rect width=\"100%\" height=\"100%\" fill=\"rgb(0,0,0)\""));
         assert!(svg.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
         assert!(svg.ends_with("</svg>\n"));
     }
@@ -360,6 +386,7 @@ mod tests {
                     orb_size,
                     blur,
                     saturation: 1.0,
+                    ..Default::default()
                 };
                 let css = render_css(&extreme_clusters, &opts);
                 let stops = extract_css_stops(&css);

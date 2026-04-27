@@ -36,6 +36,8 @@ pub struct RenderOptions {
     pub blur: f32,
     /// 彩度倍率（1.0 = unchanged）
     pub saturation: f32,
+    /// 背景 RGBA。alpha=0 で透過。デフォルトは黒不透明。
+    pub background: [u8; 4],
 }
 
 impl Default for RenderOptions {
@@ -46,6 +48,7 @@ impl Default for RenderOptions {
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
+            background: [0, 0, 0, 255],
         }
     }
 }
@@ -64,10 +67,15 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
     let orb_size = opts.orb_size.max(0.0);
 
     // Pixmap::new は uninit を 0 埋めしてくれる（つまり全画面が透明）。
-    // 初期化を「黒 不透明」にしたいので明示的に塗る。
+    // 透過 (alpha=0) 指定なら fill をスキップしてその透明初期値を活かす。
+    // 不透明な背景指定なら明示的に塗る。tiny-skia は premultiplied alpha だが、
+    // Color::from_rgba8 は straight 色を内部で premul に直して塗る。
     let mut pixmap =
         Pixmap::new(width, height).expect("pixmap allocation should succeed for >0 dimensions");
-    pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+    let [br, bg, bb, ba] = opts.background;
+    if ba > 0 {
+        pixmap.fill(Color::from_rgba8(br, bg, bb, ba));
+    }
 
     let base_radius_unit = (width.min(height) as f32) * 0.25 * orb_size;
 
@@ -211,6 +219,7 @@ mod tests {
             blur: 0.5,
             saturation: 1.0,
             orb_size: 1.0,
+            ..Default::default()
         };
         let img = render_static(&[cluster([255, 0, 0], 0.5, 0.5, 1.0)], &opts);
         let center = img.get_pixel(50, 50);
@@ -288,6 +297,7 @@ mod tests {
             blur: 0.5,
             saturation: 0.0,
             orb_size: 1.0,
+            ..Default::default()
         };
         let img = render_static(&[cluster([220, 30, 40], 0.5, 0.5, 1.0)], &opts);
         let center = img.get_pixel(50, 50);
@@ -316,6 +326,7 @@ mod tests {
             saturation: 1.0,
             orb_size: 1.0,
             blur: 0.0,
+            ..Default::default()
         };
         let opts_sharp = RenderOptions {
             blur: 0.0,

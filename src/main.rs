@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use orber::animate::MotionPreset;
+use orber::background::{resolve as resolve_background, Background};
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
@@ -78,6 +79,12 @@ struct Cli {
     /// Animated output duration in milliseconds (1000..=600000, i.e. 1s..=10min).
     #[arg(long, default_value_t = 5000)]
     duration_ms: u64,
+
+    /// Background color: black, white, auto, transparent, or #RRGGBB(AA).
+    /// `auto` picks a dimmed average color of the input image.
+    /// `transparent` is rejected for mp4/webm (yuv420p has no alpha).
+    #[arg(long, default_value = "auto")]
+    background: String,
 }
 
 fn main() -> ExitCode {
@@ -91,13 +98,27 @@ fn main() -> ExitCode {
         }
     };
 
+    let bg: Background = match cli.background.parse() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("orber: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
-        return render_video_path(&cli, codec);
+        if bg.is_transparent() {
+            eprintln!(
+                "orber: --background transparent is not supported for {mode:?} (yuv420p has no alpha channel)"
+            );
+            return ExitCode::from(2);
+        }
+        return render_video_path(&cli, codec, bg);
     }
 
     match mode {
-        OutputMode::Png => render_png(&cli),
-        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, mode),
+        OutputMode::Png => render_png(&cli, bg),
+        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, mode, bg),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
@@ -105,7 +126,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn render_style_path(cli: &Cli, mode: OutputMode) -> ExitCode {
+fn render_style_path(cli: &Cli, mode: OutputMode, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -129,6 +150,7 @@ fn render_style_path(cli: &Cli, mode: OutputMode) -> ExitCode {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
+        background: resolve_background(&img, bg),
     };
 
     // 4. mode で書き出しを分岐。
@@ -149,7 +171,7 @@ fn render_style_path(cli: &Cli, mode: OutputMode) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
+fn render_video_path(cli: &Cli, codec: VideoCodec, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -175,6 +197,7 @@ fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
         saturation: cli.saturation,
         motion: cli.motion.into(),
         seed: cli.seed.unwrap_or(0),
+        background: resolve_background(&img, bg),
     };
 
     // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -186,7 +209,7 @@ fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn render_png(cli: &Cli) -> ExitCode {
+fn render_png(cli: &Cli, bg: Background) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -211,6 +234,7 @@ fn render_png(cli: &Cli) -> ExitCode {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
+        background: resolve_background(&img, bg),
         ..RenderOptions::default()
     };
 
