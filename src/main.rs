@@ -266,6 +266,31 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
     (cli.direction.into(), cli.speed.into())
 }
 
+/// orb プールが空になった（K=1 / 単色画像）ときに stderr で警告し、処理は継続する。
+///
+/// `drop_dominant` でドミナントクラスタを 1 個落としたあと、残りが 0 個になる
+/// ケースを検出する。フォールバックは入れない（背景塗りだけの出力になる）。
+fn warn_if_orb_pool_empty(orb_clusters: &[Cluster]) {
+    if orb_clusters.is_empty() {
+        eprintln!(
+            "orber: warning: input image yielded only 1 cluster; orb pool is empty (output will be background only)"
+        );
+    }
+}
+
+/// `--shape aquarelle` と `--count` の組合せを使ったときに stderr で警告する。
+///
+/// Aquarelle 経路は cluster 数だけ orb を描画する設計（per-orb の独立揺らぎを
+/// 入れると bleed/bloom/halo の質感セットが壊れるため）。CLI からは aquarelle の
+/// ときだけ count が無視される事実が見えないので、ここで明示的に教える。
+fn warn_if_aquarelle_count_ignored(cli: &Cli) {
+    if matches!(cli.shape, Shape::Aquarelle) {
+        eprintln!(
+            "orber: warning: aquarelle shape ignores --count (rendering one orb per k-means cluster from the palette)"
+        );
+    }
+}
+
 fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
@@ -288,6 +313,7 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     // 3. 背景色を最大 weight クラスタから自動派生し、orb プールはそれを除いた残り。
     let background = derive_background_rgba(&clusters);
     let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
 
     // 4. style オプション構築。
     let opts = StyleOptions {
@@ -334,6 +360,8 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
     let background = derive_background_rgba(&clusters);
     let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
 
     // 4. ビデオオプション構築。解像度は固定。
     let (direction, speed) = resolve_motion(cli);
@@ -380,6 +408,8 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
     let background = derive_background_rgba(&clusters);
     let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
 
     // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
     //    描画する。これで --count による orb 数の展開が単発出力でも効く。
@@ -466,6 +496,8 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     // 全 spec で共通（同じ入力画像から同じ背景・同じ orb プールを使う）。
     let background = derive_background_rgba(&base_clusters);
     let orb_clusters = drop_dominant(&base_clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
 
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
