@@ -1,9 +1,9 @@
 use clap::{Parser, ValueEnum};
-use orber::animate::{AnimateOptions, MotionPreset};
+use orber::animate::MotionPreset;
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
-use orber::video::{render_video, VideoCodec};
+use orber::video::{calc_frame_count, render_video, VideoCodec, VideoOptions, VIDEO_FPS};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -120,18 +120,27 @@ fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
         }
     };
 
-    // 3. アニメーションオプションを構築。解像度は render_video 内で
-    //    VIDEO_WIDTH/HEIGHT に強制上書きされる。
-    let opts = AnimateOptions {
+    // 3. ビデオオプション構築。解像度は固定。
+    let opts = VideoOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
         motion: cli.motion.into(),
         seed: cli.seed.unwrap_or(0),
-        ..AnimateOptions::default()
     };
 
-    // 4. 動画書き出し。
+    // 4. 進捗フィードバック（フレーム数を先に検証して表示）。
+    let frame_count = match calc_frame_count(cli.duration_ms) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("orber: invalid duration: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!("orber: rendering {frame_count} frames at {VIDEO_FPS}fps...");
+
+    // 5. 動画書き出し。
+    eprintln!("orber: invoking ffmpeg...");
     if let Err(e) = render_video(&clusters, &opts, &cli.output, cli.duration_ms, codec) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
@@ -186,6 +195,8 @@ fn render_png(cli: &Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orber::animate::AnimateOptions;
+    use orber::video::MAX_DURATION_MS;
 
     #[test]
     fn cli_defaults_match_render_options_defaults() {
@@ -200,5 +211,27 @@ mod tests {
             "saturation default mismatch"
         );
         // duration_ms は RenderOptions に対応フィールドが無いので対象外。
+    }
+
+    #[test]
+    fn cli_defaults_match_animate_options_defaults() {
+        // CLI のデフォルトが AnimateOptions::default() と一致することを保証。
+        // 動画経路は VideoOptions だが、内部で AnimateOptions を組み立てるため
+        // ここで motion/orb_size/blur/saturation の SoT 一致を担保する。
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.mp4"]);
+        let a = AnimateOptions::default();
+        let motion: MotionPreset = cli.motion.into();
+        assert_eq!(motion, a.motion, "motion default mismatch");
+        assert_eq!(cli.orb_size, a.orb_size, "orb_size default mismatch");
+        assert_eq!(cli.blur, a.blur, "blur default mismatch");
+        assert_eq!(cli.saturation, a.saturation, "saturation default mismatch");
+
+        // duration_ms は妥当範囲（>0 かつ <= MAX_DURATION_MS）であること。
+        assert!(cli.duration_ms > 0, "duration_ms default must be > 0");
+        assert!(
+            cli.duration_ms <= MAX_DURATION_MS,
+            "duration_ms default must be <= MAX_DURATION_MS, got {}",
+            cli.duration_ms
+        );
     }
 }
