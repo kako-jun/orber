@@ -276,9 +276,12 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
                 }
             };
 
-            // 範囲外に出た場合は clamp。軌道半径は数% 程度なので長時間停滞は起きにくい。
-            let new_x = (c.centroid.x + dx).clamp(0.0, 1.0);
-            let new_y = (c.centroid.y + dy).clamp(0.0, 1.0);
+            // 範囲外に出た場合は wrap (`rem_euclid`) で反対側から入り直す。
+            // v0.2.0 までは clamp で枠内に押し込めていたが、振幅が大きい preset では
+            // 端に張り付くだけで動きが死んでいた。トーラス的な周回にすることで
+            // 「画面端に消えていって反対から戻ってくる」絵が成立する。
+            let new_x = (c.centroid.x + dx).rem_euclid(1.0);
+            let new_y = (c.centroid.y + dy).rem_euclid(1.0);
 
             // 色揺らぎ: HSL の S と L を 1 ± amp_color の範囲で振る。
             // Twinkle は明度の振れ幅を倍にして「瞬き」感を強める。
