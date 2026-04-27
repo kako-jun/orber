@@ -112,6 +112,34 @@ impl Shape {
     }
 }
 
+/// f32 のパース + 有限性 + 範囲チェックを 1 つにまとめた値パーサ。
+///
+/// NaN / 無限大は弾く。clap の `value_parser` 互換シグネチャ。
+fn parse_f32_in_range(min: f32, max: f32) -> impl Fn(&str) -> Result<f32, String> + Clone {
+    move |s: &str| {
+        let v: f32 = s
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+        if !v.is_finite() {
+            return Err(format!("must be a finite number (not NaN/inf), got {v}"));
+        }
+        if v < min || v > max {
+            return Err(format!("must be in {min}..={max}, got {v}"));
+        }
+        Ok(v)
+    }
+}
+
+fn parse_orb_size(s: &str) -> Result<f32, String> {
+    parse_f32_in_range(0.0, 10.0)(s)
+}
+fn parse_unit_interval(s: &str) -> Result<f32, String> {
+    parse_f32_in_range(0.0, 1.0)(s)
+}
+fn parse_saturation(s: &str) -> Result<f32, String> {
+    parse_f32_in_range(0.0, 4.0)(s)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "orber")]
 #[command(version)]
@@ -144,12 +172,12 @@ struct Cli {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Orb size as a relative multiplier (1.0 = default).
-    #[arg(long, default_value_t = 1.0)]
+    /// Orb size as a relative multiplier (0.0..=10.0; 1.0 = default).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_orb_size)]
     orb_size: f32,
 
-    /// Blur strength in 0.0..=1.0.
-    #[arg(long, default_value_t = 0.5)]
+    /// Blur strength (0.0..=1.0).
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     blur: f32,
 
     /// Back-compat drift preset for animated outputs. Equivalent to a fixed
@@ -171,12 +199,12 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
     shape: Shape,
 
-    /// Saturation multiplier (1.0 = unchanged).
-    #[arg(long, default_value_t = 1.0)]
+    /// Saturation multiplier (0.0..=4.0; 1.0 = unchanged).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_saturation)]
     saturation: f32,
 
     /// Animated output duration in milliseconds (1000..=600000, i.e. 1s..=10min).
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1000..=600_000))]
     duration_ms: u64,
 
     /// Background color: black, white, auto, transparent, or #RRGGBB(AA).
@@ -186,19 +214,19 @@ struct Cli {
     background: String,
 
     /// Aquarelle: bleed strength (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_bleed: f32,
 
     /// Aquarelle: blown-out core strength (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_bloom: f32,
 
     /// Aquarelle: gradient center offset (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_offset: f32,
 
     /// Aquarelle: peripheral saturation (halo) (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_halo: f32,
 }
 
@@ -562,5 +590,63 @@ mod tests {
             "duration_ms default must be <= MAX_DURATION_MS, got {}",
             cli.duration_ms
         );
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut full = vec!["orber", "--input", "x", "--output", "x.png"];
+        full.extend(args);
+        Cli::try_parse_from(full)
+    }
+
+    #[test]
+    fn parse_f32_in_range_helper() {
+        // 範囲内 / 範囲外 / NaN / inf / 不正文字列の各分岐をユニットで担保する。
+        let p = parse_f32_in_range(0.0, 1.0);
+        assert_eq!(p("0.0").unwrap(), 0.0);
+        assert_eq!(p("1.0").unwrap(), 1.0);
+        assert!(p("1.5").is_err(), "above max should error");
+        assert!(p("-0.1").is_err(), "below min should error");
+        assert!(p("NaN").is_err(), "NaN should error");
+        assert!(p("inf").is_err(), "inf should error");
+        assert!(p("xyz").is_err(), "non-numeric should error");
+    }
+
+    #[test]
+    fn blur_out_of_range_rejected() {
+        assert!(try_parse(&["--blur", "1.5"]).is_err());
+        assert!(try_parse(&["--blur", "-0.1"]).is_err());
+        assert!(try_parse(&["--blur", "NaN"]).is_err());
+        assert!(try_parse(&["--blur", "0.5"]).is_ok());
+    }
+
+    #[test]
+    fn orb_size_out_of_range_rejected() {
+        assert!(try_parse(&["--orb-size", "20.0"]).is_err());
+        assert!(try_parse(&["--orb-size", "-1.0"]).is_err());
+        assert!(try_parse(&["--orb-size", "1.5"]).is_ok());
+    }
+
+    #[test]
+    fn saturation_out_of_range_rejected() {
+        assert!(try_parse(&["--saturation", "5.0"]).is_err());
+        assert!(try_parse(&["--saturation", "-0.1"]).is_err());
+        assert!(try_parse(&["--saturation", "1.0"]).is_ok());
+        assert!(try_parse(&["--saturation", "0.0"]).is_ok());
+    }
+
+    #[test]
+    fn duration_ms_out_of_range_rejected() {
+        assert!(try_parse(&["--duration-ms", "999"]).is_err());
+        assert!(try_parse(&["--duration-ms", "600001"]).is_err());
+        assert!(try_parse(&["--duration-ms", "1000"]).is_ok());
+        assert!(try_parse(&["--duration-ms", "600000"]).is_ok());
+    }
+
+    #[test]
+    fn aquarelle_params_out_of_range_rejected() {
+        assert!(try_parse(&["--aquarelle-bleed", "1.5"]).is_err());
+        assert!(try_parse(&["--aquarelle-bloom", "-0.1"]).is_err());
+        assert!(try_parse(&["--aquarelle-offset", "0.7"]).is_ok());
+        assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
     }
 }
