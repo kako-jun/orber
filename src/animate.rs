@@ -24,10 +24,12 @@
 //! - 各 orb の進行量は `(phase + (cycle_count * t).fract()).rem_euclid(1.0)`。
 //!   `cycle_count` は整数 (1/2/3) なので t=1.0 で fract が 0 になり、t=0 と
 //!   完全一致するピクセル単位ループが成り立つ。
-//! - 速度ジッタ（orb ごとに ±20% 速度変える）は **入れない**。整数 cycle で
-//!   ループ閉じる前提を壊さないため。代わりに **phase の散らばり** (0..1 の一様分布)
-//!   で「個体差」を出す。phase が違えば、画面上の各時点の orb 位置が散らばる
-//!   ので「同期して動いていない」感が出る。
+//! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
+//!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
+//!   両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
+//!   Slow / Medium と組み合わせると実効周回数は {1, 2, 3, 4, 6, 9} に変化に富む。
+//! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
+//!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
 //!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
@@ -135,7 +137,8 @@ impl Default for AnimateOptions {
 /// `cluster_idx` はこの orb の色とサイズを取ってくる元クラスタの index（重み比例で抽選）。
 /// `cross_axis` は進行方向と直交する軸の正規化座標 0..1。orb をクラスタ重心に固定
 /// せず、画面全体に散らせるためのオフセット。
-/// 速度ジッタは入れない（ループ性が崩れるため。代わりに phase で散らばらせる）。
+/// `speed_mult` は整数倍速度 (1 / 2 / 3)。`cycle_count * speed_mult` も整数なので
+/// `t=1` でループが閉じる。視覚的なバラつきの主因。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
@@ -152,6 +155,8 @@ struct OrbParams {
     cluster_idx: usize,
     /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
     cross_axis: f32,
+    /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
+    speed_mult: u32,
 }
 
 /// 重み比例の 1 サンプルをもらう抽選器。
@@ -195,6 +200,9 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
                 OrbStyle::Soft
             };
             let cluster_idx = pick_weighted(&mut rng, cluster_weights, total_w);
+            // 整数倍速度。1/2/3 を均等に割り当て。整数 × 整数の cycle_count なので
+            // t=1 で fract が 0 になりループ性は保たれる。
+            let speed_mult = rng.gen_range(1..=3);
             OrbParams {
                 phase,
                 phi_radius,
@@ -203,6 +211,7 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
                 style,
                 cluster_idx,
                 cross_axis,
+                speed_mult,
             }
         })
         .collect()
@@ -277,8 +286,9 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
         // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
         let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
 
-        // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * t で進める。
-        let advance = (cycle as f32 * t).fract();
+        // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * speed_mult * t で
+        // 進める。両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。
+        let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
         let progress = (p.phase + advance).rem_euclid(1.0);
 
         // 直交軸は cluster 重心ではなく cross_axis（seed 由来 0..1）で散らせる。
@@ -342,7 +352,7 @@ fn render_frame_aquarelle(
         .iter()
         .zip(params.iter())
         .map(|(c, p)| {
-            let advance = (cycle as f32 * t).fract();
+            let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
             let progress = (p.phase + advance).rem_euclid(1.0);
             let (nx, ny) = match opts.direction {
                 MotionDirection::LeftToRight => (progress, c.centroid.y),
@@ -717,6 +727,29 @@ mod tests {
             all_three_same, 0,
             "breath axes must not be synchronized for any orb"
         );
+    }
+
+    #[test]
+    fn speed_mult_distribution() {
+        // 30 個の orb を引けば 1/2/3 のうち少なくとも 2 種類は出現する。
+        // 全部同じ値になる確率は (1/3)^29 * 3 ≈ 1.5e-13 で実質 0。
+        let p = generate_orb_params(99, 30, &[1.0]);
+        let n1 = p.iter().filter(|q| q.speed_mult == 1).count();
+        let n2 = p.iter().filter(|q| q.speed_mult == 2).count();
+        let n3 = p.iter().filter(|q| q.speed_mult == 3).count();
+        let kinds = [n1, n2, n3].iter().filter(|&&n| n > 0).count();
+        assert!(
+            kinds >= 2,
+            "expected at least 2 distinct speed_mult values; got n1={n1}, n2={n2}, n3={n3}"
+        );
+        // 全 orb が {1, 2, 3} の範囲内であることも確認。
+        for q in &p {
+            assert!(
+                (1..=3).contains(&q.speed_mult),
+                "speed_mult must be 1, 2, or 3; got {}",
+                q.speed_mult
+            );
+        }
     }
 
     #[test]
