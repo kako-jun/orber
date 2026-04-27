@@ -48,7 +48,6 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 
 - Web frontend (planned later as a separate effort)
 - WASM build (planned later)
-- Publishing on crates.io (planned later)
 - Realtime / interactive editing (CLI-only for now)
 
 ## Relationship to aquarelle

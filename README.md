@@ -42,6 +42,23 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
+## Installation
+
+```bash
+cargo install orber
+```
+
+Or download a prebuilt binary from GitHub Releases once `v0.1.0+` tags are published.
+
+## Release
+
+`orber` is prepared as a Rust CLI crate with:
+- `cargo install orber`
+- GitHub Actions CI on pushes and pull requests
+- a tag-driven GitHub Releases workflow for Linux, macOS, and Windows artifacts
+
+The first public crate/release target is `v0.1.0`.
+
 ## License
 
 MIT
