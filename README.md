@@ -34,7 +34,26 @@ orber --input photo.jpg --output orb.png --background "#1a1a1a"
 orber --input photo.jpg --output orb.svg --background transparent
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, motion speed, shape (circle / aquarelle bleed), saturation, clip duration, and background color (`black` / `white` / `auto` / `transparent` / `#RRGGBB[AA]`; default `auto` picks a dimmed average color of the input image). See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed), saturation, clip duration, and background color (`black` / `white` / `auto` / `transparent` / `#RRGGBB[AA]`; default `auto` picks a dimmed average color of the input image). See all flags via `orber --help`.
+
+### Motion model
+
+Animated outputs use a **one-way conveyor belt**: every orb in a clip drifts in the
+same direction, exits one edge, and re-enters from the opposite edge (toroidal wrap).
+A single clip flows in exactly one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the
+direction and pace with:
+
+```bash
+orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
+orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
+```
+
+`--speed` chooses how many full screen-crosses fit into the whole clip (1 / 2 / 3 for
+`very-slow` / `slow` / `medium`). Combined with a long `--duration-ms`, this gives the
+characteristic gentle drift. Every orb also gets a tiny breathing pulse (±10% radius)
+applied automatically — there is no opt-in flag for that.
+
+### Variation preset
 
 To explore looks for a single input, batch out a curated set of 10 alternates:
 
@@ -42,9 +61,9 @@ To explore looks for a single input, batch out a curated set of 10 alternates:
 orber --input photo.jpg --variations 10 --output-dir out/
 ```
 
-Each preset varies hue, lightness, k-means cluster count, and motion shape so the
-ten outputs are visibly distinct (4 stills + 6 animations). Use `--variations-mode still`
-or `--variations-mode video` to filter.
+Each preset varies hue, lightness, k-means cluster count, conveyor direction, and
+speed so the ten outputs are visibly distinct (4 stills + 6 animations). Use
+`--variations-mode still` or `--variations-mode video` to filter.
 
 ## Build
 
