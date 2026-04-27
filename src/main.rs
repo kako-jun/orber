@@ -1,7 +1,9 @@
 use clap::{Parser, ValueEnum};
+use orber::animate::MotionPreset;
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
+use orber::video::{render_video, VideoCodec, VideoOptions};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -14,6 +16,16 @@ enum Motion {
     Slow,
     /// Lively, faster drift.
     Lively,
+}
+
+impl From<Motion> for MotionPreset {
+    fn from(m: Motion) -> Self {
+        match m {
+            Motion::Still => MotionPreset::Still,
+            Motion::Slow => MotionPreset::Slow,
+            Motion::Lively => MotionPreset::Lively,
+        }
+    }
 }
 
 /// Shape used to render each orb.
@@ -62,7 +74,7 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     saturation: f32,
 
-    /// Animated output duration in milliseconds.
+    /// Animated output duration in milliseconds (1000..=600000, i.e. 1s..=10min).
     #[arg(long, default_value_t = 5000)]
     duration_ms: u64,
 }
@@ -78,6 +90,10 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        return render_video_path(&cli, codec);
+    }
+
     match mode {
         OutputMode::Png => render_png(&cli),
         _ => {
@@ -85,6 +101,43 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
+    // 1. 入力画像を読み込み RGB8 に正規化。
+    let img = match image::open(&cli.input) {
+        Ok(img) => img.to_rgb8(),
+        Err(e) => {
+            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    // 2. 代表色クラスタ抽出（k=6 固定。後の Issue で CLI 化検討）。
+    let clusters = match extract_clusters(&img, 6) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 3. ビデオオプション構築。解像度は固定。
+    let opts = VideoOptions {
+        orb_size: cli.orb_size,
+        blur: cli.blur,
+        saturation: cli.saturation,
+        motion: cli.motion.into(),
+        seed: cli.seed.unwrap_or(0),
+    };
+
+    // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
+    if let Err(e) = render_video(&clusters, &opts, &cli.output, cli.duration_ms, codec) {
+        eprintln!("orber: video render failed: {e}");
+        return ExitCode::from(2);
+    }
+    eprintln!("orber: wrote {}", cli.output.display());
+    ExitCode::SUCCESS
 }
 
 fn render_png(cli: &Cli) -> ExitCode {
@@ -133,6 +186,8 @@ fn render_png(cli: &Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orber::animate::AnimateOptions;
+    use orber::video::MAX_DURATION_MS;
 
     #[test]
     fn cli_defaults_match_render_options_defaults() {
@@ -147,5 +202,27 @@ mod tests {
             "saturation default mismatch"
         );
         // duration_ms は RenderOptions に対応フィールドが無いので対象外。
+    }
+
+    #[test]
+    fn cli_defaults_match_animate_options_defaults() {
+        // CLI のデフォルトが AnimateOptions::default() と一致することを保証。
+        // 動画経路は VideoOptions だが、内部で AnimateOptions を組み立てるため
+        // ここで motion/orb_size/blur/saturation の SoT 一致を担保する。
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.mp4"]);
+        let a = AnimateOptions::default();
+        let motion: MotionPreset = cli.motion.into();
+        assert_eq!(motion, a.motion, "motion default mismatch");
+        assert_eq!(cli.orb_size, a.orb_size, "orb_size default mismatch");
+        assert_eq!(cli.blur, a.blur, "blur default mismatch");
+        assert_eq!(cli.saturation, a.saturation, "saturation default mismatch");
+
+        // duration_ms は妥当範囲（>0 かつ <= MAX_DURATION_MS）であること。
+        assert!(cli.duration_ms > 0, "duration_ms default must be > 0");
+        assert!(
+            cli.duration_ms <= MAX_DURATION_MS,
+            "duration_ms default must be <= MAX_DURATION_MS, got {}",
+            cli.duration_ms
+        );
     }
 }
