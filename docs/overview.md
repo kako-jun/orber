@@ -96,6 +96,11 @@ the slowest orbs). Real-time pacing is set by `--duration-ms`: `--speed slow
 --duration-ms 8000` means the slowest orbs cross the screen twice in 8 seconds
 (4 s/cross), with `2x` orbs proportionally faster.
 
+> Note: the aquarelle shape uses the legacy `[0, 1]` wrap. Its bleed / bloom / halo
+> textures clip cleanly enough that the off-screen wrap buffer would interfere with
+> the halo rendering. The `[-r, 1+r]` off-screen wrap described above applies to
+> the `circle` shape only.
+
 ## Orb count and visual mix (v0.3.0)
 
 The k-means palette gives K colors (5 in the variations path). `--count <N>`
@@ -112,6 +117,9 @@ Each orb is also assigned one of two visual styles deterministically from the se
 
 The two styles mix roughly 50:50 inside a single frame, so some orbs look like
 ring-haloed lights and others like plain soft glows.
+
+> Note: the aquarelle shape ignores `--count` (palette-only rendering). It renders
+> one orb per k-means cluster so the bleed / bloom / halo texture set stays coherent.
 
 ## Variation preset (v0.3.0)
 

@@ -47,6 +47,10 @@ pub enum OrbShape {
 }
 
 impl PartialEq for OrbShape {
+    // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
+    // ここでの "等価" は「形が同じか（Circle vs Aquarelle）」だけを判定する用途を
+    // 想定している。bleed / bloom / offset / halo まで含めて区別したい場合は
+    // AquarelleParams を直接比較すること。
     fn eq(&self, other: &Self) -> bool {
         matches!(
             (self, other),

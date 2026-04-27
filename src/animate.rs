@@ -12,8 +12,9 @@
 //! - 画面端から消えた orb は、反対側から新しい orb として入ってくる
 //!   （wrap = `rem_euclid` による永続ループ）
 //! - orb ごとに初期位相 (phase) を 0..1 でばらけさせ、配置と「同期しない」感を作る
-//! - 移動中は全 orb 共通で半径・blur・opacity が呼吸的に微揺らぎ
-//!   （独立モードではなく、常に薄く乗る自動効果）
+//! - 移動中は orb ごとに 3 軸独立の位相で半径・blur・opacity が呼吸的に微揺らぎ
+//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立。
+//!   独立モードではなく、常に薄く乗る自動効果）
 //! - 静止画は流れの一瞬。t=0 のフレームを切り取った絵で、phase 由来で
 //!   orb が散らばっており、画面端で半分欠けるのが普通の状態
 //!
@@ -242,8 +243,10 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
 ///
 /// # 決定論性
 ///
-/// 同じ seed と同じ clusters なら出力は完全一致する。RNG は cluster index 順に
-/// 消費するため、cluster 数や順序が変わると各 orb の phase / phi_breath も変わる。
+/// 同じ seed と同じ clusters なら出力は完全一致する。RNG は orb index 順に固定
+/// シーケンスで消費されるため、count や seed が変わると各 orb の phase /
+/// phi_radius / phi_blur / phi_opacity / cross_axis / style / cluster_idx /
+/// speed_mult 割当が同時に変わる。
 pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
     let cycle = opts.speed.cycle_count();
     // count を解決。`None` なら cluster 数（後方互換）。

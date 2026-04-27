@@ -62,6 +62,11 @@ this gives the characteristic gentle, layered drift. Every orb also gets three
 independent breathing pulses (radius ±10%, blur ±15%, opacity ±5%) applied
 automatically — there is no opt-in flag for that.
 
+> Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
+> textures clip cleanly enough that the off-screen buffer would interfere with the
+> rendered halo). The off-screen wrap buffer described above applies to the
+> `circle` shape only.
+
 ### Orb count
 
 Use `--count <N>` (1..=200, default 20) to control how many orbs are visible on screen
@@ -79,6 +84,10 @@ orber --input photo.jpg --output sparse.png --count 8 --orb-size 4.5
 random count in the GUI) is the caller's responsibility, not a CLI feature. Each orb
 is also assigned one of two visual styles (rim or soft) deterministically from the
 seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
+
+> Note: the aquarelle shape ignores `--count` (palette-only rendering). It always
+> renders one orb per cluster from the k-means palette so the bleed / bloom / halo
+> texture set stays coherent.
 
 ### Variation preset
 

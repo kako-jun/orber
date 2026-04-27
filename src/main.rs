@@ -141,7 +141,7 @@ struct Cli {
 
     /// Generate N variations of the input under --output-dir instead of a single file.
     /// Requires --output-dir. Variations are picked from a curated preset table
-    /// (still ×3, drift ×4, breathe ×1, lissajous ×2 = up to 10).
+    /// (4 still snapshots + 6 mp4 flows = up to 10).
     #[arg(long)]
     variations: Option<usize>,
 
