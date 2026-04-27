@@ -32,7 +32,7 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused)
 - `--count` — orbs visible on screen at once (1..=200, default 20)
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
-- `--speed` — conveyor pace: `very-slow` / `slow` / `medium` (cross counts per clip)
+- `--speed` — conveyor pace: `very-slow` / `slow` (cross counts per clip)
 - `--shape` — `circle` or `aquarelle` (watercolor bleed)
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
@@ -84,17 +84,17 @@ phase offset and looping once per clip duration:
 - blur: ±15%
 - opacity: ±5%
 
-Each orb is also assigned an integer **speed multiplier** (`1x` / `2x` / `3x`)
+Each orb is also assigned an integer **speed multiplier** (`1x` / `2x`)
 deterministically from the seed, so individual orbs visibly travel at different
 paces inside the same clip. Combined with the global `--speed` cycle count
-(`very-slow` / `slow` / `medium` = 1 / 2 / 3), per-orb effective traversal counts
-spread over `{1, 2, 3, 4, 6, 9}` per clip. Because every factor is an integer, the
-loop closure at `t = 0 ≡ t = 1` remains pixel-exact.
+(`very-slow` / `slow` = 1 / 2), per-orb effective traversal counts spread over
+`{1, 2, 4}` per clip. Because every factor is an integer, the loop closure at
+`t = 0 ≡ t = 1` remains pixel-exact.
 
-`--speed` itself is the global cycle count (1 / 2 / 3 screen-crosses per clip for
+`--speed` itself is the global cycle count (1 / 2 screen-crosses per clip for
 the slowest orbs). Real-time pacing is set by `--duration-ms`: `--speed slow
 --duration-ms 8000` means the slowest orbs cross the screen twice in 8 seconds
-(4 s/cross), with `2x` and `3x` orbs proportionally faster.
+(4 s/cross), with `2x` orbs proportionally faster.
 
 ## Orb count and visual mix (v0.3.0)
 
@@ -124,7 +124,7 @@ all ten outputs. Differentiation comes from layout (count / size / blur) and mot
 - 4 stills: `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`,
   `snapshot_bt_blurry`
 - 6 animations (8 s each): `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`,
-  `flow_bt_blurry`, `flow_lr_medium`, `flow_rl_huge`
+  `flow_bt_blurry`, `flow_lr_slow_v2`, `flow_rl_huge`
 
 Stills are not pure `render_static` snapshots — they are the `t = 0` frame of the
 conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fraction

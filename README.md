@@ -52,15 +52,15 @@ orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
 ```
 
-`--speed` is the **global** cycle count (1 / 2 / 3 screen-crosses per clip for the
-slowest orbs). Each orb also gets a per-orb integer **speed multiplier** (`1x` / `2x` /
-`3x`) assigned deterministically from the seed, so individual orbs visibly travel at
-different paces inside the same clip — effective traversal counts spread over
-`{1, 2, 3, 4, 6, 9}` per clip. All factors are integers, so the loop closure at
-`t = 0 ≡ t = 1` stays pixel-exact. Combined with a long `--duration-ms`, this gives
-the characteristic gentle, layered drift. Every orb also gets three independent
-breathing pulses (radius ±10%, blur ±15%, opacity ±5%) applied automatically — there
-is no opt-in flag for that.
+`--speed` is the **global** cycle count (`very-slow` / `slow` = 1 / 2 screen-crosses
+per clip for the slowest orbs). Each orb also gets a per-orb integer **speed
+multiplier** (`1x` / `2x`) assigned deterministically from the seed, so individual
+orbs visibly travel at different paces inside the same clip — effective traversal
+counts spread over `{1, 2, 4}` per clip. All factors are integers, so the loop
+closure at `t = 0 ≡ t = 1` stays pixel-exact. Combined with a long `--duration-ms`,
+this gives the characteristic gentle, layered drift. Every orb also gets three
+independent breathing pulses (radius ±10%, blur ±15%, opacity ±5%) applied
+automatically — there is no opt-in flag for that.
 
 ### Orb count
 
