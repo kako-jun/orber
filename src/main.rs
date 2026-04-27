@@ -3,7 +3,7 @@ use orber::animate::MotionPreset;
 use orber::cluster::extract_clusters;
 use orber::orb::{render_static, RenderOptions};
 use orber::output_mode::OutputMode;
-use orber::video::{calc_frame_count, render_video, VideoCodec, VideoOptions, VIDEO_FPS};
+use orber::video::{render_video, VideoCodec, VideoOptions};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -74,7 +74,7 @@ struct Cli {
     #[arg(long, default_value_t = 1.0)]
     saturation: f32,
 
-    /// Animated output duration in milliseconds.
+    /// Animated output duration in milliseconds (1000..=600000, i.e. 1s..=10min).
     #[arg(long, default_value_t = 5000)]
     duration_ms: u64,
 }
@@ -90,10 +90,12 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        return render_video_path(&cli, codec);
+    }
+
     match mode {
         OutputMode::Png => render_png(&cli),
-        OutputMode::Mp4 => render_video_path(&cli, VideoCodec::H264),
-        OutputMode::Webm => render_video_path(&cli, VideoCodec::Vp9),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
@@ -129,18 +131,7 @@ fn render_video_path(cli: &Cli, codec: VideoCodec) -> ExitCode {
         seed: cli.seed.unwrap_or(0),
     };
 
-    // 4. 進捗フィードバック（フレーム数を先に検証して表示）。
-    let frame_count = match calc_frame_count(cli.duration_ms) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("orber: invalid duration: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    eprintln!("orber: rendering {frame_count} frames at {VIDEO_FPS}fps...");
-
-    // 5. 動画書き出し。
-    eprintln!("orber: invoking ffmpeg...");
+    // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
     if let Err(e) = render_video(&clusters, &opts, &cli.output, cli.duration_ms, codec) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);

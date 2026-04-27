@@ -157,7 +157,9 @@ pub fn calc_frame_count(duration_ms: u64) -> Result<usize, VideoError> {
         .checked_mul(VIDEO_FPS as u64)
         .ok_or(VideoError::InvalidDuration)?
         / 1000;
-    Ok(n.max(1) as usize)
+    // 範囲チェックを通った時点で n >= 30 が保証されているため、ここで
+    // n が 0 になることはない。usize 変換だけ行う。
+    Ok(n as usize)
 }
 
 /// 連番 PNG を一時ディレクトリに書き出して ffmpeg で動画に結合する。
@@ -165,6 +167,10 @@ pub fn calc_frame_count(duration_ms: u64) -> Result<usize, VideoError> {
 /// 解像度は常に [`VIDEO_WIDTH`] / [`VIDEO_HEIGHT`]。
 /// フレーム時刻は `t = i / total` （i ∈ 0..total）。ループ繋ぎ目で
 /// フレームが重複しないよう、`t = 1.0` は含めない。
+///
+/// 進捗は stderr に出力される（書き出し開始時、10% 毎、ffmpeg 起動時）。
+/// CLI バイナリ向けの便宜であり、サイレントに動かしたい場合は呼び出し側で
+/// stderr を捨てること。
 pub fn render_video(
     clusters: &[Cluster],
     opts: &VideoOptions,
@@ -173,6 +179,7 @@ pub fn render_video(
     codec: VideoCodec,
 ) -> Result<(), VideoError> {
     let total = calc_frame_count(duration_ms)?;
+    eprintln!("orber: rendering {total} frames at {VIDEO_FPS}fps...");
 
     // ビデオ用の AnimateOptions を組み立てる（解像度は固定）。
     let frame_opts = AnimateOptions {
@@ -187,15 +194,21 @@ pub fn render_video(
 
     let temp_dir = tempfile::TempDir::new()?;
 
-    // フレーム書き出し（逐次）。
+    // フレーム書き出し（逐次）。10% 刻みで stderr に進捗を出す。
+    let progress_step = (total / 10).max(1);
     for i in 0..total {
         let t = i as f32 / total as f32;
         let frame = render_frame(clusters, &frame_opts, t);
         let path = temp_dir.path().join(format!("frame_{i:05}.png"));
         frame.save(&path).map_err(VideoError::FrameSave)?;
+        if i > 0 && i % progress_step == 0 {
+            let pct = (i * 100) / total;
+            eprintln!("orber: {pct}% ({i}/{total} frames)");
+        }
     }
 
     // ffmpeg コマンド組み立て。
+    eprintln!("orber: invoking ffmpeg ({codec:?})...");
     let pattern = temp_dir.path().join("frame_%05d.png");
     let fps_str = VIDEO_FPS.to_string();
 
