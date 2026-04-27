@@ -1,8 +1,7 @@
 use clap::{Parser, ValueEnum};
 use orber::animate::{MotionDirection, MotionSpeed};
 use orber::aquarelle::AquarelleParams;
-use orber::background::{resolve as resolve_background, Background};
-use orber::cluster::{extract_clusters, Cluster};
+use orber::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber::orb::{OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
@@ -196,12 +195,6 @@ struct Cli {
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1000..=600_000))]
     duration_ms: u64,
 
-    /// Background color: black, white, auto, transparent, or #RRGGBB(AA).
-    /// `auto` picks a dimmed average color of the input image.
-    /// `transparent` is rejected for mp4/webm (yuv420p has no alpha).
-    #[arg(long, default_value = "auto")]
-    background: String,
-
     /// Aquarelle: bleed strength (0.0..=1.0). Only used with --shape aquarelle.
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_bleed: f32,
@@ -237,16 +230,8 @@ impl Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let bg: Background = match cli.background.parse() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("orber: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
     if let Some(n) = cli.variations {
-        return render_variations(&cli, n, bg);
+        return render_variations(&cli, n);
     }
 
     let output = match &cli.output {
@@ -266,18 +251,12 @@ fn main() -> ExitCode {
     };
 
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
-        if bg.is_transparent() {
-            eprintln!(
-                "orber: --background transparent is not supported for {mode:?} (yuv420p has no alpha channel)"
-            );
-            return ExitCode::from(2);
-        }
-        return render_video_path(&cli, &output, codec, bg);
+        return render_video_path(&cli, &output, codec);
     }
 
     match mode {
-        OutputMode::Png => render_png(&cli, &output, bg),
-        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, &output, mode, bg),
+        OutputMode::Png => render_png(&cli, &output),
+        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, &output, mode),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
@@ -290,7 +269,7 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
     (cli.direction.into(), cli.speed.into())
 }
 
-fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode, bg: Background) -> ExitCode {
+fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -309,18 +288,22 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode, bg: Background)
         }
     };
 
-    // 3. style オプション構築。
+    // 3. 背景色を最大 weight クラスタから自動派生し、orb プールはそれを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+
+    // 4. style オプション構築。
     let opts = StyleOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
-        background: resolve_background(&img, bg),
+        background,
     };
 
-    // 4. mode で書き出しを分岐。
+    // 5. mode で書き出しを分岐。
     let content = match mode {
-        OutputMode::Svg => render_svg(&clusters, &opts),
-        OutputMode::Css => render_css(&clusters, &opts),
+        OutputMode::Svg => render_svg(&orb_clusters, &opts),
+        OutputMode::Css => render_css(&orb_clusters, &opts),
         _ => unreachable!("render_style_path called with non-style mode {mode:?}"),
     };
 
@@ -332,7 +315,7 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode, bg: Background)
     ExitCode::SUCCESS
 }
 
-fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background) -> ExitCode {
+fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -351,7 +334,11 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background
         }
     };
 
-    // 3. ビデオオプション構築。解像度は固定。
+    // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+
+    // 4. ビデオオプション構築。解像度は固定。
     let (direction, speed) = resolve_motion(cli);
     let opts = VideoOptions {
         orb_size: cli.orb_size,
@@ -361,12 +348,12 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background
         speed,
         seed: cli.seed.unwrap_or(0),
         count: Some(cli.count),
-        background: resolve_background(&img, bg),
+        background,
         shape: cli.orb_shape(),
     };
 
-    // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
-    if let Err(e) = render_video(&clusters, &opts, output, cli.duration_ms, codec) {
+    // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
+    if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
     }
@@ -374,7 +361,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec, bg: Background
     ExitCode::SUCCESS
 }
 
-fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
+fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -393,7 +380,11 @@ fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
         }
     };
 
-    // 3. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
+    // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+
+    // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
     //    描画する。これで --count による orb 数の展開が単発出力でも効く。
     //    （render_static は count を解釈しないので、count=clusters.len() に固定された
     //     旧経路にしないよう animate::render_frame を一律に使う。）
@@ -408,10 +399,10 @@ fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
         speed,
         seed: cli.seed.unwrap_or(0),
         count: Some(cli.count),
-        background: resolve_background(&img, bg),
+        background,
         shape: cli.orb_shape(),
     };
-    let out = orber::animate::render_frame(&clusters, &frame_opts, 0.0);
+    let out = orber::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
     if let Err(e) = out.save(output) {
@@ -423,7 +414,7 @@ fn render_png(cli: &Cli, output: &Path, bg: Background) -> ExitCode {
 }
 
 /// `--variations` 経路。`output_dir` を作って各 spec で逐次書き出す。
-fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
+fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     let dir = match &cli.output_dir {
         Some(d) => d.clone(),
         None => {
@@ -436,8 +427,7 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // 入力画像は全 spec で共有。クラスタ抽出は spec.cluster_count に依存するので
-    // spec ごとにキャッシュ付きで行う（cluster_count が同じなら使い回し）。
+    // 入力画像は全 spec で共有。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
@@ -445,7 +435,6 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let resolved_bg = resolve_background(&img, bg);
 
     let specs = select_specs(n, cli.variations_mode.into());
     if specs.is_empty() {
@@ -476,19 +465,18 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         }
     };
 
+    // 背景色は最大 weight クラスタから自動派生し、orb プールはそれを除いた残り。
+    // 全 spec で共通（同じ入力画像から同じ背景・同じ orb プールを使う）。
+    let background = derive_background_rgba(&base_clusters);
+    let orb_clusters = drop_dominant(&base_clusters);
+
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
 
-        // 動画 + 透過は不可（yuv420p）。bg が transparent なら black に置換して進める。
-        let spec_bg = if spec.kind == VariationKind::Mp4 && resolved_bg[3] == 0 {
-            [0, 0, 0, 255]
-        } else {
-            resolved_bg
-        };
-        let result = render_one_variation(&base_clusters, spec, &out_path, spec_bg, orb_shape);
+        let result = render_one_variation(&orb_clusters, spec, &out_path, background, orb_shape);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
