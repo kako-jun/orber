@@ -14,7 +14,7 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use crate::animate::{render_frame, AnimateOptions, MotionShape, MotionSpeed};
+use crate::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
 use crate::cluster::Cluster;
 use crate::orb::OrbShape;
 use crate::output_mode::OutputMode;
@@ -77,8 +77,8 @@ pub struct VideoOptions {
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
-    pub motion_shape: MotionShape,
-    pub motion_speed: MotionSpeed,
+    pub direction: MotionDirection,
+    pub speed: MotionSpeed,
     pub seed: u64,
     /// 背景 RGBA。動画は yuv420p 制約で alpha 不可なので呼び出し側で透過を弾くこと。
     pub background: [u8; 4],
@@ -93,8 +93,8 @@ impl Default for VideoOptions {
             orb_size: a.orb_size,
             blur: a.blur,
             saturation: a.saturation,
-            motion_shape: a.motion_shape,
-            motion_speed: a.motion_speed,
+            direction: a.direction,
+            speed: a.speed,
             seed: a.seed,
             background: a.background,
             shape: a.shape,
@@ -197,8 +197,8 @@ pub fn render_video(
         orb_size: opts.orb_size,
         blur: opts.blur,
         saturation: opts.saturation,
-        motion_shape: opts.motion_shape,
-        motion_speed: opts.motion_speed,
+        direction: opts.direction,
+        speed: opts.speed,
         seed: opts.seed,
         background: opts.background,
         shape: opts.shape,
@@ -365,8 +365,8 @@ mod tests {
         assert_eq!(v.orb_size, a.orb_size);
         assert_eq!(v.blur, a.blur);
         assert_eq!(v.saturation, a.saturation);
-        assert_eq!(v.motion_shape, a.motion_shape);
-        assert_eq!(v.motion_speed, a.motion_speed);
+        assert_eq!(v.direction, a.direction);
+        assert_eq!(v.speed, a.speed);
         assert_eq!(v.seed, a.seed);
     }
 }
