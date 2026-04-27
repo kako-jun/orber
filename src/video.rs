@@ -1,21 +1,20 @@
 //! 縦長動画出力モジュール。
 //!
-//! クラスタ列とアニメーションオプションを受け取り、一時ディレクトリに
-//! 連番 PNG を書き出してから `ffmpeg` を子プロセス起動して mp4 / webm に
-//! まとめる。
+//! クラスタ列とビデオ用オプションを受け取り、一時ディレクトリに連番 PNG を
+//! 書き出してから `ffmpeg` を子プロセス起動して mp4 / webm にまとめる。
 //!
 //! # 設計メモ
 //!
 //! - 解像度は 1080x1920、fps は 30 で固定（`VIDEO_WIDTH` / `VIDEO_HEIGHT`
-//!   / `VIDEO_FPS`）。`AnimateOptions` の width/height は無視され、必ず
-//!   ビデオ用の値で上書きされる。
+//!   / `VIDEO_FPS`）。動画モジュールでは解像度を CLI から受け付けず、
+//!   常にビデオ用の値を使う（[`VideoOptions`] に width/height は無い）。
 //! - フレーム時刻は `t = i / total` （i ∈ 0..total）で計算し、`t = 1.0`
 //!   は含めない。`render_frame` が `t=0` と `t=1` で同一フレームになる
 //!   ループ性を持つので、両端を含めるとループ繋ぎ目で 1 フレーム重複する。
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use crate::animate::{render_frame, AnimateOptions};
+use crate::animate::{render_frame, AnimateOptions, MotionPreset};
 use crate::cluster::Cluster;
 use crate::output_mode::OutputMode;
 use std::io;
@@ -23,13 +22,29 @@ use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 /// 動画の幅（縦長 9:16）。
+///
+/// yuv420p は色差を 2x2 サブサンプルするため、幅・高さ共に 2 で割り切れる
+/// 必要がある。`VIDEO_WIDTH` / `VIDEO_HEIGHT` を変更する際は両方とも偶数で
+/// あることを維持すること。
 pub const VIDEO_WIDTH: u32 = 1080;
 /// 動画の高さ（縦長 9:16）。
+///
+/// yuv420p は色差を 2x2 サブサンプルするため、幅・高さ共に 2 で割り切れる
+/// 必要がある。`VIDEO_WIDTH` / `VIDEO_HEIGHT` を変更する際は両方とも偶数で
+/// あることを維持すること。
 pub const VIDEO_HEIGHT: u32 = 1920;
 /// 動画のフレームレート（fps）。
 pub const VIDEO_FPS: u32 = 30;
+/// duration_ms の最大値（10 分）。
+///
+/// これを超える長さは想定外として [`VideoError::InvalidDuration`] を返す。
+/// 一時ディレクトリに連番 PNG を書き出す方式なので、長すぎると
+/// ディスク容量も消費するため上限を設けている。
+pub const MAX_DURATION_MS: u64 = 600_000;
 
 /// 動画コーデック。
+///
+/// std の `IpAddr::V4` 等の TitleCase 慣習に揃えて variant を命名する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     /// H.264 (libx264)、mp4 コンテナ向け。
@@ -51,6 +66,33 @@ impl VideoCodec {
     }
 }
 
+/// 動画 1 本書き出しのオプション。
+///
+/// 解像度は [`VIDEO_WIDTH`] / [`VIDEO_HEIGHT`] で固定なので持たない。
+/// ([`AnimateOptions`] の width/height を黙って捨てるのを避けるため、
+/// ビデオ向けには専用構造体を切っている。)
+#[derive(Debug, Clone)]
+pub struct VideoOptions {
+    pub orb_size: f32,
+    pub blur: f32,
+    pub saturation: f32,
+    pub motion: MotionPreset,
+    pub seed: u64,
+}
+
+impl Default for VideoOptions {
+    fn default() -> Self {
+        let a = AnimateOptions::default();
+        Self {
+            orb_size: a.orb_size,
+            blur: a.blur,
+            saturation: a.saturation,
+            motion: a.motion,
+            seed: a.seed,
+        }
+    }
+}
+
 /// `render_video` のエラー。
 #[derive(Debug)]
 pub enum VideoError {
@@ -60,7 +102,9 @@ pub enum VideoError {
     FfmpegFailed { status: ExitStatus, stderr: String },
     /// I/O エラー（テンポラリディレクトリ作成失敗、PNG 書き出し失敗等）。
     Io(io::Error),
-    /// duration_ms = 0 等で有効なフレーム数が算出できない。
+    /// PNG エンコード失敗等、フレーム書き出し時の image クレート由来エラー。
+    FrameSave(image::ImageError),
+    /// duration_ms = 0、上限超過、オーバーフロー等で有効なフレーム数が算出できない。
     InvalidDuration,
 }
 
@@ -75,7 +119,11 @@ impl std::fmt::Display for VideoError {
                 write!(f, "ffmpeg failed with {status}: {stderr}")
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::InvalidDuration => write!(f, "duration_ms must be > 0"),
+            Self::FrameSave(e) => write!(f, "failed to encode frame: {e}"),
+            Self::InvalidDuration => write!(
+                f,
+                "duration_ms must be in 1000..={MAX_DURATION_MS} (1s..=10min)"
+            ),
         }
     }
 }
@@ -84,6 +132,7 @@ impl std::error::Error for VideoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::FrameSave(e) => Some(e),
             _ => None,
         }
     }
@@ -97,48 +146,53 @@ impl From<io::Error> for VideoError {
 
 /// `duration_ms` から書き出すフレーム数を計算する。
 ///
-/// 1 フレーム未満になる極端に短い長さでも 1 を返す（duration_ms > 0 の場合）。
-/// duration_ms = 0 のときは [`VideoError::InvalidDuration`]。
-pub(crate) fn calc_frame_count(duration_ms: u64) -> Result<usize, VideoError> {
-    if duration_ms == 0 {
+/// 妥当な範囲は `1000 <= duration_ms <= MAX_DURATION_MS`。
+/// 1 秒未満では正味の動画にならないため [`VideoError::InvalidDuration`] を返す。
+/// `duration_ms * VIDEO_FPS` がオーバーフローする極端な値も同じく `InvalidDuration`。
+pub fn calc_frame_count(duration_ms: u64) -> Result<usize, VideoError> {
+    if !(1000..=MAX_DURATION_MS).contains(&duration_ms) {
         return Err(VideoError::InvalidDuration);
     }
-    let n = (duration_ms * VIDEO_FPS as u64) / 1000;
-    Ok((n.max(1)) as usize)
+    let n = duration_ms
+        .checked_mul(VIDEO_FPS as u64)
+        .ok_or(VideoError::InvalidDuration)?
+        / 1000;
+    Ok(n.max(1) as usize)
 }
 
 /// 連番 PNG を一時ディレクトリに書き出して ffmpeg で動画に結合する。
 ///
-/// `opts.width` / `opts.height` は [`VIDEO_WIDTH`] / [`VIDEO_HEIGHT`] で
-/// 上書きされたコピーを使う（呼び出し側 `opts` は変更されない）。
-///
+/// 解像度は常に [`VIDEO_WIDTH`] / [`VIDEO_HEIGHT`]。
 /// フレーム時刻は `t = i / total` （i ∈ 0..total）。ループ繋ぎ目で
 /// フレームが重複しないよう、`t = 1.0` は含めない。
 pub fn render_video(
     clusters: &[Cluster],
-    opts: &AnimateOptions,
+    opts: &VideoOptions,
     output: &Path,
     duration_ms: u64,
     codec: VideoCodec,
 ) -> Result<(), VideoError> {
     let total = calc_frame_count(duration_ms)?;
 
-    // ビデオ用に解像度を強制上書きしたコピーを作る。
-    let mut video_opts = opts.clone();
-    video_opts.width = VIDEO_WIDTH;
-    video_opts.height = VIDEO_HEIGHT;
+    // ビデオ用の AnimateOptions を組み立てる（解像度は固定）。
+    let frame_opts = AnimateOptions {
+        width: VIDEO_WIDTH,
+        height: VIDEO_HEIGHT,
+        orb_size: opts.orb_size,
+        blur: opts.blur,
+        saturation: opts.saturation,
+        motion: opts.motion,
+        seed: opts.seed,
+    };
 
     let temp_dir = tempfile::TempDir::new()?;
 
     // フレーム書き出し（逐次）。
     for i in 0..total {
         let t = i as f32 / total as f32;
-        let frame = render_frame(clusters, &video_opts, t);
+        let frame = render_frame(clusters, &frame_opts, t);
         let path = temp_dir.path().join(format!("frame_{i:05}.png"));
-        frame.save(&path).map_err(|e| {
-            // image::ImageError -> io::Error の自然な変換は無いので Other で包む。
-            VideoError::Io(io::Error::other(e.to_string()))
-        })?;
+        frame.save(&path).map_err(VideoError::FrameSave)?;
     }
 
     // ffmpeg コマンド組み立て。
@@ -147,6 +201,8 @@ pub fn render_video(
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
+        .arg("-loglevel")
+        .arg("error")
         .arg("-framerate")
         .arg(&fps_str)
         .arg("-i")
@@ -161,9 +217,7 @@ pub fn render_video(
                 "yuv420p",
                 "-movflags",
                 "+faststart",
-                "-r",
-            ])
-            .arg(&fps_str);
+            ]);
         }
         VideoCodec::Vp9 => {
             cmd.args([
@@ -175,9 +229,7 @@ pub fn render_video(
                 "0",
                 "-crf",
                 "32",
-                "-r",
-            ])
-            .arg(&fps_str);
+            ]);
         }
     }
 
@@ -212,12 +264,41 @@ mod tests {
         assert_eq!(calc_frame_count(5000).unwrap(), 150);
         // duration_ms = 1000 -> 30 frames
         assert_eq!(calc_frame_count(1000).unwrap(), 30);
-        // duration_ms = 33 -> (33*30)/1000 = 0.99 -> max(1) -> 1
-        assert_eq!(calc_frame_count(33).unwrap(), 1);
+        // duration_ms = 999 -> 1 秒未満は InvalidDuration
+        match calc_frame_count(999) {
+            Err(VideoError::InvalidDuration) => {}
+            other => panic!("expected InvalidDuration, got {other:?}"),
+        }
+        // duration_ms = 33 -> 1 秒未満は InvalidDuration
+        match calc_frame_count(33) {
+            Err(VideoError::InvalidDuration) => {}
+            other => panic!("expected InvalidDuration, got {other:?}"),
+        }
         // duration_ms = 0 -> InvalidDuration
         match calc_frame_count(0) {
             Err(VideoError::InvalidDuration) => {}
             other => panic!("expected InvalidDuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_count_max_duration() {
+        // 上限ちょうど: 600_000 ms * 30 fps / 1000 = 18,000 frames
+        assert_eq!(calc_frame_count(MAX_DURATION_MS).unwrap(), 18_000);
+        // 上限超過は InvalidDuration
+        match calc_frame_count(MAX_DURATION_MS + 1) {
+            Err(VideoError::InvalidDuration) => {}
+            other => panic!("expected InvalidDuration for over-cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_count_overflow_safe() {
+        // u64::MAX を渡しても panic せず InvalidDuration になる。
+        // （現状は範囲チェックで先に弾かれるが、checked_mul の安全網も担保。）
+        match calc_frame_count(u64::MAX) {
+            Err(VideoError::InvalidDuration) => {}
+            other => panic!("expected InvalidDuration for u64::MAX, got {other:?}"),
         }
     }
 
@@ -248,5 +329,18 @@ mod tests {
             msg.contains("install"),
             "FfmpegNotFound display should mention install: {msg}"
         );
+    }
+
+    #[test]
+    fn video_options_default_matches_animate() {
+        // VideoOptions::default() は AnimateOptions::default() の対応フィールドと
+        // 一致する（解像度を除く）。CLI default の SoT 統一が崩れないか守る。
+        let v = VideoOptions::default();
+        let a = AnimateOptions::default();
+        assert_eq!(v.orb_size, a.orb_size);
+        assert_eq!(v.blur, a.blur);
+        assert_eq!(v.saturation, a.saturation);
+        assert_eq!(v.motion, a.motion);
+        assert_eq!(v.seed, a.seed);
     }
 }
