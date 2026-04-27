@@ -10,8 +10,8 @@ input image / video
   ├─ extract color clusters       → N representative colors  [implemented]
   ├─ place orbs                   → position, size, base color per orb  [implemented for static PNG]
   ├─ render frame(s)              → RGBA buffer with radial-gradient orbs  [implemented via tiny-skia]
-  ├─ (animated) interpolate       → frame sequence over time t  [implemented (lib only)]
-  └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG implemented]
+  ├─ (animated) interpolate       → frame sequence over time t  [implemented]
+  └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG / MP4 / WebM implemented]
 ```
 
 ## Output formats
