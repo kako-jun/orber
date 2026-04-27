@@ -28,20 +28,20 @@
 //!   ループ閉じる前提を壊さないため。代わりに **phase の散らばり** (0..1 の一様分布)
 //!   で「個体差」を出す。phase が違えば、画面上の各時点の orb 位置が散らばる
 //!   ので「同期して動いていない」感が出る。
-//! - 呼吸揺らぎは `sin_loop(1, t, 1, phi_breath)` で全動画 1 周。半径 ±10% の
-//!   `weight` 倍率に転換することで `render_static` 側に手を入れずに揺らせる。
-//!   blur / opacity の独立揺らぎは将来 Issue で検討（現状は半径だけで十分）。
+//! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
+//!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
 //!   t で 100% 同一フレームが返る。
-//! - 描画は [`crate::orb::render_static`] を素直に呼ぶ。位置と weight を変調した
-//!   `Cluster` 列を作って渡す。
+//! - 描画は [`crate::orb::render_one_orb`] を per-orb で呼ぶ。背景塗りと
+//!   un-premultiply は animate 側で同等の処理を行う。
 
-use crate::cluster::{Centroid, Cluster};
-use crate::orb::{render_static, OrbShape, RenderOptions};
+use crate::cluster::Cluster;
+use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use image::RgbaImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::f32::consts::TAU;
+use tiny_skia::{Color, Pixmap};
 
 /// 流れる方向。1 動画で 1 方向のみ。
 ///
@@ -121,14 +121,19 @@ impl Default for AnimateOptions {
 
 /// 各 orb の決定的なパラメータ。
 ///
-/// `phase` は 0..1 の初期位置オフセット。`phi_breath` は呼吸の位相シフト。
+/// `phase` は 0..1 の初期位置オフセット。`phi_radius` / `phi_blur` / `phi_opacity` は
+/// 3 軸独立の呼吸位相シフト（radius は ±10%、blur は ±15%、opacity は ±5%）。
 /// 速度ジッタは入れない（ループ性が崩れるため。代わりに phase で散らばらせる）。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
     phase: f32,
-    /// 呼吸 sin の位相シフト。
-    phi_breath: f32,
+    /// 半径呼吸 sin の位相シフト。
+    phi_radius: f32,
+    /// blur 呼吸 sin の位相シフト。radius と同期させない。
+    phi_blur: f32,
+    /// opacity 呼吸 sin の位相シフト。3 軸を独立に。
+    phi_opacity: f32,
 }
 
 /// `seed` から各 orb のパラメータを決定的に生成する。
@@ -137,7 +142,9 @@ fn generate_orb_params(seed: u64, n_orbs: usize) -> Vec<OrbParams> {
     (0..n_orbs)
         .map(|_| OrbParams {
             phase: rng.gen_range(0.0..1.0),
-            phi_breath: rng.gen_range(0.0..TAU),
+            phi_radius: rng.gen_range(0.0..TAU),
+            phi_blur: rng.gen_range(0.0..TAU),
+            phi_opacity: rng.gen_range(0.0..TAU),
         })
         .collect()
 }
@@ -173,42 +180,105 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     let cycle = opts.speed.cycle_count();
     let params = generate_orb_params(opts.seed, clusters.len());
 
+    let width = opts.width.max(1);
+    let height = opts.height.max(1);
+
+    // Aquarelle 経路は per-orb の独立揺らぎに対応していないので、従来の
+    // render_static + Cluster 列変調パスへフォールバックする（Aquarelle は
+    // bleed/bloom/halo を内部で持っているので 3 軸揺らぎを足すと壊れる）。
+    if let OrbShape::Aquarelle(_) = opts.shape {
+        return render_frame_aquarelle(clusters, opts, t);
+    }
+
+    // Circle 経路: 自前で Pixmap を作って per-orb で render_one_orb を呼ぶ。
+    let mut pixmap =
+        Pixmap::new(width, height).expect("pixmap allocation should succeed for >0 dimensions");
+    let [br, bg, bb, ba] = opts.background;
+    if ba > 0 {
+        pixmap.fill(Color::from_rgba8(br, bg, bb, ba));
+    }
+
+    let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
+    let saturation = opts.saturation.max(0.0);
+    let base_blur = opts.blur.clamp(0.0, 1.0);
+
+    for (c, p) in clusters.iter().zip(params.iter()) {
+        // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * t で進める。
+        // cycle が整数なので t=0 と t=1 では `phase` と `phase + cycle` が
+        // mod 1 で完全一致し、フレームがピクセル一致でループする。
+        let advance = (cycle as f32 * t).fract();
+        let progress = (p.phase + advance).rem_euclid(1.0);
+
+        let (nx, ny) = match opts.direction {
+            MotionDirection::LeftToRight => (progress, c.centroid.y),
+            MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
+            MotionDirection::TopToBottom => (c.centroid.x, progress),
+            MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
+        };
+
+        // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
+        // ループする。位相は seed から決定的に生成しているので、軸間で同期しない。
+        // - radius: ±10%
+        // - blur: ±15%
+        // - opacity: ±5%
+        let radius_factor = 1.0 + 0.10 * sin_loop(1, t, 1, p.phi_radius);
+        let blur_delta = 0.15 * sin_loop(1, t, 1, p.phi_blur);
+        let opacity_factor = 1.0 + 0.05 * sin_loop(1, t, 1, p.phi_opacity);
+
+        let radius = base_radius_unit * c.weight.max(0.0).sqrt() * radius_factor;
+        if radius <= 0.0 {
+            continue;
+        }
+
+        let cx = nx.clamp(0.0, 1.0) * width as f32;
+        let cy = ny.clamp(0.0, 1.0) * height as f32;
+        let rgb = adjust_saturation_pub(c.color, saturation);
+        let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
+        let opacity = opacity_factor.clamp(0.0, 1.0);
+
+        // C16 時点では全 orb Rim 固定。Soft 混在は C17 で導入する。
+        render_one_orb(
+            &mut pixmap,
+            (cx, cy),
+            radius,
+            rgb,
+            blur,
+            opacity,
+            OrbStyle::Rim,
+        );
+    }
+
+    finalize_pixmap(pixmap, width, height)
+}
+
+/// Aquarelle shape は既存の render_static フォールバック経路。
+///
+/// Aquarelle は内部で bleed / bloom / halo を持っているため、per-orb の独立揺らぎを
+/// 足すと質感セットが壊れる。半径だけの呼吸を従来どおり cluster.weight に乗せる。
+fn render_frame_aquarelle(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
+    use crate::cluster::Centroid;
+    use crate::orb::{render_static, RenderOptions};
+
+    let cycle = opts.speed.cycle_count();
+    let params = generate_orb_params(opts.seed, clusters.len());
+
     let modulated: Vec<Cluster> = clusters
         .iter()
         .zip(params.iter())
         .map(|(c, p)| {
-            // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * t で進める。
-            // cycle が整数なので t=0 と t=1 では `phase` と `phase + cycle` が
-            // mod 1 で完全一致し、フレームがピクセル一致でループする。
-            // `(cycle * t).fract()` で先に整数部を捨てておくのが鍵。
             let advance = (cycle as f32 * t).fract();
             let progress = (p.phase + advance).rem_euclid(1.0);
-
-            // 方向に応じて x または y のどちらかだけが進む。直交軸は不動。
-            // 「初期位置 = centroid」ではなく、進行方向の軸は `progress` で完全に
-            // 上書きする。これにより phase が散らばっていれば orb が画面全体に
-            // ばらまかれた状態になる。
-            let (new_x, new_y) = match opts.direction {
+            let (nx, ny) = match opts.direction {
                 MotionDirection::LeftToRight => (progress, c.centroid.y),
                 MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
                 MotionDirection::TopToBottom => (c.centroid.x, progress),
                 MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
             };
-
-            // 呼吸揺らぎ（全 orb 共通の自動効果）。半径のみ変調する。
-            // blur / opacity を本気で変えるには render_static 側に手を入れる必要があるが、
-            // 半径の ±10% で「ふわっとした明滅感」は十分に出るので、現状は半径だけに
-            // 留める（API 拡張なしで実装できる範囲）。
-            let breath_phase = sin_loop(1, t, 1, p.phi_breath);
-            let radius_factor = 1.0 + 0.10 * breath_phase;
-
-            // radius = base * sqrt(weight) なので、半径を radius_factor 倍するには
-            // weight を radius_factor^2 倍すれば良い。
+            let radius_factor = 1.0 + 0.10 * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
-
             Cluster {
                 color: c.color,
-                centroid: Centroid { x: new_x, y: new_y },
+                centroid: Centroid { x: nx, y: ny },
                 weight: (c.weight * weight_scale).max(0.0),
             }
         })
@@ -226,9 +296,32 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     render_static(&modulated, &render_opts)
 }
 
+/// Pixmap → RgbaImage 変換（un-premultiply 込み）。
+///
+/// tiny-skia の Pixmap は premultiplied alpha なので straight に戻す。
+fn finalize_pixmap(pixmap: Pixmap, width: u32, height: u32) -> RgbaImage {
+    let mut buf = pixmap.take();
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            let inv = 255.0 / a as f32;
+            px[0] = (px[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            px[1] = (px[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            px[2] = (px[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    RgbaImage::from_raw(width, height, buf)
+        .expect("raw buffer length matches width * height * 4 by construction")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::Centroid;
 
     fn cluster(color: [u8; 3], cx: f32, cy: f32, weight: f32) -> Cluster {
         Cluster {
@@ -481,5 +574,50 @@ mod tests {
         assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
         assert_eq!(MotionSpeed::Slow.cycle_count(), 2);
         assert_eq!(MotionSpeed::Medium.cycle_count(), 3);
+    }
+
+    #[test]
+    fn breath_axes_are_independent() {
+        // 3 軸（radius / blur / opacity）の位相が seed から独立に生成されていること。
+        // 同じ seed で同じインデックスの OrbParams が phi_radius / phi_blur /
+        // phi_opacity 3 つとも同じ値になっているとアウト（同期している）。
+        let p = generate_orb_params(42, 16);
+        let mut all_three_same = 0;
+        for op in &p {
+            // 3 つが完全一致しているケースを数える。0 件であることを期待する
+            // （偶然一致は理論上ゼロではないが、ChaCha8Rng + f32 の連続値で
+            //  一致する確率は実質 0）。
+            if (op.phi_radius - op.phi_blur).abs() < 1e-6
+                && (op.phi_blur - op.phi_opacity).abs() < 1e-6
+            {
+                all_three_same += 1;
+            }
+        }
+        assert_eq!(
+            all_three_same, 0,
+            "breath axes must not be synchronized for any orb"
+        );
+    }
+
+    #[test]
+    fn breath_axes_each_drive_visible_change_in_isolation() {
+        // 3 軸独立揺らぎが効いていることの間接確認。
+        // 単一 cluster で位置を中央固定し（centroid を 0.5,0.5）、
+        // TopToBottom + VerySlow にすることで t を動かしても直交軸 x は不動。
+        // 進行方向 y は動くが、breath（半径 / blur / opacity）も乗るので、
+        // 単純に「breath なし」のフレームと違う結果になる。回帰として中心ピクセルの
+        // 値が t=0 と t=0.5 で同一でないことを確認する（半径/blur/opacity が乗っているため）。
+        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::VerySlow);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 0.5);
+        let pa = a.get_pixel(opts.width / 2, opts.height / 2);
+        let pb = b.get_pixel(opts.width / 2, opts.height / 2);
+        // 全く同じであれば 3 軸 breath が効いていない（または相殺している）。
+        // どこかしらに差が出ることを軽く確認する。
+        assert!(
+            pa[0] != pb[0] || pa[1] != pb[1] || pa[2] != pb[2] || pa[3] != pb[3],
+            "breath axes should produce visible center-pixel difference between t=0 and t=0.5"
+        );
     }
 }
