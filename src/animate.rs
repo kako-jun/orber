@@ -20,10 +20,13 @@
 //! # 設計メモ
 //!
 //! - 軌道はもはやリサジュー曲線ではなく、**進行方向への線形運動 +
-//!   `rem_euclid(1.0)` による wrap**。直交軸の位置は初期位置から動かない。
-//! - 各 orb の進行量は `(phase + (cycle_count * t).fract()).rem_euclid(1.0)`。
-//!   `cycle_count` は整数 (1/2/3) なので t=1.0 で fract が 0 になり、t=0 と
-//!   完全一致するピクセル単位ループが成り立つ。
+//!   画面外バッファ付き `rem_euclid` による wrap**。直交軸の位置は初期位置から動かない。
+//! - 各 orb の進行範囲は `[-r, 1+r]`（`r` = orb 半径を進行軸長で正規化した値）。
+//!   wrap 境界の出現/消失が画面の縁で起こるのではなく、orb が完全に画面外に
+//!   出てから入れ替わるので、視覚的にシームレスにつながる。
+//! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
+//!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
+//!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
 //! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
 //!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
 //!   両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
@@ -234,10 +237,10 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
 ///
 /// # ループ性の根拠
 ///
-/// - 進行方向の位置: `(phase + (cycle * t).fract()).rem_euclid(1.0)`。
-///   `cycle_count` を整数 1 / 2 / 3 に固定し、`(cycle * t).fract()` で先に整数部を
-///   捨てる。`t = 1.0` ちょうどで `(cycle * 1.0)` は整数になるので fract は 0、
-///   `t = 0.0` のときと完全同一の演算に収束する。
+/// - 進行方向の位置: 画面外バッファ付き wrap。`extent = 1 + 2r` の周期上で
+///   `raw = (phase + cycle * speed_mult * t) * extent`、`pos = raw.rem_euclid(extent) - r`。
+///   `cycle * speed_mult` は整数なので `t = 1.0` で `(cycle * speed_mult * 1.0)` も整数、
+///   fract は 0 になり `t = 0.0` のときと完全同一の演算に収束する。
 /// - 呼吸揺らぎ: `sin_loop(1, t, 1, phi)` で 1 周。t=0 と t=1 で同じ sin 値。
 ///
 /// # 決定論性
@@ -282,23 +285,44 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     let saturation = opts.saturation.max(0.0);
     let base_blur = opts.blur.clamp(0.0, 1.0);
 
+    // 進行軸の長さ（ピクセル）。LR/RL では width、TB/BT では height。
+    // r_normalized を計算する基準になる。
+    let progress_axis_pixels = match opts.direction {
+        MotionDirection::LeftToRight | MotionDirection::RightToLeft => width as f32,
+        MotionDirection::TopToBottom | MotionDirection::BottomToTop => height as f32,
+    };
+
     for p in params.iter() {
         // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
         let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
 
-        // 進行量（0..1）。phase で初期位置を散らばらせ、cycle * speed_mult * t で
-        // 進める。両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。
-        let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
-        let progress = (p.phase + advance).rem_euclid(1.0);
+        // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
+        // r_normalized は進行軸 [0,1] スケールにおける半径相当。
+        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * 1.10;
+        let r_normalized = if progress_axis_pixels > 0.0 {
+            r_pixels_max / progress_axis_pixels
+        } else {
+            0.0
+        };
+        // 周期長: 画面外バッファを左右（あるいは上下）に r ずつ持つので [-r, 1+r) の幅。
+        let extent = 1.0 + 2.0 * r_normalized;
+
+        // 進行量。phase は 0..1 を extent にスケール、advance は extent 単位で進める。
+        // cycle * speed_mult は整数なので t=1 で fract が 0、ループ性は保たれる。
+        let advance_steps = (cycle as f32 * p.speed_mult as f32 * t).fract();
+        let raw = p.phase * extent + advance_steps * extent;
+        // pos ∈ [-r_normalized, 1 + r_normalized)。画面外バッファに居る間は orb 中心が
+        // 画面の縁を超えており、半径を考慮しても完全に画面外。
+        let pos = raw.rem_euclid(extent) - r_normalized;
 
         // 直交軸は cluster 重心ではなく cross_axis（seed 由来 0..1）で散らせる。
         // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
         // なるので、画面全体に散布するため orb 個別のオフセットを使う。
         let (nx, ny) = match opts.direction {
-            MotionDirection::LeftToRight => (progress, p.cross_axis),
-            MotionDirection::RightToLeft => (1.0 - progress, p.cross_axis),
-            MotionDirection::TopToBottom => (p.cross_axis, progress),
-            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - progress),
+            MotionDirection::LeftToRight => (pos, p.cross_axis),
+            MotionDirection::RightToLeft => (1.0 - pos, p.cross_axis),
+            MotionDirection::TopToBottom => (p.cross_axis, pos),
+            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - pos),
         };
 
         // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
@@ -315,8 +339,10 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
             continue;
         }
 
-        let cx = nx.clamp(0.0, 1.0) * width as f32;
-        let cy = ny.clamp(0.0, 1.0) * height as f32;
+        // clamp を外し、画面外（負・1超）の値も許可する。tiny-skia 側は描画範囲外を
+        // 安全にクリップする（半透明グラデのカウントだけ無駄に走るが、許容範囲）。
+        let cx = nx * width as f32;
+        let cy = ny * height as f32;
         let rgb = adjust_saturation_pub(c.color, saturation);
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
         let opacity = opacity_factor.clamp(0.0, 1.0);
@@ -755,22 +781,98 @@ mod tests {
     #[test]
     fn breath_axes_each_drive_visible_change_in_isolation() {
         // 3 軸独立揺らぎが効いていることの間接確認。
-        // 単一 cluster で位置を中央固定し（centroid を 0.5,0.5）、
-        // TopToBottom + VerySlow にすることで t を動かしても直交軸 x は不動。
-        // 進行方向 y は動くが、breath（半径 / blur / opacity）も乗るので、
-        // 単純に「breath なし」のフレームと違う結果になる。回帰として中心ピクセルの
-        // 値が t=0 と t=0.5 で同一でないことを確認する（半径/blur/opacity が乗っているため）。
+        // 64 個の orb を散らせて、t=0 と t=0.5 のフレームに差があることを確認する
+        // （位置 + breath の両方が乗るので必ず差が出る）。中央ピクセル単発では
+        // 画面外バッファ wrap で orb が center を通らない可能性があるため、
+        // 全画面でいずれかのピクセルに差があることを見る。
         let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::VerySlow);
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::VerySlow);
+        opts.count = Some(64);
         let a = render_frame(&clusters, &opts, 0.0);
         let b = render_frame(&clusters, &opts, 0.5);
-        let pa = a.get_pixel(opts.width / 2, opts.height / 2);
-        let pb = b.get_pixel(opts.width / 2, opts.height / 2);
-        // 全く同じであれば 3 軸 breath が効いていない（または相殺している）。
-        // どこかしらに差が出ることを軽く確認する。
         assert!(
-            pa[0] != pb[0] || pa[1] != pb[1] || pa[2] != pb[2] || pa[3] != pb[3],
-            "breath axes should produce visible center-pixel difference between t=0 and t=0.5"
+            !pixels_equal(&a, &b),
+            "breath axes should produce visible difference between t=0 and t=0.5"
+        );
+    }
+
+    #[test]
+    fn wrap_buffer_keeps_orbs_offscreen_at_seam() {
+        // wrap 境界の前後で、画面内に orb 中心は描かれない。
+        // 直接的に、orb 1 個・phase 既知のセットアップを作ってその orb の中心が
+        // 画面外 (cx < 0 or cx >= width) に居る瞬間に、画面内の最大輝度が低い
+        // ことで「画面端で見える状態のまま消える」アーティファクトが無いことを確認。
+        //
+        // 単一クラスタ + count=1 + seed 固定で、orb のピクセル位置を計算し、
+        // pos = -r や pos = 1+r 周辺の t における画面内ピクセル最大輝度が低いことを見る。
+        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
+        let width = 128u32;
+        let height = 128u32;
+        let opts = AnimateOptions {
+            width,
+            height,
+            orb_size: 1.0,
+            seed: 11,
+            count: Some(1),
+            direction: MotionDirection::LeftToRight,
+            speed: MotionSpeed::VerySlow,
+            ..AnimateOptions::default()
+        };
+        // generate_orb_params で実際のパラメータを取り出して、orb が画面外に居る
+        // (cx + r <= 0 または cx - r >= width) ような t を計算する。
+        let params = generate_orb_params(opts.seed, 1, &[1.0]);
+        let p = params[0];
+        let base_radius_unit = (width.min(height) as f32) * 0.25;
+        let r_pixels_max = base_radius_unit * 1.0_f32.sqrt() * 1.10;
+        let r_normalized = r_pixels_max / width as f32;
+        let extent = 1.0 + 2.0 * r_normalized;
+        // 探索: 0..=N の t の中で、orb 中心 cx の画面内位置 pos*width が
+        // [-r_pixels-1, r_pixels+1] のどこかに居る t を探し、その t において
+        // 画面内のピクセル最大輝度が低いことを確認する。
+        let cycle = opts.speed.cycle_count() as f32 * p.speed_mult as f32;
+        let mut found_offscreen_t: Option<f32> = None;
+        for i in 0..1000 {
+            let t = i as f32 / 1000.0;
+            let advance_steps = (cycle * t).fract();
+            let raw = p.phase * extent + advance_steps * extent;
+            let pos = raw.rem_euclid(extent) - r_normalized;
+            // 画面外: cx + r_pixels <= 0  ⇔  pos*width + r_pixels <= 0  ⇔ pos <= -r_normalized
+            // または cx - r_pixels >= width  ⇔ pos >= 1 + r_normalized
+            // 最も画面外らしい瞬間（pos が -r_normalized 付近 or 1+r_normalized 付近）。
+            if pos <= -r_normalized + 0.001 || pos >= 1.0 + r_normalized - 0.001 {
+                found_offscreen_t = Some(t);
+                break;
+            }
+        }
+        let t_off = found_offscreen_t.expect("should find an off-screen instant within [0,1)");
+        let img = render_frame(&clusters, &opts, t_off);
+        // 画面内の最大 R 値が極めて低い（背景 alpha=255 なので R は 0）か、グラデの
+        // 端が少し漏れる場合でも 8/255 未満であることを見る。
+        let mut max_r = 0u8;
+        for px in img.pixels() {
+            if px[0] > max_r {
+                max_r = px[0];
+            }
+        }
+        assert!(
+            max_r < 16,
+            "off-screen orb should not contribute visible pixels; max_r={max_r} at t={t_off}"
+        );
+    }
+
+    #[test]
+    fn loop_continuity_at_t1_with_speed_mult() {
+        // 速度倍数 (1/2/3) を含めても t=0 と t=1 が完全一致することを再確認。
+        // 既存 all_direction_speed_combinations_loop_closed でカバーしているが、
+        // count=64 で speed_mult のばらつきが必ず起きるケースで明示的に再検証する。
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Medium);
+        opts.count = Some(64);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        assert!(
+            pixels_equal(&a, &b),
+            "loop must close at t=1 even with mixed speed_mult"
         );
     }
 }
