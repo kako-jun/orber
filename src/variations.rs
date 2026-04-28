@@ -75,7 +75,7 @@ pub struct VariationSpec {
     pub orb_size: f32,
     pub blur: f32,
     pub seed: u64,
-    /// 動画用の長さ（ms）。Png では参照されない。
+    /// 動画用の長さ（ms）。Png では参照されない（Png は 0 がカノニカル）。
     pub duration_ms: u64,
 }
 
@@ -97,7 +97,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 3.0,
         blur: 0.5,
         seed: 1,
-        duration_ms: 6000,
+        duration_ms: 0,
     },
     VariationSpec {
         label: "snapshot_rl_huge",
@@ -108,7 +108,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 4.5,
         blur: 0.6,
         seed: 2,
-        duration_ms: 6000,
+        duration_ms: 0,
     },
     VariationSpec {
         label: "snapshot_tb_fine",
@@ -119,7 +119,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 2.5,
         blur: 0.4,
         seed: 3,
-        duration_ms: 6000,
+        duration_ms: 0,
     },
     VariationSpec {
         label: "snapshot_bt_blurry",
@@ -130,7 +130,7 @@ pub const DEFAULT_VARIATIONS: &[VariationSpec] = &[
         orb_size: 3.5,
         blur: 0.8,
         seed: 4,
-        duration_ms: 6000,
+        duration_ms: 0,
     },
     VariationSpec {
         label: "flow_lr_slow",

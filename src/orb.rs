@@ -280,7 +280,9 @@ pub fn adjust_saturation_pub(rgb: [u8; 3], factor: f32) -> [u8; 3] {
 }
 
 pub(crate) fn adjust_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
-    if (factor - 1.0).abs() < f32::EPSILON {
+    // 1.0001 等の浮動小数点誤差レベルの入力でも fast path に入るよう、緩めの 1e-4
+    // 閾値を使う（f32::EPSILON ≈ 1.19e-7 だと CLI 入力では実用上ほぼ通らない）。
+    if (factor - 1.0).abs() < 1e-4 {
         return rgb;
     }
     let srgb = Srgb::new(

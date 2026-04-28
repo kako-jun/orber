@@ -359,6 +359,30 @@ mod tests {
     }
 
     #[test]
+    fn derive_background_unsorted_three_clusters() {
+        // 3 要素 unsorted で、中央に位置する要素が最大 weight のときも
+        // 正しく拾えること（sorted 前提に依存していないことの追加担保）。
+        let clusters = vec![
+            Cluster {
+                color: [10, 10, 10],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+            Cluster {
+                color: [20, 20, 20],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.5, // dominant
+            },
+            Cluster {
+                color: [30, 30, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.3,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [20, 20, 20, 255]);
+    }
+
+    #[test]
     fn derive_background_empty_clusters_yields_black() {
         let clusters: Vec<Cluster> = vec![];
         assert_eq!(derive_background_rgba(&clusters), [0, 0, 0, 255]);

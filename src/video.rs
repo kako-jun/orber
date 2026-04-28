@@ -14,7 +14,9 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use crate::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+use crate::animate::{
+    precompute_orb_params, render_frame_with_params, AnimateOptions, MotionDirection, MotionSpeed,
+};
 use crate::cluster::Cluster;
 use crate::orb::OrbShape;
 use crate::output_mode::OutputMode;
@@ -210,11 +212,16 @@ pub fn render_video(
 
     let temp_dir = tempfile::TempDir::new()?;
 
+    // OrbParams は seed / count / clusters のみに依存し t は不変なので、ループ前に
+    // 1 回だけ計算してフレーム間で使い回す。240 frame なら 240 回の Vec 割当 +
+    // RNG 走行を 1 回に圧縮できる。
+    let cache = precompute_orb_params(&frame_opts, clusters);
+
     // フレーム書き出し（逐次）。10% 刻みで stderr に進捗を出す。
     let progress_step = (total / 10).max(1);
     for i in 0..total {
         let t = i as f32 / total as f32;
-        let frame = render_frame(clusters, &frame_opts, t);
+        let frame = render_frame_with_params(clusters, &frame_opts, &cache, t);
         let path = temp_dir.path().join(format!("frame_{i:05}.png"));
         frame.save(&path).map_err(VideoError::FrameSave)?;
         if i > 0 && i % progress_step == 0 {

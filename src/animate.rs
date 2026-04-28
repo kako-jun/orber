@@ -133,6 +133,13 @@ impl Default for AnimateOptions {
     }
 }
 
+/// 半径呼吸の上限係数。`render_frame` の `radius_factor` の最大値（1.0 + 0.10）と
+/// 一致させる必要がある。`r_pixels_max` の見積りで使うため定数として括り出している。
+const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
+
+/// 半径呼吸の振幅。`BREATH_RADIUS_MAX_FACTOR = 1.0 + BREATH_RADIUS_AMPLITUDE`。
+const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
+
 /// 各 orb の決定的なパラメータ。
 ///
 /// `phase` は 0..1 の初期位置オフセット。`phi_radius` / `phi_blur` / `phi_opacity` は
@@ -172,6 +179,10 @@ fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
     if total <= 0.0 || weights.is_empty() {
         return 0;
     }
+    debug_assert!(
+        !weights.is_empty(),
+        "pick_weighted assumes non-empty weights after early return"
+    );
     let r = rng.gen::<f32>() * total;
     let mut acc = 0.0;
     for (i, &w) in weights.iter().enumerate() {
@@ -197,6 +208,9 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
             let phi_radius = rng.gen_range(0.0..TAU);
             let phi_blur = rng.gen_range(0.0..TAU);
             let phi_opacity = rng.gen_range(0.0..TAU);
+            // cross_axis は完全独立の一様分布で散らす。cluster centroid をそのまま
+            // 使うと同色 orb が同じ縦軸 / 横軸に並んで縞模様になるため、画面全体に
+            // 散布する目的でクラスタ重心とは無関係なオフセットを使う。
             let cross_axis = rng.gen_range(0.0..1.0);
             let style = if rng.gen::<u32>() & 1 == 0 {
                 OrbStyle::Rim
@@ -251,16 +265,53 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
 /// phi_radius / phi_blur / phi_opacity / cross_axis / style / cluster_idx /
 /// speed_mult 割当が同時に変わる。
 pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
-    let cycle = opts.speed.cycle_count();
-    // count を解決。`None` なら cluster 数（後方互換）。
+    let params = precompute_orb_params(opts, clusters);
+    render_frame_with_params(clusters, opts, &params, t)
+}
+
+/// `render_frame` で使う per-orb パラメータをまとめてプリコンピュートしたもの。
+///
+/// 連続するフレームで同じ `seed` / `count` / `clusters` を使う場合（典型的には
+/// 動画書き出し）、これを 1 回計算してフレームループで使い回すことで
+/// `Vec<OrbParams>` 割当と RNG 走行のコストを排除できる。
+///
+/// `seed` / `count` / `cluster_weights` のいずれかを変える場合は再計算する必要がある
+/// （`Default` / `Copy` を実装しないのは、その不変条件をうっかり壊すのを防ぐため）。
+#[derive(Debug, Clone)]
+pub struct CachedOrbParams {
+    params: Vec<OrbParams>,
+}
+
+/// `opts.seed` / `opts.count` / `clusters.weight` から決定的な orb パラメータ列を生成する。
+///
+/// 動画書き出しのフレームループで使い回す前提のキャッシュ。`render_frame` の中で
+/// 暗黙に毎フレーム呼ばれていたものを、呼び出し側で 1 回呼んで保持できるよう
+/// 公開した。
+pub fn precompute_orb_params(opts: &AnimateOptions, clusters: &[Cluster]) -> CachedOrbParams {
     let n_orbs = opts
         .count
         .unwrap_or(clusters.len())
         .min(MAX_ORB_COUNT)
         .max(if clusters.is_empty() { 0 } else { 1 });
-
     let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
-    let params = generate_orb_params(opts.seed, n_orbs, &cluster_weights);
+    CachedOrbParams {
+        params: generate_orb_params(opts.seed, n_orbs, &cluster_weights),
+    }
+}
+
+/// プリコンピュート済みの `CachedOrbParams` を使って 1 フレーム描画する。
+///
+/// `precompute_orb_params(opts, clusters)` で得た cache を渡すこと。
+/// `clusters` / `opts` （seed / count / 解像度等）が cache 計算時と一致していないと
+/// レンダリング結果は不定（パニックはしないが意味のある画像にならない）。
+pub fn render_frame_with_params(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    cache: &CachedOrbParams,
+    t: f32,
+) -> RgbaImage {
+    let cycle = opts.speed.cycle_count();
+    let params = &cache.params;
 
     let width = opts.width.max(1);
     let height = opts.height.max(1);
@@ -269,7 +320,7 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     // render_static + Cluster 列変調パスへフォールバックする（Aquarelle は
     // bleed/bloom/halo を内部で持っているので 3 軸揺らぎを足すと壊れる）。
     if let OrbShape::Aquarelle(_) = opts.shape {
-        return render_frame_aquarelle(clusters, opts, &params, t);
+        return render_frame_aquarelle(clusters, opts, params, t);
     }
 
     // Circle 経路: 自前で Pixmap を作って per-orb で render_one_orb を呼ぶ。
@@ -301,13 +352,14 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
 
         // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
         // r_normalized は進行軸 [0,1] スケールにおける半径相当。
-        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * 1.10;
+        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
         let r_normalized = if progress_axis_pixels > 0.0 {
             r_pixels_max / progress_axis_pixels
         } else {
             0.0
         };
         // 周期長: 画面外バッファを左右（あるいは上下）に r ずつ持つので [-r, 1+r) の幅。
+        // すなわち extent = 1 + 2r、pos ∈ [-r, 1+r) という対応関係。
         let extent = 1.0 + 2.0 * r_normalized;
 
         // 進行量。phase は 0..1 を extent にスケール、advance は extent 単位で進める。
@@ -389,7 +441,7 @@ fn render_frame_aquarelle(
                 MotionDirection::TopToBottom => (c.centroid.x, progress),
                 MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
             };
-            let radius_factor = 1.0 + 0.10 * sin_loop(1, t, 1, p.phi_radius);
+            let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
             Cluster {
                 color: c.color,
@@ -848,7 +900,7 @@ mod tests {
         let params = generate_orb_params(opts.seed, 1, &[1.0]);
         let p = params[0];
         let base_radius_unit = (width.min(height) as f32) * 0.25;
-        let r_pixels_max = base_radius_unit * 1.0_f32.sqrt() * 1.10;
+        let r_pixels_max = base_radius_unit * 1.0_f32.sqrt() * BREATH_RADIUS_MAX_FACTOR;
         let r_normalized = r_pixels_max / width as f32;
         let extent = 1.0 + 2.0 * r_normalized;
         // 探索: 0..=N の t の中で、orb 中心 cx の画面内位置 pos*width が
