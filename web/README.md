@@ -1,6 +1,15 @@
 # orber web
 
-Astro 4 + Solid.js + Tailwind + WASM frontend scaffold for orber.
+Astro 4 + Solid.js + Tailwind + WASM frontend for orber.
+
+## UI flow
+
+画像をドロップ → `orber-wasm.generate_batch` で 10 枚プレビューを生成 → ❤ で
+気に入ったタイルを選択 → DL（1 枚は PNG 直接、複数は ZIP）。
+
+UI 上の操作は「画像ドロップ」「アスペクト切替（縦長 540×960 / 横長 960×540）」
+「タイルの ❤ トグル」「DL ボタン」のみ。パラメータスライダーは置かず、
+バリエーションは `DEFAULT_VARIATIONS` の 10 プリセットに任せている。
 
 ## Stack
 

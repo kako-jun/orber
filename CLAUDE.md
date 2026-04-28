@@ -59,14 +59,15 @@ orber/
         └── src/
             └── lib.rs          # generate_single / generate_batch / generate_svg
 
-web/                        # Web フロントエンド scaffold (#37)
+web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind
-├── package.json            #   npm scripts: wasm:build / dev / build / deploy
+├── package.json            #   npm scripts: wasm:build / dev / build / deploy（jszip 依存）
 ├── wrangler.toml           #   Cloudflare Pages 設定（pages_build_output_dir = "dist"）
 └── src/
-    ├── pages/index.astro       # scaffold ページ
+    ├── pages/index.astro       # トップページ（画像ドロップ → 10 枚バッチ生成 GUI）
     ├── layouts/Base.astro      # 共通レイアウト（黒地に白文字）
-    ├── components/Studio.tsx   # Solid アイランド。orber-wasm を import / init
+    ├── components/Studio.tsx   # Solid アイランド。10 枚バッチ生成 GUI（#38）
+    ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
     └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
 ```
 
