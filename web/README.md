@@ -4,18 +4,41 @@ Astro 4 + Solid.js + Tailwind + WASM frontend for orber.
 
 ## UI flow
 
-画像をドロップ → `orber-wasm.generate_batch` で N 枚プレビューを生成 → ❤ で
-気に入ったタイルを選択 → DL（1 枚は PNG 直接、複数は ZIP）。
+画像をドロップ → `orber-wasm.generate_batch` で N 枚の静止プレビュー (PNG) を
+生成 → 後半 5 タイルを並行で `start_animation_for_batch_spec` + WebCodecs
+`VideoEncoder` で H.264 mp4 化 → タイルが順次 `<img>` から `<video>` に差し替わる
+（autoplay / muted / playsinline / loop）→ ✓ で気に入ったタイルを選択 → DL
+（1 枚は拡張子に応じた直接 DL、複数は ZIP に PNG / MP4 が混在）。
 
-UI 上の操作は「画像ドロップ」「アスペクト切替（縦長 540×960 / 横長 960×540）」
-「タイルの ❤ トグル」「DL ボタン」のみ。パラメータスライダーは置かない。
-バリエーションは `orber_core::variations::random_batch_specs(seed, total, still_count)`
-で **ドロップごとに毎回ランダム**に振られる（前半は静止画 PNG、後半は MP4 枠と
+UI 上の操作は「画像ドロップ」「アスペクト切替（縦長 / 横長アイコン）」
+「ガチャ（同じ画像で再ロール）」「タイルの ✓ トグル」「DL ボタン」のみ。
+パラメータスライダーは置かない。バリエーションは
+`orber_core::variations::random_batch_specs(seed, total, still_count)` で
+**ドロップごとに毎回ランダム**に振られる（前半は静止画 PNG、後半は MP4 枠と
 いう枠だけ固定し、direction / speed / count / orb_size / blur / seed /
 duration_ms はすべて呼び出しごとに `random_ranges` から一様サンプル）。タイル
 枚数は縦長 10 枚（5×2）、横長 9 枚（3×3）でグリッドが綺麗に揃うように切り
 替える。CLI の `--variations` は `DEFAULT_VARIATIONS` 決定論プリセットのままな
 ので、再現性が必要な用途は CLI 側で扱う。
+
+## 動画化
+
+後半 5 タイルは `<video muted autoplay playsinline loop>` でグリッド内で勝手に
+動く。フロー:
+
+1. `wasm.start_animation_for_batch_spec(params, n, spec_idx, total_frames)` で
+   `AnimationHandle` を取得（24fps × 4s = 96 フレーム固定）
+2. `handle.next_frame()` で RGBA バイト列を 1 枚ずつ受け取り、
+   `ImageData` → `createImageBitmap` → `VideoFrame` で WebCodecs に流す
+3. `mp4-muxer` の `ArrayBufferTarget` に詰めて `finalize()` → mp4 Blob
+4. Solid signal 経由で該当タイルの `videoBlobUrl` を埋めて `<video>` に差し替え
+
+`orber` の motion model は最初から `t=0 ≡ t=1` のピクセル一致ループに設計
+されているので、`<video loop>` で継ぎ目なくエンドレス再生される
+（`AnimationCursor` は `t = i / total_frames` (i=0..total_frames) を返し、
+`t=1` を出さないことでループ閉鎖を担保）。
+
+WebCodecs 非対応ブラウザでは静止画 PNG のまま表示される（フォールバック）。
 
 ## Stack
 
