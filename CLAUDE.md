@@ -26,21 +26,36 @@ cargo fmt --check
 - docs/overview.md は英語
 - docs/roadmap.md と CLAUDE.md は日本語（内部用）
 
-## ソース構成（予定）
+## ソース構成
+
+`v0.3.0` から Cargo workspace 構成。GUI / WASM フロントエンドが純粋描画コアだけを依存できるよう、I/O と子プロセスを CLI 側に隔離している（Issue #35）。
 
 ```
-src/
-├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
-├── lib.rs          # モジュール宣言
-├── output_mode.rs  # 出力拡張子 → OutputMode 判定（png/webp/mp4/webm/svg/css）
-├── cluster.rs      # 入力画像 → 代表色クラスタ抽出
-├── orb.rs          # orb 1 個の描画（円形ぼかし）
-├── animate.rs      # 時間 t におけるフレーム生成
-├── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
-├── style.rs        # CSS / SVG 静的書き出し（実装済み）
-└── aquarelle/      # にじみ形状の orb（将来別 crate に分離する境界）
-    └── mod.rs
+orber/
+├── Cargo.toml              # [workspace] members = ["crates/core", "crates/cli"]
+├── .cargo/config.toml      # wasm32-unknown-unknown 用の getrandom_backend cfg
+└── crates/
+    ├── core/               # orber-core: 純粋描画コア（wasm ビルド可能・I/O 一切なし）
+    │   ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── output_mode.rs  # 出力拡張子 → OutputMode 判定
+    │       ├── cluster.rs      # 入力画像 → 代表色クラスタ抽出
+    │       ├── orb.rs          # orb 1 個の描画（円形ぼかし）
+    │       ├── animate.rs      # 時間 t におけるフレーム生成
+    │       ├── style.rs        # CSS / SVG 静的書き出し
+    │       ├── variations.rs   # バリエーション spec 定義
+    │       ├── batch.rs        # generate_batch — 1 入力から複数 PNG を一括生成（GUI / WASM 用）
+    │       └── aquarelle/      # にじみ形状（将来別 crate に分離する境界）
+    │           └── mod.rs
+    └── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
+        ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
+        └── src/
+            ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
+            └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
 ```
+
+`std::fs` / `std::process::Command` / `tempfile` を使うのは `crates/cli/` だけ。`crates/core/` は wasm32-unknown-unknown でもビルド通る（getrandom 0.3 の wasm_js バックエンドを `.cargo/config.toml` で有効化済み）。
 
 ## 主要な設計判断
 

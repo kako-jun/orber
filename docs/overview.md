@@ -155,4 +155,13 @@ visual language of the videos.
 
 ## Relationship to aquarelle
 
-The aquarelle (watercolor bleed) shape generator will eventually be split out into its own crate, shared between `orber` (irregular orb shapes) and `blueprinter` (sumi / watercolor diagram themes). For the prototype it lives inside `orber` under `src/aquarelle/` so the module boundary is already in place.
+The aquarelle (watercolor bleed) shape generator will eventually be split out into its own crate, shared between `orber` (irregular orb shapes) and `blueprinter` (sumi / watercolor diagram themes). For the prototype it lives inside `orber-core` under `crates/core/src/aquarelle/` so the module boundary is already in place.
+
+## Workspace layout
+
+Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
+
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, orb rendering, animation frames, CSS / SVG output, and the `batch::generate_batch` helper. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so a future Web frontend can call it directly.
+- **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
+
+User-facing CLI behavior is unchanged.

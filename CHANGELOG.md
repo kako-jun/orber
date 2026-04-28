@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+- Repository restructured into a Cargo workspace with two crates: `orber-core` (pure rendering library, `crates/core/`) and `orber` (CLI binary, `crates/cli/`). The split is internal-only — there are no user-facing CLI changes, no flag changes, and no output-format changes. `orber-core` builds for `wasm32-unknown-unknown` to unblock future GUI / Web frontends. (#35)
+
+### Added
+- `orber_core::batch::generate_batch` — given a source image, k, canvas size, shape, and a list of `VariationSpec`, returns one PNG byte buffer per spec. Used by the upcoming GUI / WASM frontend; the CLI's `--variations` mode will eventually be a thin wrapper around this. (#35)
+
 ## [0.3.0] - 2026-04-28
 
 ### Added
