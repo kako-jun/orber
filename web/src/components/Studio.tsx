@@ -49,8 +49,7 @@ export default function Studio() {
     setDragOver(true);
   };
 
-  const onDragLeave = (e: DragEvent) => {
-    e.preventDefault();
+  const onDragLeave = () => {
     setDragOver(false);
   };
 
@@ -98,6 +97,8 @@ export default function Studio() {
         )}
       </label>
 
+      {/* wasm load 失敗時のエラーは status==='error' のブロックで表示するので、
+          ここでは非対応 MIME 等のファイル受付エラーだけ出す。*/}
       {errorMsg() && status() !== 'error' && (
         <p class="text-xs text-red-300">{errorMsg()}</p>
       )}
