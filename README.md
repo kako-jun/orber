@@ -108,13 +108,18 @@ A drag-and-drop browser GUI is published at <https://orber.llll-ll.com/>. Drop a
 image and the page generates a fresh batch every time — 10 tiles in portrait mode
 (540×960) or 9 tiles in landscape mode (960×540, 3×3 grid). Unlike the CLI's fixed
 `--variations` preset, the GUI samples direction / speed / count / orb size / blur
-randomly per drop, so the same image yields a different layout each time. The only
-guarantee is that the first half of the batch is a still and the second half is
-intended as motion (currently rendered as the `t=0` frame; see Issue #50). Heart-
-toggle tiles to pick favorites and download single (PNG) or multi (ZIP).
+randomly per drop, so the same image yields a different layout each time. The first
+**half** of the batch (5 tiles) are static PNGs; the **last 5 tiles** are H.264 mp4
+loops generated client-side via WebCodecs and inlined as `<video muted autoplay
+playsinline loop>`, so they animate continuously in the grid without any user
+interaction. Pick favorites with the ✓ toggle and download single (PNG / MP4) or
+multi (mixed-extension ZIP).
 
-The GUI runs entirely client-side via the `orber-wasm` crate (WASM bundle ≈ 237 KB
-gzipped). Source: `web/` (Astro + Solid + Tailwind).
+The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
+(measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via
+the WebCodecs API (Chrome 94+ / Safari 16.4+ / Firefox 130+). On older browsers
+the video tiles fall back to the static PNG. Source: `web/` (Astro + Solid +
+Tailwind).
 
 ## Build
 

@@ -18,12 +18,14 @@
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+use orber_core::animate::{
+    render_frame, AnimateOptions, AnimationCursor, MotionDirection, MotionSpeed,
+};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters};
 use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, StyleOptions};
-use orber_core::variations::random_batch_specs;
+use orber_core::variations::{random_batch_specs, GUI_VIDEO_COUNT_DEFAULT};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -191,24 +193,22 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 
 /// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
-/// 後半 `MP4_COUNT` (= 5) 件を `VariationKind::Mp4`、残りを `Png` にする。
-/// GUI では n が 9（横長 3×3）／10（縦長 5×2）で運用されるため、どちらの
-/// 場合でも「後半 5 枚は動画枠」になる。`n < MP4_COUNT` のときは全件 Mp4。
-/// 当面はどちらも先頭フレーム PNG として返す（Mp4 の動画化は別 Issue）。
+/// 後半 [`GUI_VIDEO_COUNT_DEFAULT`] (= 5) 件を `VariationKind::Mp4`、残りを
+/// `Png` にする。GUI では n が 9（横長 3×3）／10（縦長 5×2）で運用される
+/// ため、どちらの場合でも「後半 5 枚は動画枠」になる。
+/// `n < GUI_VIDEO_COUNT_DEFAULT` のときは全件 Mp4。Mp4 タイルも当面は先頭
+/// フレーム PNG として返す（動画化は `start_animation_for_batch_spec` 経由）。
 ///
 /// `n` は 1..=50 にクランプする。
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
-    /// 後半 N 枚を Mp4 枠とする（n=9 でも 10 でも「後半 5」を維持）。
-    const MP4_COUNT: usize = 5;
-
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
     let shape = parse_shape(&p.shape).map_err(err_to_js)?;
 
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let total = (n as usize).clamp(1, 50);
-    let still_count = total.saturating_sub(MP4_COUNT);
+    let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
     let specs = random_batch_specs(p.seed as u64, total, still_count);
 
     let input = BatchInput {
@@ -227,6 +227,113 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
         arr.push(&js_sys::Uint8Array::from(&png[..]));
     }
     Ok(arr)
+}
+
+/// 動画 1 タイル分の RGBA フレームを 1 枚ずつ取り出すハンドル。
+///
+/// `start_animation_for_batch_spec` で構築する。各 `next_frame()` は
+/// `width * height * 4` バイトの RGBA8 ピクセル列 (`Uint8ClampedArray`) を
+/// 返す。完了後は `null`。`<video loop>` 用途を想定しており、
+/// `t = i / total_frames` (i = 0..total_frames) を出すので、最後のフレームの
+/// 次が t=0 とピクセル一致する（README の loop closure 不変条件を維持）。
+#[wasm_bindgen]
+pub struct AnimationHandle {
+    cursor: AnimationCursor,
+}
+
+#[wasm_bindgen]
+impl AnimationHandle {
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.cursor.width()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.cursor.height()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn total_frames(&self) -> u32 {
+        self.cursor.total_frames()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn next_index(&self) -> u32 {
+        self.cursor.next_index()
+    }
+
+    /// 次のフレームの RGBA バイト列を返す。完了後は `null`。
+    pub fn next_frame(&mut self) -> Option<js_sys::Uint8ClampedArray> {
+        let img = self.cursor.next_frame()?;
+        Some(js_sys::Uint8ClampedArray::from(img.as_raw().as_slice()))
+    }
+}
+
+/// 後半の動画タイルのアニメーションを起動する。
+///
+/// `random_batch_specs(params.seed, n, n - GUI_VIDEO_COUNT_DEFAULT)` を再生成
+/// して `spec_idx` 番目の spec を取り、入力画像のクラスタ抽出を 1 回だけ
+/// 走らせて `AnimationCursor` を返す。JS 側は `next_frame()` を `total_frames`
+/// 回呼んで WebCodecs `VideoEncoder` に流し込む想定。
+///
+/// # 決定論性
+///
+/// `random_batch_specs` は同じ `(seed, total, still_count)` で同じ spec 列を
+/// 返す（`crates/core::variations::random_batch_specs_is_deterministic_per_seed`
+/// テストで担保）。よって `generate_batch(params, n)` で得た spec 列の
+/// `spec_idx` 番目と、ここで再構築した spec 列の `spec_idx` 番目は完全一致する。
+/// その結果、静止画タイル（`generate_batch` で描かれた `t=0` フレーム）と
+/// 動画タイル（このアニメーション）は同じパラメータで描画され、見た目の
+/// 整合性が保たれる。
+///
+/// `total_frames` は呼び出し側で計算する（GUI 既定: `fps × seconds = 24 × 4 = 96`）。
+/// `spec_idx` が `[still_count, total)` の範囲外なら `Mp4` 枠ではないので
+/// `JsError`。
+#[wasm_bindgen]
+pub fn start_animation_for_batch_spec(
+    params_js: JsValue,
+    n: u32,
+    spec_idx: u32,
+    total_frames: u32,
+) -> Result<AnimationHandle, JsError> {
+    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
+
+    let total = (n as usize).clamp(1, 50);
+    let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
+    let spec_idx = spec_idx as usize;
+    if spec_idx < still_count || spec_idx >= total {
+        return Err(JsError::new(&format!(
+            "spec_idx {spec_idx} is not within the Mp4 range [{still_count}, {total})"
+        )));
+    }
+    if total_frames == 0 {
+        return Err(JsError::new("total_frames must be > 0"));
+    }
+
+    let source = build_source_image(&mut p).map_err(err_to_js)?;
+    let clusters_full = extract_clusters(&source, p.k)
+        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
+    let bg = derive_background_rgba(&clusters_full);
+    let clusters = drop_dominant(&clusters_full);
+
+    let specs = random_batch_specs(p.seed as u64, total, still_count);
+    let spec = specs[spec_idx];
+
+    let opts = AnimateOptions {
+        width: p.width,
+        height: p.height,
+        seed: spec.seed,
+        direction: spec.direction,
+        speed: spec.speed,
+        count: Some(spec.count),
+        orb_size: spec.orb_size,
+        blur: spec.blur,
+        saturation: 1.0,
+        background: bg,
+        shape,
+    };
+
+    let cursor = AnimationCursor::new(clusters, opts, total_frames);
+    Ok(AnimationHandle { cursor })
 }
 
 /// 入力画像 1 枚から SVG 文字列を生成する。

@@ -414,6 +414,72 @@ const MAX_ORB_COUNT: usize = 1024;
 
 /// Aquarelle shape は既存の render_static フォールバック経路。
 ///
+/// 動画 1 タイル分のフレームを 1 枚ずつ生成する反復子。
+///
+/// `precompute_orb_params` を 1 回だけ走らせ、`next_frame()` 呼び出しごとに
+/// `t = i / total_frames` (i = 0..total_frames) の RGBA フレームを返す。
+/// 完了後は `None`。`total_frames` の倍数では `t = 1` を出さない設計なので、
+/// `t = 0` と「最後のフレームの次」がピクセル一致する `<video loop>` 用途に
+/// そのまま使える（README の "loop closure at t=0 ≡ t=1" を維持）。
+///
+/// `clusters` と `opts` を所有する: 呼び出し側のライフタイムに縛られず JS /
+/// wasm-bindgen 経由で Cursor をハンドルとして持ち回せる設計。
+pub struct AnimationCursor {
+    clusters: Vec<Cluster>,
+    opts: AnimateOptions,
+    cache: CachedOrbParams,
+    total_frames: u32,
+    next_idx: u32,
+}
+
+impl AnimationCursor {
+    /// `clusters` / `opts` / `total_frames` からカーソルを構築する。
+    ///
+    /// # Panics
+    ///
+    /// `total_frames == 0` で panic する（ループ閉鎖の不変条件 `t = i / N`
+    /// で `N > 0` を要求するため）。WASM ラッパーは早期に Result でエラーを
+    /// 返すので、ここに 0 が来るのは内部バグ扱い。
+    pub fn new(clusters: Vec<Cluster>, opts: AnimateOptions, total_frames: u32) -> Self {
+        assert!(
+            total_frames > 0,
+            "AnimationCursor requires total_frames > 0"
+        );
+        let cache = precompute_orb_params(&opts, &clusters);
+        Self {
+            clusters,
+            opts,
+            cache,
+            total_frames,
+            next_idx: 0,
+        }
+    }
+
+    /// 次のフレームを 1 枚返す。すべてのフレームを返し終えたら `None`。
+    pub fn next_frame(&mut self) -> Option<RgbaImage> {
+        if self.next_idx >= self.total_frames {
+            return None;
+        }
+        let t = self.next_idx as f32 / self.total_frames as f32;
+        let frame = render_frame_with_params(&self.clusters, &self.opts, &self.cache, t);
+        self.next_idx += 1;
+        Some(frame)
+    }
+
+    pub fn total_frames(&self) -> u32 {
+        self.total_frames
+    }
+    pub fn next_index(&self) -> u32 {
+        self.next_idx
+    }
+    pub fn width(&self) -> u32 {
+        self.opts.width
+    }
+    pub fn height(&self) -> u32 {
+        self.opts.height
+    }
+}
+
 /// Aquarelle は内部で bleed / bloom / halo を持っているため、per-orb の独立揺らぎを
 /// 足すと質感セットが壊れる。半径だけの呼吸を従来どおり cluster.weight に乗せる。
 /// count による展開は Aquarelle では行わない（質感セットが orb ごとに重い）。
@@ -935,6 +1001,68 @@ mod tests {
             max_r < 16,
             "off-screen orb should not contribute visible pixels; max_r={max_r} at t={t_off}"
         );
+    }
+
+    #[test]
+    fn animation_cursor_yields_n_frames_then_none() {
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut cursor = AnimationCursor::new(sample_clusters(), opts, 4);
+        assert_eq!(cursor.total_frames(), 4);
+        for expected_idx in 0..4 {
+            assert_eq!(cursor.next_index(), expected_idx);
+            assert!(
+                cursor.next_frame().is_some(),
+                "frame {expected_idx} missing"
+            );
+        }
+        assert!(
+            cursor.next_frame().is_none(),
+            "exhausted cursor must return None"
+        );
+    }
+
+    #[test]
+    fn animation_cursor_first_frame_matches_render_frame_at_zero() {
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let clusters = sample_clusters();
+        let mut cursor = AnimationCursor::new(clusters.clone(), opts.clone(), 24);
+        let cursor_frame = cursor.next_frame().expect("first frame");
+        let direct = render_frame(&clusters, &opts, 0.0);
+        assert!(
+            pixels_equal(&cursor_frame, &direct),
+            "AnimationCursor first frame must equal render_frame(t=0)"
+        );
+    }
+
+    #[test]
+    fn animation_cursor_does_not_emit_t_one() {
+        // ループ閉鎖の不変条件: cursor は t = i/N (i = 0..N) のみ出すので
+        // 最後のフレームは i = N-1。i = N のフレーム（= t = 1）は出さず、
+        // <video loop> の次のループ頭 (= 改めて render_frame(.., 0.0)) と
+        // ピクセル一致する。逆に、最後の next_frame() が render_frame(.., 1.0)
+        // と一致しないことで「t=1 を出していない」ことが確認できる
+        // （t=0 と t=1 が一致するという別不変条件を逆手に使うと、
+        // 最後フレーム == render_frame(t=0) と一致してはいけない）。
+        let n = 8;
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let clusters = sample_clusters();
+        let mut cursor = AnimationCursor::new(clusters.clone(), opts.clone(), n);
+        let mut last = None;
+        for _ in 0..n {
+            last = Some(cursor.next_frame().unwrap());
+        }
+        let t_zero = render_frame(&clusters, &opts, 0.0);
+        assert!(
+            !pixels_equal(&last.unwrap(), &t_zero),
+            "last frame (t=(N-1)/N) must NOT equal render_frame(t=0); otherwise the cursor is emitting t=1"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "total_frames > 0")]
+    fn animation_cursor_panics_on_zero_frames() {
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let _ = AnimationCursor::new(sample_clusters(), opts, 0);
     }
 
     #[test]
