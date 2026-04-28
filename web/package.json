@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "wasm:install": "command -v wasm-pack >/dev/null 2>&1 || cargo install wasm-pack --locked",
+    "wasm:ensure-rust": "which rustup || (unset RUSTUP_VERSION && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && . $HOME/.cargo/env && rustup target add wasm32-unknown-unknown)",
+    "wasm:install": ". $HOME/.cargo/env 2>/dev/null; which wasm-pack || cargo install wasm-pack --locked",
     "wasm:build": "cd .. && wasm-pack build crates/wasm --target web --out-dir ../../web/src/wasm --release",
     "dev": "npm run wasm:build && astro dev",
     "build": "npm run wasm:build && astro build",
-    "build:cf": "npm run wasm:install && npm run build",
+    "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && astro build",
     "preview": "astro preview",
     "deploy": "wrangler pages deploy dist"
   },
