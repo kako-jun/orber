@@ -591,8 +591,8 @@ fn render_one_variation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orber_core::animate::AnimateOptions;
     use crate::video::MAX_DURATION_MS;
+    use orber_core::animate::AnimateOptions;
 
     #[test]
     fn cli_defaults_match_render_options_defaults() {

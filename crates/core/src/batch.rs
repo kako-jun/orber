@@ -8,7 +8,9 @@
 //! 画像 I/O や子プロセス起動を一切しないので wasm32 ターゲットでも動く。
 
 use crate::animate::{render_frame, AnimateOptions};
-use crate::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster, ClusterError};
+use crate::cluster::{
+    derive_background_rgba, drop_dominant, extract_clusters, Cluster, ClusterError,
+};
 use crate::orb::OrbShape;
 use crate::variations::VariationSpec;
 use image::codecs::png::PngEncoder;
@@ -86,10 +88,22 @@ mod tests {
     fn synthetic_source() -> RgbImage {
         // 4x4 で 4 色を散らした入力。kmeans が縮退しない程度に色を分ける。
         let pixels: [[u8; 3]; 16] = [
-            [255, 0, 0], [200, 30, 30], [255, 0, 0], [200, 30, 30],
-            [0, 200, 0], [30, 220, 30], [0, 200, 0], [30, 220, 30],
-            [0, 0, 200], [30, 30, 220], [0, 0, 200], [30, 30, 220],
-            [240, 240, 240], [200, 200, 200], [240, 240, 240], [200, 200, 200],
+            [255, 0, 0],
+            [200, 30, 30],
+            [255, 0, 0],
+            [200, 30, 30],
+            [0, 200, 0],
+            [30, 220, 30],
+            [0, 200, 0],
+            [30, 220, 30],
+            [0, 0, 200],
+            [30, 30, 220],
+            [0, 0, 200],
+            [30, 30, 220],
+            [240, 240, 240],
+            [200, 200, 200],
+            [240, 240, 240],
+            [200, 200, 200],
         ];
         let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(4, 4);
         for (i, p) in pixels.iter().enumerate() {
@@ -102,7 +116,11 @@ mod tests {
 
     #[test]
     fn generate_batch_returns_one_png_per_spec() {
-        let specs = DEFAULT_VARIATIONS.iter().take(2).copied().collect::<Vec<_>>();
+        let specs = DEFAULT_VARIATIONS
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
         let n = specs.len();
         let input = BatchInput {
             source: synthetic_source(),
@@ -120,7 +138,10 @@ mod tests {
                 png.starts_with(PNG_MAGIC),
                 "spec {i} output does not start with PNG magic bytes"
             );
-            assert!(png.len() > PNG_MAGIC.len(), "spec {i} PNG is suspiciously small");
+            assert!(
+                png.len() > PNG_MAGIC.len(),
+                "spec {i} PNG is suspiciously small"
+            );
         }
     }
 }
