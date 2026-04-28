@@ -1,0 +1,9 @@
+---
+import Base from '../layouts/Base.astro';
+import Studio from '../components/Studio';
+---
+<Base title="orber web (scaffold)">
+  <h1 class="text-2xl font-semibold mb-6">orber web</h1>
+  <p class="text-zinc-400 mb-8">scaffold — wasm が読み込まれているか動作確認するだけのページ</p>
+  <Studio client:load />
+</Base>
