@@ -32,7 +32,7 @@ cargo fmt --check
 
 ```
 orber/
-├── Cargo.toml              # [workspace] members = ["crates/core", "crates/cli"]
+├── Cargo.toml              # [workspace] members = ["crates/core", "crates/cli", "crates/wasm"]
 ├── .cargo/config.toml      # wasm32-unknown-unknown 用の getrandom_backend cfg
 └── crates/
     ├── core/               # orber-core: 純粋描画コア（wasm ビルド可能・I/O 一切なし）
@@ -48,11 +48,16 @@ orber/
     │       ├── batch.rs        # generate_batch — 1 入力から複数 PNG を一括生成（GUI / WASM 用）
     │       └── aquarelle/      # にじみ形状（将来別 crate に分離する境界）
     │           └── mod.rs
-    └── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
-        ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
+    ├── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
+    │   ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
+    │   └── src/
+    │       ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
+    │       └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
+    └── wasm/               # orber-wasm: ブラウザ向け wasm-bindgen ラッパー（#36）
+        ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
+        ├── test.html       #   ブラウザ確認用デモ（pkg/ を fetch）
         └── src/
-            ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
-            └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
+            └── lib.rs          # generate_single / generate_batch / generate_svg
 ```
 
 `std::fs` / `std::process::Command` / `tempfile` を使うのは `crates/cli/` だけ。`crates/core/` は wasm32-unknown-unknown でもビルド通る（getrandom 0.3 の wasm_js バックエンドを `.cargo/config.toml` で有効化済み）。
