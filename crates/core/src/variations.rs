@@ -489,10 +489,9 @@ mod tests {
     }
 
     #[test]
-    fn random_batch_specs_n_one_keeps_still_first() {
-        // wasm/lib.rs は still_count = ceil(n/2) で呼ぶので、n=1 のときは
-        // still_count=1 → 1 件目が Png になる。「前半は静止画」の不変条件を
-        // n=1 でも壊さないことを担保する。
+    fn random_batch_specs_total_one_still_one_returns_png() {
+        // random_batch_specs(_, 1, 1) は 1 件 Png を返す、という関数自体の
+        // 決定論的挙動を担保（wasm 側の still_count 計算ルールとは独立）。
         let specs = random_batch_specs(1, 1, 1);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].kind, VariationKind::Png);

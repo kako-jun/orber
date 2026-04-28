@@ -191,24 +191,24 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 
 /// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
-/// `random_batch_specs(params.seed, n, ceil(n / 2))` で `n` 件のランダム spec
-/// を作る。前半 `ceil(n / 2)` 件は `VariationKind::Png`、残りは `Mp4` の枠を
-/// 維持する。奇数件のときは still 側を 1 枚多くする（"前半静止 / 後半動画" の
-/// 不変条件を `n=1` でも成立させるため）。当面はどちらも先頭フレーム PNG として
-/// 返す（Mp4 の動画化は別 Issue）。
+/// 後半 `MP4_COUNT` (= 5) 件を `VariationKind::Mp4`、残りを `Png` にする。
+/// GUI では n が 9（横長 3×3）／10（縦長 5×2）で運用されるため、どちらの
+/// 場合でも「後半 5 枚は動画枠」になる。`n < MP4_COUNT` のときは全件 Mp4。
+/// 当面はどちらも先頭フレーム PNG として返す（Mp4 の動画化は別 Issue）。
 ///
 /// `n` は 1..=50 にクランプする。
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
+    /// 後半 N 枚を Mp4 枠とする（n=9 でも 10 でも「後半 5」を維持）。
+    const MP4_COUNT: usize = 5;
+
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
     let shape = parse_shape(&p.shape).map_err(err_to_js)?;
 
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let total = (n as usize).clamp(1, 50);
-    // 奇数のとき (total + 1) / 2 で「前半 still を 1 枚多く」して、n=1 でも
-    // 1 枚目が必ず PNG になるようにする。div_ceil の手書き相当。
-    let still_count = total.div_ceil(2);
+    let still_count = total.saturating_sub(MP4_COUNT);
     let specs = random_batch_specs(p.seed as u64, total, still_count);
 
     let input = BatchInput {
