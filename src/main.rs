@@ -1,69 +1,55 @@
 use clap::{Parser, ValueEnum};
-use orber::animate::{MotionPreset, MotionShape, MotionSpeed};
+use orber::animate::{MotionDirection, MotionSpeed};
 use orber::aquarelle::AquarelleParams;
-use orber::background::{resolve as resolve_background, Background};
-use orber::cluster::{extract_clusters, Cluster};
-use orber::orb::{render_static, OrbShape, RenderOptions};
+use orber::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
+use orber::orb::{OrbShape, RenderOptions};
 use orber::output_mode::OutputMode;
 use orber::style::{render_css, render_svg, StyleOptions};
 use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use orber::video::{render_video, VideoCodec, VideoOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Back-compat motion preset (`--motion`). Equivalent to a fixed (shape, speed) pair.
+/// Conveyor-belt direction (`--direction`). All orbs flow the same way for the entire clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Motion {
-    /// No movement (shape=still).
-    Still,
-    /// Slow Lissajous drift (default).
-    Slow,
-    /// Lively Lissajous drift.
-    Lively,
+enum CliDirection {
+    /// Left to right.
+    Lr,
+    /// Right to left.
+    Rl,
+    /// Top to bottom.
+    Tb,
+    /// Bottom to top.
+    Bt,
 }
 
-impl From<Motion> for MotionPreset {
-    fn from(m: Motion) -> Self {
-        match m {
-            Motion::Still => MotionPreset::Still,
-            Motion::Slow => MotionPreset::Slow,
-            Motion::Lively => MotionPreset::Lively,
+impl From<CliDirection> for MotionDirection {
+    fn from(d: CliDirection) -> Self {
+        match d {
+            CliDirection::Lr => MotionDirection::LeftToRight,
+            CliDirection::Rl => MotionDirection::RightToLeft,
+            CliDirection::Tb => MotionDirection::TopToBottom,
+            CliDirection::Bt => MotionDirection::BottomToTop,
         }
     }
 }
 
-/// Orbit shape (`--motion-shape`).
+/// Conveyor-belt speed (`--speed`). Coarse 2-step preset; per-orb phase scatter is automatic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliMotionShape {
-    Still,
-    Lissajous,
-    Vertical,
-    Horizontal,
-    Diagonal,
-    Breathe,
-    Twinkle,
+enum CliSpeed {
+    /// One screen-cross over the whole clip (most calm).
+    VerySlow,
+    /// Two screen-crosses over the whole clip (default).
+    Slow,
 }
 
-impl From<CliMotionShape> for MotionShape {
-    fn from(s: CliMotionShape) -> Self {
+impl From<CliSpeed> for MotionSpeed {
+    fn from(s: CliSpeed) -> Self {
         match s {
-            CliMotionShape::Still => MotionShape::Still,
-            CliMotionShape::Lissajous => MotionShape::Lissajous,
-            CliMotionShape::Vertical => MotionShape::Vertical,
-            CliMotionShape::Horizontal => MotionShape::Horizontal,
-            CliMotionShape::Diagonal => MotionShape::Diagonal,
-            CliMotionShape::Breathe => MotionShape::Breathe,
-            CliMotionShape::Twinkle => MotionShape::Twinkle,
+            CliSpeed::VerySlow => MotionSpeed::VerySlow,
+            CliSpeed::Slow => MotionSpeed::Slow,
         }
     }
-}
-
-/// Motion speed (`--motion-speed`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliMotionSpeed {
-    Subtle,
-    Slow,
-    Lively,
 }
 
 /// `--variations-mode` の選択肢。
@@ -80,16 +66,6 @@ impl From<CliVariationMode> for VariationMode {
             CliVariationMode::Still => VariationMode::Still,
             CliVariationMode::Video => VariationMode::Video,
             CliVariationMode::Mixed => VariationMode::Mixed,
-        }
-    }
-}
-
-impl From<CliMotionSpeed> for MotionSpeed {
-    fn from(s: CliMotionSpeed) -> Self {
-        match s {
-            CliMotionSpeed::Subtle => MotionSpeed::Subtle,
-            CliMotionSpeed::Slow => MotionSpeed::Slow,
-            CliMotionSpeed::Lively => MotionSpeed::Lively,
         }
     }
 }
@@ -133,6 +109,28 @@ fn parse_f32_in_range(min: f32, max: f32) -> impl Fn(&str) -> Result<f32, String
 fn parse_orb_size(s: &str) -> Result<f32, String> {
     parse_f32_in_range(0.0, 10.0)(s)
 }
+fn parse_variations_n(s: &str) -> Result<usize, String> {
+    // --variations 0 は「該当無し」エラーで誤解を招くので、value parser で
+    // 1.. を強制する（preset 上限の 10 はメッセージで伝えるため弾かない）。
+    let v: usize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if v == 0 {
+        return Err("must be >= 1 (use --variations N with N >= 1)".to_string());
+    }
+    Ok(v)
+}
+
+fn parse_count(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    // ライブラリ層の MAX_ORB_COUNT (1024) と揃える。
+    if !(1..=1024).contains(&v) {
+        return Err(format!("must be in 1..=1024, got {v}"));
+    }
+    Ok(v)
+}
 fn parse_unit_interval(s: &str) -> Result<f32, String> {
     parse_f32_in_range(0.0, 1.0)(s)
 }
@@ -155,9 +153,9 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Generate N variations of the input under --output-dir instead of a single file.
-    /// Requires --output-dir. Variations are picked from a curated preset table
-    /// (still ×3, drift ×4, breathe ×1, lissajous ×2 = up to 10).
-    #[arg(long)]
+    /// Requires --output-dir (N >= 1). Variations are picked from a curated preset
+    /// table (4 still snapshots + 6 mp4 flows = up to 10).
+    #[arg(long, value_parser = parse_variations_n)]
     variations: Option<usize>,
 
     /// Output directory for --variations mode. Created if it does not exist.
@@ -168,9 +166,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliVariationMode::Mixed)]
     variations_mode: CliVariationMode,
 
-    /// Random seed for reproducible output.
-    #[arg(long)]
-    seed: Option<u64>,
+    /// Random seed for reproducible output (default 0).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
 
     /// Orb size as a relative multiplier (0.0..=10.0; 1.0 = default).
     #[arg(long, default_value_t = 1.0, value_parser = parse_orb_size)]
@@ -180,20 +178,20 @@ struct Cli {
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     blur: f32,
 
-    /// Back-compat drift preset for animated outputs. Equivalent to a fixed
-    /// (motion-shape, motion-speed) pair: still→(still,slow), slow→(lissajous,slow),
-    /// lively→(lissajous,lively). Overridden if --motion-shape or --motion-speed
-    /// is also passed.
-    #[arg(long, value_enum, default_value_t = Motion::Slow)]
-    motion: Motion,
+    /// Conveyor-belt direction. All orbs flow the same way for the entire clip.
+    #[arg(long, value_enum, default_value_t = CliDirection::Lr)]
+    direction: CliDirection,
 
-    /// Orbit shape independent of speed. Overrides the shape implied by --motion.
-    #[arg(long, value_enum)]
-    motion_shape: Option<CliMotionShape>,
+    /// Conveyor-belt speed. Coarse 2-step preset over the whole clip.
+    #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
+    speed: CliSpeed,
 
-    /// Motion speed/amplitude independent of shape. Overrides the speed implied by --motion.
-    #[arg(long, value_enum)]
-    motion_speed: Option<CliMotionSpeed>,
+    /// Number of orbs visible on screen at once (1..=1024, default 20).
+    /// Clusters are expanded to this count by weight-proportional color sampling
+    /// and per-orb scattering on the cross axis. Higher count fills more of the
+    /// frame; ~20 fills roughly 70% on the default size.
+    #[arg(long, default_value_t = 20, value_parser = parse_count)]
+    count: usize,
 
     /// Orb rendering shape.
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
@@ -206,12 +204,6 @@ struct Cli {
     /// Animated output duration in milliseconds (1000..=600000, i.e. 1s..=10min).
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1000..=600_000))]
     duration_ms: u64,
-
-    /// Background color: black, white, auto, transparent, or #RRGGBB(AA).
-    /// `auto` picks a dimmed average color of the input image.
-    /// `transparent` is rejected for mp4/webm (yuv420p has no alpha).
-    #[arg(long, default_value = "auto")]
-    background: String,
 
     /// Aquarelle: bleed strength (0.0..=1.0). Only used with --shape aquarelle.
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
@@ -248,16 +240,8 @@ impl Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let bg: Background = match cli.background.parse() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("orber: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
     if let Some(n) = cli.variations {
-        return render_variations(&cli, n, bg);
+        return render_variations(&cli, n);
     }
 
     let output = match &cli.output {
@@ -277,18 +261,12 @@ fn main() -> ExitCode {
     };
 
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
-        if bg.is_transparent() {
-            eprintln!(
-                "orber: --background transparent is not supported for {mode:?} (yuv420p has no alpha channel)"
-            );
-            return ExitCode::from(2);
-        }
-        return render_video_path(&cli, &output, codec, bg);
+        return render_video_path(&cli, &output, codec);
     }
 
     match mode {
-        OutputMode::Png => render_png(&cli, &output, bg),
-        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, &output, mode, bg),
+        OutputMode::Png => render_png(&cli, &output),
+        OutputMode::Svg | OutputMode::Css => render_style_path(&cli, &output, mode),
         _ => {
             eprintln!("orber: output mode {mode:?} is not yet implemented");
             ExitCode::from(1)
@@ -296,22 +274,37 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--motion` の preset と `--motion-shape` / `--motion-speed` の上書きを統合する。
-///
-/// 個別フラグが指定されていればそちらを優先、なければ `--motion` 由来の組を使う。
-fn resolve_motion(cli: &Cli) -> (MotionShape, MotionSpeed) {
-    let preset: MotionPreset = cli.motion.into();
-    let (mut shape, mut speed) = preset.split();
-    if let Some(s) = cli.motion_shape {
-        shape = s.into();
-    }
-    if let Some(sp) = cli.motion_speed {
-        speed = sp.into();
-    }
-    (shape, speed)
+/// CLI の `--direction` / `--speed` を内部表現に変換する。
+fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
+    (cli.direction.into(), cli.speed.into())
 }
 
-fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Background) -> ExitCode {
+/// orb プールが空になった（K=1 / 単色画像）ときに stderr で警告し、処理は継続する。
+///
+/// `drop_dominant` でドミナントクラスタを 1 個落としたあと、残りが 0 個になる
+/// ケースを検出する。フォールバックは入れない（背景塗りだけの出力になる）。
+fn warn_if_orb_pool_empty(orb_clusters: &[Cluster]) {
+    if orb_clusters.is_empty() {
+        eprintln!(
+            "orber: warning: input image yielded only 1 cluster; orb pool is empty (output will be background only)"
+        );
+    }
+}
+
+/// `--shape aquarelle` と `--count` の組合せを使ったときに stderr で警告する。
+///
+/// Aquarelle 経路は cluster 数だけ orb を描画する設計（per-orb の独立揺らぎを
+/// 入れると bleed/bloom/halo の質感セットが壊れるため）。CLI からは aquarelle の
+/// ときだけ count が無視される事実が見えないので、ここで明示的に教える。
+fn warn_if_aquarelle_count_ignored(cli: &Cli) {
+    if matches!(cli.shape, Shape::Aquarelle) {
+        eprintln!(
+            "orber: warning: aquarelle shape ignores --count (rendering one orb per k-means cluster from the palette)"
+        );
+    }
+}
+
+fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -330,18 +323,23 @@ fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Backgrou
         }
     };
 
-    // 3. style オプション構築。
+    // 3. 背景色を最大 weight クラスタから自動派生し、orb プールはそれを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+
+    // 4. style オプション構築。
     let opts = StyleOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
-        background: resolve_background(&img, bg),
+        background,
     };
 
-    // 4. mode で書き出しを分岐。
+    // 5. mode で書き出しを分岐。
     let content = match mode {
-        OutputMode::Svg => render_svg(&clusters, &opts),
-        OutputMode::Css => render_css(&clusters, &opts),
+        OutputMode::Svg => render_svg(&orb_clusters, &opts),
+        OutputMode::Css => render_css(&orb_clusters, &opts),
         _ => unreachable!("render_style_path called with non-style mode {mode:?}"),
     };
 
@@ -353,7 +351,7 @@ fn render_style_path(cli: &Cli, output: &PathBuf, mode: OutputMode, bg: Backgrou
     ExitCode::SUCCESS
 }
 
-fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Background) -> ExitCode {
+fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -372,21 +370,28 @@ fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Backgro
         }
     };
 
-    // 3. ビデオオプション構築。解像度は固定。
-    let (shape, speed) = resolve_motion(cli);
+    // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
+
+    // 4. ビデオオプション構築。解像度は固定。
+    let (direction, speed) = resolve_motion(cli);
     let opts = VideoOptions {
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
-        motion_shape: shape,
-        motion_speed: speed,
-        seed: cli.seed.unwrap_or(0),
-        background: resolve_background(&img, bg),
+        direction,
+        speed,
+        seed: cli.seed,
+        count: Some(cli.count),
+        background,
         shape: cli.orb_shape(),
     };
 
-    // 4. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
-    if let Err(e) = render_video(&clusters, &opts, output, cli.duration_ms, codec) {
+    // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
+    if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
     }
@@ -394,7 +399,7 @@ fn render_video_path(cli: &Cli, output: &PathBuf, codec: VideoCodec, bg: Backgro
     ExitCode::SUCCESS
 }
 
-fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
+fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
@@ -413,21 +418,33 @@ fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
         }
     };
 
-    // 3. 描画オプション構築（解像度はデフォルトの縦長 1080x1920）。
-    // width/height は当面デフォルト固定。CLI フラグ化は将来 Issue で対応する。
-    let opts = RenderOptions {
+    // 3. 背景色を自動派生し、orb プールはドミナントを除いた残り。
+    let background = derive_background_rgba(&clusters);
+    let orb_clusters = drop_dominant(&clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
+
+    // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
+    //    描画する。これで --count による orb 数の展開が単発出力でも効く。
+    //    （render_static は count を解釈しないので、count=clusters.len() に固定された
+    //     旧経路にしないよう animate::render_frame を一律に使う。）
+    let (direction, speed) = resolve_motion(cli);
+    let frame_opts = orber::animate::AnimateOptions {
+        width: RenderOptions::default().width,
+        height: RenderOptions::default().height,
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
-        background: resolve_background(&img, bg),
+        direction,
+        speed,
+        seed: cli.seed,
+        count: Some(cli.count),
+        background,
         shape: cli.orb_shape(),
-        ..RenderOptions::default()
     };
+    let out = orber::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
-    // 4. 静的描画。
-    let out = render_static(&clusters, &opts);
-
-    // 5. 保存。
+    // 4. 保存。
     if let Err(e) = out.save(output) {
         eprintln!("orber: failed to write output {}: {e}", output.display());
         return ExitCode::from(2);
@@ -437,7 +454,7 @@ fn render_png(cli: &Cli, output: &PathBuf, bg: Background) -> ExitCode {
 }
 
 /// `--variations` 経路。`output_dir` を作って各 spec で逐次書き出す。
-fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
+fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     let dir = match &cli.output_dir {
         Some(d) => d.clone(),
         None => {
@@ -450,7 +467,7 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // 入力 + クラスタは全 spec で共有。
+    // 入力画像は全 spec で共有。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
@@ -458,14 +475,6 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let clusters = match extract_clusters(&img, 6) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("orber: cluster extraction failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let resolved_bg = resolve_background(&img, bg);
 
     let specs = select_specs(n, cli.variations_mode.into());
     if specs.is_empty() {
@@ -485,18 +494,31 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
     }
 
     let orb_shape = cli.orb_shape();
+    // クラスタ抽出は preset 全 spec で 1 回だけ（K は VARIATIONS_KMEANS_K で固定）。
+    // パレットを spec ごとに変えると入力画像の色が崩れるので、ここはキャッシュではなく
+    // 単一パレットを使い回す方針。
+    let base_clusters = match extract_clusters(&img, VARIATIONS_KMEANS_K) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orber: cluster extraction failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 背景色は最大 weight クラスタから自動派生し、orb プールはそれを除いた残り。
+    // 全 spec で共通（同じ入力画像から同じ背景・同じ orb プールを使う）。
+    let background = derive_background_rgba(&base_clusters);
+    let orb_clusters = drop_dominant(&base_clusters);
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
+
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
-        // 動画 + 透過は不可（yuv420p）。bg が transparent なら black に置換して進める。
-        let spec_bg = if spec.kind == VariationKind::Mp4 && resolved_bg[3] == 0 {
-            [0, 0, 0, 255]
-        } else {
-            resolved_bg
-        };
-        let result = render_one_variation(&clusters, spec, &out_path, spec_bg, orb_shape);
+
+        let result = render_one_variation(&orb_clusters, spec, &out_path, background, orb_shape);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -505,6 +527,12 @@ fn render_variations(cli: &Cli, n: usize, bg: Background) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--variations` 経路で使うクラスタ数（kmeans の K）。spec ごとには変えない。
+///
+/// 5 個に固定すると主要色が拾え、かつパレットが崩れにくい。後で動かしたくなったら
+/// `VariationSpec` に `palette_k` フィールドを足す形で復活させる。
+const VARIATIONS_KMEANS_K: usize = 5;
+
 fn render_one_variation(
     clusters: &[Cluster],
     spec: &VariationSpec,
@@ -512,27 +540,37 @@ fn render_one_variation(
     bg_rgba: [u8; 4],
     orb_shape: OrbShape,
 ) -> Result<(), String> {
+    // saturation は preset で揺らさない（同一画像から作る複数バリエーションでは
+    // 入力色をそのまま使う方針）。CLI の単発経路と揃えるため 1.0 固定。
     match spec.kind {
         VariationKind::Png => {
-            let opts = RenderOptions {
+            // 静止画は「コンベアベルトの一瞬」。t=0 のフレームを 1 枚だけレンダリングする。
+            // phase 由来で orb が画面全体に散らばり、画面端で半分欠ける構図が自然に出る。
+            let frame_opts = orber::animate::AnimateOptions {
+                width: RenderOptions::default().width,
+                height: RenderOptions::default().height,
                 orb_size: spec.orb_size,
                 blur: spec.blur,
-                saturation: spec.saturation,
+                saturation: 1.0,
+                direction: spec.direction,
+                speed: spec.speed,
+                seed: spec.seed,
+                count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
-                ..RenderOptions::default()
             };
-            let img = render_static(clusters, &opts);
+            let img = orber::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
         }
         VariationKind::Mp4 => {
             let opts = VideoOptions {
                 orb_size: spec.orb_size,
                 blur: spec.blur,
-                saturation: spec.saturation,
-                motion_shape: spec.shape,
-                motion_speed: spec.speed,
+                saturation: 1.0,
+                direction: spec.direction,
+                speed: spec.speed,
                 seed: spec.seed,
+                count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
             };
@@ -573,12 +611,12 @@ mod tests {
     fn cli_defaults_match_animate_options_defaults() {
         // CLI のデフォルトが AnimateOptions::default() と一致することを保証。
         // 動画経路は VideoOptions だが、内部で AnimateOptions を組み立てるため
-        // ここで motion/orb_size/blur/saturation の SoT 一致を担保する。
+        // ここで direction/speed/orb_size/blur/saturation の SoT 一致を担保する。
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.mp4"]);
         let a = AnimateOptions::default();
-        let (shape, speed) = resolve_motion(&cli);
-        assert_eq!(shape, a.motion_shape, "motion_shape default mismatch");
-        assert_eq!(speed, a.motion_speed, "motion_speed default mismatch");
+        let (direction, speed) = resolve_motion(&cli);
+        assert_eq!(direction, a.direction, "direction default mismatch");
+        assert_eq!(speed, a.speed, "speed default mismatch");
         assert_eq!(cli.orb_size, a.orb_size, "orb_size default mismatch");
         assert_eq!(cli.blur, a.blur, "blur default mismatch");
         assert_eq!(cli.saturation, a.saturation, "saturation default mismatch");
@@ -640,6 +678,22 @@ mod tests {
         assert!(try_parse(&["--duration-ms", "600001"]).is_err());
         assert!(try_parse(&["--duration-ms", "1000"]).is_ok());
         assert!(try_parse(&["--duration-ms", "600000"]).is_ok());
+    }
+
+    #[test]
+    fn count_out_of_range_rejected() {
+        assert!(try_parse(&["--count", "0"]).is_err());
+        assert!(try_parse(&["--count", "1025"]).is_err());
+        assert!(try_parse(&["--count", "abc"]).is_err());
+        assert!(try_parse(&["--count", "1"]).is_ok());
+        assert!(try_parse(&["--count", "20"]).is_ok());
+        assert!(try_parse(&["--count", "1024"]).is_ok());
+    }
+
+    #[test]
+    fn count_default_is_twenty() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        assert_eq!(cli.count, 20);
     }
 
     #[test]

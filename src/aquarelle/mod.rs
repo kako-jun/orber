@@ -155,6 +155,7 @@ fn color_with_alpha(rgb: [u8; 3], a: u8) -> [u8; 4] {
     [rgb[0], rgb[1], rgb[2], a]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_radial(
     pixmap: &mut Pixmap,
     cx: f32,

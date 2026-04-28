@@ -1,103 +1,102 @@
-//! orb のゆったり移動アニメーションモジュール。
+//! orb の一方通行コンベアベルト型アニメーションモジュール。
 //!
 //! 時間 `t ∈ [0, 1]` を受け取り、その時刻における 1 フレーム
 //! ([`image::RgbaImage`]) を返す関数 [`render_frame`] を提供する。
 //! `t = 0` と `t = 1` は同一フレームに収束する完全ループ。
 //!
+//! # コンセプト
+//!
+//! - 1 動画につき方向は 1 つだけ（左→右 / 右→左 / 上→下 / 下→上）
+//! - 全 orb が同じ方向に**ゆったり一方通行**で進む
+//! - orb は元の位置に戻らず、リサジュー反射もしない
+//! - 画面端から消えた orb は、反対側から新しい orb として入ってくる
+//!   （wrap = `rem_euclid` による永続ループ）
+//! - orb ごとに初期位相 (phase) を 0..1 でばらけさせ、配置と「同期しない」感を作る
+//! - 移動中は orb ごとに 3 軸独立の位相で半径・blur・opacity が呼吸的に微揺らぎ
+//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立。
+//!   独立モードではなく、常に薄く乗る自動効果）
+//! - 静止画は流れの一瞬。t=0 のフレームを切り取った絵で、phase 由来で
+//!   orb が散らばっており、画面端で半分欠けるのが普通の状態
+//!
 //! # 設計メモ
 //!
-//! - 軌道は **リサジュー曲線** (sin(2π·a·t + φx), sin(2π·b·t + φy)) を採用する。
-//!   周波数比 (a, b) は整数比から RNG で選ぶ。整数比なので位相は t=1 で完全に
-//!   閉じ、ループ性が浮動小数点誤差なしに保証される。位相を計算する際は
-//!   `(a * t * freq_scale).fract()` で先に整数部を捨てておくことで、
-//!   t=1.0 の整数倍を `sin(2π·0)` と完全同一の演算に収束させる。
+//! - 軌道はもはやリサジュー曲線ではなく、**進行方向への線形運動 +
+//!   画面外バッファ付き `rem_euclid` による wrap**。直交軸の位置は初期位置から動かない。
+//! - 各 orb の進行範囲は `[-r, 1+r]`（`r` = orb 半径を進行軸長で正規化した値）。
+//!   wrap 境界の出現/消失が画面の縁で起こるのではなく、orb が完全に画面外に
+//!   出てから入れ替わるので、視覚的にシームレスにつながる。
+//! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
+//!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
+//!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
+//! - 速度ジッタは **整数倍** (1x / 2x) で導入する。orb ごとに seed 由来で
+//!   `speed_mult ∈ {1, 2}` を割り当て、進行量を `cycle * speed_mult * t` とする。
+//!   両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
+//!   Slow と組み合わせると実効周回数は {1, 2, 4} に変化に富む。
+//! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
+//!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
+//! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
+//!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
 //!   t で 100% 同一フレームが返る。
-//! - 描画は [`crate::orb::render_static`] を素直に呼ぶ。位置と色を変調した
-//!   `Cluster` 列を作って渡す。
-//! - 色揺らぎは HSL の S と L に微小な追加倍率をかける。`AnimateOptions.saturation`
-//!   とは独立 — saturation はそのまま [`crate::orb::RenderOptions`] に渡し、
-//!   揺らぎは local な追加変動として上に乗る（二重に saturation が掛からないよう
-//!   注意）。
-//! - `MotionPreset::Still` は amplitude も freq_scale も 0 で、`render_static`
-//!   と完全同一の結果を返す。
+//! - 描画は [`crate::orb::render_one_orb`] を per-orb で呼ぶ。背景塗りと
+//!   un-premultiply は animate 側で同等の処理を行う。
 
-use crate::cluster::{Centroid, Cluster};
-use crate::orb::{render_static, OrbShape, RenderOptions};
+use crate::cluster::Cluster;
+use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use image::RgbaImage;
-use palette::{FromColor, Hsl, IntoColor, Srgb};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::f32::consts::TAU;
+use tiny_skia::{Color, Pixmap};
 
-/// 軌道形（位置・サイズの動きパターン）。速度（[`MotionSpeed`]）と直交する次元。
+/// 流れる方向。1 動画で 1 方向のみ。
+///
+/// 各 orb は同じ方向に同じ向きで進む。逆向きの orb は混ぜない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionShape {
-    /// 動かない（render_static と同じ結果）
-    Still,
-    /// リサジュー曲線（互いに干渉する 2D 軌道、既定）
-    Lissajous,
-    /// 縦方向のみ往復
-    Vertical,
-    /// 横方向のみ往復
-    Horizontal,
-    /// 斜め往復（dx と dy が同位相）
-    Diagonal,
-    /// 中心固定で半径が膨張収縮（呼吸）
-    Breathe,
-    /// 中心固定で大きさと明度が微小に瞬く（瞬き）
-    Twinkle,
+pub enum MotionDirection {
+    /// 左から右へ流れる。
+    LeftToRight,
+    /// 右から左へ流れる。
+    RightToLeft,
+    /// 上から下へ流れる。
+    TopToBottom,
+    /// 下から上へ流れる。
+    BottomToTop,
 }
 
-/// 動きの速度・振幅レベル。形（[`MotionShape`]）と直交する次元。
+/// 流れの速さ。動画全体（duration）で何回画面を横断するかを整数 2 段階で表す。
+///
+/// 整数横断回数にすることで `t=0` と `t=1` のフレームが完全一致する（ループ性）。
+/// 8 秒クリップで VerySlow なら 8 秒で 1 回横断、Slow なら 4 秒で 1 回横断。
+/// 実時間で「ずっと遅い」感を出すには、長めの `duration_ms`（6000〜10000 ms 程度）
+/// と組み合わせること。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionSpeed {
-    /// 夜景向け微動（位置振幅 ~2%、freq_scale=1）
-    Subtle,
-    /// 既定（位置振幅 ~6%、freq_scale=1）
+    /// 動画全体で画面 1 回横断（最も穏やか、既定相当）。
+    VerySlow,
+    /// 動画全体で画面 2 回横断（既定）。
     Slow,
-    /// 活発（位置振幅 ~12%、freq_scale=2）
-    Lively,
 }
 
 impl MotionSpeed {
-    /// (位置振幅, 色振幅, 周波数倍率) を返す。
+    /// 動画全体での横断回数。整数なので `t=0` と `t=1` で進行量が完全一致する。
     ///
-    /// - 位置振幅は短辺 `min(width, height)` に対する比（0.06 → 6%）。
-    /// - 色振幅は HSL の S/L にかかる加算的な揺らぎ係数。
-    /// - 周波数倍率は「t=1 で何周回るか」を制御する**整数限定**。`(a, b)` リサジュー比
-    ///   や shape 内部の整数 frequency と掛け合わせても整数のままなのでループ性は保たれる。
-    pub(crate) fn coefficients(self) -> (f32, f32, u32) {
+    /// `MotionSpeed` 自体が `pub` なので、外部利用者が enum 各 variant の意味
+    /// （何回画面を横断するか）を introspect できるよう `pub` にしている。
+    pub fn cycle_count(self) -> u32 {
         match self {
-            MotionSpeed::Subtle => (0.02, 0.03, 1),
-            MotionSpeed::Slow => (0.06, 0.05, 1),
-            MotionSpeed::Lively => (0.12, 0.10, 2),
-        }
-    }
-}
-
-/// 後方互換の動きプリセット。CLI の `--motion <still|slow|lively>` 経由でのみ使う。
-///
-/// 内部処理は [`MotionShape`] と [`MotionSpeed`] の組に展開される。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionPreset {
-    Still,
-    Slow,
-    Lively,
-}
-
-impl MotionPreset {
-    /// 旧 preset を新しい (shape, speed) の組に展開する。
-    pub fn split(self) -> (MotionShape, MotionSpeed) {
-        match self {
-            MotionPreset::Still => (MotionShape::Still, MotionSpeed::Slow),
-            MotionPreset::Slow => (MotionShape::Lissajous, MotionSpeed::Slow),
-            MotionPreset::Lively => (MotionShape::Lissajous, MotionSpeed::Lively),
+            MotionSpeed::VerySlow => 1,
+            MotionSpeed::Slow => 2,
         }
     }
 }
 
 /// アニメーション 1 フレーム描画のオプション。
+///
+/// `count` は同時可視 orb の総数。`None` の場合は cluster 数と一致させる
+/// （後方互換）。`Some(n)` を指定すると、cluster K 色を seed 由来で N 個に
+/// **展開** する。色は weight 比例の重み付き抽選で割り当て、初期位相 / 縦軸
+/// オフセットは seed から決定的に振る。
 #[derive(Debug, Clone)]
 pub struct AnimateOptions {
     pub width: u32,
@@ -105,9 +104,11 @@ pub struct AnimateOptions {
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
-    pub motion_shape: MotionShape,
-    pub motion_speed: MotionSpeed,
+    pub direction: MotionDirection,
+    pub speed: MotionSpeed,
     pub seed: u64,
+    /// 同時可視 orb の総数。None → cluster 数。Some(n) → クラスタ展開。
+    pub count: Option<usize>,
     /// 背景 RGBA。alpha=0 で透過。
     pub background: [u8; 4],
     /// orb の描画形式。
@@ -122,40 +123,113 @@ impl Default for AnimateOptions {
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
-            motion_shape: MotionShape::Lissajous,
-            motion_speed: MotionSpeed::Slow,
+            direction: MotionDirection::LeftToRight,
+            speed: MotionSpeed::Slow,
             seed: 0,
+            count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
         }
     }
 }
 
-/// リサジュー周波数比の候補。すべて整数比なのでループ性が保証される。
-pub(crate) const FREQ_RATIOS: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (1, 3), (2, 5)];
+/// 半径呼吸の上限係数。`render_frame` の `radius_factor` の最大値（1.0 + 0.10）と
+/// 一致させる必要がある。`r_pixels_max` の見積りで使うため定数として括り出している。
+const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
 
-/// 各 cluster の決定的な軌道パラメータ。
+/// 半径呼吸の振幅。`BREATH_RADIUS_MAX_FACTOR = 1.0 + BREATH_RADIUS_AMPLITUDE`。
+const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
+
+/// 各 orb の決定的なパラメータ。
+///
+/// `phase` は 0..1 の初期位置オフセット。`phi_radius` / `phi_blur` / `phi_opacity` は
+/// 3 軸独立の呼吸位相シフト（radius は ±10%、blur は ±15%、opacity は ±5%）。
+/// `style` は orb ごとの描画スタイル（Rim / Soft）で、フレーム内に混在させる。
+/// `cluster_idx` はこの orb の色とサイズを取ってくる元クラスタの index（重み比例で抽選）。
+/// `cross_axis` は進行方向と直交する軸の正規化座標 0..1。orb をクラスタ重心に固定
+/// せず、画面全体に散らせるためのオフセット。
+/// `speed_mult` は整数倍速度 (1 / 2)。`cycle_count * speed_mult` も整数なので
+/// `t=1` でループが閉じる。視覚的なバラつきの主因。
 #[derive(Debug, Clone, Copy)]
-struct OrbitParams {
-    a: u32,
-    b: u32,
-    phi_x: f32,
-    phi_y: f32,
-    phi_color: f32,
+struct OrbParams {
+    /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
+    phase: f32,
+    /// 半径呼吸 sin の位相シフト。
+    phi_radius: f32,
+    /// blur 呼吸 sin の位相シフト。radius と同期させない。
+    phi_blur: f32,
+    /// opacity 呼吸 sin の位相シフト。3 軸を独立に。
+    phi_opacity: f32,
+    /// 描画スタイル（Rim / Soft）。seed 由来でほぼ 50:50 に振る。
+    style: OrbStyle,
+    /// この orb の色 / weight を借りてくる元クラスタの index。
+    cluster_idx: usize,
+    /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
+    cross_axis: f32,
+    /// 整数倍速度 (1 / 2)。MotionSpeed の cycle_count と掛け合わせて使う。
+    speed_mult: u32,
 }
 
-/// `seed` から各 cluster の軌道パラメータを決定的に生成する。
-fn generate_orbit_params(seed: u64, n_clusters: usize) -> Vec<OrbitParams> {
+/// 重み比例の 1 サンプルをもらう抽選器。
+///
+/// `weights` 全部の合計を 1 度だけ計算し、累積和上の二分探索で index を返す。
+/// 全 weight が 0 の場合は 0 を返す（呼び出し側で要素が無いケースを弾いていないと
+/// パニックするので注意）。
+fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
+    if total <= 0.0 || weights.is_empty() {
+        return 0;
+    }
+    debug_assert!(
+        !weights.is_empty(),
+        "pick_weighted assumes non-empty weights after early return"
+    );
+    let r = rng.gen::<f32>() * total;
+    let mut acc = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w.max(0.0);
+        if r <= acc {
+            return i;
+        }
+    }
+    weights.len() - 1
+}
+
+/// `seed` から各 orb のパラメータを決定的に生成する。
+///
+/// `n_orbs` は要求される orb 数。`cluster_weights` は各クラスタの占有比で、
+/// orb の色割当（cluster_idx）に重み比例で使われる。`style` と `cluster_idx` は
+/// 整数を別途引いて分布の偏りを避ける。
+fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..n_clusters)
+    let total_w: f32 = cluster_weights.iter().map(|w| w.max(0.0)).sum();
+    (0..n_orbs)
         .map(|_| {
-            let (a, b) = FREQ_RATIOS[rng.gen_range(0..FREQ_RATIOS.len())];
-            OrbitParams {
-                a,
-                b,
-                phi_x: rng.gen_range(0.0..TAU),
-                phi_y: rng.gen_range(0.0..TAU),
-                phi_color: rng.gen_range(0.0..TAU),
+            let phase = rng.gen_range(0.0..1.0);
+            let phi_radius = rng.gen_range(0.0..TAU);
+            let phi_blur = rng.gen_range(0.0..TAU);
+            let phi_opacity = rng.gen_range(0.0..TAU);
+            // cross_axis は完全独立の一様分布で散らす。cluster centroid をそのまま
+            // 使うと同色 orb が同じ縦軸 / 横軸に並んで縞模様になるため、画面全体に
+            // 散布する目的でクラスタ重心とは無関係なオフセットを使う。
+            let cross_axis = rng.gen_range(0.0..1.0);
+            let style = if rng.gen::<u32>() & 1 == 0 {
+                OrbStyle::Rim
+            } else {
+                OrbStyle::Soft
+            };
+            let cluster_idx = pick_weighted(&mut rng, cluster_weights, total_w);
+            // 整数倍速度。1/2 を均等に割り当て。整数 × 整数の cycle_count なので
+            // t=1 で fract が 0 になりループ性は保たれる。
+            let speed_mult = rng.gen_range(1..=2);
+            OrbParams {
+                phase,
+                phi_radius,
+                phi_blur,
+                phi_opacity,
+                style,
+                cluster_idx,
+                cross_axis,
+                speed_mult,
             }
         })
         .collect()
@@ -166,135 +240,212 @@ fn generate_orbit_params(seed: u64, n_clusters: usize) -> Vec<OrbitParams> {
 /// `f` と `scale` がともに整数のとき、`t = 1.0` ちょうどで `(f * t * scale)` は
 /// 整数になり `fract()` は 0.0、`t = 0.0` のときの `sin(phi)` と完全に同一の
 /// 演算に収束する。これが t=0 / t=1 フレーム完全一致（=ループ性）の根拠。
-/// 引数の型 `u32` がこの「整数限定」を型レベルで保証する。
 #[inline]
 fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
     let raw = (f as f32 * t * scale as f32).fract();
     (raw * TAU + phi).sin()
 }
 
-/// HSL の S と L に乗算的な微変動をかける（揺らぎ）。
-///
-/// `s_factor` / `l_factor` は `1 + amplitude * sin(...)` の形で渡されることを
-/// 想定する。saturation の cluster 全体倍率は呼び出し側（`render_static`）で
-/// かかるので、ここでは触らない。
-///
-/// 注意: render_static 側でも HSL 経由の saturation 調整があるので、
-/// このフレームでは色が HSL→RGB→HSL→RGB と往復する。
-/// 各段階で f32→u8 量子化が入るが、Slow preset の amplitude_color=0.05 程度なら
-/// 視覚的に差は出ない（経験的に色差 ΔE で 1 未満）。
-/// より精密な制御が必要になったら fused パイプラインに置換する。
-fn modulate_color(rgb: [u8; 3], s_factor: f32, l_factor: f32) -> [u8; 3] {
-    let srgb = Srgb::new(
-        rgb[0] as f32 / 255.0,
-        rgb[1] as f32 / 255.0,
-        rgb[2] as f32 / 255.0,
-    );
-    let mut hsl: Hsl = Hsl::from_color(srgb);
-    hsl.saturation = (hsl.saturation * s_factor).clamp(0.0, 1.0);
-    hsl.lightness = (hsl.lightness * l_factor).clamp(0.0, 1.0);
-    let out: Srgb = hsl.into_color();
-    [
-        (out.red.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (out.green.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (out.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
-}
-
 /// 時間 `t` における 1 フレームを描画する。
 ///
 /// `t = 0.0` と `t = 1.0` は同一フレームを返す（完全ループ）。
-/// `MotionPreset::Still` のときは `t` に依存せず常に同じフレームを返す。
 ///
-/// 決定論性: 同じ seed と同じ clusters なら出力は完全一致する。
-/// ただし RNG は cluster index 順に消費するため、cluster 数や順序が変わると
-/// 各 orb の軌道パラメータも変わる（後段の cluster ほど影響を受ける）。
-// TODO: weight ベースの振幅補正（小さい orb は小さく動く）は将来 Issue で検討。
-// 現状は全 orb 同振幅で軌道を描く。
+/// # ループ性の根拠
+///
+/// - 進行方向の位置: 画面外バッファ付き wrap。`extent = 1 + 2r` の周期上で
+///   `raw = (phase + cycle * speed_mult * t) * extent`、`pos = raw.rem_euclid(extent) - r`。
+///   `cycle * speed_mult` は整数なので `t = 1.0` で `(cycle * speed_mult * 1.0)` も整数、
+///   fract は 0 になり `t = 0.0` のときと完全同一の演算に収束する。
+/// - 呼吸揺らぎ: `sin_loop(1, t, 1, phi)` で 1 周。t=0 と t=1 で同じ sin 値。
+///
+/// # 決定論性
+///
+/// 同じ seed と同じ clusters なら出力は完全一致する。RNG は orb index 順に固定
+/// シーケンスで消費されるため、count や seed が変わると各 orb の phase /
+/// phi_radius / phi_blur / phi_opacity / cross_axis / style / cluster_idx /
+/// speed_mult 割当が同時に変わる。
 pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
-    // Still は速度に依存しないので、speed の係数を読まずに 0 を直接使う。
-    // それ以外の shape は speed から振幅と freq_scale を取り出す。
-    let (amp_pos, amp_color, freq_scale) = if opts.motion_shape == MotionShape::Still {
-        (0.0, 0.0, 0)
-    } else {
-        opts.motion_speed.coefficients()
-    };
-    let params = generate_orbit_params(opts.seed, clusters.len());
+    let params = precompute_orb_params(opts, clusters);
+    render_frame_with_params(clusters, opts, &params, t)
+}
 
-    // amp_pos は短辺 (min(w, h)) 基準の振幅比。normalized 座標 [0, 1] に直接
-    // 加算すると、render_static 側で x は width 倍・y は height 倍されて
-    // 縦横比に歪んだ楕円になってしまう。axis-scale 補正で normalized 座標系
-    // における円軌道を保つ。
-    let min_side = opts.width.min(opts.height) as f32;
-    let scale_x = min_side / opts.width as f32; // <= 1.0
-    let scale_y = min_side / opts.height as f32; // <= 1.0
+/// `render_frame` で使う per-orb パラメータをまとめてプリコンピュートしたもの。
+///
+/// 連続するフレームで同じ `seed` / `count` / `clusters` を使う場合（典型的には
+/// 動画書き出し）、これを 1 回計算してフレームループで使い回すことで
+/// `Vec<OrbParams>` 割当と RNG 走行のコストを排除できる。
+///
+/// `seed` / `count` / `cluster_weights` のいずれかを変える場合は再計算する必要がある
+/// （`Default` / `Copy` を実装しないのは、その不変条件をうっかり壊すのを防ぐため）。
+#[derive(Debug, Clone)]
+pub struct CachedOrbParams {
+    params: Vec<OrbParams>,
+}
+
+/// `opts.seed` / `opts.count` / `clusters.weight` から決定的な orb パラメータ列を生成する。
+///
+/// 動画書き出しのフレームループで使い回す前提のキャッシュ。`render_frame` の中で
+/// 暗黙に毎フレーム呼ばれていたものを、呼び出し側で 1 回呼んで保持できるよう
+/// 公開した。
+pub fn precompute_orb_params(opts: &AnimateOptions, clusters: &[Cluster]) -> CachedOrbParams {
+    let n_orbs = opts
+        .count
+        .unwrap_or(clusters.len())
+        .min(MAX_ORB_COUNT)
+        .max(if clusters.is_empty() { 0 } else { 1 });
+    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
+    CachedOrbParams {
+        params: generate_orb_params(opts.seed, n_orbs, &cluster_weights),
+    }
+}
+
+/// プリコンピュート済みの `CachedOrbParams` を使って 1 フレーム描画する。
+///
+/// `precompute_orb_params(opts, clusters)` で得た cache を渡すこと。
+/// `clusters` / `opts` （seed / count / 解像度等）が cache 計算時と一致していないと
+/// レンダリング結果は不定（パニックはしないが意味のある画像にならない）。
+pub fn render_frame_with_params(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    cache: &CachedOrbParams,
+    t: f32,
+) -> RgbaImage {
+    let cycle = opts.speed.cycle_count();
+    let params = &cache.params;
+
+    let width = opts.width.max(1);
+    let height = opts.height.max(1);
+
+    // Aquarelle 経路は per-orb の独立揺らぎに対応していないので、従来の
+    // render_static + Cluster 列変調パスへフォールバックする（Aquarelle は
+    // bleed/bloom/halo を内部で持っているので 3 軸揺らぎを足すと壊れる）。
+    if let OrbShape::Aquarelle(_) = opts.shape {
+        return render_frame_aquarelle(clusters, opts, params, t);
+    }
+
+    // Circle 経路: 自前で Pixmap を作って per-orb で render_one_orb を呼ぶ。
+    let mut pixmap =
+        Pixmap::new(width, height).expect("pixmap allocation should succeed for >0 dimensions");
+    let [br, bg, bb, ba] = opts.background;
+    if ba > 0 {
+        pixmap.fill(Color::from_rgba8(br, bg, bb, ba));
+    }
+
+    if clusters.is_empty() {
+        return finalize_pixmap(pixmap, width, height);
+    }
+
+    let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
+    let saturation = opts.saturation.max(0.0);
+    let base_blur = opts.blur.clamp(0.0, 1.0);
+
+    // 進行軸の長さ（ピクセル）。LR/RL では width、TB/BT では height。
+    // r_normalized を計算する基準になる。
+    let progress_axis_pixels = match opts.direction {
+        MotionDirection::LeftToRight | MotionDirection::RightToLeft => width as f32,
+        MotionDirection::TopToBottom | MotionDirection::BottomToTop => height as f32,
+    };
+
+    for p in params.iter() {
+        // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
+        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
+
+        // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
+        // r_normalized は進行軸 [0,1] スケールにおける半径相当。
+        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_normalized = if progress_axis_pixels > 0.0 {
+            r_pixels_max / progress_axis_pixels
+        } else {
+            0.0
+        };
+        // 周期長: 画面外バッファを左右（あるいは上下）に r ずつ持つので [-r, 1+r) の幅。
+        // すなわち extent = 1 + 2r、pos ∈ [-r, 1+r) という対応関係。
+        let extent = 1.0 + 2.0 * r_normalized;
+
+        // 進行量。phase は 0..1 を extent にスケール、advance は extent 単位で進める。
+        // cycle * speed_mult は整数なので t=1 で fract が 0、ループ性は保たれる。
+        let advance_steps = (cycle as f32 * p.speed_mult as f32 * t).fract();
+        let raw = p.phase * extent + advance_steps * extent;
+        // pos ∈ [-r_normalized, 1 + r_normalized)。画面外バッファに居る間は orb 中心が
+        // 画面の縁を超えており、半径を考慮しても完全に画面外。
+        let pos = raw.rem_euclid(extent) - r_normalized;
+
+        // 直交軸は cluster 重心ではなく cross_axis（seed 由来 0..1）で散らせる。
+        // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
+        // なるので、画面全体に散布するため orb 個別のオフセットを使う。
+        let (nx, ny) = match opts.direction {
+            MotionDirection::LeftToRight => (pos, p.cross_axis),
+            MotionDirection::RightToLeft => (1.0 - pos, p.cross_axis),
+            MotionDirection::TopToBottom => (p.cross_axis, pos),
+            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - pos),
+        };
+
+        // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
+        // ループする。位相は seed から決定的に生成しているので、軸間で同期しない。
+        // - radius: ±10%
+        // - blur: ±15%
+        // - opacity: ±5%
+        let radius_factor = 1.0 + 0.10 * sin_loop(1, t, 1, p.phi_radius);
+        let blur_delta = 0.15 * sin_loop(1, t, 1, p.phi_blur);
+        let opacity_factor = 1.0 + 0.05 * sin_loop(1, t, 1, p.phi_opacity);
+
+        let radius = base_radius_unit * c.weight.max(0.0).sqrt() * radius_factor;
+        if radius <= 0.0 {
+            continue;
+        }
+
+        // clamp を外し、画面外（負・1超）の値も許可する。tiny-skia 側は描画範囲外を
+        // 安全にクリップする（半透明グラデのカウントだけ無駄に走るが、許容範囲）。
+        let cx = nx * width as f32;
+        let cy = ny * height as f32;
+        let rgb = adjust_saturation_pub(c.color, saturation);
+        let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
+        let opacity = opacity_factor.clamp(0.0, 1.0);
+
+        // 各 orb のスタイル（Rim / Soft）を seed 由来で振り分け、フレーム内に混在させる。
+        render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
+    }
+
+    finalize_pixmap(pixmap, width, height)
+}
+
+/// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
+const MAX_ORB_COUNT: usize = 1024;
+
+/// Aquarelle shape は既存の render_static フォールバック経路。
+///
+/// Aquarelle は内部で bleed / bloom / halo を持っているため、per-orb の独立揺らぎを
+/// 足すと質感セットが壊れる。半径だけの呼吸を従来どおり cluster.weight に乗せる。
+/// count による展開は Aquarelle では行わない（質感セットが orb ごとに重い）。
+/// 受け取った `params` の先頭から cluster 数だけ消費する。
+fn render_frame_aquarelle(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    params: &[OrbParams],
+    t: f32,
+) -> RgbaImage {
+    use crate::cluster::Centroid;
+    use crate::orb::{render_static, RenderOptions};
+
+    let cycle = opts.speed.cycle_count();
 
     let modulated: Vec<Cluster> = clusters
         .iter()
         .zip(params.iter())
         .map(|(c, p)| {
-            // shape ごとに位置オフセットと weight 倍率を決める。
-            // weight 倍率は radius = base * sqrt(weight) を介して半径を
-            // (sqrt(weight_scale)) 倍する。Breathe / Twinkle で半径を直接揺らす。
-            let (dx, dy, radius_factor) = match opts.motion_shape {
-                MotionShape::Still => (0.0, 0.0, 1.0),
-                MotionShape::Lissajous => (
-                    amp_pos * scale_x * sin_loop(p.a, t, freq_scale, p.phi_x),
-                    amp_pos * scale_y * sin_loop(p.b, t, freq_scale, p.phi_y),
-                    1.0,
-                ),
-                MotionShape::Vertical => (
-                    0.0,
-                    amp_pos * scale_y * sin_loop(1, t, freq_scale, p.phi_y),
-                    1.0,
-                ),
-                MotionShape::Horizontal => (
-                    amp_pos * scale_x * sin_loop(1, t, freq_scale, p.phi_x),
-                    0.0,
-                    1.0,
-                ),
-                MotionShape::Diagonal => {
-                    let v = sin_loop(1, t, freq_scale, p.phi_x);
-                    (amp_pos * scale_x * v, amp_pos * scale_y * v, 1.0)
-                }
-                MotionShape::Breathe => {
-                    // 半径を ±(2 * amp_pos) の範囲で呼吸させる（位置基準の amp_pos を流用）。
-                    // amp_pos=0.06 なら半径は 0.88..1.12 倍で揺らぐ。
-                    let phase = sin_loop(1, t, freq_scale, p.phi_color);
-                    let r = (1.0 + 2.0 * amp_pos * phase).max(0.0);
-                    (0.0, 0.0, r)
-                }
-                MotionShape::Twinkle => {
-                    // 半径と明度を sin で同期して揺らす。amp_pos=0.06 なら半径は 0.7..1.3 倍。
-                    // 「瞬き」感を出すため Breathe より振幅を大きめに、freq_scale も 2 倍する。
-                    let phase = sin_loop(2, t, freq_scale, p.phi_color);
-                    let r = (1.0 + 5.0 * amp_pos * phase).max(0.0);
-                    (0.0, 0.0, r)
-                }
+            let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
+            let progress = (p.phase + advance).rem_euclid(1.0);
+            let (nx, ny) = match opts.direction {
+                MotionDirection::LeftToRight => (progress, c.centroid.y),
+                MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
+                MotionDirection::TopToBottom => (c.centroid.x, progress),
+                MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
             };
-
-            // 範囲外に出た場合は clamp。軌道半径は数% 程度なので長時間停滞は起きにくい。
-            let new_x = (c.centroid.x + dx).clamp(0.0, 1.0);
-            let new_y = (c.centroid.y + dy).clamp(0.0, 1.0);
-
-            // 色揺らぎ: HSL の S と L を 1 ± amp_color の範囲で振る。
-            // Twinkle は明度の振れ幅を倍にして「瞬き」感を強める。
-            let color_phase = sin_loop(1, t, freq_scale, p.phi_color);
-            let l_amp = match opts.motion_shape {
-                MotionShape::Twinkle => amp_color,
-                _ => amp_color * 0.5,
-            };
-            let s_factor = 1.0 + amp_color * color_phase;
-            let l_factor = 1.0 + l_amp * color_phase;
-            let new_color = modulate_color(c.color, s_factor, l_factor);
-
-            // radius = base * sqrt(weight) なので、半径を radius_factor 倍するには
-            // weight を radius_factor^2 倍すれば良い。
+            let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
-
             Cluster {
-                color: new_color,
-                centroid: Centroid { x: new_x, y: new_y },
+                color: c.color,
+                centroid: Centroid { x: nx, y: ny },
                 weight: (c.weight * weight_scale).max(0.0),
             }
         })
@@ -312,9 +463,32 @@ pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> Rgba
     render_static(&modulated, &render_opts)
 }
 
+/// Pixmap → RgbaImage 変換（un-premultiply 込み）。
+///
+/// tiny-skia の Pixmap は premultiplied alpha なので straight に戻す。
+fn finalize_pixmap(pixmap: Pixmap, width: u32, height: u32) -> RgbaImage {
+    let mut buf = pixmap.take();
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            let inv = 255.0 / a as f32;
+            px[0] = (px[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            px[1] = (px[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            px[2] = (px[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    RgbaImage::from_raw(width, height, buf)
+        .expect("raw buffer length matches width * height * 4 by construction")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::Centroid;
 
     fn cluster(color: [u8; 3], cx: f32, cy: f32, weight: f32) -> Cluster {
         Cluster {
@@ -332,32 +506,17 @@ mod tests {
         ]
     }
 
-    fn small_opts(motion: MotionPreset) -> AnimateOptions {
-        let (shape, speed) = motion.split();
+    fn opts_with(direction: MotionDirection, speed: MotionSpeed) -> AnimateOptions {
         AnimateOptions {
             width: 64,
             height: 64,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
-            motion_shape: shape,
-            motion_speed: speed,
+            direction,
+            speed,
             seed: 12345,
-            background: [0, 0, 0, 255],
-            shape: OrbShape::Circle,
-        }
-    }
-
-    fn opts_with(shape: MotionShape, speed: MotionSpeed) -> AnimateOptions {
-        AnimateOptions {
-            width: 64,
-            height: 64,
-            orb_size: 1.0,
-            blur: 0.5,
-            saturation: 1.0,
-            motion_shape: shape,
-            motion_speed: speed,
-            seed: 12345,
+            count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
         }
@@ -369,9 +528,9 @@ mod tests {
 
     #[test]
     fn t_zero_and_t_one_match() {
-        // 整数周波数比 + 整数 freq_scale + fract 補正により、t=0 と t=1 は
-        // 完全同一フレームになることを検証（ループ性）。
-        let opts = small_opts(MotionPreset::Slow);
+        // wrap で進行量 = (phase + cycle*0) と (phase + cycle*1) は mod 1 で同一に
+        // なるので t=0 と t=1 のフレームは完全一致する（ループ性）。
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         let clusters = sample_clusters();
         let a = render_frame(&clusters, &opts, 0.0);
         let b = render_frame(&clusters, &opts, 1.0);
@@ -383,8 +542,7 @@ mod tests {
 
     #[test]
     fn same_seed_same_t_deterministic() {
-        // 同じ seed・clusters・opts・t で 2 回 render すると完全一致する。
-        let opts = small_opts(MotionPreset::Slow);
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         let clusters = sample_clusters();
         let a = render_frame(&clusters, &opts, 0.37);
         let b = render_frame(&clusters, &opts, 0.37);
@@ -396,11 +554,11 @@ mod tests {
 
     #[test]
     fn different_t_produces_different_frame() {
-        // 同じ seed で t を変えると別フレームになる（Slow preset は動く）。
-        let opts = small_opts(MotionPreset::Slow);
+        // t を変えると進行量が変わって別フレームになる。
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         let clusters = sample_clusters();
         let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.25);
+        let b = render_frame(&clusters, &opts, 0.5);
         assert!(
             !pixels_equal(&a, &b),
             "different t must produce different frames under Slow motion"
@@ -408,69 +566,18 @@ mod tests {
     }
 
     #[test]
-    fn still_motion_independent_of_t() {
-        // Still preset は amplitude=0, freq_scale=0 なので t に依存せず常に同じ。
-        let opts = small_opts(MotionPreset::Still);
+    fn different_seed_changes_layout() {
+        // 同じ clusters・opts でも seed が違うと phase が変わって配置が変わる。
         let clusters = sample_clusters();
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.3);
-        let c = render_frame(&clusters, &opts, 0.7);
-        assert!(pixels_equal(&a, &b), "Still: t=0.0 vs t=0.3 must match");
-        assert!(pixels_equal(&b, &c), "Still: t=0.3 vs t=0.7 must match");
-    }
-
-    #[test]
-    fn lively_amplitude_larger_than_slow() {
-        // Slow と Lively で完全一致しないこと（preset の違いが描画に表れる）と、
-        // t=0 からの差分総和が Lively > Slow になることの両方を担保する。
-        // 位置振幅 (Slow=0.06, Lively=0.12) と freq_scale (1 vs 2) の両方が
-        // 効くので、Lively の方が動きが大きく出るはず。
-        let clusters = sample_clusters();
-        let slow_opts = small_opts(MotionPreset::Slow);
-        let lively_opts = small_opts(MotionPreset::Lively);
-        let slow = render_frame(&clusters, &slow_opts, 0.25);
-        let lively = render_frame(&clusters, &lively_opts, 0.25);
-
-        assert!(
-            !pixels_equal(&slow, &lively),
-            "Slow and Lively must render differently at t=0.25"
-        );
-
-        let slow_t0 = render_frame(&clusters, &slow_opts, 0.0);
-        let lively_t0 = render_frame(&clusters, &lively_opts, 0.0);
-        let slow_diff: u64 = slow
-            .as_raw()
-            .iter()
-            .zip(slow_t0.as_raw().iter())
-            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
-            .sum();
-        let lively_diff: u64 = lively
-            .as_raw()
-            .iter()
-            .zip(lively_t0.as_raw().iter())
-            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
-            .sum();
-        assert!(
-            lively_diff > slow_diff,
-            "Lively diff ({}) should exceed Slow diff ({}) from t=0 reference",
-            lively_diff,
-            slow_diff
-        );
-    }
-
-    #[test]
-    fn different_seed_changes_orbit() {
-        // 同じ clusters・opts でも seed が違うと（Still 以外で）軌道が変わるはず。
-        let clusters = sample_clusters();
-        let mut opts_a = small_opts(MotionPreset::Slow);
-        let mut opts_b = small_opts(MotionPreset::Slow);
+        let mut opts_a = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut opts_b = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         opts_a.seed = 1;
         opts_b.seed = 2;
         let a = render_frame(&clusters, &opts_a, 0.25);
         let b = render_frame(&clusters, &opts_b, 0.25);
         assert!(
             !pixels_equal(&a, &b),
-            "different seed should change the orbit (and hence the frame)"
+            "different seed should change orb phase (and hence the frame)"
         );
     }
 
@@ -488,54 +595,65 @@ mod tests {
     }
 
     #[test]
-    fn freq_scale_combinations_have_integer_period() {
-        // すべての (a, b) × speed で t=1 のとき位相が完全に閉じる。
-        for &(a, b) in FREQ_RATIOS {
-            for speed in [MotionSpeed::Subtle, MotionSpeed::Slow, MotionSpeed::Lively] {
-                let (_, _, scale) = speed.coefficients();
-                let prod_a = (a as f32 * 1.0 * scale as f32).fract();
-                let prod_b = (b as f32 * 1.0 * scale as f32).fract();
-                assert_eq!(prod_a, 0.0, "a={a} scale={scale}");
-                assert_eq!(prod_b, 0.0, "b={b} scale={scale}");
-            }
-        }
-    }
-
-    #[test]
-    fn all_shape_speed_combinations_loop_closed() {
-        // 全 shape × 全 speed で t=0 と t=1 が完全一致することを検証する。
-        // Twinkle は freq_scale を内部で 2 倍するが、整数演算のままなので閉じる。
+    fn all_direction_speed_combinations_loop_closed() {
+        // 全 direction × 全 speed で t=0 と t=1 が完全一致することを検証する。
         let clusters = sample_clusters();
-        for shape in [
-            MotionShape::Still,
-            MotionShape::Lissajous,
-            MotionShape::Vertical,
-            MotionShape::Horizontal,
-            MotionShape::Diagonal,
-            MotionShape::Breathe,
-            MotionShape::Twinkle,
+        for dir in [
+            MotionDirection::LeftToRight,
+            MotionDirection::RightToLeft,
+            MotionDirection::TopToBottom,
+            MotionDirection::BottomToTop,
         ] {
-            for speed in [MotionSpeed::Subtle, MotionSpeed::Slow, MotionSpeed::Lively] {
-                let opts = opts_with(shape, speed);
+            for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+                let opts = opts_with(dir, speed);
                 let a = render_frame(&clusters, &opts, 0.0);
                 let b = render_frame(&clusters, &opts, 1.0);
                 assert!(
                     pixels_equal(&a, &b),
-                    "loop closure broken for shape={shape:?} speed={speed:?}"
+                    "loop closure broken for direction={dir:?} speed={speed:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn vertical_does_not_move_horizontally() {
-        // Vertical では cluster の x 座標が変わらないので、横スキャンで非ゼロピクセルの
-        // 列範囲が t=0 と t=0.25 で同じになる。簡易チェックとして、最も明るいピクセルの
-        // x 座標が一致することを確認する。
-        let clusters = vec![cluster([255, 0, 0], 0.5, 0.3, 0.5)];
-        let opts = opts_with(MotionShape::Vertical, MotionSpeed::Lively);
+    fn left_to_right_does_not_move_vertically() {
+        // LeftToRight では y が初期位置（centroid.y）のまま動かない。
+        // 1 cluster だけ centroid を画面下半分に置き、最も明るいピクセルの y 座標が
+        // t=0 と t=0.5 で一致することを確認する。
+        let clusters = vec![cluster([255, 0, 0], 0.5, 0.7, 0.5)];
+        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
         let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.25);
+        let b = render_frame(&clusters, &opts, 0.5);
+        let bright_y = |img: &RgbaImage| -> u32 {
+            let mut best = 0u32;
+            let mut best_v = 0u32;
+            for y in 0..img.height() {
+                let mut row_sum = 0u32;
+                for x in 0..img.width() {
+                    row_sum += img.get_pixel(x, y)[0] as u32;
+                }
+                if row_sum > best_v {
+                    best_v = row_sum;
+                    best = y;
+                }
+            }
+            best
+        };
+        assert_eq!(
+            bright_y(&a),
+            bright_y(&b),
+            "LeftToRight must not shift vertically"
+        );
+    }
+
+    #[test]
+    fn top_to_bottom_does_not_move_horizontally() {
+        // TopToBottom では x が初期位置のまま動かない。
+        let clusters = vec![cluster([255, 0, 0], 0.3, 0.5, 0.5)];
+        let opts = opts_with(MotionDirection::TopToBottom, MotionSpeed::Slow);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 0.5);
         let bright_x = |img: &RgbaImage| -> u32 {
             let mut best = 0u32;
             let mut best_v = 0u32;
@@ -554,36 +672,284 @@ mod tests {
         assert_eq!(
             bright_x(&a),
             bright_x(&b),
-            "Vertical shape must not shift horizontally"
+            "TopToBottom must not shift horizontally"
         );
     }
 
     #[test]
-    fn breathe_keeps_center_changes_radius() {
-        // Breathe は位置不動・半径変動。t=0 と t=0.5 で違う絵になる（radius が違う）。
-        let clusters = sample_clusters();
-        let opts = opts_with(MotionShape::Breathe, MotionSpeed::Slow);
+    fn left_to_right_advances_x_over_time() {
+        // 単一 orb で phase=0 になるよう調整は難しいので、直接位置を計算して比較する。
+        // generate_orb_params の RNG は seed=0 で再現できるので、その orb が t=0.0 と
+        // t=0.25 で異なる x を持つことを確認する。
+        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
+        let opts = AnimateOptions {
+            width: 128,
+            height: 128,
+            seed: 7,
+            ..AnimateOptions::default()
+        };
         let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.5);
+        let b = render_frame(&clusters, &opts, 0.25);
         assert!(
             !pixels_equal(&a, &b),
-            "Breathe must produce different frame at t=0 vs t=0.5 (radius modulation)"
+            "LeftToRight must shift horizontally between t=0 and t=0.25"
         );
     }
 
     #[test]
-    fn motion_preset_split_back_compat() {
-        assert_eq!(
-            MotionPreset::Still.split(),
-            (MotionShape::Still, MotionSpeed::Slow)
+    fn wrap_brings_orb_back_at_t_one() {
+        // 1 周期分進んだ orb は元の位置に戻ってくる（rem_euclid による wrap）。
+        // 既に t_zero_and_t_one_match で確認済みだが、Slow 以外も含めて再確認する。
+        let clusters = sample_clusters();
+        for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+            let opts = opts_with(MotionDirection::LeftToRight, speed);
+            let a = render_frame(&clusters, &opts, 0.0);
+            let b = render_frame(&clusters, &opts, 1.0);
+            assert!(
+                pixels_equal(&a, &b),
+                "wrap loop must bring frame back at t=1 (speed={speed:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_count_matches_speed() {
+        // 速度の cycle_count が仕様通りであることを保証する回帰テスト。
+        assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
+        assert_eq!(MotionSpeed::Slow.cycle_count(), 2);
+    }
+
+    #[test]
+    fn count_expands_orb_pool_beyond_clusters() {
+        // count を None で渡すと cluster 数（3）と同じ orb が描かれる。
+        // count = Some(40) を指定すると 40 個に展開される。展開した方が画面の
+        // 平均明度（R チャネルの平均）が大きくなることで「より多くの orb が描かれた」
+        // ことを間接確認する。
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.count = None;
+        let img_default = render_frame(&clusters, &opts, 0.0);
+
+        opts.count = Some(40);
+        let img_expanded = render_frame(&clusters, &opts, 0.0);
+
+        let mean_r = |img: &RgbaImage| -> f64 {
+            let mut s = 0u64;
+            for px in img.pixels() {
+                s += px[0] as u64;
+            }
+            s as f64 / (img.width() as f64 * img.height() as f64)
+        };
+        let m_def = mean_r(&img_default);
+        let m_exp = mean_r(&img_expanded);
+        assert!(
+            m_exp > m_def + 0.5,
+            "expanding count should increase mean brightness; default={m_def}, expanded={m_exp}"
         );
-        assert_eq!(
-            MotionPreset::Slow.split(),
-            (MotionShape::Lissajous, MotionSpeed::Slow)
+    }
+
+    #[test]
+    fn style_is_mixed_across_orbs() {
+        // 多めの orb を生成すると Rim と Soft が両方出現する。
+        // 50:50 程度に振っているので、64 サンプルなら両方とも 20..=44 の範囲に
+        // 収まることをチェック（理論期待値 32、片側に大きく寄ると分布が壊れている
+        // サインなので緩めに 20..=44 で監視）。
+        let p = generate_orb_params(7, 64, &[1.0]);
+        let n_rim = p.iter().filter(|q| q.style == OrbStyle::Rim).count();
+        let n_soft = p.iter().filter(|q| q.style == OrbStyle::Soft).count();
+        assert!(
+            (20..=44).contains(&n_rim),
+            "Rim count out of expected band 20..=44; got rim={n_rim} soft={n_soft}"
         );
+        assert!(
+            (20..=44).contains(&n_soft),
+            "Soft count out of expected band 20..=44; got rim={n_rim} soft={n_soft}"
+        );
+    }
+
+    #[test]
+    fn breath_axes_are_independent() {
+        // 3 軸（radius / blur / opacity）の位相が seed から独立に生成されていること。
+        // 同じ seed で同じインデックスの OrbParams が phi_radius / phi_blur /
+        // phi_opacity 3 つとも同じ値になっているとアウト（同期している）。
+        let p = generate_orb_params(42, 16, &[1.0]);
+        let mut all_three_same = 0;
+        for op in &p {
+            // 3 つが完全一致しているケースを数える。0 件であることを期待する
+            // （偶然一致は理論上ゼロではないが、ChaCha8Rng + f32 の連続値で
+            //  一致する確率は実質 0）。
+            if (op.phi_radius - op.phi_blur).abs() < 1e-6
+                && (op.phi_blur - op.phi_opacity).abs() < 1e-6
+            {
+                all_three_same += 1;
+            }
+        }
         assert_eq!(
-            MotionPreset::Lively.split(),
-            (MotionShape::Lissajous, MotionSpeed::Lively)
+            all_three_same, 0,
+            "breath axes must not be synchronized for any orb"
+        );
+    }
+
+    #[test]
+    fn speed_mult_distribution() {
+        // 64 サンプルで 1x / 2x の出現数が 20..=44 のバンドに収まること。
+        // 理論期待値 32（50:50）。片側に大きく偏ると分布が壊れているサイン。
+        let p = generate_orb_params(99, 64, &[1.0]);
+        let n1 = p.iter().filter(|q| q.speed_mult == 1).count();
+        let n2 = p.iter().filter(|q| q.speed_mult == 2).count();
+        assert!(
+            (20..=44).contains(&n1),
+            "speed_mult=1 count out of expected band 20..=44; got n1={n1}, n2={n2}"
+        );
+        assert!(
+            (20..=44).contains(&n2),
+            "speed_mult=2 count out of expected band 20..=44; got n1={n1}, n2={n2}"
+        );
+        // 全 orb が {1, 2} の範囲内であることも確認。
+        for q in &p {
+            assert!(
+                (1..=2).contains(&q.speed_mult),
+                "speed_mult must be 1 or 2; got {}",
+                q.speed_mult
+            );
+        }
+    }
+
+    #[test]
+    fn breath_phases_are_seeded_per_orb_and_per_axis() {
+        // breath 機能の検証は OrbParams の位相分布だけでやる。
+        // - 同じ orb 内では radius / blur / opacity の 3 軸が異なる位相
+        // - orb 間でも同じ軸の位相が散らばっている（どれか 1 軸でも全 orb 一致は許さない）
+        //
+        // 旧 breath テストはどちらも LeftToRight + t!=0 で「pixels_equal にならない」
+        // ことを主張していたが、orb は LR 移動するので breath を OFF にしても
+        // 通ってしまう（=何も検証していない）。位相分布チェックに置き換える。
+        let p = generate_orb_params(42, 16, &[1.0]);
+        // 3 軸が同一位相の orb が 1 つでもあったらアウト。
+        for op in &p {
+            assert!(
+                (op.phi_radius - op.phi_blur).abs() > 1e-6
+                    || (op.phi_blur - op.phi_opacity).abs() > 1e-6,
+                "breath axes must not all share the same phase: phi_radius={} phi_blur={} phi_opacity={}",
+                op.phi_radius,
+                op.phi_blur,
+                op.phi_opacity
+            );
+        }
+        // orb 間でも各軸の位相が散らばっていること（最小値と最大値が十分離れている）。
+        // f32 の位相が完全一致する確率は実質 0 だが、念のため幅を見る。
+        let mut min_r = f32::INFINITY;
+        let mut max_r = f32::NEG_INFINITY;
+        let mut min_b = f32::INFINITY;
+        let mut max_b = f32::NEG_INFINITY;
+        let mut min_o = f32::INFINITY;
+        let mut max_o = f32::NEG_INFINITY;
+        for op in &p {
+            min_r = min_r.min(op.phi_radius);
+            max_r = max_r.max(op.phi_radius);
+            min_b = min_b.min(op.phi_blur);
+            max_b = max_b.max(op.phi_blur);
+            min_o = min_o.min(op.phi_opacity);
+            max_o = max_o.max(op.phi_opacity);
+        }
+        // TAU ≈ 6.28 のうち、16 サンプルあれば spread が 1.0 以上は固い。
+        assert!(
+            max_r - min_r > 1.0,
+            "phi_radius spread too narrow ({} .. {})",
+            min_r,
+            max_r
+        );
+        assert!(
+            max_b - min_b > 1.0,
+            "phi_blur spread too narrow ({} .. {})",
+            min_b,
+            max_b
+        );
+        assert!(
+            max_o - min_o > 1.0,
+            "phi_opacity spread too narrow ({} .. {})",
+            min_o,
+            max_o
+        );
+    }
+
+    #[test]
+    fn wrap_buffer_keeps_orbs_offscreen_at_seam() {
+        // wrap 境界の前後で、画面内に orb 中心は描かれない。
+        // 直接的に、orb 1 個・phase 既知のセットアップを作ってその orb の中心が
+        // 画面外 (cx < 0 or cx >= width) に居る瞬間に、画面内の最大輝度が低い
+        // ことで「画面端で見える状態のまま消える」アーティファクトが無いことを確認。
+        //
+        // 単一クラスタ + count=1 + seed 固定で、orb のピクセル位置を計算し、
+        // pos = -r や pos = 1+r 周辺の t における画面内ピクセル最大輝度が低いことを見る。
+        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
+        let width = 128u32;
+        let height = 128u32;
+        let opts = AnimateOptions {
+            width,
+            height,
+            orb_size: 1.0,
+            seed: 11,
+            count: Some(1),
+            direction: MotionDirection::LeftToRight,
+            speed: MotionSpeed::VerySlow,
+            ..AnimateOptions::default()
+        };
+        // generate_orb_params で実際のパラメータを取り出して、orb が画面外に居る
+        // (cx + r <= 0 または cx - r >= width) ような t を計算する。
+        let params = generate_orb_params(opts.seed, 1, &[1.0]);
+        let p = params[0];
+        let base_radius_unit = (width.min(height) as f32) * 0.25;
+        let r_pixels_max = base_radius_unit * 1.0_f32.sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_normalized = r_pixels_max / width as f32;
+        let extent = 1.0 + 2.0 * r_normalized;
+        // 探索: 0..=N の t の中で、orb 中心 cx の画面内位置 pos*width が
+        // [-r_pixels-1, r_pixels+1] のどこかに居る t を探し、その t において
+        // 画面内のピクセル最大輝度が低いことを確認する。
+        let cycle = opts.speed.cycle_count() as f32 * p.speed_mult as f32;
+        let mut found_offscreen_t: Option<f32> = None;
+        for i in 0..1000 {
+            let t = i as f32 / 1000.0;
+            let advance_steps = (cycle * t).fract();
+            let raw = p.phase * extent + advance_steps * extent;
+            let pos = raw.rem_euclid(extent) - r_normalized;
+            // 画面外: cx + r_pixels <= 0  ⇔  pos*width + r_pixels <= 0  ⇔ pos <= -r_normalized
+            // または cx - r_pixels >= width  ⇔ pos >= 1 + r_normalized
+            // 最も画面外らしい瞬間（pos が -r_normalized 付近 or 1+r_normalized 付近）。
+            if pos <= -r_normalized + 0.001 || pos >= 1.0 + r_normalized - 0.001 {
+                found_offscreen_t = Some(t);
+                break;
+            }
+        }
+        let t_off = found_offscreen_t.expect("should find an off-screen instant within [0,1)");
+        let img = render_frame(&clusters, &opts, t_off);
+        // 画面内の最大 R 値が極めて低い（背景 alpha=255 なので R は 0）か、グラデの
+        // 端が少し漏れる場合でも 8/255 未満であることを見る。
+        let mut max_r = 0u8;
+        for px in img.pixels() {
+            if px[0] > max_r {
+                max_r = px[0];
+            }
+        }
+        assert!(
+            max_r < 16,
+            "off-screen orb should not contribute visible pixels; max_r={max_r} at t={t_off}"
+        );
+    }
+
+    #[test]
+    fn loop_continuity_at_t1_with_speed_mult() {
+        // 速度倍数 (1/2) を含めても t=0 と t=1 が完全一致することを再確認。
+        // 既存 all_direction_speed_combinations_loop_closed でカバーしているが、
+        // count=64 で speed_mult のばらつきが必ず起きるケースで明示的に再検証する。
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.count = Some(64);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        assert!(
+            pixels_equal(&a, &b),
+            "loop must close at t=1 even with mixed speed_mult"
         );
     }
 }

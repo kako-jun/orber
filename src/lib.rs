@@ -4,7 +4,6 @@
 
 pub mod animate;
 pub mod aquarelle;
-pub mod background;
 pub mod cluster;
 pub mod orb;
 pub mod output_mode;

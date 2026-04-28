@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-04-28
+
+### Added
+- New CLI flag `--count <N>` (1..=200, default 20) that controls how many orbs are visible on screen at once. The K colors picked by k-means are *expanded* into N orbs by weight-proportional color sampling and per-orb cross-axis scattering, so a single image can fill roughly 70% of the frame at the default count. (#41)
+- All-orb breathing modulation in **three independent axes**: radius ±10%, blur ±15%, opacity ±5%. Each orb's three axes are decorrelated by separate seed-derived phase offsets, and each axis loops once per clip duration. (#41)
+- `OrbStyle` enum (`Rim` / `Soft`) and `render_one_orb` per-orb rendering helper. Each orb is assigned a style deterministically from the seed (≈50:50), so a single frame mixes the rim-emphasized look with plain soft gradients. (#41)
+- Per-orb integer speed multipliers (`1x` / `2x`) assigned deterministically from the seed. Combined with the `MotionSpeed` cycle count (`VerySlow` / `Slow` = 1 / 2), effective traversal counts spread over `{1, 2, 4}` per clip — orbs visibly move at varied paces while pixel-exact loop closure at `t=0 ≡ t=1` is preserved (integer × integer cycles). (#41)
+- Off-screen wrap buffer: each orb's progress range is extended from `[0, 1]` to `[-r, 1+r]` (where `r` is its radius normalized by the progress-axis length). Orbs now spawn and despawn fully off-screen, so the wrap moment is invisible — the seam at `pos = 1+r → -r` happens beyond the canvas edges. (#41)
+- New cluster helpers `cluster::derive_background_rgba` and `cluster::drop_dominant`. The dominant (highest-weight) cluster becomes the canvas color and is dropped from the orb pool, so the input image's most prevalent color is no longer drawn as an orb on top of itself. (#41)
+
+### Changed
+- **BREAKING**: Motion model rebuilt as a one-way conveyor belt. Each clip flows in a single direction (left→right / right→left / top→bottom / bottom→top) with all orbs traveling the same way. Orbs no longer reflect or oscillate; they exit one edge and re-enter from the opposite edge (wrap loop). (#41)
+- **BREAKING**: `MotionShape` (`Still`, `Lissajous`, `Vertical`, `Horizontal`, `Diagonal`, `Breathe`, `Twinkle`) is **removed**. The standalone `Breathe` / `Twinkle` modes are gone — breathing is now an automatic effect applied to every clip.
+- **BREAKING**: Old `MotionSpeed` variants (`Subtle` / `Slow` / `Lively`) are **removed** in favor of `VerySlow` / `Slow`, defined as integer screen-cross counts per clip (1 / 2). Pixel-exact loop closure at `t=0 ≡ t=1` is preserved.
+- **BREAKING**: New `MotionDirection` enum (`LeftToRight`, `RightToLeft`, `TopToBottom`, `BottomToTop`) added.
+- **BREAKING**: CLI flags `--motion`, `--motion-shape`, `--motion-speed` are **removed** and replaced with `--direction <lr|rl|tb|bt>` and `--speed <very-slow|slow>`.
+- **BREAKING**: Animation boundary mode switched from `clamp` to wrap (`rem_euclid`).
+- **BREAKING**: `DEFAULT_VARIATIONS` preset rebuilt around direction × speed × `count` × `orb_size` × `blur` (color is no longer a preset axis). Output filenames change to `snapshot_lr_dense`, `snapshot_rl_huge`, `snapshot_tb_fine`, `snapshot_bt_blurry`, `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`, `flow_bt_blurry`, `flow_lr_dense_small`, `flow_rl_huge`. (#41)
+- **BREAKING**: `VariationSpec` now carries `count: usize` instead of the old color/cluster fields. `VariationSpec.shape` / `VariationSpec.speed` (old types) replaced with `direction` and the new `speed`.
+- PNG single-output path now goes through `animate::render_frame(t=0)` instead of `render_static` so `--count` takes effect for stills as well as videos.
+- Animated variation duration extended from 4000 ms to 8000 ms so the slow conveyor pacing reads as gentle.
+
+### Removed
+- **BREAKING**: `ColorMod` module is **deleted**. Hue shift, lightness bias, saturation modulation, and dominant cluster rotation are gone. The premise — that a single input photo should yield multiple recolored variations — was wrong: if you want different colors, feed in a different image. K-means palette colors are now used unmodified end-to-end. (#41)
+- **BREAKING**: `VariationSpec` fields `hue_shift_deg`, `lightness_bias`, `saturation`, `dominant_rotation`, and `cluster_count` are **removed**. The `VariationSpec::color_mod()` method is also gone. The k-means K used by the variations path is fixed internally at 5.
+- **BREAKING**: CLI flag `--background` is **removed**, along with the entire `background` module (`Background` enum, `resolve`, `BackgroundParseError`). The background color is now derived automatically from the input image: the dominant (highest-weight) k-means cluster becomes the canvas color, and the remaining clusters become the orb pool. A nightscape gives a black canvas with bright points; a daytime sky gives a sky-blue canvas with floating points; a beige interior gives a beige canvas with small accents. To change colors, change the input image. (#41)
+- The `--background transparent` rejection branch for mp4/webm is gone (auto-derived backgrounds are always opaque, so the rejection branch became unreachable). (#41)
+
 ## [0.2.0] - 2026-04-27
 
 ### Added

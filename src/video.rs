@@ -14,7 +14,9 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use crate::animate::{render_frame, AnimateOptions, MotionShape, MotionSpeed};
+use crate::animate::{
+    precompute_orb_params, render_frame_with_params, AnimateOptions, MotionDirection, MotionSpeed,
+};
 use crate::cluster::Cluster;
 use crate::orb::OrbShape;
 use crate::output_mode::OutputMode;
@@ -77,9 +79,11 @@ pub struct VideoOptions {
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
-    pub motion_shape: MotionShape,
-    pub motion_speed: MotionSpeed,
+    pub direction: MotionDirection,
+    pub speed: MotionSpeed,
     pub seed: u64,
+    /// 同時可視 orb 数。None なら cluster 数（後方互換）。
+    pub count: Option<usize>,
     /// 背景 RGBA。動画は yuv420p 制約で alpha 不可なので呼び出し側で透過を弾くこと。
     pub background: [u8; 4],
     /// orb の描画形式。
@@ -93,9 +97,10 @@ impl Default for VideoOptions {
             orb_size: a.orb_size,
             blur: a.blur,
             saturation: a.saturation,
-            motion_shape: a.motion_shape,
-            motion_speed: a.motion_speed,
+            direction: a.direction,
+            speed: a.speed,
             seed: a.seed,
+            count: a.count,
             background: a.background,
             shape: a.shape,
         }
@@ -197,20 +202,26 @@ pub fn render_video(
         orb_size: opts.orb_size,
         blur: opts.blur,
         saturation: opts.saturation,
-        motion_shape: opts.motion_shape,
-        motion_speed: opts.motion_speed,
+        direction: opts.direction,
+        speed: opts.speed,
         seed: opts.seed,
+        count: opts.count,
         background: opts.background,
         shape: opts.shape,
     };
 
     let temp_dir = tempfile::TempDir::new()?;
 
+    // OrbParams は seed / count / clusters のみに依存し t は不変なので、ループ前に
+    // 1 回だけ計算してフレーム間で使い回す。240 frame なら 240 回の Vec 割当 +
+    // RNG 走行を 1 回に圧縮できる。
+    let cache = precompute_orb_params(&frame_opts, clusters);
+
     // フレーム書き出し（逐次）。10% 刻みで stderr に進捗を出す。
     let progress_step = (total / 10).max(1);
     for i in 0..total {
         let t = i as f32 / total as f32;
-        let frame = render_frame(clusters, &frame_opts, t);
+        let frame = render_frame_with_params(clusters, &frame_opts, &cache, t);
         let path = temp_dir.path().join(format!("frame_{i:05}.png"));
         frame.save(&path).map_err(VideoError::FrameSave)?;
         if i > 0 && i % progress_step == 0 {
@@ -365,8 +376,8 @@ mod tests {
         assert_eq!(v.orb_size, a.orb_size);
         assert_eq!(v.blur, a.blur);
         assert_eq!(v.saturation, a.saturation);
-        assert_eq!(v.motion_shape, a.motion_shape);
-        assert_eq!(v.motion_speed, a.motion_speed);
+        assert_eq!(v.direction, a.direction);
+        assert_eq!(v.speed, a.speed);
         assert_eq!(v.seed, a.seed);
     }
 }

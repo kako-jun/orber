@@ -24,21 +24,33 @@ use tiny_skia::{
     Transform,
 };
 
+/// 個別 orb の描画スタイル。1 フレーム内で混在させる前提。
+///
+/// `Rim` は中心明 → 中間で少し落として外周フェードのリング感、`Soft` は中心明 →
+/// 外周フェードの単純グラデーション。`render_one_orb` 経由で per-orb に切替できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrbStyle {
+    /// リム強調（中間 stop で alpha を一段落として輪郭感を出す）。
+    #[default]
+    Rim,
+    /// 単純ソフト（中間 stop なし、中心 → 透明への単調減衰）。
+    Soft,
+}
+
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
 /// 質感セット（[`crate::aquarelle`]）を有効にする。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum OrbShape {
+    #[default]
     Circle,
     Aquarelle(AquarelleParams),
 }
 
-impl Default for OrbShape {
-    fn default() -> Self {
-        Self::Circle
-    }
-}
-
 impl PartialEq for OrbShape {
+    // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
+    // ここでの "等価" は「形が同じか（Circle vs Aquarelle）」だけを判定する用途を
+    // 想定している。bleed / bloom / offset / halo まで含めて区別したい場合は
+    // AquarelleParams を直接比較すること。
     fn eq(&self, other: &Self) -> bool {
         matches!(
             (self, other),
@@ -124,52 +136,18 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
             continue;
         }
-        let center_color = Color::from_rgba8(r, g, b, 255);
-        // 中間 stop の半透明色は中心と同じ RGB で alpha だけ落とす。
-        let mid_color = Color::from_rgba8(r, g, b, 128);
-        let edge_color = Color::TRANSPARENT;
 
-        // blur=0 で中間 stop が外寄り（中心の不透明領域が広い）、
-        // blur=1 で中間 stop が中心寄り（中心の不透明領域が点に近い）。
-        let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
-
-        let stops = vec![
-            GradientStop::new(0.0, center_color),
-            GradientStop::new(mid_stop, mid_color),
-            GradientStop::new(1.0, edge_color),
-        ];
-
-        // fall-through guard: radius==0 ケースは上で先に弾いているので、ここに来るのは
-        // tiny-skia 内部でグラデーション構築に失敗した場合のみ。
-        let Some(shader) = RadialGradient::new(
-            Point::from_xy(cx, cy),
-            Point::from_xy(cx, cy),
+        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・opacity=1.0
+        // で固定（既存挙動の互換）。動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
+        render_one_orb(
+            &mut pixmap,
+            (cx, cy),
             radius,
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) else {
-            continue;
-        };
-
-        let paint = Paint {
-            shader,
-            anti_alias: true,
-            ..Default::default()
-        };
-
-        // 半径の 1.5 倍程度の円パスで塗る範囲を限定（fill_rect で全画面塗るより軽い）。
-        let mut pb = PathBuilder::new();
-        pb.push_circle(cx, cy, radius * 1.5);
-        if let Some(path) = pb.finish() {
-            pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
+            [r, g, b],
+            blur,
+            1.0,
+            OrbStyle::Rim,
+        );
     }
 
     // tiny-skia の Pixmap は premultiplied alpha なので un-premultiply して straight に戻す。
@@ -196,13 +174,115 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
         .expect("raw buffer length matches width * height * 4 by construction")
 }
 
+/// 単一 orb（Circle 系）を既存の Pixmap に SourceOver で重ねる。
+///
+/// `blur` / `opacity` / `style` は per-orb で受ける。`render_static` から「全 orb 共通の
+/// 静的設定」で呼ぶこともできるし、[`crate::animate::render_frame`] から「フレーム毎の
+/// per-orb 揺らぎ」で呼ぶこともできる共通エントリ。
+///
+/// - `center` は描画位置（ピクセル座標、左上原点）。
+/// - `radius` は不透明領域から外周フェード端までの全長。`<= 0.0` なら何もしない。
+/// - `rgb` は sRGB 0-255。彩度補正は呼び出し側で済ませておくこと。
+/// - `blur` ∈ [0, 1]。0 でシャープ、1 で完全ソフト。`Rim` では中間 stop の位置、
+///   `Soft` では外周フェード曲線に効く。
+/// - `opacity` ∈ [0, 1]。中心の alpha 倍率（外周は常に 0 にフェード）。
+/// - `style` は `Rim` / `Soft` の 2 種類。
+///
+/// 描画失敗（半径 0 や tiny-skia 内部失敗）はサイレントに無視する。
+pub fn render_one_orb(
+    pixmap: &mut Pixmap,
+    center: (f32, f32),
+    radius: f32,
+    rgb: [u8; 3],
+    blur: f32,
+    opacity: f32,
+    style: OrbStyle,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+    let blur = blur.clamp(0.0, 1.0);
+    let opacity = opacity.clamp(0.0, 1.0);
+    let (cx, cy) = center;
+    let [r, g, b] = rgb;
+
+    // 中心 alpha は opacity に比例。255 を超えないよう u8 で握る。
+    let center_a = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    if center_a == 0 {
+        return;
+    }
+    let center_color = Color::from_rgba8(r, g, b, center_a);
+    let edge_color = Color::TRANSPARENT;
+
+    let stops = match style {
+        OrbStyle::Rim => {
+            // 既存挙動: 中間 stop で alpha を半分に落としてリング感を作る。
+            // blur=0 で中間 stop が外寄り（不透明領域広い）、blur=1 で中心寄り（点に近い）。
+            let mid_a = ((opacity * 128.0).round().clamp(0.0, 255.0)) as u8;
+            let mid_color = Color::from_rgba8(r, g, b, mid_a);
+            let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
+            vec![
+                GradientStop::new(0.0, center_color),
+                GradientStop::new(mid_stop, mid_color),
+                GradientStop::new(1.0, edge_color),
+            ]
+        }
+        OrbStyle::Soft => {
+            // 単純な中心 → 透明グラデーション。中間 stop なし。
+            // blur=0 では中心 alpha を保つ範囲が広くなるよう、フェード開始位置を
+            // 外側に寄せた中間 stop（同じ alpha）を 1 つ挟む。
+            let hold_stop = (1.0 - blur).clamp(0.05, 0.95);
+            vec![
+                GradientStop::new(0.0, center_color),
+                GradientStop::new(hold_stop, center_color),
+                GradientStop::new(1.0, edge_color),
+            ]
+        }
+    };
+
+    let Some(shader) = RadialGradient::new(
+        Point::from_xy(cx, cy),
+        Point::from_xy(cx, cy),
+        radius,
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, radius * 1.5);
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
 /// sRGB 0-255 を HSL に変換し、彩度を `factor` 倍してから sRGB に戻す。
 ///
 /// 彩度調整は HSL 経路で行う。cluster 抽出は LAB（知覚距離）を使うが、
 /// 彩度のフラグは「CSS 的な見た目の彩度」に合わせるほうが UI 直感に近いため、
 /// 意図的に色空間を分けている。
+pub fn adjust_saturation_pub(rgb: [u8; 3], factor: f32) -> [u8; 3] {
+    adjust_saturation(rgb, factor)
+}
+
 pub(crate) fn adjust_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
-    if (factor - 1.0).abs() < f32::EPSILON {
+    // 1.0001 等の浮動小数点誤差レベルの入力でも fast path に入るよう、緩めの 1e-4
+    // 閾値を使う（f32::EPSILON ≈ 1.19e-7 だと CLI 入力では実用上ほぼ通らない）。
+    if (factor - 1.0).abs() < 1e-4 {
         return rgb;
     }
     let srgb = Srgb::new(
@@ -371,7 +451,7 @@ mod tests {
             ..base.clone()
         };
         let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
-        let img_sharp = render_static(&[c.clone()], &opts_sharp);
+        let img_sharp = render_static(std::slice::from_ref(&c), &opts_sharp);
         let img_blurred = render_static(&[c], &opts_blurred);
 
         // orb 半径 = min(w,h)*0.25*orb_size*sqrt(weight) = 100*0.25 = 25

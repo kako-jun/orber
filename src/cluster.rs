@@ -160,6 +160,51 @@ pub fn extract_clusters(img: &RgbImage, k: usize) -> Result<Vec<Cluster>, Cluste
     Ok(clusters)
 }
 
+/// クラスタ列から背景 RGBA を派生する。
+///
+/// 最大 weight のクラスタの色（sRGB 8bit）を取り、alpha=255 を付けて返す。
+/// クラスタが空の場合は黒 `[0, 0, 0, 255]`。
+///
+/// # 設計メモ
+///
+/// 入力写真のドミナント色をそのまま背景にする。`extract_clusters` の戻り値は
+/// weight 降順にソート済みなので「先頭」が最大 weight だが、この関数は順序に
+/// 依存せず `max_by` で明示的に最大を取り直す（呼び出し側がソート済みを
+/// 保証しなくても動くようにするため）。
+pub fn derive_background_rgba(clusters: &[Cluster]) -> [u8; 4] {
+    clusters
+        .iter()
+        .max_by(|a, b| a.weight.total_cmp(&b.weight))
+        .map(|c| {
+            let [r, g, b] = c.color;
+            [r, g, b, 255]
+        })
+        .unwrap_or([0, 0, 0, 255])
+}
+
+/// 最大 weight のクラスタを 1 個だけ取り除いた新しい Vec を返す。
+///
+/// orb プールの色バリエーションから「背景に使うドミナント色」を抜くために使う。
+/// 例えば夜景 (黒が支配的) なら、黒を除いた残りの色が orb として浮かぶ。
+///
+/// 元の順序は保たれる（`extract_clusters` は weight 降順で返すので、結果は
+/// weight 降順から先頭 1 個を抜いた列になる）。クラスタが空の場合は空 Vec。
+/// 同 weight が複数ある場合は `max_by` の規定に従い最後尾を最大として落とすが、
+/// 後段の orb 配置は重み比例の重み付き抽選なので実害なし。
+pub fn drop_dominant(clusters: &[Cluster]) -> Vec<Cluster> {
+    let dominant_idx = clusters
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
+        .map(|(i, _)| i);
+    clusters
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != dominant_idx)
+        .map(|(_, c)| *c)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +315,146 @@ mod tests {
             Err(ClusterError::KZero) => {}
             other => panic!("expected KZero, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn derive_background_picks_max_weight_cluster() {
+        // 最大 weight のクラスタの色が alpha=255 で返ることを確認。
+        let clusters = vec![
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.7,
+            },
+            Cluster {
+                color: [0, 0, 0],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.1,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn derive_background_unsorted_input() {
+        // weight 降順でなくても max_by で最大を引けることを確認。
+        let clusters = vec![
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.7,
+            },
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn derive_background_unsorted_three_clusters() {
+        // 3 要素 unsorted で、中央に位置する要素が最大 weight のときも
+        // 正しく拾えること（sorted 前提に依存していないことの追加担保）。
+        let clusters = vec![
+            Cluster {
+                color: [10, 10, 10],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+            Cluster {
+                color: [20, 20, 20],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.5, // dominant
+            },
+            Cluster {
+                color: [30, 30, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.3,
+            },
+        ];
+        assert_eq!(derive_background_rgba(&clusters), [20, 20, 20, 255]);
+    }
+
+    #[test]
+    fn derive_background_empty_clusters_yields_black() {
+        let clusters: Vec<Cluster> = vec![];
+        assert_eq!(derive_background_rgba(&clusters), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn drop_dominant_removes_max_weight() {
+        // 最大 weight のクラスタが除外され、残り 2 個になることを確認。
+        let clusters = vec![
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.2,
+            },
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.7,
+            },
+            Cluster {
+                color: [0, 0, 0],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.1,
+            },
+        ];
+        let rest = drop_dominant(&clusters);
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|c| c.color != [200, 100, 50]));
+        // 順序保存（先頭 weight=0.2、次 weight=0.1）。
+        assert_eq!(rest[0].color, [10, 20, 30]);
+        assert_eq!(rest[1].color, [0, 0, 0]);
+    }
+
+    #[test]
+    fn drop_dominant_on_sorted_input_returns_tail() {
+        // extract_clusters 由来の weight 降順入力では先頭が落ちて tail が返る。
+        let clusters = vec![
+            Cluster {
+                color: [200, 100, 50],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.6,
+            },
+            Cluster {
+                color: [10, 20, 30],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.3,
+            },
+            Cluster {
+                color: [0, 0, 0],
+                centroid: Centroid { x: 0.5, y: 0.5 },
+                weight: 0.1,
+            },
+        ];
+        let rest = drop_dominant(&clusters);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].color, [10, 20, 30]);
+        assert_eq!(rest[1].color, [0, 0, 0]);
+    }
+
+    #[test]
+    fn drop_dominant_empty_input() {
+        let clusters: Vec<Cluster> = vec![];
+        assert!(drop_dominant(&clusters).is_empty());
+    }
+
+    #[test]
+    fn drop_dominant_single_cluster_yields_empty() {
+        let clusters = vec![Cluster {
+            color: [200, 100, 50],
+            centroid: Centroid { x: 0.5, y: 0.5 },
+            weight: 1.0,
+        }];
+        assert!(drop_dominant(&clusters).is_empty());
     }
 }
