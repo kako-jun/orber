@@ -1,0 +1,33 @@
+[package]
+name = "orber-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WASM bindings for orber-core (browser-friendly orb rendering)"
+keywords = ["wasm", "image", "abstract", "orb"]
+categories = ["wasm", "graphics"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+orber-core = { path = "../core", version = "0.3.0" }
+image = { workspace = true, features = ["png"] }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+
+# 注意: per-crate `[profile.release]` は workspace member では指定できない
+# （root の `[profile.release]` が継承される）。
+# wasm 専用の opt-level = "s" 等が必要になったら、root に
+# `[profile.release-wasm]` カスタムプロファイルを足して
+# `wasm-pack build --profile release-wasm` で叩く方針。
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

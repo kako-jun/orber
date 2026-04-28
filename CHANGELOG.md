@@ -11,6 +11,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Added
 - `orber_core::batch::generate_batch` — given a source image, k, canvas size, shape, and a list of `VariationSpec`, returns one PNG byte buffer per spec. Used by the upcoming GUI / WASM frontend; the CLI's `--variations` mode will eventually be a thin wrapper around this. (#35)
+- New workspace crate `orber-wasm` (`crates/wasm/`) — wasm-bindgen wrapper around `orber-core` for browsers. Exposes `generate_single` (1 PNG), `generate_batch` (N PNGs from `DEFAULT_VARIATIONS`), and `generate_svg` (SVG string). Image decoding is left to the JS side: callers pass raw RGB bytes from `<canvas>` / `ImageData`, keeping the wasm bundle small. Includes a minimal `crates/wasm/test.html` demo that can be served alongside `wasm-pack build --target web` output. (#36)
 
 ## [0.3.0] - 2026-04-28
 
