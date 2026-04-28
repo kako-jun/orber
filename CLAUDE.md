@@ -64,10 +64,13 @@ web/                        # Web フロントエンド (#37, #38)
 ├── package.json            #   npm scripts: wasm:build / dev / build / deploy（jszip 依存）
 ├── wrangler.toml           #   Cloudflare Pages 設定（pages_build_output_dir = "dist"）
 └── src/
-    ├── pages/index.astro       # トップページ（画像ドロップ → 10 枚バッチ生成 GUI）
-    ├── layouts/Base.astro      # 共通レイアウト（黒地に白文字）
-    ├── components/Studio.tsx   # Solid アイランド。10 枚バッチ生成 GUI（#38）
+    ├── pages/index.astro       # トップページ（ロゴ + Subtitle + Studio）
+    ├── layouts/Base.astro      # 共通レイアウト（Space Grotesk + lang 自動切替, #62）
+    ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI（#38, #62 で glass 化）
+    ├── components/Subtitle.tsx # Solid アイランド。用途提案サブタイトル（i18n, #62）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
+    ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）
+    ├── lib/strings.ts          # i18n 文言集約 + ja/en 自動切替（#62）
     └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
 ```
 
