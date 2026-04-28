@@ -3,6 +3,17 @@
 //! 画像デコードは JS 側に任せる: 呼び出し側は `<canvas>` / `ImageData` で
 //! 生 RGB バイトを取り出して `WasmParams.source_rgb` に詰めて渡す。core クレート
 //! は wasm バンドルサイズ削減のため PNG デコード以外を積まない。
+//!
+//! ## API の責務分離
+//!
+//! - `generate_single`: 呼び出し側のパラメータ（seed/direction/speed/count/
+//!   orb_size/blur/shape）をそのまま使って 1 フレームを描く。フル制御版。
+//! - `generate_batch`: `DEFAULT_VARIATIONS` の preset を使って n 枚生成する。
+//!   呼び出し側 params の seed/direction/speed/count/orb_size/blur は **無視**
+//!   され、preset の値が使われる（shape / 入力画像 / 出力サイズ / k のみ反映）。
+//! - `generate_svg`: SVG は静的なので動き系パラメータは無視。orb_size/blur のみ反映。
+
+const MAX_DIM: u32 = 8192;
 
 use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
@@ -42,44 +53,82 @@ pub struct WasmParams {
     pub shape: String,
 }
 
-fn parse_direction(s: &str) -> Result<MotionDirection, JsError> {
+// Pure parsers/validators return String errors so they can be unit-tested on
+// the host (non-wasm) target where JsError can't be constructed.
+
+fn parse_direction(s: &str) -> Result<MotionDirection, String> {
     match s {
         "lr" => Ok(MotionDirection::LeftToRight),
         "rl" => Ok(MotionDirection::RightToLeft),
         "tb" => Ok(MotionDirection::TopToBottom),
         "bt" => Ok(MotionDirection::BottomToTop),
-        other => Err(JsError::new(&format!("invalid direction: {other}"))),
+        other => Err(format!("invalid direction: {other}")),
     }
 }
 
-fn parse_speed(s: &str) -> Result<MotionSpeed, JsError> {
+fn parse_speed(s: &str) -> Result<MotionSpeed, String> {
     match s {
         "very-slow" => Ok(MotionSpeed::VerySlow),
         "slow" => Ok(MotionSpeed::Slow),
-        other => Err(JsError::new(&format!("invalid speed: {other}"))),
+        other => Err(format!("invalid speed: {other}")),
     }
 }
 
-fn parse_shape(s: &str) -> Result<OrbShape, JsError> {
+fn parse_shape(s: &str) -> Result<OrbShape, String> {
     // OrbShape::Aquarelle はパラメータが多いので wasm 入口では `circle` のみ受ける。
     // Aquarelle は将来必要になったら別 API を生やす。
     match s {
         "circle" => Ok(OrbShape::Circle),
-        other => Err(JsError::new(&format!(
+        other => Err(format!(
             "invalid shape: {other} (only 'circle' is supported for now)"
-        ))),
+        )),
     }
 }
 
-fn build_source_image(p: &WasmParams) -> Result<image::RgbImage, JsError> {
-    image::RgbImage::from_raw(p.source_width, p.source_height, p.source_rgb.clone()).ok_or_else(
-        || JsError::new("source_rgb length does not match source_width * source_height * 3"),
-    )
+fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
+    let rgb = std::mem::take(&mut p.source_rgb);
+    image::RgbImage::from_raw(p.source_width, p.source_height, rgb).ok_or_else(|| {
+        "source_rgb length does not match source_width * source_height * 3".to_string()
+    })
 }
 
-fn deserialize_params(params_js: JsValue) -> Result<WasmParams, JsError> {
-    serde_wasm_bindgen::from_value(params_js)
-        .map_err(|e| JsError::new(&format!("failed to parse params: {e}")))
+fn deserialize_params(params_js: JsValue) -> Result<WasmParams, String> {
+    let p: WasmParams = serde_wasm_bindgen::from_value(params_js)
+        .map_err(|e| format!("failed to parse params: {e}"))?;
+    validate_params(&p)?;
+    Ok(p)
+}
+
+fn validate_params(p: &WasmParams) -> Result<(), String> {
+    if !p.seed.is_finite() || p.seed < 0.0 {
+        return Err(format!(
+            "seed must be a non-negative finite number, got {}",
+            p.seed
+        ));
+    }
+    if p.source_width == 0 || p.source_height == 0 {
+        return Err("source_width / source_height must be > 0".to_string());
+    }
+    if p.width == 0 || p.height == 0 {
+        return Err("width / height must be > 0".to_string());
+    }
+    if p.width > MAX_DIM || p.height > MAX_DIM {
+        return Err(format!(
+            "width / height must be <= {MAX_DIM}, got {}x{}",
+            p.width, p.height
+        ));
+    }
+    if p.source_width > MAX_DIM || p.source_height > MAX_DIM {
+        return Err(format!(
+            "source_width / source_height must be <= {MAX_DIM}, got {}x{}",
+            p.source_width, p.source_height
+        ));
+    }
+    Ok(())
+}
+
+fn err_to_js(s: String) -> JsError {
+    JsError::new(&s)
 }
 
 fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
@@ -104,12 +153,12 @@ fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
 /// `derive_background_rgba` で入力画像から自動決定する。
 #[wasm_bindgen]
 pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError> {
-    let p = deserialize_params(params_js)?;
-    let direction = parse_direction(&p.direction)?;
-    let speed = parse_speed(&p.speed)?;
-    let shape = parse_shape(&p.shape)?;
+    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let direction = parse_direction(&p.direction).map_err(err_to_js)?;
+    let speed = parse_speed(&p.speed).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
 
-    let source = build_source_image(&p)?;
+    let source = build_source_image(&mut p).map_err(err_to_js)?;
     let clusters_full = extract_clusters(&source, p.k)
         .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
     let bg = derive_background_rgba(&clusters_full);
@@ -139,10 +188,10 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 /// preset 件数まで丸める。返値は `Array<Uint8Array>`。
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
-    let p = deserialize_params(params_js)?;
-    let shape = parse_shape(&p.shape)?;
+    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
 
-    let source = build_source_image(&p)?;
+    let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let take_n = (n as usize).min(DEFAULT_VARIATIONS.len());
     let specs = DEFAULT_VARIATIONS.iter().take(take_n).copied().collect();
@@ -172,8 +221,8 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// 静的のみ）。`orb_size` / `blur` のみ反映する。
 #[wasm_bindgen]
 pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
-    let p = deserialize_params(params_js)?;
-    let source = build_source_image(&p)?;
+    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let clusters_full = extract_clusters(&source, p.k)
         .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
@@ -187,4 +236,106 @@ pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
         background: bg,
     };
     Ok(core_render_svg(&clusters, &opts))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_direction_roundtrip() {
+        assert!(matches!(
+            parse_direction("lr"),
+            Ok(MotionDirection::LeftToRight)
+        ));
+        assert!(matches!(
+            parse_direction("rl"),
+            Ok(MotionDirection::RightToLeft)
+        ));
+        assert!(matches!(
+            parse_direction("tb"),
+            Ok(MotionDirection::TopToBottom)
+        ));
+        assert!(matches!(
+            parse_direction("bt"),
+            Ok(MotionDirection::BottomToTop)
+        ));
+        assert!(parse_direction("xx").is_err());
+    }
+
+    #[test]
+    fn parse_speed_roundtrip() {
+        assert!(matches!(
+            parse_speed("very-slow"),
+            Ok(MotionSpeed::VerySlow)
+        ));
+        assert!(matches!(parse_speed("slow"), Ok(MotionSpeed::Slow)));
+        assert!(parse_speed("fast").is_err());
+    }
+
+    #[test]
+    fn parse_shape_only_circle() {
+        assert!(matches!(parse_shape("circle"), Ok(OrbShape::Circle)));
+        assert!(parse_shape("aquarelle").is_err());
+        assert!(parse_shape("").is_err());
+    }
+
+    fn base_params() -> WasmParams {
+        WasmParams {
+            source_rgb: vec![0; 4 * 4 * 3],
+            source_width: 4,
+            source_height: 4,
+            k: 4,
+            width: 64,
+            height: 64,
+            seed: 42.0,
+            direction: "lr".into(),
+            speed: "slow".into(),
+            count: 10,
+            orb_size: 3.0,
+            blur: 0.5,
+            shape: "circle".into(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_seed() {
+        let mut p = base_params();
+        p.seed = -1.0;
+        assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nan_seed() {
+        let mut p = base_params();
+        p.seed = f64::NAN;
+        assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_dimensions() {
+        let mut p = base_params();
+        p.width = 0;
+        assert!(validate_params(&p).is_err());
+
+        let mut p = base_params();
+        p.source_height = 0;
+        assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversize_dimensions() {
+        let mut p = base_params();
+        p.width = MAX_DIM + 1;
+        assert!(validate_params(&p).is_err());
+
+        let mut p = base_params();
+        p.source_width = 100_000;
+        assert!(validate_params(&p).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_reasonable_params() {
+        assert!(validate_params(&base_params()).is_ok());
+    }
 }

@@ -21,7 +21,10 @@
       const file = ev.target.files[0];
       if (!file) return;
       const bitmap = await createImageBitmap(file);
-      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      // OffscreenCanvas を避けて通常 canvas を使う（古い Safari 互換）。
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(bitmap, 0, 0);
       const imgData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
@@ -33,7 +36,9 @@
         rgb[j+2] = imgData.data[i+2];
       }
       const params = {
-        source_rgb: Array.from(rgb),
+        // serde-wasm-bindgen は Uint8Array をそのまま Vec<u8> に解釈するので
+        // Array.from せずに渡すことでコピー回数を減らせる。
+        source_rgb: rgb,
         source_width: bitmap.width,
         source_height: bitmap.height,
         k: 5,
