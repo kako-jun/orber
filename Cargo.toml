@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/wasm"]
 
 [workspace.package]
 version = "0.3.0"
@@ -22,6 +22,12 @@ thiserror = "1"
 tiny-skia = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
+# wasm 向け
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
 
 [profile.release]
 lto = true
