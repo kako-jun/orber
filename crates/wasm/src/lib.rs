@@ -8,9 +8,12 @@
 //!
 //! - `generate_single`: 呼び出し側のパラメータ（seed/direction/speed/count/
 //!   orb_size/blur/shape）をそのまま使って 1 フレームを描く。フル制御版。
-//! - `generate_batch`: `DEFAULT_VARIATIONS` の preset を使って n 枚生成する。
-//!   呼び出し側 params の seed/direction/speed/count/orb_size/blur は **無視**
-//!   され、preset の値が使われる（shape / 入力画像 / 出力サイズ / k のみ反映）。
+//! - `generate_batch`: `random_batch_specs(params.seed)` で 10 件のランダム spec
+//!   を生成し、各 spec ごとに 1 フレームを描く。前半半分は `Png`、後半半分は
+//!   `Mp4` の枠を維持する（当面 GUI 側は両方とも先頭フレームを PNG として表示
+//!   する。`Mp4` の動画化は #40 / #49 で別途扱う）。`params` のうち
+//!   direction/speed/count/orb_size/blur は **無視** され、ランダム値が使われる
+//!   （shape / 入力画像 / 出力サイズ / k / seed のみ反映）。
 //! - `generate_svg`: SVG は静的なので動き系パラメータは無視。orb_size/blur のみ反映。
 
 const MAX_DIM: u32 = 8192;
@@ -20,7 +23,7 @@ use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters};
 use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, StyleOptions};
-use orber_core::variations::DEFAULT_VARIATIONS;
+use orber_core::variations::random_batch_specs;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -186,10 +189,13 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
     Ok(js_sys::Uint8Array::from(&png[..]))
 }
 
-/// 入力画像 1 枚から `n` 個の variation PNG を一括生成する。
+/// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
-/// `DEFAULT_VARIATIONS` の先頭 `n` 件を使う。`n` が 10 を超える場合は実際の
-/// preset 件数まで丸める。返値は `Array<Uint8Array>`。
+/// `random_batch_specs(params.seed, n, n / 2)` で 10 件（`n` 件）のランダム
+/// spec を作る。前半 `n / 2` 件は `VariationKind::Png`、残りは `Mp4` の枠を
+/// 維持する。当面はどちらも先頭フレーム PNG として返す（Mp4 の動画化は別 Issue）。
+///
+/// `n` の上限は安全側で 50 にクランプする。
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
@@ -197,8 +203,9 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
-    let take_n = (n as usize).min(DEFAULT_VARIATIONS.len());
-    let specs = DEFAULT_VARIATIONS.iter().take(take_n).copied().collect();
+    let total = (n as usize).clamp(1, 50);
+    let still_count = total / 2;
+    let specs = random_batch_specs(p.seed as u64, total, still_count);
 
     let input = BatchInput {
         source,

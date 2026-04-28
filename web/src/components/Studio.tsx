@@ -75,6 +75,10 @@ export default function Studio() {
     setPhase('generating');
 
     const [w, h] = aspect() === 'portrait' ? [540, 960] : [960, 540];
+    // 2**48 までは JS Number で無損失。呼び出しごとに新しい base seed を引く
+    // ことで、ドラッグするたびに 10 枚すべての direction / count / orb_size /
+    // blur / 配置がランダムに変わる（GUI 要件）。
+    const baseSeed = Math.floor(Math.random() * 2 ** 48);
     const params = {
       source_rgb: src.rgb,
       source_width: src.width,
@@ -82,7 +86,7 @@ export default function Studio() {
       k: 5,
       width: w,
       height: h,
-      seed: 42,
+      seed: baseSeed,
       direction: 'lr',
       speed: 'slow',
       count: 20,
@@ -232,7 +236,12 @@ export default function Studio() {
           type="file"
           accept="image/*"
           class="hidden"
-          onChange={(e) => acceptFiles(e.currentTarget.files)}
+          onChange={(e) => {
+            const target = e.currentTarget;
+            acceptFiles(target.files);
+            // 同じファイルを連続で選んだときも change が発火するように value をクリア。
+            target.value = '';
+          }}
         />
         {pickedName() ? (
           <span class="text-zinc-200">{pickedName()}</span>
@@ -303,7 +312,14 @@ export default function Studio() {
       </Show>
 
       <Show when={tiles().length > 0}>
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+        <div
+          class={
+            'grid gap-2 ' +
+            (aspect() === 'portrait'
+              ? 'grid-cols-3 sm:grid-cols-4 md:grid-cols-5'
+              : 'grid-cols-1 sm:grid-cols-2 md:grid-cols-3')
+          }
+        >
           <For each={tiles()}>
             {(tile, i) => (
               <button
@@ -313,11 +329,14 @@ export default function Studio() {
                   'group relative block w-full overflow-hidden rounded ' +
                   (tile.selected ? 'ring-2 ring-pink-400' : 'ring-1 ring-zinc-800')
                 }
+                style={{
+                  'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
+                }}
               >
                 <img
                   src={tile.blobUrl}
                   alt={`orber variation ${i() + 1}`}
-                  class="block h-40 w-full object-cover"
+                  class="block h-full w-full object-cover"
                 />
                 <span
                   class={
