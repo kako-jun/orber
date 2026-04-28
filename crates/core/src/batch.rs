@@ -5,6 +5,11 @@
 //! `--variations` は最終的にこの API のラッパーになる予定だが、現時点では
 //! まだ呼ばれていない。
 //!
+//! `OrbShape` は [`BatchInput`] が一括で持つ。`VariationSpec` 自身は
+//! shape を持たないので、1 バッチ内で spec ごとに shape を変えることは
+//! できない（CLI の `--shape` フラグと同じ運用）。spec 単位で shape を
+//! 出し分けたい需要が出たら破壊的変更で対応する。
+//!
 //! 画像 I/O や子プロセス起動を一切しないので wasm32 ターゲットでも動く。
 
 use crate::animate::{render_frame, AnimateOptions};
@@ -15,6 +20,18 @@ use crate::orb::OrbShape;
 use crate::variations::VariationSpec;
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbImage};
+use thiserror::Error;
+
+/// バッチ描画中に起きうるエラー。
+#[derive(Debug, Error)]
+pub enum BatchError {
+    /// kmeans クラスタ抽出でのエラー。
+    #[error("cluster extraction failed: {0}")]
+    Cluster(#[from] ClusterError),
+    /// PNG エンコード時の I/O エラー（実用上は発火しないが将来の `image` 仕様変更に備える）。
+    #[error("PNG encode failed: {0}")]
+    Encode(#[from] image::ImageError),
+}
 
 /// バッチ描画の入力。
 pub struct BatchInput {
@@ -36,17 +53,12 @@ pub struct BatchInput {
 ///
 /// 戻り値の長さは `input.specs.len()` と等しい。`Vec<u8>` はそのまま
 /// `<img src="data:image/png;base64,...">` 等で使える PNG ファイルの中身。
-///
-/// # パニック
-///
-/// PNG エンコードに失敗した場合パニックする。`tiny-skia` の出力は常に
-/// RGBA8 なのでフォーマット由来の失敗は実用上起きない。
-pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, ClusterError> {
+pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, BatchError> {
     let clusters_full = extract_clusters(&input.source, input.k)?;
     let bg = derive_background_rgba(&clusters_full);
     let clusters: Vec<Cluster> = drop_dominant(&clusters_full);
 
-    Ok(input
+    input
         .specs
         .iter()
         .map(|spec| {
@@ -65,18 +77,15 @@ pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, ClusterError> {
             };
             let frame = render_frame(&clusters, &opts, 0.0);
             let mut buf = Vec::new();
-            let encoder = PngEncoder::new(&mut buf);
-            encoder
-                .write_image(
-                    frame.as_raw(),
-                    frame.width(),
-                    frame.height(),
-                    ExtendedColorType::Rgba8,
-                )
-                .expect("PNG encode of RGBA8 frame should not fail");
-            buf
+            PngEncoder::new(&mut buf).write_image(
+                frame.as_raw(),
+                frame.width(),
+                frame.height(),
+                ExtendedColorType::Rgba8,
+            )?;
+            Ok(buf)
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]

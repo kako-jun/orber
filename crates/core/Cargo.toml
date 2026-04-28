@@ -16,7 +16,7 @@ categories = ["graphics", "multimedia"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 kmeans_colors = { workspace = true }
 palette = { workspace = true }
 rand = { workspace = true }
@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 tiny-skia = { workspace = true }
 
 # wasm32: getrandom needs the `wasm_js` backend so kmeans_colors' thread_rng compiles.
+# kmeans_colors 0.7 経由で getrandom 0.2 が、rand 0.9 経由で 0.3 が引かれるため両方を明示する。
+# TODO: kmeans_colors が 0.2 依存を切ったら getrandom_02 alias を剥がす
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }

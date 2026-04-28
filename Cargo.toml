@@ -12,6 +12,8 @@ repository = "https://github.com/kako-jun/orber"
 rust-version = "1.78.0"
 
 [workspace.dependencies]
+# core は features = ["png"] のみで継承、CLI は features 追加で format auto-detection を有効化する
+image = { version = "0.25", default-features = false }
 kmeans_colors = { version = "0.7", default-features = false, features = ["palette_color"] }
 palette = "0.7"
 rand = "0.8"
