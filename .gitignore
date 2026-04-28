@@ -21,3 +21,11 @@ Thumbs.db
 .mcp.json
 .vscode/
 .idea/
+
+# web frontend
+web/node_modules/
+web/dist/
+web/.astro/
+web/src/wasm/*
+!web/src/wasm/.gitkeep
+web/.wrangler/

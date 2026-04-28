@@ -58,6 +58,16 @@ orber/
         ├── test.html       #   ブラウザ確認用デモ（pkg/ を fetch）
         └── src/
             └── lib.rs          # generate_single / generate_batch / generate_svg
+
+web/                        # Web フロントエンド scaffold (#37)
+├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind
+├── package.json            #   npm scripts: wasm:build / dev / build / deploy
+├── wrangler.toml           #   Cloudflare Pages 設定（pages_build_output_dir = "dist"）
+└── src/
+    ├── pages/index.astro       # scaffold ページ
+    ├── layouts/Base.astro      # 共通レイアウト（黒地に白文字）
+    ├── components/Studio.tsx   # Solid アイランド。orber-wasm を import / init
+    └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
 ```
 
 `std::fs` / `std::process::Command` / `tempfile` を使うのは `crates/cli/` だけ。`crates/core/` は wasm32-unknown-unknown でもビルド通る（getrandom 0.3 の wasm_js バックエンドを `.cargo/config.toml` で有効化済み）。

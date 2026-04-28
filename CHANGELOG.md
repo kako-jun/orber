@@ -12,6 +12,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 - `orber_core::batch::generate_batch` — given a source image, k, canvas size, shape, and a list of `VariationSpec`, returns one PNG byte buffer per spec. Used by the upcoming GUI / WASM frontend; the CLI's `--variations` mode will eventually be a thin wrapper around this. (#35)
 - New workspace crate `orber-wasm` (`crates/wasm/`) — wasm-bindgen wrapper around `orber-core` for browsers. Exposes `generate_single` (1 PNG), `generate_batch` (N PNGs from `DEFAULT_VARIATIONS`), and `generate_svg` (SVG string). Image decoding is left to the JS side: callers pass raw RGB bytes from `<canvas>` / `ImageData`, keeping the wasm bundle small. Includes a minimal `crates/wasm/test.html` demo that can be served alongside `wasm-pack build --target web` output. (#36)
+- Web frontend scaffold under `web/` — Astro 4 static build with a Solid.js island and Tailwind CSS. The scaffold loads `orber-wasm` via `wasm-pack --target web` output and confirms `init_panic_hook` runs on mount; the UI is a placeholder file picker. Deployed via `wrangler pages deploy dist` (no SSR adapter needed for `output: 'static'`). `npm run wasm:build` rebuilds `crates/wasm` into `web/src/wasm/`. (#37)
 
 ## [0.3.0] - 2026-04-28
 
