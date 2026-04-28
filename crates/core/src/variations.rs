@@ -279,12 +279,11 @@ pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<Va
             let spec_seed: u64 = rng.gen();
             let duration_ms = match kind {
                 VariationKind::Png => 0,
-                VariationKind::Mp4 => rng.gen_range(
-                    random_ranges::DURATION_MS_MIN..=random_ranges::DURATION_MS_MAX,
-                ),
+                VariationKind::Mp4 => {
+                    rng.gen_range(random_ranges::DURATION_MS_MIN..=random_ranges::DURATION_MS_MAX)
+                }
             };
-            let label: &'static str =
-                Box::leak(format!("random_{:02}", i + 1).into_boxed_str());
+            let label: &'static str = Box::leak(format!("random_{:02}", i + 1).into_boxed_str());
             VariationSpec {
                 label,
                 kind,
@@ -483,7 +482,10 @@ mod tests {
         // 配置の根幹となる spec.seed が 10 件すべて違うことだけ保証する
         // （direction や count は離散レンジが狭いので偶然一致しうる）。
         let any_seed_diff = a.iter().zip(b.iter()).any(|(l, r)| l.seed != r.seed);
-        assert!(any_seed_diff, "different base seed must produce different spec seeds");
+        assert!(
+            any_seed_diff,
+            "different base seed must produce different spec seeds"
+        );
     }
 
     #[test]
@@ -523,7 +525,10 @@ mod tests {
                 }
             }
         }
-        assert!(hit_max, "COUNT_MAX never reached — range may have become exclusive");
+        assert!(
+            hit_max,
+            "COUNT_MAX never reached — range may have become exclusive"
+        );
         assert!(hit_min, "COUNT_MIN never reached");
     }
 
