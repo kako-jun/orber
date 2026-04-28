@@ -1,0 +1,30 @@
+[package]
+name = "orber-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure rendering core for orber: color clusters, orb drawing, animation frames"
+readme = "../../README.md"
+keywords = ["image", "abstract", "orb", "wasm"]
+categories = ["graphics", "multimedia"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+kmeans_colors = { workspace = true }
+palette = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }
+tiny-skia = { workspace = true }
+
+# wasm32: getrandom needs the `wasm_js` backend so kmeans_colors' thread_rng compiles.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }

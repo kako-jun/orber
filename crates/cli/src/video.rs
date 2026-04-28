@@ -14,12 +14,12 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use crate::animate::{
+use orber_core::animate::{
     precompute_orb_params, render_frame_with_params, AnimateOptions, MotionDirection, MotionSpeed,
 };
-use crate::cluster::Cluster;
-use crate::orb::OrbShape;
-use crate::output_mode::OutputMode;
+use orber_core::cluster::Cluster;
+use orber_core::orb::OrbShape;
+use orber_core::output_mode::OutputMode;
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
