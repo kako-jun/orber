@@ -233,7 +233,7 @@ export default function Studio() {
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         class={
-          'block cursor-pointer rounded border-2 border-dashed p-8 text-center transition-colors ' +
+          'block cursor-pointer rounded-3xl border-2 border-dashed p-10 text-center transition-colors ' +
           (dragOver()
             ? 'border-zinc-300 bg-zinc-900'
             : 'border-zinc-700 hover:border-zinc-500')
@@ -360,7 +360,7 @@ export default function Studio() {
           </For>
         </div>
 
-        <div class="flex flex-wrap items-center gap-2 pt-2">
+        <div class="flex flex-wrap items-center justify-center gap-2 pt-2">
           <button
             type="button"
             onClick={downloadSelected}
