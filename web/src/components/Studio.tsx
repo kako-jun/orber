@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 
 type WasmModule = typeof import('../wasm/orber_wasm.js');
@@ -33,6 +33,12 @@ export default function Studio() {
   // 同時実行中の runBatch を区別するための世代カウンタ。
   // 進行中のループは自分の世代と現世代を比較して食い違ったら抜ける。
   let runGen = 0;
+
+  // タイル枚数はアスペクトで決まる（縦長 10 / 横長 9）。runBatch / 進捗表示の
+  // 両方から参照するので一箇所に括っておく。
+  const batchN = createMemo(() =>
+    aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE,
+  );
 
   onMount(async () => {
     try {
@@ -78,7 +84,7 @@ export default function Studio() {
 
     const [w, h] = aspect() === 'portrait' ? [540, 960] : [960, 540];
     // 2**48 までは JS Number で無損失。呼び出しごとに新しい base seed を引く
-    // ことで、ドラッグするたびに 10 枚すべての direction / count / orb_size /
+    // ことで、ドラッグするたびに N 枚すべての direction / count / orb_size /
     // blur / 配置がランダムに変わる（GUI 要件）。
     const baseSeed = Math.floor(Math.random() * 2 ** 48);
     const params = {
@@ -101,11 +107,9 @@ export default function Studio() {
     await yieldFrame();
     if (myGen !== runGen) return;
 
-    const batchN = aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE;
-
     let pngs: Uint8Array[];
     try {
-      const result = wasm.generate_batch(params, batchN);
+      const result = wasm.generate_batch(params, batchN());
       pngs = result as unknown as Uint8Array[];
     } catch (e) {
       if (myGen !== runGen) return;
@@ -306,9 +310,7 @@ export default function Studio() {
         <p class="text-sm text-zinc-400">画像をデコード中…</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        <p class="text-sm text-zinc-400">
-          生成中… {progress()} / {aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE}
-        </p>
+        <p class="text-sm text-zinc-400">生成中… {progress()} / {batchN()}</p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>

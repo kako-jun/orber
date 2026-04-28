@@ -8,12 +8,12 @@
 //!
 //! - `generate_single`: 呼び出し側のパラメータ（seed/direction/speed/count/
 //!   orb_size/blur/shape）をそのまま使って 1 フレームを描く。フル制御版。
-//! - `generate_batch`: `random_batch_specs(params.seed)` で 10 件のランダム spec
-//!   を生成し、各 spec ごとに 1 フレームを描く。前半半分は `Png`、後半半分は
-//!   `Mp4` の枠を維持する（当面 GUI 側は両方とも先頭フレームを PNG として表示
-//!   する。`Mp4` の動画化は #40 / #49 で別途扱う）。`params` のうち
-//!   direction/speed/count/orb_size/blur は **無視** され、ランダム値が使われる
-//!   （shape / 入力画像 / 出力サイズ / k / seed のみ反映）。
+//! - `generate_batch`: `random_batch_specs(params.seed, n, ceil(n/2))` で `n`
+//!   件のランダム spec を生成し、各 spec ごとに 1 フレームを描く。前半 `ceil(n/2)`
+//!   は `Png`、残りは `Mp4` の枠を維持する（当面 GUI 側は両方とも先頭フレームを
+//!   PNG として表示する。`Mp4` の動画化は #40 / #50 で別途扱う）。`params` の
+//!   うち direction/speed/count/orb_size/blur は **無視** され、ランダム値が
+//!   使われる（shape / 入力画像 / 出力サイズ / k / seed のみ反映）。
 //! - `generate_svg`: SVG は静的なので動き系パラメータは無視。orb_size/blur のみ反映。
 
 const MAX_DIM: u32 = 8192;
@@ -191,11 +191,13 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 
 /// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
-/// `random_batch_specs(params.seed, n, n / 2)` で 10 件（`n` 件）のランダム
-/// spec を作る。前半 `n / 2` 件は `VariationKind::Png`、残りは `Mp4` の枠を
-/// 維持する。当面はどちらも先頭フレーム PNG として返す（Mp4 の動画化は別 Issue）。
+/// `random_batch_specs(params.seed, n, ceil(n / 2))` で `n` 件のランダム spec
+/// を作る。前半 `ceil(n / 2)` 件は `VariationKind::Png`、残りは `Mp4` の枠を
+/// 維持する。奇数件のときは still 側を 1 枚多くする（"前半静止 / 後半動画" の
+/// 不変条件を `n=1` でも成立させるため）。当面はどちらも先頭フレーム PNG として
+/// 返す（Mp4 の動画化は別 Issue）。
 ///
-/// `n` の上限は安全側で 50 にクランプする。
+/// `n` は 1..=50 にクランプする。
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
@@ -204,7 +206,9 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let total = (n as usize).clamp(1, 50);
-    let still_count = total / 2;
+    // 奇数のとき (total + 1) / 2 で「前半 still を 1 枚多く」して、n=1 でも
+    // 1 枚目が必ず PNG になるようにする。div_ceil の手書き相当。
+    let still_count = total.div_ceil(2);
     let specs = random_batch_specs(p.seed as u64, total, still_count);
 
     let input = BatchInput {

@@ -4,12 +4,18 @@ Astro 4 + Solid.js + Tailwind + WASM frontend for orber.
 
 ## UI flow
 
-画像をドロップ → `orber-wasm.generate_batch` で 10 枚プレビューを生成 → ❤ で
+画像をドロップ → `orber-wasm.generate_batch` で N 枚プレビューを生成 → ❤ で
 気に入ったタイルを選択 → DL（1 枚は PNG 直接、複数は ZIP）。
 
 UI 上の操作は「画像ドロップ」「アスペクト切替（縦長 540×960 / 横長 960×540）」
-「タイルの ❤ トグル」「DL ボタン」のみ。パラメータスライダーは置かず、
-バリエーションは `DEFAULT_VARIATIONS` の 10 プリセットに任せている。
+「タイルの ❤ トグル」「DL ボタン」のみ。パラメータスライダーは置かない。
+バリエーションは `orber_core::variations::random_batch_specs(seed, total, still_count)`
+で **ドロップごとに毎回ランダム**に振られる（前半は静止画 PNG、後半は MP4 枠と
+いう枠だけ固定し、direction / speed / count / orb_size / blur / seed /
+duration_ms はすべて呼び出しごとに `random_ranges` から一様サンプル）。タイル
+枚数は縦長 10 枚（5×2）、横長 9 枚（3×3）でグリッドが綺麗に揃うように切り
+替える。CLI の `--variations` は `DEFAULT_VARIATIONS` 決定論プリセットのままな
+ので、再現性が必要な用途は CLI 側で扱う。
 
 ## Stack
 

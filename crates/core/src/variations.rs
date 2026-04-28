@@ -232,17 +232,19 @@ pub mod random_ranges {
     pub const DURATION_MS_MAX: u64 = 10000;
 }
 
-/// `seed` から再現可能な 10 件の `VariationSpec` をランダム生成する。
+/// `seed` から再現可能な `total` 件の `VariationSpec` をランダム生成する。
 ///
 /// 枠（不変）:
 /// - 前半 `still_count` 件は `VariationKind::Png`
 /// - 残り (`total - still_count`) 件は `VariationKind::Mp4`
 ///
+/// `still_count > total` なら `total` にクランプされる（全件 Png）。
+///
 /// 各 spec の direction / speed / count / orb_size / blur / seed / duration_ms
 /// は [`random_ranges`] の範囲から一様サンプル。`label` は `random_NN` 形式。
 ///
-/// 同じ `seed` なら同じ 10 件が返る（再現性）。GUI からは
-/// `Math.random() * 2**48` を渡してドラッグごとに違う 10 件を引かせる想定。
+/// 同じ `seed` なら同じ spec 列が返る（再現性）。GUI からは
+/// `Math.random() * 2**48` を渡してドラッグごとに違う spec 列を引かせる想定。
 pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<VariationSpec> {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -250,7 +252,9 @@ pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<Va
     let still_count = still_count.min(total);
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     // ラベルは leak して 'static にする（VariationSpec.label が &'static str のため）。
-    // 件数は GUI 想定で 10 件程度しか作られないので leak の総量は無視できる。
+    // 呼び出し側は `total <= 50` で運用される（`crates/wasm` で clamp 済み）ので
+    // 1 ドロップあたり最大 50 個 × 12 byte 程度の leak。永続実行でも数 MB に
+    // 達するには数百万ドロップが必要で、ブラウザのページ寿命では実害なし。
     (0..total)
         .map(|i| {
             let kind = if i < still_count {
@@ -480,6 +484,47 @@ mod tests {
         // （direction や count は離散レンジが狭いので偶然一致しうる）。
         let any_seed_diff = a.iter().zip(b.iter()).any(|(l, r)| l.seed != r.seed);
         assert!(any_seed_diff, "different base seed must produce different spec seeds");
+    }
+
+    #[test]
+    fn random_batch_specs_n_one_keeps_still_first() {
+        // wasm/lib.rs は still_count = ceil(n/2) で呼ぶので、n=1 のときは
+        // still_count=1 → 1 件目が Png になる。「前半は静止画」の不変条件を
+        // n=1 でも壊さないことを担保する。
+        let specs = random_batch_specs(1, 1, 1);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, VariationKind::Png);
+    }
+
+    #[test]
+    fn random_batch_specs_clamps_still_count_to_total() {
+        let specs = random_batch_specs(1, 3, 999);
+        assert_eq!(specs.len(), 3);
+        for s in &specs {
+            assert_eq!(s.kind, VariationKind::Png, "all-still expected");
+        }
+    }
+
+    #[test]
+    fn random_batch_specs_count_extremes_are_inclusive() {
+        // 整数レンジ (COUNT_MIN..=COUNT_MAX = 10..=50) は inclusive で呼んでいる
+        // 前提。多めの seed 試行で MIN / MAX を踏めることを確認する（将来
+        // `..COUNT_MAX` (exclusive) に変えたら 50 が見えなくなって気付く）。
+        // 浮動小数のレンジ境界は連続値で確率的にヒットしないため対象外。
+        let mut hit_max = false;
+        let mut hit_min = false;
+        for seed in 0u64..2000 {
+            for s in random_batch_specs(seed, 10, 5) {
+                if s.count == random_ranges::COUNT_MAX {
+                    hit_max = true;
+                }
+                if s.count == random_ranges::COUNT_MIN {
+                    hit_min = true;
+                }
+            }
+        }
+        assert!(hit_max, "COUNT_MAX never reached — range may have become exclusive");
+        assert!(hit_min, "COUNT_MIN never reached");
     }
 
     #[test]
