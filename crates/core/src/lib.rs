@@ -2,6 +2,7 @@
 
 pub mod animate;
 pub mod aquarelle;
+pub mod batch;
 pub mod cluster;
 pub mod orb;
 pub mod output_mode;
