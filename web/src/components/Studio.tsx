@@ -1,5 +1,4 @@
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import JSZip from 'jszip';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 
 type WasmModule = typeof import('../wasm/orber_wasm.js');
@@ -29,6 +28,9 @@ export default function Studio() {
 
   let wasm: WasmModule | null = null;
   let fileInput: HTMLInputElement | undefined;
+  // 同時実行中の runBatch を区別するための世代カウンタ。
+  // 進行中のループは自分の世代と現世代を比較して食い違ったら抜ける。
+  let runGen = 0;
 
   onMount(async () => {
     try {
@@ -52,6 +54,9 @@ export default function Studio() {
     setTiles([]);
   };
 
+  // 1 frame ぶん描画を挟む（setTimeout(0) より意図が明確）。
+  const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+
   const runBatch = async () => {
     const src = decoded();
     if (!src) return;
@@ -60,6 +65,9 @@ export default function Studio() {
       setPhase('error');
       return;
     }
+
+    runGen += 1;
+    const myGen = runGen;
 
     clearTiles();
     setErrorMsg('');
@@ -84,14 +92,15 @@ export default function Studio() {
     };
 
     // 重い WASM コール前に 1 フレーム描画させる
-    await new Promise((r) => setTimeout(r, 0));
+    await yieldFrame();
+    if (myGen !== runGen) return;
 
     let pngs: Uint8Array[];
     try {
       const result = wasm.generate_batch(params, BATCH_N);
       pngs = result as unknown as Uint8Array[];
     } catch (e) {
-      console.error('generate_batch failed', e);
+      if (myGen !== runGen) return;
       setErrorMsg(String(e));
       setPhase('error');
       return;
@@ -99,15 +108,17 @@ export default function Studio() {
 
     try {
       for (const png of pngs) {
+        if (myGen !== runGen) return;
         const blob = new Blob([png], { type: 'image/png' });
         const blobUrl = URL.createObjectURL(blob);
         setTiles((prev) => [...prev, { blob, blobUrl, selected: false }]);
         setProgress((n) => n + 1);
-        await new Promise((r) => setTimeout(r, 0));
+        await yieldFrame();
       }
+      if (myGen !== runGen) return;
       setPhase('done');
     } catch (e) {
-      console.error('tile build failed', e);
+      if (myGen !== runGen) return;
       setErrorMsg(String(e));
       setPhase('error');
     }
@@ -145,7 +156,10 @@ export default function Studio() {
   };
 
   const onDragLeave = (e: DragEvent) => {
-    e.preventDefault();
+    // 子要素間移動で発火する dragleave を握りつぶしてハイライトの点滅を防ぐ。
+    const related = e.relatedTarget as Node | null;
+    const current = e.currentTarget as Node | null;
+    if (related && current && current.contains(related)) return;
     setDragOver(false);
   };
 
@@ -180,6 +194,9 @@ export default function Studio() {
       triggerDownload(chosen[0].blob, 'orber.png');
       return;
     }
+    // jszip は ZIP 化する瞬間にしか使わないので、初回 DL 時に動的読み込みする。
+    // 訪問しただけのユーザーに 30KB 余分な JS を読ませない。
+    const { default: JSZip } = await import('jszip');
     const zip = new JSZip();
     chosen.forEach((t, i) => {
       zip.file(`orber_${String(i + 1).padStart(2, '0')}.png`, t.blob);
@@ -199,6 +216,7 @@ export default function Studio() {
   return (
     <section class="space-y-4">
       <label
+        aria-label="画像ファイル選択 / ドラッグ&ドロップ"
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -329,7 +347,8 @@ export default function Studio() {
           <button
             type="button"
             onClick={downloadAll}
-            class="px-3 py-1.5 rounded text-sm border border-zinc-600 text-zinc-200 hover:border-zinc-400"
+            disabled={phase() === 'generating' || tiles().length === 0}
+            class="px-3 py-1.5 rounded text-sm border border-zinc-600 text-zinc-200 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
           >
             全 {tiles().length} 枚 DL
           </button>

@@ -4,6 +4,10 @@ export interface DecodedImage {
   height: number;
 }
 
+// orber-wasm 側 `validate_params` が辺長 8192 を超える入力を reject するので、
+// JS 側でも先に弾いてブラウザのメモリ圧迫を避ける。
+const MAX_DIM = 8192;
+
 /**
  * `File` をデコードして RGB バイト列にする。
  *
@@ -15,6 +19,12 @@ export async function decodeImageToRgb(file: File): Promise<DecodedImage> {
     throw new Error(`not an image: ${file.type || 'unknown'}`);
   }
   const bitmap = await createImageBitmap(file);
+  if (bitmap.width > MAX_DIM || bitmap.height > MAX_DIM) {
+    bitmap.close?.();
+    throw new Error(
+      `image too large: ${bitmap.width}x${bitmap.height} (max ${MAX_DIM} per side)`,
+    );
+  }
   try {
     const canvas = document.createElement('canvas');
     canvas.width = bitmap.width;
