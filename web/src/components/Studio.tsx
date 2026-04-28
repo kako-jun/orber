@@ -12,7 +12,9 @@ interface Tile {
   selected: boolean;
 }
 
-const BATCH_N = 10;
+// 縦長は 5 列 × 2 行 = 10 枚、横長は 3 列 × 3 行 = 9 枚で綺麗に割り切れる。
+const BATCH_PORTRAIT = 10;
+const BATCH_LANDSCAPE = 9;
 
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
@@ -99,9 +101,11 @@ export default function Studio() {
     await yieldFrame();
     if (myGen !== runGen) return;
 
+    const batchN = aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE;
+
     let pngs: Uint8Array[];
     try {
-      const result = wasm.generate_batch(params, BATCH_N);
+      const result = wasm.generate_batch(params, batchN);
       pngs = result as unknown as Uint8Array[];
     } catch (e) {
       if (myGen !== runGen) return;
@@ -302,7 +306,9 @@ export default function Studio() {
         <p class="text-sm text-zinc-400">画像をデコード中…</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        <p class="text-sm text-zinc-400">生成中… {progress()} / {BATCH_N}</p>
+        <p class="text-sm text-zinc-400">
+          生成中… {progress()} / {aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE}
+        </p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
