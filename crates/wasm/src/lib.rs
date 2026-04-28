@@ -62,7 +62,9 @@ fn parse_direction(s: &str) -> Result<MotionDirection, String> {
         "rl" => Ok(MotionDirection::RightToLeft),
         "tb" => Ok(MotionDirection::TopToBottom),
         "bt" => Ok(MotionDirection::BottomToTop),
-        other => Err(format!("invalid direction: {other}")),
+        other => Err(format!(
+            "invalid direction: {other} (expected one of lr / rl / tb / bt)"
+        )),
     }
 }
 
@@ -70,7 +72,9 @@ fn parse_speed(s: &str) -> Result<MotionSpeed, String> {
     match s {
         "very-slow" => Ok(MotionSpeed::VerySlow),
         "slow" => Ok(MotionSpeed::Slow),
-        other => Err(format!("invalid speed: {other}")),
+        other => Err(format!(
+            "invalid speed: {other} (expected one of very-slow / slow)"
+        )),
     }
 }
 
