@@ -1,0 +1,25 @@
+{
+  "name": "orber-web",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "wasm:build": "cd .. && wasm-pack build crates/wasm --target web --out-dir ../../web/src/wasm --release",
+    "dev": "npm run wasm:build && astro dev",
+    "build": "npm run wasm:build && astro build",
+    "preview": "astro preview",
+    "deploy": "wrangler pages deploy dist",
+    "deploy:dry": "wrangler pages deploy dist --dry-run"
+  },
+  "dependencies": {
+    "@astrojs/solid-js": "^4.4.0",
+    "@astrojs/tailwind": "^5.1.0",
+    "astro": "^4.16.0",
+    "solid-js": "^1.9.0",
+    "tailwindcss": "^3.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "wrangler": "^3.80.0"
+  }
+}
