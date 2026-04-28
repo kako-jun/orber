@@ -216,6 +216,89 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
         .collect()
 }
 
+/// GUI バッチ生成用のランダム範囲。
+///
+/// CLI の固定 preset (`DEFAULT_VARIATIONS`) では各位置の系統が決まっているが、
+/// GUI では「ドラッグするたびに違う 10 枚」が欲しい。各軸を一様サンプルする
+/// レンジをここに集約しておく（テスト・ドキュメントから参照しやすい形に）。
+pub mod random_ranges {
+    pub const COUNT_MIN: usize = 10;
+    pub const COUNT_MAX: usize = 50;
+    pub const ORB_SIZE_MIN: f32 = 1.5;
+    pub const ORB_SIZE_MAX: f32 = 5.0;
+    pub const BLUR_MIN: f32 = 0.3;
+    pub const BLUR_MAX: f32 = 0.8;
+    pub const DURATION_MS_MIN: u64 = 6000;
+    pub const DURATION_MS_MAX: u64 = 10000;
+}
+
+/// `seed` から再現可能な `total` 件の `VariationSpec` をランダム生成する。
+///
+/// 枠（不変）:
+/// - 前半 `still_count` 件は `VariationKind::Png`
+/// - 残り (`total - still_count`) 件は `VariationKind::Mp4`
+///
+/// `still_count > total` なら `total` にクランプされる（全件 Png）。
+///
+/// 各 spec の direction / speed / count / orb_size / blur / seed / duration_ms
+/// は [`random_ranges`] の範囲から一様サンプル。`label` は `random_NN` 形式。
+///
+/// 同じ `seed` なら同じ spec 列が返る（再現性）。GUI からは
+/// `Math.random() * 2**48` を渡してドラッグごとに違う spec 列を引かせる想定。
+pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<VariationSpec> {
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    let still_count = still_count.min(total);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    // ラベルは leak して 'static にする（VariationSpec.label が &'static str のため）。
+    // 呼び出し側は `total <= 50` で運用される（`crates/wasm` で clamp 済み）ので
+    // 1 ドロップあたり最大 50 個 × 12 byte 程度の leak。永続実行でも数 MB に
+    // 達するには数百万ドロップが必要で、ブラウザのページ寿命では実害なし。
+    (0..total)
+        .map(|i| {
+            let kind = if i < still_count {
+                VariationKind::Png
+            } else {
+                VariationKind::Mp4
+            };
+            let direction = match rng.gen_range(0..4u8) {
+                0 => MotionDirection::LeftToRight,
+                1 => MotionDirection::RightToLeft,
+                2 => MotionDirection::TopToBottom,
+                _ => MotionDirection::BottomToTop,
+            };
+            let speed = if rng.gen_bool(0.5) {
+                MotionSpeed::Slow
+            } else {
+                MotionSpeed::VerySlow
+            };
+            let count = rng.gen_range(random_ranges::COUNT_MIN..=random_ranges::COUNT_MAX);
+            let orb_size = rng.gen_range(random_ranges::ORB_SIZE_MIN..=random_ranges::ORB_SIZE_MAX);
+            let blur = rng.gen_range(random_ranges::BLUR_MIN..=random_ranges::BLUR_MAX);
+            let spec_seed: u64 = rng.gen();
+            let duration_ms = match kind {
+                VariationKind::Png => 0,
+                VariationKind::Mp4 => {
+                    rng.gen_range(random_ranges::DURATION_MS_MIN..=random_ranges::DURATION_MS_MAX)
+                }
+            };
+            let label: &'static str = Box::leak(format!("random_{:02}", i + 1).into_boxed_str());
+            VariationSpec {
+                label,
+                kind,
+                direction,
+                speed,
+                count,
+                orb_size,
+                blur,
+                seed: spec_seed,
+                duration_ms,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +416,140 @@ mod tests {
         assert_eq!(three.len(), 3);
         let zero = select_specs(0, VariationMode::Mixed);
         assert_eq!(zero.len(), 0);
+    }
+
+    #[test]
+    fn random_batch_specs_keeps_kind_split() {
+        let specs = random_batch_specs(42, 10, 5);
+        assert_eq!(specs.len(), 10);
+        for s in &specs[..5] {
+            assert_eq!(s.kind, VariationKind::Png, "first half must be PNG");
+            assert_eq!(s.duration_ms, 0, "PNG specs must have duration_ms=0");
+        }
+        for s in &specs[5..] {
+            assert_eq!(s.kind, VariationKind::Mp4, "second half must be MP4");
+            assert!(
+                (random_ranges::DURATION_MS_MIN..=random_ranges::DURATION_MS_MAX)
+                    .contains(&s.duration_ms),
+                "MP4 spec duration_ms {} out of range",
+                s.duration_ms
+            );
+        }
+    }
+
+    #[test]
+    fn random_batch_specs_in_range() {
+        let specs = random_batch_specs(123, 10, 5);
+        for s in &specs {
+            assert!(
+                (random_ranges::COUNT_MIN..=random_ranges::COUNT_MAX).contains(&s.count),
+                "count {} out of range",
+                s.count
+            );
+            assert!(
+                s.orb_size >= random_ranges::ORB_SIZE_MIN
+                    && s.orb_size <= random_ranges::ORB_SIZE_MAX,
+                "orb_size {} out of range",
+                s.orb_size
+            );
+            assert!(
+                s.blur >= random_ranges::BLUR_MIN && s.blur <= random_ranges::BLUR_MAX,
+                "blur {} out of range",
+                s.blur
+            );
+        }
+    }
+
+    #[test]
+    fn random_batch_specs_is_deterministic_per_seed() {
+        let a = random_batch_specs(7, 10, 5);
+        let b = random_batch_specs(7, 10, 5);
+        assert_eq!(a.len(), b.len());
+        for (l, r) in a.iter().zip(b.iter()) {
+            assert_eq!(l.kind, r.kind);
+            assert_eq!(l.direction, r.direction);
+            assert_eq!(l.speed, r.speed);
+            assert_eq!(l.count, r.count);
+            assert_eq!(l.seed, r.seed);
+            assert_eq!(l.duration_ms, r.duration_ms);
+        }
+    }
+
+    #[test]
+    fn random_batch_specs_differ_across_seeds() {
+        let a = random_batch_specs(1, 10, 5);
+        let b = random_batch_specs(2, 10, 5);
+        // 配置の根幹となる spec.seed が 10 件すべて違うことだけ保証する
+        // （direction や count は離散レンジが狭いので偶然一致しうる）。
+        let any_seed_diff = a.iter().zip(b.iter()).any(|(l, r)| l.seed != r.seed);
+        assert!(
+            any_seed_diff,
+            "different base seed must produce different spec seeds"
+        );
+    }
+
+    #[test]
+    fn random_batch_specs_n_one_keeps_still_first() {
+        // wasm/lib.rs は still_count = ceil(n/2) で呼ぶので、n=1 のときは
+        // still_count=1 → 1 件目が Png になる。「前半は静止画」の不変条件を
+        // n=1 でも壊さないことを担保する。
+        let specs = random_batch_specs(1, 1, 1);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, VariationKind::Png);
+    }
+
+    #[test]
+    fn random_batch_specs_clamps_still_count_to_total() {
+        let specs = random_batch_specs(1, 3, 999);
+        assert_eq!(specs.len(), 3);
+        for s in &specs {
+            assert_eq!(s.kind, VariationKind::Png, "all-still expected");
+        }
+    }
+
+    #[test]
+    fn random_batch_specs_count_extremes_are_inclusive() {
+        // 整数レンジ (COUNT_MIN..=COUNT_MAX = 10..=50) は inclusive で呼んでいる
+        // 前提。多めの seed 試行で MIN / MAX を踏めることを確認する（将来
+        // `..COUNT_MAX` (exclusive) に変えたら 50 が見えなくなって気付く）。
+        // 浮動小数のレンジ境界は連続値で確率的にヒットしないため対象外。
+        let mut hit_max = false;
+        let mut hit_min = false;
+        for seed in 0u64..2000 {
+            for s in random_batch_specs(seed, 10, 5) {
+                if s.count == random_ranges::COUNT_MAX {
+                    hit_max = true;
+                }
+                if s.count == random_ranges::COUNT_MIN {
+                    hit_min = true;
+                }
+            }
+        }
+        assert!(
+            hit_max,
+            "COUNT_MAX never reached — range may have become exclusive"
+        );
+        assert!(hit_min, "COUNT_MIN never reached");
+    }
+
+    #[test]
+    fn random_batch_specs_directions_diversify() {
+        // seed 42 / 10 件で 4 方向のうち少なくとも 2 種類は出る（多様性の最低ライン）。
+        let specs = random_batch_specs(42, 10, 5);
+        let mut seen = [false; 4];
+        for s in &specs {
+            let idx = match s.direction {
+                MotionDirection::LeftToRight => 0,
+                MotionDirection::RightToLeft => 1,
+                MotionDirection::TopToBottom => 2,
+                MotionDirection::BottomToTop => 3,
+            };
+            seen[idx] = true;
+        }
+        let unique = seen.iter().filter(|b| **b).count();
+        assert!(
+            unique >= 2,
+            "expected at least 2 distinct directions, got {unique}"
+        );
     }
 }

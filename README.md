@@ -102,6 +102,20 @@ produce ten visibly distinct outputs (4 stills + 6 animations). Colors come stra
 from the k-means palette of the input image — variations never recolor the photo.
 Use `--variations-mode still` or `--variations-mode video` to filter the table.
 
+### Web GUI
+
+A drag-and-drop browser GUI is published at <https://orber.llll-ll.com/>. Drop an
+image and the page generates a fresh batch every time — 10 tiles in portrait mode
+(540×960) or 9 tiles in landscape mode (960×540, 3×3 grid). Unlike the CLI's fixed
+`--variations` preset, the GUI samples direction / speed / count / orb size / blur
+randomly per drop, so the same image yields a different layout each time. The only
+guarantee is that the first half of the batch is a still and the second half is
+intended as motion (currently rendered as the `t=0` frame; see Issue #50). Heart-
+toggle tiles to pick favorites and download single (PNG) or multi (ZIP).
+
+The GUI runs entirely client-side via the `orber-wasm` crate (WASM bundle ≈ 237 KB
+gzipped). Source: `web/` (Astro + Solid + Tailwind).
+
 ## Build
 
 ```bash
