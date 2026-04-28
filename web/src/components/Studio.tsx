@@ -258,8 +258,7 @@ export default function Studio() {
         )}
       </label>
 
-      <div class="flex items-center gap-2">
-        <span class="text-zinc-500 text-sm mr-1">アスペクト:</span>
+      <div class="flex items-center justify-center gap-2">
         <button
           type="button"
           aria-pressed={aspect() === 'portrait'}
@@ -286,25 +285,24 @@ export default function Studio() {
         >
           横長 960×540
         </button>
+        <button
+          type="button"
+          onClick={() => void runBatch()}
+          disabled={!decoded() || phase() === 'decoding' || phase() === 'generating'}
+          aria-label="同じ画像で再生成"
+          title="同じ画像で再生成"
+          class="px-3 py-1 rounded text-sm border border-zinc-700 text-zinc-300 hover:border-zinc-500 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          もう一度
+        </button>
       </div>
 
-      <div class="text-xs">
-        <span class="text-zinc-500 mr-2">wasm:</span>
-        <span
-          class={
-            wasmStatus() === 'ready'
-              ? 'text-green-400'
-              : wasmStatus() === 'error'
-              ? 'text-red-400'
-              : 'text-yellow-400'
-          }
-        >
-          {wasmStatus()}
-        </span>
-        <Show when={wasmStatus() === 'error'}>
-          <pre class="mt-2 text-xs text-red-300 whitespace-pre-wrap">{wasmErr()}</pre>
-        </Show>
-      </div>
+      <Show when={wasmStatus() === 'error'}>
+        <div class="rounded border border-red-700 bg-red-950/40 p-3 text-sm text-red-300">
+          wasm の読み込みに失敗しました
+          <pre class="mt-2 text-xs whitespace-pre-wrap">{wasmErr()}</pre>
+        </div>
+      </Show>
 
       <Show when={phase() === 'decoding'}>
         <p class="text-sm text-zinc-400">画像をデコード中…</p>
@@ -335,7 +333,7 @@ export default function Studio() {
                 onClick={() => toggleTile(i())}
                 class={
                   'group relative block w-full overflow-hidden rounded ' +
-                  (tile.selected ? 'ring-2 ring-pink-400' : 'ring-1 ring-zinc-800')
+                  (tile.selected ? 'ring-2 ring-emerald-400' : 'ring-1 ring-zinc-800')
                 }
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
@@ -348,14 +346,14 @@ export default function Studio() {
                 />
                 <span
                   class={
-                    'absolute top-1 right-1 text-lg leading-none ' +
+                    'absolute top-1 right-1 text-lg leading-none font-bold ' +
                     (tile.selected
-                      ? 'text-pink-400'
+                      ? 'text-emerald-400'
                       : 'text-zinc-500 opacity-0 group-hover:opacity-100')
                   }
                   aria-hidden="true"
                 >
-                  ♥
+                  ✓
                 </span>
               </button>
             )}
@@ -367,7 +365,7 @@ export default function Studio() {
             type="button"
             onClick={downloadSelected}
             disabled={selectedCount() === 0}
-            class="px-3 py-1.5 rounded text-sm border border-pink-500 text-pink-300 hover:bg-pink-950/40 disabled:opacity-40 disabled:cursor-not-allowed"
+            class="px-3 py-1.5 rounded text-sm border border-emerald-500 text-emerald-300 hover:bg-emerald-950/40 disabled:opacity-40 disabled:cursor-not-allowed"
           >
             選択を DL ({selectedCount()})
           </button>
