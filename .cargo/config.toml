@@ -1,0 +1,5 @@
+# wasm32: getrandom 0.3 requires the wasm_js backend to be selected via cfg.
+# This makes `cargo build --target wasm32-unknown-unknown -p orber-core` work
+# without needing RUSTFLAGS on the command line.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

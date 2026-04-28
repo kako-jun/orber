@@ -1,14 +1,16 @@
 use clap::{Parser, ValueEnum};
-use orber::animate::{MotionDirection, MotionSpeed};
-use orber::aquarelle::AquarelleParams;
-use orber::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
-use orber::orb::{OrbShape, RenderOptions};
-use orber::output_mode::OutputMode;
-use orber::style::{render_css, render_svg, StyleOptions};
-use orber::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
-use orber::video::{render_video, VideoCodec, VideoOptions};
+use orber_core::animate::{MotionDirection, MotionSpeed};
+use orber_core::aquarelle::AquarelleParams;
+use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
+use orber_core::orb::{OrbShape, RenderOptions};
+use orber_core::output_mode::OutputMode;
+use orber_core::style::{render_css, render_svg, StyleOptions};
+use orber_core::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+mod video;
+use video::{render_video, VideoCodec, VideoOptions};
 
 /// Conveyor-belt direction (`--direction`). All orbs flow the same way for the entire clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -429,7 +431,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     //    （render_static は count を解釈しないので、count=clusters.len() に固定された
     //     旧経路にしないよう animate::render_frame を一律に使う。）
     let (direction, speed) = resolve_motion(cli);
-    let frame_opts = orber::animate::AnimateOptions {
+    let frame_opts = orber_core::animate::AnimateOptions {
         width: RenderOptions::default().width,
         height: RenderOptions::default().height,
         orb_size: cli.orb_size,
@@ -442,7 +444,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         background,
         shape: cli.orb_shape(),
     };
-    let out = orber::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+    let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
     if let Err(e) = out.save(output) {
@@ -546,7 +548,7 @@ fn render_one_variation(
         VariationKind::Png => {
             // 静止画は「コンベアベルトの一瞬」。t=0 のフレームを 1 枚だけレンダリングする。
             // phase 由来で orb が画面全体に散らばり、画面端で半分欠ける構図が自然に出る。
-            let frame_opts = orber::animate::AnimateOptions {
+            let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
                 orb_size: spec.orb_size,
@@ -559,7 +561,7 @@ fn render_one_variation(
                 background: bg_rgba,
                 shape: orb_shape,
             };
-            let img = orber::animate::render_frame(clusters, &frame_opts, 0.0);
+            let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
         }
         VariationKind::Mp4 => {
@@ -589,8 +591,8 @@ fn render_one_variation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orber::animate::AnimateOptions;
-    use orber::video::MAX_DURATION_MS;
+    use crate::video::MAX_DURATION_MS;
+    use orber_core::animate::AnimateOptions;
 
     #[test]
     fn cli_defaults_match_render_options_defaults() {

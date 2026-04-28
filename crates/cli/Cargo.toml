@@ -1,0 +1,26 @@
+[package]
+name = "orber"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Turn photos and videos into abstract orb mood images and short-form vertical videos"
+documentation = "https://docs.rs/orber"
+readme = "../../README.md"
+keywords = ["image", "video", "abstract", "orb", "mood"]
+categories = ["command-line-utilities", "graphics", "multimedia"]
+exclude = [".github/", "target/"]
+
+[[bin]]
+name = "orber"
+path = "src/main.rs"
+
+[dependencies]
+orber-core = { path = "../core", version = "0.3.0" }
+clap = { workspace = true }
+image = { workspace = true, default-features = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }

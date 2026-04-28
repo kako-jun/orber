@@ -51,7 +51,7 @@ impl OutputMode {
     /// extension is missing or not one of the supported formats.
     ///
     /// ```
-    /// use orber::output_mode::OutputMode;
+    /// use orber_core::output_mode::OutputMode;
     /// use std::path::Path;
     ///
     /// assert_eq!(OutputMode::from_path(Path::new("clip.mp4")).unwrap(), OutputMode::Mp4);
