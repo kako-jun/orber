@@ -119,7 +119,9 @@ The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
 (measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via
 the WebCodecs API (Chrome 94+ / Safari 16.4+ / Firefox 130+). On older browsers
 the video tiles fall back to the static PNG. Source: `web/` (Astro + Solid +
-Tailwind).
+Tailwind). The visual language and component conventions are documented in
+[`DESIGN.md`](./DESIGN.md). UI text is auto-localized: Japanese for `ja-*`
+browsers, English everywhere else, with no language picker.
 
 ## Build
 
