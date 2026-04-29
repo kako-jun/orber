@@ -5,7 +5,7 @@ import {
   encodeAnimationToMp4,
   isWebCodecsSupported,
 } from '../lib/encodeMp4';
-import { t, lang, setLang, detectLang } from '../lib/strings';
+import { t, lang } from '../lib/strings';
 
 type WasmModule = typeof import('../wasm/orber_wasm.js');
 
@@ -56,11 +56,9 @@ export default function Studio() {
     aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE,
   );
 
+  // lang 同期 (setLang + document.documentElement.lang) は Subtitle.tsx に集約。
+  // pre-hydration では Base.astro の inline script が <html lang> を確定済み。
   onMount(async () => {
-    setLang(detectLang());
-    if (typeof document !== 'undefined') {
-      document.documentElement.lang = detectLang();
-    }
     try {
       const mod = await import('../wasm/orber_wasm.js');
       await mod.default();

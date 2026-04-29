@@ -3,15 +3,14 @@
 // `t(key, vars?)` で文字列を取り出す。SolidJS signal `lang` を更新すると
 // 全ての `t()` 呼び出しが reactive に再評価される。
 //
-// 文字列は appTitle / subtitle / dropZoneLabel ... など ~25 キーを想定。
-// aria-label / title / プレースホルダ・エラー文言までここに集約する。
+// 文字列は subtitle / dropZoneLabel ... など 20 弱のキーを集約する。
+// aria-label / title / プレースホルダ・エラー文言までここに含める。
 
 import { createSignal } from 'solid-js';
 
 export type Lang = 'ja' | 'en';
 
 export const STRINGS = {
-  appTitle: { ja: 'orber', en: 'orber' },
   subtitle: {
     ja: '画像から街の光を抽出。配信や動画の背景に。',
     en: 'Extract city lights from any image. Use as a video or stream background.',
@@ -63,7 +62,9 @@ export function detectLang(): Lang {
 const [lang, setLang] = createSignal<Lang>('en');
 export { lang, setLang };
 
-export function t<K extends keyof typeof STRINGS>(
+export type StringKey = keyof typeof STRINGS;
+
+export function t<K extends StringKey>(
   key: K,
   vars?: Record<string, string | number>,
 ): string {
