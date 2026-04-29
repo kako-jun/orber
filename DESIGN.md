@@ -63,9 +63,30 @@ No bold anywhere. Headers are deliberately light.
 - Background: transparent
 - Border: `1px dashed hairline`, radius `0.75rem`
 - Padding: `2.5rem` (40px) vertical, `2rem` (32px) horizontal
-- Drag-over state: border swaps to `fg-muted`, no fill change
-- Text: placeholder uses `fg-subtle`, picked filename uses `fg`
-- Cursor: `pointer`
+- Hover state (empty): border swaps to `fg-muted`
+- Drag-over state: border swaps to `fg`, fill `glass-bg`
+- Text: placeholder uses `fg-muted`, picked filename uses `fg`
+- Cursor: `pointer` (always — even when filled with a thumbnail; the area
+  remains an active drop target / file picker trigger)
+- Focus: when the inner `<input type=file>` is focused, the surrounding
+  `<label>` gets `focus-within:border-focusRing`
+
+#### Filled state (thumbnail)
+
+After a file is picked, the drop area shows the source image as a thumbnail
+**without losing its drop-target framing**. The dashed border, padding, and
+cursor are kept exactly as in the empty state — only the inner content swaps.
+
+- Thumbnail: `<img>`, centered, `object-contain`, `max-h-40` (160px) so the
+  drop frame keeps a consistent height regardless of source aspect
+- Replace overlay: a fade-in layer above the thumbnail
+  - Hover (group): `opacity 0 → 1`, fill `bg/40` (40% black scrim), centered
+    `Replace` / `差し替え` label in `font-display`, `text-sm`, `tracking-wide`,
+    color `fg`
+  - Drag-over: overlay fully opaque with fill `fg/5` (faint white wash) and
+    no label — the active drop affordance is the white border and the wash
+- The overlay is `pointer-events: none` so the underlying `<label>` keeps
+  receiving drag / click events
 
 ### Button (Glass)
 
