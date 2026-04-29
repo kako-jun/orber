@@ -194,9 +194,9 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 /// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
 /// 後半 [`GUI_VIDEO_COUNT_DEFAULT`] (= 4) 件を `VariationKind::Mp4`、残りを
-/// `Png` にする。GUI では n が 9（横長 3×3）／10（縦長 2×5）で運用される
-/// ため、どちらの場合でも「後半 4 枚は動画枠」になる。動画 4 枚には
-/// `start_animation_for_batch_spec` で LR / RL / TB / BT が 1 枚ずつ
+/// `Png` にする。GUI では n = 12 (#61 で縦横共通に統一、前半 8 枚静止 +
+/// 後半 4 枚動画) で運用されるため、「後半 4 枚は動画枠」になる。動画 4 枚
+/// には `start_animation_for_batch_spec` で LR / RL / TB / BT が 1 枚ずつ
 /// 重複なく割り当てられる（#59）。
 /// `n < GUI_VIDEO_COUNT_DEFAULT` のときは全件 Mp4。Mp4 タイルも当面は先頭
 /// フレーム PNG として返す（動画化は `start_animation_for_batch_spec` 経由）。
