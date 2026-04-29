@@ -11,8 +11,34 @@ const { title = 'orber' } = Astro.props;
     <meta name="viewport" content="width=device-width" />
     <meta name="generator" content={Astro.generator} />
     <title>{title}</title>
+    <!--
+      DESIGN.md §3 — ロゴ専用フォント Space Grotesk を Google Fonts CDN から
+      読み込む。本文は system sans のままなので weights は 300 / 400 / 500 のみ。
+      preconnect で TLS / DNS のラウンドトリップを先に済ませる (推奨パターン)。
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500&display=swap"
+    />
+    <!--
+      orber#62 — 言語自動切替。
+      hydration を待たずに <html lang> を navigator.language に合わせて書き換える
+      ことで、スクリーンリーダー / 翻訳ツールが最初から正しい言語で読み上げる。
+      strings.ts 側の reactive な切替 (lang signal) は Subtitle.tsx の onMount で
+      行うが、これは DOM 属性側の早期同期 (DESIGN.md §8 参照)。
+    -->
+    <script is:inline>
+      try {
+        var nav = navigator.language || '';
+        document.documentElement.lang = nav.toLowerCase().indexOf('ja') === 0 ? 'ja' : 'en';
+      } catch (_) {
+        /* noop — locale read failure must not block render. lang stays "en". */
+      }
+    </script>
   </head>
-  <body class="min-h-screen bg-black text-white">
+  <body class="min-h-screen bg-bg text-fg">
     <main class="mx-auto max-w-3xl p-8">
       <slot />
     </main>

@@ -165,3 +165,20 @@ Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
+
+## Design system & i18n (web GUI)
+
+The web GUI (`web/`) follows a single design system documented in `DESIGN.md` at the
+repository root. Theme: black-canvas gothic with glass-only buttons (no accent
+hue, no shadows, no decorative motion). Tailwind theme tokens in
+`web/tailwind.config.mjs` (`fg`, `glass-bg`, `hairline`, etc.) are the only place
+where chrome colors are defined; raw `red-*` / `emerald-*` Tailwind classes never
+appear in components.
+
+All visible strings live in `web/src/lib/strings.ts` and are accessed via
+`t('key')`. Language is auto-detected from `navigator.language`: a Japanese
+locale renders Japanese, every other locale renders English. There is no
+language picker — users do not choose. The `<html lang>` attribute is set
+pre-hydration by an inline script in `Base.astro` so screen readers pick the
+right voice from first paint, and the Solid `lang` signal is synced
+post-hydration by `Subtitle.tsx` for reactive UI text.

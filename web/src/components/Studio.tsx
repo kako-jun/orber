@@ -5,6 +5,7 @@ import {
   encodeAnimationToMp4,
   isWebCodecsSupported,
 } from '../lib/encodeMp4';
+import { t, lang } from '../lib/strings';
 
 type WasmModule = typeof import('../wasm/orber_wasm.js');
 
@@ -55,6 +56,8 @@ export default function Studio() {
     aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE,
   );
 
+  // lang 同期 (setLang + document.documentElement.lang) は Subtitle.tsx に集約。
+  // pre-hydration では Base.astro の inline script が <html lang> を確定済み。
   onMount(async () => {
     try {
       const mod = await import('../wasm/orber_wasm.js');
@@ -212,7 +215,7 @@ export default function Studio() {
     }
     if (myGen !== runGen) return;
     if (firstAnimErr !== null) {
-      setErrorMsg(`動画生成に失敗したタイルがあります: ${String(firstAnimErr)}`);
+      setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
     }
     setPhase('done');
   };
@@ -317,18 +320,29 @@ export default function Studio() {
     void downloadTiles(tiles());
   };
 
+  // glass スタイル統一トークン — DESIGN.md §1, §4
+  // ボタン / トグル / ガチャ / DL ボタンに共通で使う。padding は DESIGN.md §4 (8px / 14px)。
+  const GLASS_BTN =
+    'px-3.5 py-2 rounded inline-flex items-center justify-center ' +
+    'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
+    'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+    'transition-colors duration-200 ease-out ' +
+    'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed';
+  // toggled (アスペクト ON 等) で重ねる class — DESIGN.md §4 Toggle.
+  const GLASS_BTN_TOGGLED = 'bg-glassBgHover';
+
   return (
-    <section class="space-y-4">
+    <section class="space-y-4" data-lang={lang()}>
       <label
-        aria-label="画像ファイル選択 / ドラッグ&ドロップ"
+        aria-label={t('dropZoneLabel')}
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         class={
-          'block cursor-pointer rounded-3xl border-2 border-dashed p-10 text-center transition-colors ' +
+          'block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out ' +
           (dragOver()
-            ? 'border-zinc-300 bg-zinc-900'
-            : 'border-zinc-700 hover:border-zinc-500')
+            ? 'border-fg bg-glassBg'
+            : 'border-hairline hover:border-fgMuted')
         }
       >
         <input
@@ -344,9 +358,9 @@ export default function Studio() {
           }}
         />
         {pickedName() ? (
-          <span class="text-zinc-200">{pickedName()}</span>
+          <span class="text-fg">{pickedName()}</span>
         ) : (
-          <span class="text-zinc-500">画像を 1 つドロップ / クリックして選択</span>
+          <span class="text-fgMuted">{t('dropZonePlaceholder')}</span>
         )}
       </label>
 
@@ -354,15 +368,10 @@ export default function Studio() {
         <button
           type="button"
           aria-pressed={aspect() === 'portrait'}
-          aria-label="縦長"
-          title="縦長 540×960"
+          aria-label={t('aspectPortrait')}
+          title={t('aspectPortraitTitle')}
           onClick={() => setAspectAndMaybeRerun('portrait')}
-          class={
-            'px-3 py-1.5 rounded border inline-flex items-center justify-center ' +
-            (aspect() === 'portrait'
-              ? 'border-zinc-200 bg-zinc-800 text-zinc-100'
-              : 'border-zinc-700 text-zinc-400 hover:border-zinc-500')
-          }
+          class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 縦長を示すシルエット (角丸縦長方形) */}
           <svg
@@ -371,7 +380,7 @@ export default function Studio() {
             height="20"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linejoin="round"
             aria-hidden="true"
           >
@@ -381,15 +390,10 @@ export default function Studio() {
         <button
           type="button"
           aria-pressed={aspect() === 'landscape'}
-          aria-label="横長"
-          title="横長 960×540"
+          aria-label={t('aspectLandscape')}
+          title={t('aspectLandscapeTitle')}
           onClick={() => setAspectAndMaybeRerun('landscape')}
-          class={
-            'px-3 py-1.5 rounded border inline-flex items-center justify-center ' +
-            (aspect() === 'landscape'
-              ? 'border-zinc-200 bg-zinc-800 text-zinc-100'
-              : 'border-zinc-700 text-zinc-400 hover:border-zinc-500')
-          }
+          class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 横長を示すシルエット (角丸横長方形) */}
           <svg
@@ -398,7 +402,7 @@ export default function Studio() {
             height="20"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linejoin="round"
             aria-hidden="true"
           >
@@ -409,18 +413,18 @@ export default function Studio() {
           type="button"
           onClick={() => void runBatch()}
           disabled={!decoded() || phase() === 'decoding' || phase() === 'generating' || phase() === 'animating'}
-          aria-label="同じ画像でガチャ"
-          title="同じ画像でもう一度ガチャ"
-          class="px-3 py-1.5 rounded text-sm border border-zinc-700 text-zinc-300 hover:border-zinc-500 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+          aria-label={t('rerollLabel')}
+          title={t('rerollTitle')}
+          class={GLASS_BTN}
         >
-          {/* リロード (循環矢印) */}
+          {/* リロード (循環矢印) — アイコンのみ。テキストラベルは廃止 */}
           <svg
             viewBox="0 0 24 24"
             width="16"
             height="16"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linecap="round"
             stroke-linejoin="round"
             aria-hidden="true"
@@ -430,29 +434,28 @@ export default function Studio() {
             <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
             <path d="M3 21v-5h5" />
           </svg>
-          ガチャ
         </button>
       </div>
 
       <Show when={wasmStatus() === 'error'}>
-        <div class="rounded border border-red-700 bg-red-950/40 p-3 text-sm text-red-300">
-          wasm の読み込みに失敗しました
-          <pre class="mt-2 text-xs whitespace-pre-wrap">{wasmErr()}</pre>
+        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+          {t('wasmLoadFailed')}
+          <pre class="mt-2 text-xs whitespace-pre-wrap text-fgMuted">{wasmErr()}</pre>
         </div>
       </Show>
 
       <Show when={phase() === 'decoding'}>
-        <p class="text-sm text-zinc-400">画像をデコード中…</p>
+        <p class="text-sm text-fgMuted">{t('decoding')}</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        <p class="text-sm text-zinc-400">生成中… {progress()} / {batchN()}</p>
+        <p class="text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
       </Show>
       <Show when={phase() === 'animating'}>
-        <p class="text-sm text-zinc-400">動画化中…</p>
+        <p class="text-sm text-fgMuted">{t('animating')}</p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
-        <div class="rounded border border-red-700 bg-red-950/40 p-3 text-sm text-red-300">
+        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {errorMsg()}
         </div>
       </Show>
@@ -471,10 +474,7 @@ export default function Studio() {
               <button
                 type="button"
                 onClick={() => toggleTile(i())}
-                class={
-                  'group relative block w-full overflow-hidden rounded ' +
-                  (tile.selected ? 'ring-2 ring-emerald-400' : 'ring-1 ring-zinc-800')
-                }
+                class="group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
                 }}
@@ -484,7 +484,7 @@ export default function Studio() {
                   fallback={
                     <img
                       src={tile.blobUrl}
-                      alt={`orber variation ${i() + 1}`}
+                      alt={t('variationAlt', { n: i() + 1 })}
                       class="block h-full w-full object-cover"
                     />
                   }
@@ -497,19 +497,69 @@ export default function Studio() {
                     playsinline
                     loop
                     class="block h-full w-full object-cover"
-                    aria-label={`orber variation ${i() + 1} (animated)`}
+                    aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
                   />
                 </Show>
+                {/* 4-corner L marker — DESIGN.md §4 SelectionMarker */}
                 <span
                   class={
-                    'absolute top-1 right-1 text-lg leading-none font-bold ' +
-                    (tile.selected
-                      ? 'text-emerald-400'
-                      : 'text-zinc-500 opacity-0 group-hover:opacity-100')
+                    'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
+                    (tile.selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-30')
                   }
                   aria-hidden="true"
                 >
-                  ✓
+                  {/* top-left */}
+                  <svg
+                    class="absolute top-1 left-1"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  >
+                    <path d="M2 5 V2 H5" />
+                  </svg>
+                  {/* top-right */}
+                  <svg
+                    class="absolute top-1 right-1"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  >
+                    <path d="M9 2 H12 V5" />
+                  </svg>
+                  {/* bottom-left */}
+                  <svg
+                    class="absolute bottom-1 left-1"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  >
+                    <path d="M2 9 V12 H5" />
+                  </svg>
+                  {/* bottom-right */}
+                  <svg
+                    class="absolute bottom-1 right-1"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 14 14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  >
+                    <path d="M9 12 H12 V9" />
+                  </svg>
                 </span>
               </button>
             )}
@@ -521,17 +571,17 @@ export default function Studio() {
             type="button"
             onClick={downloadSelected}
             disabled={selectedCount() === 0}
-            class="px-3 py-1.5 rounded text-sm border border-emerald-500 text-emerald-300 hover:bg-emerald-950/40 disabled:opacity-40 disabled:cursor-not-allowed"
+            class={GLASS_BTN + ' text-sm'}
           >
-            選択を DL ({selectedCount()})
+            {t('downloadSelected')} ({selectedCount()})
           </button>
           <button
             type="button"
             onClick={downloadAll}
             disabled={phase() === 'generating' || phase() === 'animating' || tiles().length === 0}
-            class="px-3 py-1.5 rounded text-sm border border-zinc-600 text-zinc-200 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
+            class={GLASS_BTN + ' text-sm'}
           >
-            全 {tiles().length} 枚 DL
+            {t('downloadAll', { n: tiles().length })}
           </button>
         </div>
       </Show>
