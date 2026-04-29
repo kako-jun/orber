@@ -219,10 +219,10 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 /// GUI のバッチ後半を `VariationKind::Mp4` 枠にする件数の既定値。
 ///
 /// `crates/wasm` の `generate_batch` / `start_animation_for_batch_spec` と
-/// Web フロント (`web/src/components/Studio.tsx`) の両方が参照する。レイアウト
-/// （縦長 10 / 横長 9）に関わらず後半 4 タイルを動画枠で固定したいので、
-/// この定数を軸に各層が `still_count = total - GUI_VIDEO_COUNT_DEFAULT` を
-/// 計算する。
+/// Web フロント (`web/src/components/Studio.tsx`) の両方が参照する。GUI は
+/// #61 で 12 枚統一になったため、後半 4 タイル (= 12 - 4 = 8 枚静止 + 4 枚
+/// 動画) を動画枠で固定する。この定数を軸に各層が
+/// `still_count = total - GUI_VIDEO_COUNT_DEFAULT` を計算する。
 ///
 /// 4 にしている理由（#59）: 動画タイル 4 枚に LR / RL / TB / BT を **重複なく
 /// 1 枚ずつ** 割り当てて「全方向揃い踏み」の見せ場にするため。direction の
@@ -246,7 +246,7 @@ pub const GUI_VIDEO_DIRECTIONS: [crate::animate::MotionDirection; GUI_VIDEO_COUN
 /// GUI バッチ生成用のランダム範囲。
 ///
 /// CLI の固定 preset (`DEFAULT_VARIATIONS`) では各位置の系統が決まっているが、
-/// GUI では「ドラッグするたびに違う 10 枚」が欲しい。各軸を一様サンプルする
+/// GUI では「ドラッグするたびに違う 12 枚」が欲しい。各軸を一様サンプルする
 /// レンジをここに集約しておく（テスト・ドキュメントから参照しやすい形に）。
 pub mod random_ranges {
     pub const COUNT_MIN: usize = 10;

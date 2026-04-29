@@ -158,6 +158,10 @@ Tailwind spacing scale (4px base):
 - Stack between major sections: `space-y-4` (16px)
 - Tile grid gap: `0.5rem` (8px)
 - Button group gap: `0.5rem` (8px)
+- Tile batch count: **12** (1/2/3/4/6/12 で割り切れる最大公約数の大きい数字、
+  どの幅でも余りなくグリッドが組める)。前半 8 枚静止 + 後半 4 枚動画 (#59, #61)
+- Tile grid columns: portrait (tall cells) = `grid-cols-2 sm:grid-cols-3 md:grid-cols-4`、
+  landscape (wide cells) = `grid-cols-1 sm:grid-cols-2 md:grid-cols-3`
 
 ## 6. Motion
 

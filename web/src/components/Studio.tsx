@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import {
   ANIM_TOTAL_FRAMES,
@@ -58,10 +58,9 @@ export default function Studio() {
   // 完了した時点で一斉に play() を呼び、4 枚の動き始めを揃える。
   let videoRefs: (HTMLVideoElement | undefined)[] = [];
 
-  // タイル枚数は #61 から縦長 / 横長を問わず 12 枚で統一。createMemo を経由
-  // しているのは進捗表示など複数箇所から呼ばれるため、定数直書きに変えても
-  // 等価だが将来 UI から変えられるようにしておく余地としても残しておく。
-  const batchN = createMemo(() => BATCH_TILE_COUNT);
+  // タイル枚数は #61 から縦長 / 横長を問わず 12 枚で統一。依存 signal が
+  // ないので createMemo は不要 (コスト払うだけ)。プレーンな関数で揃える。
+  const batchN = () => BATCH_TILE_COUNT;
 
   // lang 同期 (setLang + document.documentElement.lang) は Subtitle.tsx に集約。
   // pre-hydration では Base.astro の inline script が <html lang> を確定済み。
@@ -232,13 +231,19 @@ export default function Studio() {
     // ここまでは静止 (PNG 下敷きが見える) で待機し、全 mp4 化が終わった瞬間
     // に 4 枚同時に動き始める。yieldFrame で setTiles → DOM mount → ref 確定
     // のサイクルを 1 フレーム回してから play() を呼ぶ。
+    // Promise.all で全 play() が解決するまで待つことで、4 枚の readyState
+    // 解消タイミングを揃える (個々の play() は内部的に readyState 待ちを
+    // 含むため、await を挟まないとタイル間のずれが見える可能性)。
     await yieldFrame();
     if (myGen !== runGen) return;
-    for (const v of videoRefs) {
-      // play() は user gesture 要件等で reject しうる。muted な <video> なら
-      // 通るはずだが、保険で握りつぶす (無音動画が視覚的に静止しても許容)。
-      v?.play().catch(() => {});
-    }
+    await Promise.all(
+      videoRefs.map((v) =>
+        // play() は user gesture 要件等で reject しうる。muted な <video> なら
+        // 通るはずだが、保険で握りつぶす (無音動画が視覚的に静止しても許容)。
+        v ? v.play().catch(() => {}) : Promise.resolve(),
+      ),
+    );
+    if (myGen !== runGen) return;
 
     setPhase('done');
   };
@@ -569,7 +574,12 @@ export default function Studio() {
                       autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
                       一斉に play() する (動き始めを揃えるため)。 */}
                   <video
-                    ref={(el) => { videoRefs[i()] = el; }}
+                    ref={(el) => {
+                      // unmount 時に null/undefined が来るケースを除外して
+                      // 古いスロットを上書きしないようガード (#61 セルフ
+                      // レビュー S4)。リセットは runBatch 冒頭で一括行う。
+                      if (el) videoRefs[i()] = el;
+                    }}
                     src={tile.videoBlobUrl}
                     muted
                     playsinline
