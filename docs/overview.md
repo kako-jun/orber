@@ -166,6 +166,51 @@ Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
 User-facing CLI behavior is unchanged.
 
+## Web GUI rendering pipeline
+
+The web frontend (`web/`) renders 12 tiles per drop (8 stills + 4 animated) via
+the WASM bindings. The pipeline is split between a **main thread** (UI + DOM)
+and a **dedicated Worker thread** (wasm + WebCodecs):
+
+```
+[main thread]                          [worker thread (orberWorker.ts)]
+  Studio.tsx                             wasm-bindgen loaded once
+   ├ runBatch                            ├ generate_one_at_index × 12
+   │   └ workerGenerateOne(i) ────────→  │   └→ PNG bytes (Transferable)
+   ├ animate phase                       ├ start_animation_for_batch_spec × 4
+   │   └ workerAnimateOne(i) ─────────→  │   ├ next_frame loop
+   │                                     │   ├ WebCodecs VideoEncoder
+   │                                     │   └→ mp4 Blob (Transferable)
+   └ DL high-res                         └ same APIs, with width/height = 1080×1920
+       └ workerGenerateOne / workerAnimateOne (per selected index)
+```
+
+The source RGB buffer is uploaded once via `workerSetSource` and cached in the
+Worker; subsequent `generateOne` / `animateOne` calls reference that cache so
+multi-megabyte arrays are not copied per call.
+
+**Preview vs. download resolution.** Tiles are rendered at **540×960** (portrait)
+or **960×540** (landscape) for the preview grid — light enough to keep mobile
+generation fast. When the user clicks Download, the Worker re-renders only the
+selected tiles at **1080×1920** / **1920×1080** (4× resolution, same 9:16 / 16:9).
+Determinism is provided by `random_batch_specs(seed, total, still_count)` in
+`crates/core::variations`: the same `baseSeed` reproduces the exact same
+variation specs at any resolution.
+
+**Browser requirements.** OffscreenCanvas / VideoEncoder / VideoFrame in Worker
+context. iOS Safari 16.4+, current Android Chrome / Firefox 130+. There is no
+fallback path for older browsers — the GUI shows an error if WebCodecs is
+unavailable.
+
+**Progressive UX.** While the Worker is busy:
+
+- An empty grid of 12 **skeleton tiles** appears the moment the user drops an
+  image, so the layout is fixed before any pixel is rendered.
+- Stills replace their skeleton one by one as PNG bytes arrive from the Worker.
+- Video tiles show a softer shimmer (`.skeleton-soft`) plus an "Animating" badge
+  on top of the still PNG until the mp4 is delivered, signalling that they will
+  start moving shortly.
+
 ## Design system & i18n (web GUI)
 
 The web GUI (`web/`) follows a single design system documented in `DESIGN.md` at the

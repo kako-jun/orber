@@ -57,7 +57,9 @@ orber/
         ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
         ├── test.html       #   ブラウザ確認用デモ（pkg/ を fetch）
         └── src/
-            └── lib.rs          # generate_single / generate_batch / generate_svg
+            └── lib.rs          # generate_single / generate_batch / generate_svg /
+                                # generate_one_at_index (#73) /
+                                # start_animation_for_batch_spec (#52)
 
 web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind
@@ -65,11 +67,19 @@ web/                        # Web フロントエンド (#37, #38)
 ├── wrangler.toml           #   Cloudflare Pages 設定（pages_build_output_dir = "dist"）
 └── src/
     ├── pages/index.astro       # トップページ（ロゴ + Subtitle + Studio）
-    ├── layouts/Base.astro      # 共通レイアウト（Space Grotesk + lang 自動切替, #62）
-    ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI（#38, #62 glass 化, #61 で 12 枚統一 + 4 動画一斉再生）
+    ├── layouts/Base.astro      # 共通レイアウト（Space Grotesk + lang 自動切替, #62 /
+    │                           # skeleton & skeleton-soft shimmer #71 #80）
+    ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI
+    │                           # (#38, #62 glass, #61 12 枚統一 + 動画一斉再生,
+    │                           #  #71 skeleton 先出し, #73 hi-res DL,
+    │                           #  #75 worker 経由化, #80 video pending overlay)
     ├── components/Subtitle.tsx # Solid アイランド。用途提案サブタイトル（i18n, #62）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
-    ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）
+    ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）。
+    │                           # encodeAnimationToMp4 本体は worker 側で呼ばれる (#75)。
+    │                           # ANIM_TOTAL_FRAMES / isWebCodecsSupported は main 側からも import される。
+    ├── lib/orberWorker.ts      # #75 wasm 描画 + WebCodecs を実行する Worker 本体
+    ├── lib/orberClient.ts      # #75 main 側 Worker クライアント（postMessage を Promise 化）
     ├── lib/strings.ts          # i18n 文言集約 + ja/en 自動切替（#62）
     └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
 ```
@@ -89,6 +99,9 @@ web/                        # Web フロントエンド (#37, #38)
 - **描画バックエンドは tiny-skia** — pure Rust で外部 C ライブラリ不要、`RadialGradient` をネイティブで持っており orb 表現に向く。`Pixmap` は **premultiplied alpha** なので、`RgbaImage` (straight alpha) に変換する際は un-premultiply が必要
 - **アニメーション軌道はリサジュー曲線** — `animate.rs` の `render_frame` は `(sin(2π·a·t·s + φx), sin(2π·b·t·s + φy))` を採用。周波数比 `(a, b)` は整数比候補 `[(1,2),(2,3),(3,4),(1,3),(2,5)]` から `seed` で決定的に選ぶ。`(a · t · s).fract()` で位相を巻き戻すことで、t=0 と t=1 のフレームが浮動小数点誤差なく完全一致する（ループ性保証）。色揺らぎは HSL の S/L に追加倍率として乗せ、`saturation` フラグの倍率と二重掛けにならないよう独立させる
 - **`animate.rs` は `orb::render_static` を再利用** — 位置と色を変調した `Cluster` 列を作って渡すだけ。orb 側に新 API を増やさない
+- **Web GUI の wasm は Worker で動かす（#75）** — メインスレッドは UI / DOM / Solid signal だけにして、wasm 描画 + WebCodecs エンコード + mp4-muxer は全部 `orberWorker.ts` 内で完結させる。スマホで生成中もタップ・スクロールが反応するためのコア施策。フォールバックパスは作らない（最新ブラウザ前提、死コード化を防ぐ）
+- **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
+- **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
 
 ## 関連プロジェクト
 
