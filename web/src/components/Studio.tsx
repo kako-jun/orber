@@ -24,9 +24,11 @@ interface Tile {
   selected: boolean;
 }
 
-// 縦長は 5 列 × 2 行 = 10 枚、横長は 3 列 × 3 行 = 9 枚で綺麗に割り切れる。
-const BATCH_PORTRAIT = 10;
-const BATCH_LANDSCAPE = 9;
+// 縦長 / 横長どちらも 12 枚で統一する (#61)。12 は 1/2/3/4/6/12 で
+// 割り切れるため、スマホからデスクトップまでどの幅でも綺麗にグリッドが
+// 揃う最大公約数の大きい数字。前半 8 枚が静止画、後半 4 枚が動画
+// (GUI_VIDEO_COUNT_DEFAULT = 4)。
+const BATCH_TILE_COUNT = 12;
 // `crates/core/src/variations.rs::GUI_VIDEO_COUNT_DEFAULT` と一致させる。
 // wasm バインディング経由で値を引っ張る方法もあるが、コンパイル時定数で済む
 // 軽い値なのでミラーする。#59 で 5 → 4 に変更（4 方向 LR/RL/TB/BT を
@@ -52,12 +54,14 @@ export default function Studio() {
   // 同時実行中の runBatch を区別するための世代カウンタ。
   // 進行中のループは自分の世代と現世代を比較して食い違ったら抜ける。
   let runGen = 0;
+  // #61: 動画タイル <video> の参照を tile index で集める。すべての mp4 化が
+  // 完了した時点で一斉に play() を呼び、4 枚の動き始めを揃える。
+  let videoRefs: (HTMLVideoElement | undefined)[] = [];
 
-  // タイル枚数はアスペクトで決まる（縦長 10 / 横長 9）。runBatch / 進捗表示の
-  // 両方から参照するので一箇所に括っておく。
-  const batchN = createMemo(() =>
-    aspect() === 'portrait' ? BATCH_PORTRAIT : BATCH_LANDSCAPE,
-  );
+  // タイル枚数は #61 から縦長 / 横長を問わず 12 枚で統一。createMemo を経由
+  // しているのは進捗表示など複数箇所から呼ばれるため、定数直書きに変えても
+  // 等価だが将来 UI から変えられるようにしておく余地としても残しておく。
+  const batchN = createMemo(() => BATCH_TILE_COUNT);
 
   // lang 同期 (setLang + document.documentElement.lang) は Subtitle.tsx に集約。
   // pre-hydration では Base.astro の inline script が <html lang> を確定済み。
@@ -109,6 +113,8 @@ export default function Studio() {
     setErrorMsg('');
     setProgress(0);
     setPhase('generating');
+    // #61: 新しい run の開始でビデオ参照テーブルもリセット。
+    videoRefs = [];
 
     const [w, h] = aspect() === 'portrait' ? [540, 960] : [960, 540];
     // 2**48 までは JS Number で無損失。呼び出しごとに新しい base seed を引く
@@ -221,6 +227,19 @@ export default function Studio() {
     if (firstAnimErr !== null) {
       setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
     }
+
+    // #61: 4 枚揃ってから一斉に play()。<video autoplay> を切ってあるので
+    // ここまでは静止 (PNG 下敷きが見える) で待機し、全 mp4 化が終わった瞬間
+    // に 4 枚同時に動き始める。yieldFrame で setTiles → DOM mount → ref 確定
+    // のサイクルを 1 フレーム回してから play() を呼ぶ。
+    await yieldFrame();
+    if (myGen !== runGen) return;
+    for (const v of videoRefs) {
+      // play() は user gesture 要件等で reject しうる。muted な <video> なら
+      // 通るはずだが、保険で握りつぶす (無音動画が視覚的に静止しても許容)。
+      v?.play().catch(() => {});
+    }
+
     setPhase('done');
   };
 
@@ -514,11 +533,13 @@ export default function Studio() {
       </Show>
 
       <Show when={tiles().length > 0}>
+        {/* 12 枚 = 1/2/3/4/6/12 で割り切れるので、どの列数でも余りが出ない。
+            縦長 (tall) と横長 (wide) でセル幅が違うため列数を別系統にしてある。 */}
         <div
           class={
             'grid gap-2 ' +
             (aspect() === 'portrait'
-              ? 'grid-cols-3 sm:grid-cols-4 md:grid-cols-5'
+              ? 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4'
               : 'grid-cols-1 sm:grid-cols-2 md:grid-cols-3')
           }
         >
@@ -544,11 +565,12 @@ export default function Studio() {
                   class="block h-full w-full object-cover"
                 />
                 <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
-                  {/* poster は冗長 (autoplay 即時 + 下敷き <img> が同等の役割)
-                      なので付けない。 */}
+                  {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
+                      autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
+                      一斉に play() する (動き始めを揃えるため)。 */}
                   <video
+                    ref={(el) => { videoRefs[i()] = el; }}
                     src={tile.videoBlobUrl}
-                    autoplay
                     muted
                     playsinline
                     loop

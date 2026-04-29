@@ -66,7 +66,7 @@ web/                        # Web フロントエンド (#37, #38)
 └── src/
     ├── pages/index.astro       # トップページ（ロゴ + Subtitle + Studio）
     ├── layouts/Base.astro      # 共通レイアウト（Space Grotesk + lang 自動切替, #62）
-    ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI（#38, #62 で glass 化）
+    ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI（#38, #62 glass 化, #61 で 12 枚統一 + 4 動画一斉再生）
     ├── components/Subtitle.tsx # Solid アイランド。用途提案サブタイトル（i18n, #62）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
     ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）

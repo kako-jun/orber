@@ -105,20 +105,22 @@ Use `--variations-mode still` or `--variations-mode video` to filter the table.
 ### Web GUI
 
 A drag-and-drop browser GUI is published at <https://orber.llll-ll.com/>. Drop an
-image and the page generates a fresh batch every time — 10 tiles in portrait mode
-(540×960) or 9 tiles in landscape mode (960×540, 3×3 grid). Unlike the CLI's fixed
-`--variations` preset, the GUI samples direction / speed / count / orb size / blur
-randomly per drop, so the same image yields a different layout each time. The
-first portion of the batch (6 tiles in portrait, 5 in landscape) are static PNGs;
-the **last 4 tiles** are H.264 mp4 loops generated client-side via WebCodecs and
-inlined as `<video muted autoplay playsinline loop>`, so they animate
-continuously in the grid without any user interaction. Those 4 video tiles each
-flow in a different direction (left→right, right→left, top→bottom, bottom→top),
-shown in that order so every batch always offers all four motion axes side by
-side. Pick favorites with the corner-marker toggle and download single
-(PNG / MP4) or multi (mixed-extension ZIP). After drop, the source image stays
-in the drop zone as a thumbnail; hover (or drag a new file over it) to swap it
-out without touching any other control.
+image and the page generates a fresh batch of **12 tiles** every time, regardless
+of aspect (portrait 540×960 or landscape 960×540). 12 was picked because its
+divisor count (1/2/3/4/6/12) lets the grid lay out cleanly across phone widths.
+Unlike the CLI's fixed `--variations` preset, the GUI samples direction / speed /
+count / orb size / blur randomly per drop, so the same image yields a different
+layout each time. The first **8 tiles** are static PNGs; the **last 4 tiles**
+are H.264 mp4 loops generated client-side via WebCodecs and inlined as
+`<video muted playsinline loop>`. Each of the 4 video tiles flows in a
+different direction (left→right, right→left, top→bottom, bottom→top), shown in
+that order so every batch always offers all four motion axes side by side. The
+4 videos start playing **simultaneously** once all encodes finish, so the field
+animates as a single coordinated burst rather than staggered pop-ins. Pick
+favorites with the corner-marker toggle and download single (PNG / MP4) or
+multi (mixed-extension ZIP). After drop, the source image stays in the drop
+zone as a thumbnail; hover (or drag a new file over it) to swap it out without
+touching any other control.
 
 The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
 (measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via
