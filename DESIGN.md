@@ -139,6 +139,26 @@ Not used in this iteration; reserved. The aspect Portrait / Landscape pair is in
 - Glass button base, **icon-only** (curved arrows / reload glyph, 16px stroke 1.5)
 - No "ガチャ" / "Roll again" text in the visual; full label lives in `aria-label` and `title` only
 
+### PreviewOverlay
+
+Press-and-hold preview for the drop-zone thumbnail (#57). Triggered by a long
+press of ~400ms, dismissed when the pointer is released.
+
+- `position: fixed`, `inset: 0`, `z-50`, full viewport
+- Background: `bg/80` (80% black scrim)
+- Content: the source image, centered, `max-h-[90vh] max-w-[90vw]`,
+  `object-contain` so it never crops
+- `pointer-events: none` — the overlay never intercepts the user's release;
+  the original drop-zone `<label>` keeps owning the gesture
+- Mounts via `.fade-in` (DESIGN.md §6) so the overlay rises smoothly
+- The thumbnail `<img>` underneath wears `select-none touch-none` (and an
+  inline `-webkit-touch-callout: none`) to suppress iOS callout / loupe and
+  text selection during the long press
+- A short tap (under 400ms) is treated as a normal label click and opens the
+  file picker; only the long-press path opens the overlay. The synthetic click
+  fired after a successful long-press is suppressed by an `isLongPress` flag
+  in the click handler.
+
 ## 5. Spacing & Layout
 
 Tailwind spacing scale (4px base):
