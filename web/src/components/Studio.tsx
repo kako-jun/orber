@@ -48,6 +48,8 @@ export default function Studio() {
   const [errorMsg, setErrorMsg] = createSignal<string>('');
   const [tiles, setTiles] = createSignal<Tile[]>([]);
   const [dragOver, setDragOver] = createSignal(false);
+  // #57: ドロップエリア長押し中だけ拡大プレビュー。
+  const [previewVisible, setPreviewVisible] = createSignal(false);
 
   let wasm: WasmModule | null = null;
   let fileInput: HTMLInputElement | undefined;
@@ -57,6 +59,12 @@ export default function Studio() {
   // #61: 動画タイル <video> の参照を tile index で集める。すべての mp4 化が
   // 完了した時点で一斉に play() を呼び、4 枚の動き始めを揃える。
   let videoRefs: (HTMLVideoElement | undefined)[] = [];
+  // #57: 長押し検出。pointerdown から 400ms 経つと拡大プレビューを開く。
+  // タイマーが発火した = 長押し成立した時に isLongPress を立て、
+  // 続いて発火する click を抑止してファイル選択ダイアログが開かないようにする。
+  const LONG_PRESS_MS = 400;
+  let longPressTimer: number | undefined;
+  let isLongPress = false;
 
   // タイル枚数は #61 から縦長 / 横長を問わず 12 枚で統一。依存 signal が
   // ないので createMemo は不要 (コスト払うだけ)。プレーンな関数で揃える。
@@ -83,6 +91,9 @@ export default function Studio() {
       if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
     }
     if (pickedThumbUrl()) URL.revokeObjectURL(pickedThumbUrl());
+    // #57 — 走行中の長押しタイマーを止める。コンポーネントが消えた後に
+    // setPreviewVisible が呼ばれるのを防ぐ。
+    if (longPressTimer !== undefined) clearTimeout(longPressTimer);
   });
 
   const clearTiles = () => {
@@ -296,6 +307,48 @@ export default function Studio() {
     setDragOver(false);
   };
 
+  // #57 — 長押しで拡大プレビュー。
+  // pointerdown 時に LONG_PRESS_MS のタイマーを仕掛け、満了したらオーバーレイを
+  // 開きつつ isLongPress を立てる。pointerup / cancel で常にタイマーをクリア
+  // しオーバーレイを閉じる。pointerleave は使わない (S1: 押下中に指がラベル外
+  // に少しずれただけで閉じる UX を避けるため)。代わりに pointerdown で
+  // setPointerCapture を取り、指がラベル外に移動しても pointerup が必ず
+  // ラベルに届くようにする。
+  // click は label のネイティブ動作でファイル選択を起動するので、isLongPress
+  // が立っていたら preventDefault で抑止する。サムネイルが無い (空ドロップ
+  // エリア) ときは何もしない。
+  const endLongPress = () => {
+    if (longPressTimer !== undefined) {
+      clearTimeout(longPressTimer);
+      longPressTimer = undefined;
+    }
+    setPreviewVisible(false);
+  };
+  const onDropZonePointerDown = (e: PointerEvent) => {
+    if (!pickedThumbUrl()) return;
+    isLongPress = false;
+    // ジェスチャ全体を label に閉じ込める。指が外にスライドしても
+    // pointerup / pointercancel が必ず label に届く。
+    const target = e.currentTarget as HTMLElement | null;
+    target?.setPointerCapture?.(e.pointerId);
+    longPressTimer = window.setTimeout(() => {
+      isLongPress = true;
+      setPreviewVisible(true);
+      longPressTimer = undefined;
+    }, LONG_PRESS_MS);
+  };
+  const onDropZonePointerEnd = () => {
+    endLongPress();
+  };
+  const onDropZoneClick = (e: MouseEvent) => {
+    if (isLongPress) {
+      e.preventDefault();
+      e.stopPropagation();
+      // click は pointerup の後に来る一発限り。次の操作のために即リセット。
+      isLongPress = false;
+    }
+  };
+
   const setAspectAndMaybeRerun = (a: Aspect) => {
     if (aspect() === a) return;
     setAspect(a);
@@ -379,8 +432,12 @@ export default function Studio() {
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
+        onPointerDown={onDropZonePointerDown}
+        onPointerUp={onDropZonePointerEnd}
+        onPointerCancel={onDropZonePointerEnd}
+        onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
+          'group relative block cursor-pointer touch-manipulation rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
           (dragOver()
             ? 'border-fg bg-glassBg'
             : 'border-hairline hover:border-fgMuted')
@@ -412,10 +469,14 @@ export default function Studio() {
         >
           {(url) => (
             <div class="relative">
+              {/* select-none / touch-none / draggable=false で iOS の長押し
+                  callout・拡大鏡・テキスト選択・ドラッグを抑止 (#57)。 */}
               <img
                 src={url}
                 alt={t('pickedThumbAlt', { name: pickedName() })}
-                class="fade-in mx-auto max-h-40 object-contain"
+                draggable={false}
+                class="fade-in mx-auto max-h-40 object-contain select-none touch-none"
+                style={{ '-webkit-touch-callout': 'none' }}
               />
               {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
                   dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 Filled state)。
@@ -671,6 +732,23 @@ export default function Studio() {
           >
             {t('downloadAll', { n: tiles().length })}
           </button>
+        </div>
+      </Show>
+
+      {/* #57 — 長押し中だけ表示する拡大プレビュー (DESIGN.md §4 PreviewOverlay)。
+          pointer-events-none で下のドロップエリアが pointerup を受けられる。
+          .fade-in (#60) を流用して 200ms フェードイン。 */}
+      <Show when={previewVisible() && pickedThumbUrl()}>
+        <div
+          class="fade-in pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-bg/80"
+          aria-hidden="true"
+        >
+          <img
+            src={pickedThumbUrl()}
+            alt={t('pickedThumbAlt', { name: pickedName() })}
+            draggable={false}
+            class="max-h-[90vh] max-w-[90vw] object-contain select-none touch-none"
+          />
         </div>
       </Show>
     </section>
