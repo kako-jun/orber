@@ -75,6 +75,22 @@ const { title = 'orber' } = Astro.props;
         background-size: 200% 100%;
         animation: orb-skeleton-shimmer 1.6s linear infinite;
       }
+      /* orber#? — 静止 PNG が出来た後、動画化が完了するまで重ねる soft 版。
+         skeleton と同じ shimmer を bg-color なしで動かし、下の PNG が透ける
+         ようにする。「処理中」シグナルを skeleton と一貫した語彙で出すための
+         二段階表現（強い shimmer = まだ何もない、弱い shimmer = 静止は出た
+         けど動画はまだ）。 */
+      .skeleton-soft {
+        background-image: linear-gradient(
+          90deg,
+          rgba(255, 255, 255, 0) 0%,
+          rgba(255, 255, 255, 0.18) 50%,
+          rgba(255, 255, 255, 0) 100%
+        );
+        background-size: 200% 100%;
+        animation: orb-skeleton-shimmer 1.8s linear infinite;
+        pointer-events: none;
+      }
       @media (prefers-reduced-motion: reduce) {
         /* belt-and-suspenders — 変数を 0ms にすれば animation-duration も
            解決時に 0ms になるが、念のため `.fade-in` 側でも明示する。 */
@@ -85,6 +101,10 @@ const { title = 'orber' } = Astro.props;
           animation-duration: 0ms;
         }
         .skeleton {
+          animation: none;
+          background-image: none;
+        }
+        .skeleton-soft {
           animation: none;
           background-image: none;
         }

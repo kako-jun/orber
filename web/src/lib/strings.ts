@@ -50,6 +50,7 @@ export const STRINGS = {
   decoding: { ja: '画像をデコード中…', en: 'Decoding image…' },
   generating: { ja: '生成中…', en: 'Generating…' },
   animating: { ja: '動画化中…', en: 'Animating…' },
+  videoPendingBadge: { ja: '動画化中', en: 'Animating' },
   animateError: {
     ja: '動画生成に失敗したタイルがあります',
     en: 'Some tiles failed to encode to video',

@@ -784,6 +784,20 @@ export default function Studio() {
                       aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
                     />
                   </Show>
+                  {/* 動画タイル限定: 静止 PNG は出たが mp4 がまだ来てない間、
+                      soft shimmer + コーナーバッジを重ねて「これから動く」
+                      ことを示す。skeleton（強い shimmer）= 何もない /
+                      skeleton-soft（弱い shimmer）= 静止は出たが動画は処理中
+                      の二段階で進行を表現する。 */}
+                  <Show when={tile.kind === 'video' && !tile.videoBlobUrl}>
+                    <div class="skeleton-soft fade-in absolute inset-0" aria-hidden="true" />
+                    <span
+                      class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-[10px] tracking-wide text-fg"
+                      aria-label={t('videoPendingBadge')}
+                    >
+                      {t('videoPendingBadge')}…
+                    </span>
+                  </Show>
                 </Show>
                 {/* 4-corner L marker — DESIGN.md §4 SelectionMarker
                     skeleton 中は disabled なので hover も発火しない。 */}
