@@ -112,8 +112,10 @@ randomly per drop, so the same image yields a different layout each time. The fi
 **half** of the batch (5 tiles) are static PNGs; the **last 5 tiles** are H.264 mp4
 loops generated client-side via WebCodecs and inlined as `<video muted autoplay
 playsinline loop>`, so they animate continuously in the grid without any user
-interaction. Pick favorites with the ✓ toggle and download single (PNG / MP4) or
-multi (mixed-extension ZIP).
+interaction. Pick favorites with the corner-marker toggle and download single
+(PNG / MP4) or multi (mixed-extension ZIP). After drop, the source image stays
+in the drop zone as a thumbnail; hover (or drag a new file over it) to swap it
+out without touching any other control.
 
 The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
 (measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via
