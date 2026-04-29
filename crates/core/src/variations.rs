@@ -243,6 +243,20 @@ pub const GUI_VIDEO_DIRECTIONS: [crate::animate::MotionDirection; GUI_VIDEO_COUN
     crate::animate::MotionDirection::BottomToTop,
 ];
 
+/// GUI バッチ後半 (= 動画タイル) の speed 並び。`video_idx = spec_idx -
+/// still_count` で添字すると VerySlow / Slow が必ず 2 枚ずつ含まれる。
+///
+/// 元々は `random_batch_specs` で speed をランダムに引いていたが、それだと
+/// 「4 つ全部速い run / 全部遅い run」が偶然発生してガチャ感が薄れる。
+/// direction と同様に固定割当して、4 タイルが必ず速度のばらつきを持つよう
+/// にする (#77)。alternating 配列にすることで隣接タイルの体感差を最大化。
+pub const GUI_VIDEO_SPEEDS: [crate::animate::MotionSpeed; GUI_VIDEO_COUNT_DEFAULT] = [
+    crate::animate::MotionSpeed::VerySlow,
+    crate::animate::MotionSpeed::Slow,
+    crate::animate::MotionSpeed::VerySlow,
+    crate::animate::MotionSpeed::Slow,
+];
+
 /// GUI バッチ生成用のランダム範囲。
 ///
 /// CLI の固定 preset (`DEFAULT_VARIATIONS`) では各位置の系統が決まっているが、

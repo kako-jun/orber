@@ -197,6 +197,23 @@ Determinism is provided by `random_batch_specs(seed, total, still_count)` in
 `crates/core::variations`: the same `baseSeed` reproduces the exact same
 variation specs at any resolution.
 
+**Video tile direction & speed assignment.** Each of the 4 video tiles in a
+batch gets its `direction` and `speed` deterministically assigned by index, not
+randomly. `GUI_VIDEO_DIRECTIONS = [LR, RL, TB, BT]` and
+`GUI_VIDEO_SPEEDS = [VerySlow, Slow, VerySlow, Slow]` guarantee that every
+roll contains all 4 directions exactly once and a 2:2 mix of slow/very-slow,
+so a batch never degenerates into "all 4 fast" or "all 4 slow". Static tiles
+keep their spec values; only the animated tiles get the override (#59 / #77).
+The wasm helpers `direction_for_spec_idx` / `speed_for_spec_idx` apply the
+same logic to both the preview PNG (`generate_one_at_index`) and the
+animation cursor (`start_animation_for_batch_spec`), so the t=0 frame and the
+mp4 are guaranteed to match.
+
+**Clip duration.** Animated tiles are **8 seconds long at 24 fps** (192 frames).
+Combined with the assigned speeds above, VerySlow tiles cross the screen once
+in 8 s — slow enough to feel "drifting", appropriate for use as overlay /
+background plates beneath text.
+
 **Browser requirements.** OffscreenCanvas / VideoEncoder / VideoFrame in Worker
 context. iOS Safari 16.4+, current Android Chrome / Firefox 130+. There is no
 fallback path for older browsers — the GUI shows an error if WebCodecs is

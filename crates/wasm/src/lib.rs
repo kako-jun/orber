@@ -27,6 +27,7 @@ use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, StyleOptions};
 use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
+    GUI_VIDEO_SPEEDS,
 };
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -168,6 +169,30 @@ fn direction_for_spec_idx(
     }
 }
 
+/// バッチ index に対応する speed を返す。
+///
+/// 静止画タイル領域では spec.speed をそのまま使い、動画タイル領域では
+/// `GUI_VIDEO_SPEEDS` の対応 index で上書きする。これにより GUI 経路の
+/// 動画 4 枚は VerySlow / Slow / VerySlow / Slow と必ずばらけて、
+/// 「4 つ全部速い / 全部遅い」のガチャ感低下を防ぐ (#77)。
+///
+/// `direction_for_spec_idx` と同じ責務分担で、core の `generate_batch`
+/// は spec.speed をそのまま使うので、speed 固定割当は wasm 入口経由の
+/// GUI 経路でのみ適用される。
+fn speed_for_spec_idx(
+    spec_idx: usize,
+    still_count: usize,
+    spec: &VariationSpec,
+) -> MotionSpeed {
+    if spec_idx >= still_count {
+        let video_idx = spec_idx - still_count;
+        debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);
+        GUI_VIDEO_SPEEDS[video_idx]
+    } else {
+        spec.speed
+    }
+}
+
 fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
     use image::codecs::png::PngEncoder;
     use image::{ExtendedColorType, ImageEncoder};
@@ -296,17 +321,18 @@ pub fn generate_one_at_index(
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
 
-    // direction の決定は純粋関数 direction_for_spec_idx に集約。
-    // start_animation_for_batch_spec と同じロジックを共有することで、
-    // プレビュー静止 PNG と動画タイルの direction を構造的に揃える。
+    // direction / speed は純粋関数に集約。start_animation_for_batch_spec と
+    // 同じロジックを共有することで、プレビュー静止 PNG と動画タイルの
+    // 描画パラメータが構造的に揃う（#77 で speed も index 固定割当）。
     let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
+    let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
 
     let opts = AnimateOptions {
         width: p.width,
         height: p.height,
         seed: spec.seed,
         direction,
-        speed: spec.speed,
+        speed,
         count: Some(spec.count),
         orb_size: spec.orb_size,
         blur: spec.blur,
@@ -409,17 +435,19 @@ pub fn start_animation_for_batch_spec(
     let spec = specs[spec_idx];
 
     // #59: 動画タイル 4 枚に LR / RL / TB / BT を 1 枚ずつ重複なく割り当てる。
-    // direction_for_spec_idx を経由することで、`generate_one_at_index` で
-    // 描かれる t=0 PNG と完全に同じ direction を選ぶ（プレビュー静止画と
-    // 動画の整合性を構造的に保証）。
+    // #77: speed も VerySlow / Slow を 2 枚ずつ固定割当（ガチャ感の保証）。
+    // direction_for_spec_idx / speed_for_spec_idx を経由することで、
+    // `generate_one_at_index` で描かれる t=0 PNG と完全に同じパラメータで
+    // 動画化される（プレビュー静止画と動画の整合性を構造的に保証）。
     let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
+    let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
 
     let opts = AnimateOptions {
         width: p.width,
         height: p.height,
         seed: spec.seed,
         direction,
-        speed: spec.speed,
+        speed,
         count: Some(spec.count),
         orb_size: spec.orb_size,
         blur: spec.blur,
@@ -623,5 +651,44 @@ mod tests {
             GUI_VIDEO_DIRECTIONS[0],
             "spec_idx == still_count is video range index 0"
         );
+    }
+
+    /// #77: 動画タイル領域の speed は GUI_VIDEO_SPEEDS で固定割当される。
+    /// VerySlow / Slow が必ず 2 枚ずつ（4 タイルがガチャ感を保つ最小条件）。
+    #[test]
+    fn speed_for_spec_idx_overrides_video_range_with_assigned_speeds() {
+        let still_count = 8;
+        let total = 12;
+        // spec.speed は何を入れても video 領域では無視される。
+        let mut spec = synth_spec(MotionDirection::LeftToRight);
+        spec.speed = MotionSpeed::Slow;
+        let mut very_slow = 0;
+        let mut slow = 0;
+        for spec_idx in still_count..total {
+            let s = speed_for_spec_idx(spec_idx, still_count, &spec);
+            assert_eq!(s, GUI_VIDEO_SPEEDS[spec_idx - still_count]);
+            match s {
+                MotionSpeed::VerySlow => very_slow += 1,
+                MotionSpeed::Slow => slow += 1,
+            }
+        }
+        // 4 タイルで 2 + 2 のばらけが固定で保証される。
+        assert_eq!(very_slow, 2, "must have exactly 2 VerySlow tiles");
+        assert_eq!(slow, 2, "must have exactly 2 Slow tiles");
+    }
+
+    /// 静止画タイル領域では spec.speed をそのまま使う。
+    #[test]
+    fn speed_for_spec_idx_returns_spec_speed_for_still_range() {
+        let still_count = 8;
+        let mut spec = synth_spec(MotionDirection::TopToBottom);
+        spec.speed = MotionSpeed::VerySlow;
+        for spec_idx in 0..still_count {
+            assert_eq!(
+                speed_for_spec_idx(spec_idx, still_count, &spec),
+                MotionSpeed::VerySlow,
+                "still tile {spec_idx} must inherit spec.speed"
+            );
+        }
     }
 }
