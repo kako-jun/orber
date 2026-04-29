@@ -36,6 +36,19 @@ const BATCH_TILE_COUNT = 12;
 // 1 枚ずつ重複なく見せる、wasm 側の start_animation_for_batch_spec が固定割当）。
 const VIDEO_TILE_COUNT = 4;
 
+// 解像度トークン (#73)。プレビューは選別用に軽量、DL は実用解像度。
+// すべて 9:16 / 16:9 を厳守。`generate_one_at_index` / `start_animation_for_batch_spec`
+// は同じ baseSeed + (total, index) で同じ spec を再現するので、width/height だけ
+// 上げれば「同じバリエーションの高解像版」が得られる（決定論性は wasm 側で担保）。
+const PREVIEW_W_PORTRAIT = 540;
+const PREVIEW_H_PORTRAIT = 960;
+const PREVIEW_W_LANDSCAPE = 960;
+const PREVIEW_H_LANDSCAPE = 540;
+const DL_W_PORTRAIT = 1080;
+const DL_H_PORTRAIT = 1920;
+const DL_W_LANDSCAPE = 1920;
+const DL_H_LANDSCAPE = 1080;
+
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
   const [wasmErr, setWasmErr] = createSignal<string>('');
@@ -51,12 +64,24 @@ export default function Studio() {
   const [dragOver, setDragOver] = createSignal(false);
   // #57: ドロップエリア長押し中だけ拡大プレビュー。
   const [previewVisible, setPreviewVisible] = createSignal(false);
+  // #73: DL 時の hi-res 再描画進捗。downloading=true の間 DL ボタンを
+  // ロックし、進捗テキスト「高解像度版を準備中… {done} / {total}」を出す。
+  const [downloading, setDownloading] = createSignal(false);
+  const [dlProgress, setDlProgress] = createSignal<{ done: number; total: number }>({
+    done: 0,
+    total: 0,
+  });
 
   let wasm: WasmModule | null = null;
   let fileInput: HTMLInputElement | undefined;
   // 同時実行中の runBatch を区別するための世代カウンタ。
   // 進行中のループは自分の世代と現世代を比較して食い違ったら抜ける。
   let runGen = 0;
+  // #73: 直近の runBatch の baseSeed と aspect を保持する。DL 時に
+  // hi-res で再描画するときに同じ baseSeed を使うことで、プレビューと
+  // 同じバリエーション（spec 列）を解像度違いで再現する。
+  // null は「まだ runBatch していない / 失敗した」状態。
+  let lastBaseSeed: number | null = null;
   // #61: 動画タイル <video> の参照を tile index で集める。すべての mp4 化が
   // 完了した時点で一斉に play() を呼び、4 枚の動き始めを揃える。
   let videoRefs: (HTMLVideoElement | undefined)[] = [];
@@ -147,11 +172,16 @@ export default function Studio() {
     // #61: 新しい run の開始でビデオ参照テーブルもリセット。
     videoRefs = [];
 
-    const [w, h] = aspect() === 'portrait' ? [540, 960] : [960, 540];
+    const [w, h] =
+      aspect() === 'portrait'
+        ? [PREVIEW_W_PORTRAIT, PREVIEW_H_PORTRAIT]
+        : [PREVIEW_W_LANDSCAPE, PREVIEW_H_LANDSCAPE];
     // 2**48 までは JS Number で無損失。呼び出しごとに新しい base seed を引く
     // ことで、ドラッグするたびに N 枚すべての direction / count / orb_size /
     // blur / 配置がランダムに変わる（GUI 要件）。
     const baseSeed = Math.floor(Math.random() * 2 ** 48);
+    // DL 時の hi-res 再描画で同じ spec 列を再現できるよう保存（#73）。
+    lastBaseSeed = baseSeed;
     const params = {
       source_rgb: src.rgb,
       source_width: src.width,
@@ -291,6 +321,9 @@ export default function Studio() {
   };
 
   const acceptFile = async (file: File) => {
+    // #73: hi-res 再描画中に新しい画像を受け付けると baseSeed が
+    // 上書きされて生成中の DL ジョブと食い違う。完了まで弾く。
+    if (downloading()) return;
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
@@ -405,44 +438,132 @@ export default function Studio() {
     URL.revokeObjectURL(url);
   };
 
-  // 動画タイルなら mp4 が出来ていれば mp4、まだなら静止フォールバック PNG。
-  // 静止タイルは常に PNG。skeleton 中（blob === null）は呼び出し側で除外
-  // 済みの想定: downloadAll は generating/animating 中は disabled、
-  // downloadSelected は !blob のタイルがそもそも select できない。
-  const tilePayload = (t: Tile): { blob: Blob; ext: 'png' | 'mp4' } | null => {
-    if (t.kind === 'video' && t.videoBlob) {
-      return { blob: t.videoBlob, ext: 'mp4' };
+  // #73: DL 時の hi-res 再描画。プレビュー（540×960）とは別に、同じ
+  // baseSeed + (total, index) で `generate_one_at_index` / `start_animation_for_batch_spec`
+  // を呼び、1080×1920 の PNG / mp4 を作る。プレビューと同じバリエーションが
+  // 再現される（決定論性は wasm 側 random_batch_specs が担保）。
+  //
+  // indices は **ソース配列内の元 index**。並びを保つために Map で持ち回し、
+  // 呼び出し側でソートする。
+  const renderHiResForIndices = async (
+    indices: number[],
+  ): Promise<Map<number, { blob: Blob; ext: 'png' | 'mp4' }>> => {
+    const src = decoded();
+    const out = new Map<number, { blob: Blob; ext: 'png' | 'mp4' }>();
+    if (indices.length === 0) return out;
+    if (!src || lastBaseSeed === null || !wasm) {
+      throw new Error('cannot render hi-res: missing source / seed / wasm');
     }
-    if (!t.blob) return null;
-    return { blob: t.blob, ext: 'png' };
+
+    const a = aspect();
+    const [hiW, hiH] =
+      a === 'portrait'
+        ? [DL_W_PORTRAIT, DL_H_PORTRAIT]
+        : [DL_W_LANDSCAPE, DL_H_LANDSCAPE];
+    const total = batchN();
+    const stillCount = total - VIDEO_TILE_COUNT;
+    const useWebCodecs = isWebCodecsSupported();
+
+    // wasm の WasmParams は `source_rgb` を `std::mem::take` で持っていく
+    // ので、毎回 JS 側 src.rgb の参照を渡せば serde-wasm-bindgen がコピー
+    // してくれる（src.rgb の中身は壊れない）。direction/speed/count/orb_size/
+    // blur は generate_batch / generate_one_at_index ではどのみち無視され、
+    // spec 側の値で上書きされるので、プレビュー時と同じダミー値で良い。
+    const hiParams = {
+      source_rgb: src.rgb,
+      source_width: src.width,
+      source_height: src.height,
+      k: 5,
+      width: hiW,
+      height: hiH,
+      seed: lastBaseSeed,
+      direction: 'lr',
+      speed: 'slow',
+      count: 20,
+      orb_size: 3.0,
+      blur: 0.5,
+      shape: 'circle',
+    };
+
+    setDlProgress({ done: 0, total: indices.length });
+    for (const i of indices) {
+      if (i < stillCount) {
+        const png = wasm.generate_one_at_index(hiParams, total, i) as Uint8Array;
+        out.set(i, {
+          blob: new Blob([png], { type: 'image/png' }),
+          ext: 'png',
+        });
+      } else if (useWebCodecs) {
+        // 動画タイルは hi-res で 96 フレーム再描画 → WebCodecs で h264 mp4 化。
+        // 1080×1920 × 96 はモバイルだと数秒〜十数秒かかる。WebCodecs 非対応
+        // ブラウザは else で hi-res の t=0 PNG にフォールバック。
+        const handle = wasm.start_animation_for_batch_spec(
+          hiParams,
+          total,
+          i,
+          ANIM_TOTAL_FRAMES,
+        );
+        try {
+          const mp4 = await encodeAnimationToMp4(handle);
+          out.set(i, { blob: mp4, ext: 'mp4' });
+        } finally {
+          handle.free?.();
+        }
+      } else {
+        const png = wasm.generate_one_at_index(hiParams, total, i) as Uint8Array;
+        out.set(i, {
+          blob: new Blob([png], { type: 'image/png' }),
+          ext: 'png',
+        });
+      }
+      setDlProgress((p) => ({ ...p, done: p.done + 1 }));
+      await yieldFrame();
+    }
+    return out;
   };
 
-  const downloadTiles = async (chosen: Tile[]) => {
-    const ready = chosen
-      .map((t) => tilePayload(t))
-      .filter((p): p is { blob: Blob; ext: 'png' | 'mp4' } => p !== null);
-    if (ready.length === 0) return;
-    if (ready.length === 1) {
-      triggerDownload(ready[0].blob, `orber.${ready[0].ext}`);
-      return;
+  const downloadIndices = async (indices: number[]) => {
+    if (indices.length === 0) return;
+    setDownloading(true);
+    setErrorMsg('');
+    try {
+      const rendered = await renderHiResForIndices(indices);
+      // index 順を保ってファイル名を 01, 02, ... に振る。
+      const sorted = Array.from(rendered.entries()).sort((a, b) => a[0] - b[0]);
+      if (sorted.length === 1) {
+        triggerDownload(sorted[0][1].blob, `orber.${sorted[0][1].ext}`);
+        return;
+      }
+      const { default: JSZip } = await import('jszip');
+      const zip = new JSZip();
+      sorted.forEach(([, { blob, ext }], n) => {
+        zip.file(`orber_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
+      });
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      triggerDownload(zipBlob, 'orber.zip');
+    } catch (e) {
+      console.error('hi-res download failed', e);
+      setErrorMsg(`${t('downloadFailed')}: ${String(e)}`);
+    } finally {
+      setDownloading(false);
+      setDlProgress({ done: 0, total: 0 });
     }
-    // jszip は ZIP 化する瞬間にしか使わないので、初回 DL 時に動的読み込みする。
-    // 訪問しただけのユーザーに 30KB 余分な JS を読ませない。
-    const { default: JSZip } = await import('jszip');
-    const zip = new JSZip();
-    ready.forEach(({ blob, ext }, i) => {
-      zip.file(`orber_${String(i + 1).padStart(2, '0')}.${ext}`, blob);
-    });
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
-    triggerDownload(zipBlob, 'orber.zip');
   };
 
   const downloadSelected = () => {
-    void downloadTiles(tiles().filter((t) => t.selected));
+    const indices = tiles()
+      .map((t, i) => ({ t, i }))
+      .filter(({ t }) => t.selected && t.blob)
+      .map(({ i }) => i);
+    void downloadIndices(indices);
   };
 
   const downloadAll = () => {
-    void downloadTiles(tiles());
+    const indices = tiles()
+      .map((t, i) => ({ t, i }))
+      .filter(({ t }) => t.blob)
+      .map(({ i }) => i);
+    void downloadIndices(indices);
   };
 
   // glass スタイル統一トークン — DESIGN.md §1, §4
@@ -541,6 +662,7 @@ export default function Studio() {
           aria-label={t('aspectPortrait')}
           title={t('aspectPortraitTitle')}
           onClick={() => setAspectAndMaybeRerun('portrait')}
+          disabled={downloading()}
           class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 縦長を示すシルエット (角丸縦長方形) */}
@@ -563,6 +685,7 @@ export default function Studio() {
           aria-label={t('aspectLandscape')}
           title={t('aspectLandscapeTitle')}
           onClick={() => setAspectAndMaybeRerun('landscape')}
+          disabled={downloading()}
           class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 横長を示すシルエット (角丸横長方形) */}
@@ -582,7 +705,13 @@ export default function Studio() {
         <button
           type="button"
           onClick={() => void runBatch()}
-          disabled={!decoded() || phase() === 'decoding' || phase() === 'generating' || phase() === 'animating'}
+          disabled={
+            !decoded() ||
+            phase() === 'decoding' ||
+            phase() === 'generating' ||
+            phase() === 'animating' ||
+            downloading()
+          }
           aria-label={t('rerollLabel')}
           title={t('rerollTitle')}
           class={GLASS_BTN}
@@ -771,7 +900,7 @@ export default function Studio() {
           <button
             type="button"
             onClick={downloadSelected}
-            disabled={selectedCount() === 0}
+            disabled={selectedCount() === 0 || downloading()}
             class={GLASS_BTN + ' text-sm'}
           >
             {t('downloadSelected')} ({selectedCount()})
@@ -779,12 +908,26 @@ export default function Studio() {
           <button
             type="button"
             onClick={downloadAll}
-            disabled={phase() === 'generating' || phase() === 'animating' || tiles().length === 0}
+            disabled={
+              phase() === 'generating' ||
+              phase() === 'animating' ||
+              downloading() ||
+              tiles().length === 0
+            }
             class={GLASS_BTN + ' text-sm'}
           >
             {t('downloadAll', { n: tiles().length })}
           </button>
         </div>
+        {/* #73: hi-res 再描画の進捗。downloading=true の間表示。 */}
+        <Show when={downloading()}>
+          <p class="fade-in text-center text-sm text-fgMuted">
+            {t('preparingDownload', {
+              done: dlProgress().done,
+              total: dlProgress().total,
+            })}
+          </p>
+        </Show>
       </Show>
 
       {/* #57 — 長押し中だけ表示する拡大プレビュー (DESIGN.md §4 PreviewOverlay)。

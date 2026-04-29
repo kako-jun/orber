@@ -231,6 +231,71 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
     Ok(arr)
 }
 
+/// バッチ N 枚のうち `spec_idx` 番目だけを 1 枚 PNG として生成する。
+///
+/// `generate_batch` と同じ `random_batch_specs(seed, total, still_count)` で
+/// spec 列を再構築し、`spec_idx` 番目だけ描画する。`width`/`height` を上げて
+/// 呼べば「同じバリエーションの高解像版」が得られるので、GUI のダウンロード時
+/// に表示用プレビュー（540×960）と別の解像度で焼き直す用途を想定（#73）。
+///
+/// 動画タイル領域（`spec_idx >= still_count`）では
+/// `start_animation_for_batch_spec` と同じく `GUI_VIDEO_DIRECTIONS` で
+/// direction を 4 方向に上書きし、video タイルの t=0 フレームと完全一致させる。
+#[wasm_bindgen]
+pub fn generate_one_at_index(
+    params_js: JsValue,
+    n: u32,
+    spec_idx: u32,
+) -> Result<js_sys::Uint8Array, JsError> {
+    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
+
+    let total = (n as usize).clamp(1, 50);
+    let spec_idx = spec_idx as usize;
+    if spec_idx >= total {
+        return Err(JsError::new(&format!(
+            "spec_idx {spec_idx} is out of range [0, {total})"
+        )));
+    }
+    let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
+
+    let source = build_source_image(&mut p).map_err(err_to_js)?;
+    let clusters_full = extract_clusters(&source, p.k)
+        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
+    let bg = derive_background_rgba(&clusters_full);
+    let clusters = drop_dominant(&clusters_full);
+
+    let specs = random_batch_specs(p.seed as u64, total, still_count);
+    let spec = specs[spec_idx];
+
+    // 動画タイル領域なら start_animation_for_batch_spec と同じ direction 上書き。
+    // 静止画タイルなら spec.direction をそのまま使う。
+    let direction = if spec_idx >= still_count {
+        let video_idx = spec_idx - still_count;
+        debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);
+        GUI_VIDEO_DIRECTIONS[video_idx]
+    } else {
+        spec.direction
+    };
+
+    let opts = AnimateOptions {
+        width: p.width,
+        height: p.height,
+        seed: spec.seed,
+        direction,
+        speed: spec.speed,
+        count: Some(spec.count),
+        orb_size: spec.orb_size,
+        blur: spec.blur,
+        saturation: 1.0,
+        background: bg,
+        shape,
+    };
+    let frame = render_frame(&clusters, &opts, 0.0);
+    let png = encode_png_rgba(&frame)?;
+    Ok(js_sys::Uint8Array::from(&png[..]))
+}
+
 /// 動画 1 タイル分の RGBA フレームを 1 枚ずつ取り出すハンドル。
 ///
 /// `start_animation_for_batch_spec` で構築する。各 `next_frame()` は
