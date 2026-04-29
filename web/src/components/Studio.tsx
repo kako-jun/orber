@@ -568,12 +568,36 @@ export default function Studio() {
         onPointerCancel={onDropZonePointerEnd}
         onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer touch-manipulation rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
+          'group relative block cursor-pointer touch-manipulation rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
           (dragOver()
-            ? 'border-fg bg-glassBg'
-            : 'border-hairline hover:border-fgMuted')
+            ? 'text-fg bg-glassBg'
+            : 'text-hairline hover:text-fgMuted')
         }
       >
+        {/* #79: 丸ドット周回ボーダー — orb との視覚統一。
+            stroke-dasharray="0 14" + stroke-linecap="round" で完全な円ドット
+            になる（dash 0 + 全体 stroke-width で round caps が circle 化）。
+            stroke は currentColor を参照するので、親 label の text-{color}
+            の状態切替（hairline / hover:fgMuted / focus:focusRing / dragOver:fg）
+            がそのまま色変化として伝わる。 */}
+        <svg
+          aria-hidden="true"
+          class="pointer-events-none absolute inset-0 h-full w-full overflow-visible"
+        >
+          <rect
+            x="1.5"
+            y="1.5"
+            width="calc(100% - 3px)"
+            height="calc(100% - 3px)"
+            rx="10.5"
+            ry="10.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-dasharray="0 14"
+            stroke-linecap="round"
+          />
+        </svg>
         {/* sr-only で input を視覚的に隠しつつフォーカス可能に保つ。
             display:none (旧 class="hidden") にすると Tab で focus できず
             focus-within も発火しないため使わない。 */}
