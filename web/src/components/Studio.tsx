@@ -323,12 +323,15 @@ export default function Studio() {
   };
 
   // glass スタイル統一トークン — DESIGN.md §1, §4
-  // ボタン / トグル / ガチャ / DL ボタンに共通で使う。
+  // ボタン / トグル / ガチャ / DL ボタンに共通で使う。padding は DESIGN.md §4 (8px / 14px)。
   const GLASS_BTN =
+    'px-3.5 py-2 rounded inline-flex items-center justify-center ' +
     'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
     'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
     'transition-colors duration-200 ease-out ' +
     'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed';
+  // toggled (アスペクト ON 等) で重ねる class — DESIGN.md §4 Toggle.
+  const GLASS_BTN_TOGGLED = 'bg-glassBgHover';
 
   return (
     <section class="space-y-4" data-lang={lang()}>
@@ -338,7 +341,7 @@ export default function Studio() {
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         class={
-          'block cursor-pointer rounded-3xl border-2 border-dashed p-10 text-center transition-colors duration-200 ease-out ' +
+          'block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out ' +
           (dragOver()
             ? 'border-fg bg-glassBg'
             : 'border-hairline hover:border-fgMuted')
@@ -370,11 +373,7 @@ export default function Studio() {
           aria-label={t('aspectPortrait')}
           title={t('aspectPortraitTitle')}
           onClick={() => setAspectAndMaybeRerun('portrait')}
-          class={
-            'px-3 py-1.5 rounded inline-flex items-center justify-center ' +
-            GLASS_BTN +
-            (aspect() === 'portrait' ? ' bg-glassBgHover' : '')
-          }
+          class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 縦長を示すシルエット (角丸縦長方形) */}
           <svg
@@ -383,7 +382,7 @@ export default function Studio() {
             height="20"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linejoin="round"
             aria-hidden="true"
           >
@@ -396,11 +395,7 @@ export default function Studio() {
           aria-label={t('aspectLandscape')}
           title={t('aspectLandscapeTitle')}
           onClick={() => setAspectAndMaybeRerun('landscape')}
-          class={
-            'px-3 py-1.5 rounded inline-flex items-center justify-center ' +
-            GLASS_BTN +
-            (aspect() === 'landscape' ? ' bg-glassBgHover' : '')
-          }
+          class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 横長を示すシルエット (角丸横長方形) */}
           <svg
@@ -409,7 +404,7 @@ export default function Studio() {
             height="20"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linejoin="round"
             aria-hidden="true"
           >
@@ -422,16 +417,16 @@ export default function Studio() {
           disabled={!decoded() || phase() === 'decoding' || phase() === 'generating' || phase() === 'animating'}
           aria-label={t('rerollLabel')}
           title={t('rerollTitle')}
-          class={'px-3 py-1.5 rounded inline-flex items-center justify-center ' + GLASS_BTN}
+          class={GLASS_BTN}
         >
           {/* リロード (循環矢印) — アイコンのみ。テキストラベルは廃止 */}
           <svg
             viewBox="0 0 24 24"
-            width="20"
-            height="20"
+            width="16"
+            height="16"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.5"
             stroke-linecap="round"
             stroke-linejoin="round"
             aria-hidden="true"
@@ -578,7 +573,7 @@ export default function Studio() {
             type="button"
             onClick={downloadSelected}
             disabled={selectedCount() === 0}
-            class={'px-3 py-1.5 rounded text-sm ' + GLASS_BTN}
+            class={GLASS_BTN + ' text-sm'}
           >
             {t('downloadSelected')} ({selectedCount()})
           </button>
@@ -586,7 +581,7 @@ export default function Studio() {
             type="button"
             onClick={downloadAll}
             disabled={phase() === 'generating' || phase() === 'animating' || tiles().length === 0}
-            class={'px-3 py-1.5 rounded text-sm ' + GLASS_BTN}
+            class={GLASS_BTN + ' text-sm'}
           >
             {t('downloadAll', { n: tiles().length })}
           </button>
