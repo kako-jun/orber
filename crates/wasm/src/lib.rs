@@ -193,9 +193,11 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 
 /// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
 ///
-/// 後半 [`GUI_VIDEO_COUNT_DEFAULT`] (= 5) 件を `VariationKind::Mp4`、残りを
+/// 後半 [`GUI_VIDEO_COUNT_DEFAULT`] (= 4) 件を `VariationKind::Mp4`、残りを
 /// `Png` にする。GUI では n が 9（横長 3×3）／10（縦長 5×2）で運用される
-/// ため、どちらの場合でも「後半 5 枚は動画枠」になる。
+/// ため、どちらの場合でも「後半 4 枚は動画枠」になる。動画 4 枚には
+/// `start_animation_for_batch_spec` で LR / RL / TB / BT が 1 枚ずつ
+/// 重複なく割り当てられる（#59）。
 /// `n < GUI_VIDEO_COUNT_DEFAULT` のときは全件 Mp4。Mp4 タイルも当面は先頭
 /// フレーム PNG として返す（動画化は `start_animation_for_batch_spec` 経由）。
 ///
@@ -318,11 +320,24 @@ pub fn start_animation_for_batch_spec(
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
 
+    // #59: 動画タイル 4 枚に LR / RL / TB / BT を 1 枚ずつ重複なく割り当てる。
+    // spec_idx − still_count = 0..GUI_VIDEO_COUNT_DEFAULT(=4) を使ってインデックス
+    // 順に固定。`random_batch_specs` が振った direction はここで上書きする
+    // （静止画タイルは spec の direction をそのまま使うため、上書きは動画タイル
+    // のみ）。
+    let video_idx = spec_idx - still_count;
+    let direction = match video_idx {
+        0 => MotionDirection::LeftToRight,
+        1 => MotionDirection::RightToLeft,
+        2 => MotionDirection::TopToBottom,
+        _ => MotionDirection::BottomToTop, // 3 (および GUI_VIDEO_COUNT_DEFAULT-1 まで)
+    };
+
     let opts = AnimateOptions {
         width: p.width,
         height: p.height,
         seed: spec.seed,
-        direction: spec.direction,
+        direction,
         speed: spec.speed,
         count: Some(spec.count),
         orb_size: spec.orb_size,

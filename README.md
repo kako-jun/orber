@@ -108,11 +108,14 @@ A drag-and-drop browser GUI is published at <https://orber.llll-ll.com/>. Drop a
 image and the page generates a fresh batch every time — 10 tiles in portrait mode
 (540×960) or 9 tiles in landscape mode (960×540, 3×3 grid). Unlike the CLI's fixed
 `--variations` preset, the GUI samples direction / speed / count / orb size / blur
-randomly per drop, so the same image yields a different layout each time. The first
-**half** of the batch (5 tiles) are static PNGs; the **last 5 tiles** are H.264 mp4
-loops generated client-side via WebCodecs and inlined as `<video muted autoplay
-playsinline loop>`, so they animate continuously in the grid without any user
-interaction. Pick favorites with the corner-marker toggle and download single
+randomly per drop, so the same image yields a different layout each time. The
+first portion of the batch (6 tiles in portrait, 5 in landscape) are static PNGs;
+the **last 4 tiles** are H.264 mp4 loops generated client-side via WebCodecs and
+inlined as `<video muted autoplay playsinline loop>`, so they animate
+continuously in the grid without any user interaction. Those 4 video tiles each
+flow in a different direction (left→right, right→left, top→bottom, bottom→top),
+shown in that order so every batch always offers all four motion axes side by
+side. Pick favorites with the corner-marker toggle and download single
 (PNG / MP4) or multi (mixed-extension ZIP). After drop, the source image stays
 in the drop zone as a thumbnail; hover (or drag a new file over it) to swap it
 out without touching any other control.

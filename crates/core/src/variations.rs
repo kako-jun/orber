@@ -220,10 +220,15 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 ///
 /// `crates/wasm` の `generate_batch` / `start_animation_for_batch_spec` と
 /// Web フロント (`web/src/components/Studio.tsx`) の両方が参照する。レイアウト
-/// （縦長 10 / 横長 9）に関わらず後半 5 タイルを動画枠で固定したいので、
+/// （縦長 10 / 横長 9）に関わらず後半 4 タイルを動画枠で固定したいので、
 /// この定数を軸に各層が `still_count = total - GUI_VIDEO_COUNT_DEFAULT` を
 /// 計算する。
-pub const GUI_VIDEO_COUNT_DEFAULT: usize = 5;
+///
+/// 4 にしている理由（#59）: 動画タイル 4 枚に LR / RL / TB / BT を **重複なく
+/// 1 枚ずつ** 割り当てて「全方向揃い踏み」の見せ場にするため。direction の
+/// 上書きは `start_animation_for_batch_spec` が `video_idx = spec_idx -
+/// still_count` から決定的に行う。
+pub const GUI_VIDEO_COUNT_DEFAULT: usize = 4;
 
 /// GUI バッチ生成用のランダム範囲。
 ///
