@@ -28,10 +28,11 @@
 //! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
 //!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
 //!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
-//! - 速度ジッタは **整数倍** (1x / 2x) で導入する。orb ごとに seed 由来で
-//!   `speed_mult ∈ {1, 2}` を割り当て、進行量を `cycle * speed_mult * t` とする。
-//!   両方とも整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
-//!   Slow と組み合わせると実効周回数は {1, 2, 4} に変化に富む。
+//! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
+//!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
+//!   全部整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
+//!   Slow (cycle_count = 1 / 2) と組み合わせると実効周回数は {1, 2, 3, 4, 6} の
+//!   5 段階に分散し、1 動画内のリズムが豊かになる（#53）。
 //! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
 //!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
@@ -148,8 +149,8 @@ const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 /// `cluster_idx` はこの orb の色とサイズを取ってくる元クラスタの index（重み比例で抽選）。
 /// `cross_axis` は進行方向と直交する軸の正規化座標 0..1。orb をクラスタ重心に固定
 /// せず、画面全体に散らせるためのオフセット。
-/// `speed_mult` は整数倍速度 (1 / 2)。`cycle_count * speed_mult` も整数なので
-/// `t=1` でループが閉じる。視覚的なバラつきの主因。
+/// `speed_mult` は整数倍速度 (1 / 2 / 3)。`cycle_count * speed_mult` も整数
+/// なので `t=1` でループが閉じる。視覚的なバラつきの主因（#53 で 2 → 3 段階）。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
@@ -166,7 +167,7 @@ struct OrbParams {
     cluster_idx: usize,
     /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
     cross_axis: f32,
-    /// 整数倍速度 (1 / 2)。MotionSpeed の cycle_count と掛け合わせて使う。
+    /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
     speed_mult: u32,
 }
 
@@ -220,7 +221,10 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
             let cluster_idx = pick_weighted(&mut rng, cluster_weights, total_w);
             // 整数倍速度。1/2 を均等に割り当て。整数 × 整数の cycle_count なので
             // t=1 で fract が 0 になりループ性は保たれる。
-            let speed_mult = rng.gen_range(1..=2);
+            // #53: 1..=2 → 1..=3 に拡張。1 画像内に「ゆっくり / 普通 / 速い」が
+            // 混在する。cycle_count {1, 2} × speed_mult {1, 2, 3} で実効周回は
+            // {1, 2, 3, 4, 6} の 5 段階。全部整数なのでループ性は保たれる。
+            let speed_mult = rng.gen_range(1..=3);
             OrbParams {
                 phase,
                 phi_radius,
@@ -858,24 +862,24 @@ mod tests {
 
     #[test]
     fn speed_mult_distribution() {
-        // 64 サンプルで 1x / 2x の出現数が 20..=44 のバンドに収まること。
-        // 理論期待値 32（50:50）。片側に大きく偏ると分布が壊れているサイン。
-        let p = generate_orb_params(99, 64, &[1.0]);
+        // #53: 1..=3 の 3 段階。120 サンプルで各値が均等近くに散らばること。
+        // 理論期待値 40 (1/3 ずつ)。片側極端な偏りは分布バグのサイン。
+        // ±15 のバンドで 25..=55 を許容。
+        let p = generate_orb_params(99, 120, &[1.0]);
         let n1 = p.iter().filter(|q| q.speed_mult == 1).count();
         let n2 = p.iter().filter(|q| q.speed_mult == 2).count();
-        assert!(
-            (20..=44).contains(&n1),
-            "speed_mult=1 count out of expected band 20..=44; got n1={n1}, n2={n2}"
-        );
-        assert!(
-            (20..=44).contains(&n2),
-            "speed_mult=2 count out of expected band 20..=44; got n1={n1}, n2={n2}"
-        );
-        // 全 orb が {1, 2} の範囲内であることも確認。
+        let n3 = p.iter().filter(|q| q.speed_mult == 3).count();
+        for (label, n) in [("1x", n1), ("2x", n2), ("3x", n3)] {
+            assert!(
+                (25..=55).contains(&n),
+                "speed_mult={label} count out of expected band 25..=55; got n1={n1} n2={n2} n3={n3}"
+            );
+        }
+        // 全 orb が {1, 2, 3} の範囲内であること。
         for q in &p {
             assert!(
-                (1..=2).contains(&q.speed_mult),
-                "speed_mult must be 1 or 2; got {}",
+                (1..=3).contains(&q.speed_mult),
+                "speed_mult must be 1, 2, or 3; got {}",
                 q.speed_mult
             );
         }
