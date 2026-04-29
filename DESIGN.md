@@ -161,7 +161,7 @@ Tailwind spacing scale (4px base):
 
 ## 6. Motion
 
-Single transition idiom, used everywhere. In code, this is expressed with the Tailwind defaults `duration-200 ease-out` (no custom theme keys needed):
+Single transition idiom, used everywhere. The **source of truth** for duration / easing is the CSS variables `--orb-motion-duration` / `--orb-motion-easing` defined in `Base.astro`. The Tailwind utilities `duration-200 ease-out` happen to match those values today and are used inline because Tailwind v3 cannot consume CSS variables in `transition-duration` / `transition-timing-function` shorthand. If the variables ever change, update both places (the variables and the Tailwind utilities, or migrate to a Tailwind theme that reads the variables). In code, the transition reads:
 
 ```css
 transition: opacity 200ms ease-out;

@@ -16,8 +16,11 @@ export default function Subtitle() {
   // Solid の JSX コンパイラは {expr} を effect でラップするため、
   // t() 内部の lang() 呼び出しで自動的に reactive 化される。
   // 明示的なトリガ (data-lang 等) は不要。
+  // Subtitle は SSR で既に描画されており above-the-fold で常時可視のため、
+  // .fade-in は付けない (hydration で再フェードするとちらつく)。
+  // これは DESIGN.md §6 「.fade-in は新規マウント時の出現演出」の対象外。
   return (
-    <p class="fade-in font-display text-sm tracking-wide text-fgMuted text-center mt-3 mb-10">
+    <p class="font-display text-sm tracking-wide text-fgMuted text-center mt-3 mb-10">
       {t('subtitle')}
     </p>
   );
