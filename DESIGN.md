@@ -27,6 +27,10 @@ No accent color. The generated artwork supplies all color; the chrome stays in m
 
 No hue-based accent (no emerald / coral / amber). State is communicated by opacity steps: default 55% → hover 100% → pressed/selected 100% with glass background bumped to 10%.
 
+### Error / Warning States
+
+Deliberately no red / amber / yellow. Error and warning surfaces share the glass tokens (`glass-bg` + `glass-border` + `fg`) and rely on the contextual icon, prefix word, or surrounding copy to convey state. This preserves the monochrome gothic discipline. If a future feature truly needs hue-based alarm (e.g. data loss), introduce a dedicated `state-danger` token here first — never reach for raw `red-*` / `amber-*` Tailwind classes inline.
+
 ## 3. Typography Rules
 
 ### Font Families
@@ -43,7 +47,7 @@ Space Grotesk is loaded from Google Fonts CDN with `preconnect` to `fonts.google
 
 | Element       | Size            | Weight | Tracking  | Notes                                       |
 | ------------- | --------------- | ------ | --------- | ------------------------------------------- |
-| Logo (h1)     | 2.25rem (36px)  | 300    | `0.4em`   | `font-display`, lowercase, color `fg`       |
+| Logo (h1)     | 3rem (48px)     | 300    | `0.4em`   | `font-display`, lowercase, color `fg`. Compensate the trailing tracking with `pl-[0.4em]` so the visual center aligns with the page axis. |
 | Subtitle      | 0.875rem (14px) | 400    | normal    | `font-display`, color `fg-muted`, 1 line     |
 | Status        | 0.875rem (14px) | 400    | normal    | system sans, color `fg-muted`               |
 | Button label  | 0.875rem (14px) | 400    | normal    | system sans, color `fg` / `fg-muted`        |
@@ -85,7 +89,7 @@ No bold anywhere. Headers are deliberately light.
 
 ### SegmentedControl
 
-Not used in this iteration; reserved. If introduced later, use the same glass tokens — group of buttons with shared border-radius on the outer edges.
+Not used in this iteration; reserved. The aspect Portrait / Landscape pair is intentionally implemented as **two independent glass Toggles** rather than a SegmentedControl: only two states, each carries a distinct silhouette icon, and visual independence reads better against the black canvas. If a future control needs three or more mutually-exclusive states, introduce a SegmentedControl here using the same glass tokens — a group of buttons with shared border-radius on the outer edges.
 
 ### Tile
 
@@ -136,7 +140,7 @@ Tailwind spacing scale (4px base):
 
 ## 6. Motion
 
-Single transition idiom, used everywhere:
+Single transition idiom, used everywhere. In code, this is expressed with the Tailwind defaults `duration-200 ease-out` (no custom theme keys needed):
 
 ```css
 transition: opacity 200ms ease-out;
@@ -172,7 +176,7 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - `focus-visible` ring: `1px solid rgba(255,255,255,0.7)` with `2px` offset on every button / toggle / drop label / tile
 - Contrast: `fg` on `bg` = 21:1; `fg-muted` (55%) on `bg` ≈ 9.6:1; `fg-subtle` (32%) on `bg` ≈ 5.0:1 — all clear of WCAG AA for text ≥14px
 - Tile selection state is exposed via `aria-pressed` so screen readers don't depend on the corner marker alone
-- `<html lang>` is updated post-hydration to match the detected language (`ja` or `en`) so screen readers pick the correct voice
+- `<html lang>` is updated **pre-hydration** by an `is:inline` script in `Base.astro` that reads `navigator.language` synchronously, so screen readers pick the correct voice from first paint. The Solid `lang` signal is then synchronized **post-hydration** by `Subtitle.tsx` (`onMount → setLang(detectLang())`) for reactive UI text. The two paths are intentionally separated: the document attribute is a11y-critical and must be early; the signal is reactivity-only
 - Reduced motion is honored (see §6)
 - Hit targets: every button is at least 32×32 px
 

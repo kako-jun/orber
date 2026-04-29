@@ -25,12 +25,8 @@ export default {
       backdropBlur: {
         glass: '12px',
       },
-      transitionTimingFunction: {
-        out: 'ease-out',
-      },
-      transitionDuration: {
-        200: '200ms',
-      },
+      // DESIGN.md §6 motion uses Tailwind defaults `duration-200 ease-out`.
+      // No theme keys are added here for them.
     },
   },
   plugins: [],
