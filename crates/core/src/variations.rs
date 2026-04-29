@@ -227,8 +227,21 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 /// 4 にしている理由（#59）: 動画タイル 4 枚に LR / RL / TB / BT を **重複なく
 /// 1 枚ずつ** 割り当てて「全方向揃い踏み」の見せ場にするため。direction の
 /// 上書きは `start_animation_for_batch_spec` が `video_idx = spec_idx -
-/// still_count` から決定的に行う。
+/// still_count` を [`GUI_VIDEO_DIRECTIONS`] で引いて決定的に行う。
 pub const GUI_VIDEO_COUNT_DEFAULT: usize = 4;
+
+/// GUI バッチ後半 (= 動画タイル) の direction 並び。`video_idx = spec_idx -
+/// still_count` で添字すると LR / RL / TB / BT が 1 枚ずつ重複なく取れる。
+///
+/// 配列長は `GUI_VIDEO_COUNT_DEFAULT` と一致するよう型で固定している。定数を
+/// 増やしたら配列長も合わせる必要があり、ズレるとコンパイルが通らなくなる
+/// ので「マッチアームの取りこぼし」を構造的に防ぐ目的（#59）。
+pub const GUI_VIDEO_DIRECTIONS: [crate::animate::MotionDirection; GUI_VIDEO_COUNT_DEFAULT] = [
+    crate::animate::MotionDirection::LeftToRight,
+    crate::animate::MotionDirection::RightToLeft,
+    crate::animate::MotionDirection::TopToBottom,
+    crate::animate::MotionDirection::BottomToTop,
+];
 
 /// GUI バッチ生成用のランダム範囲。
 ///
@@ -434,14 +447,17 @@ mod tests {
 
     #[test]
     fn random_batch_specs_keeps_kind_split() {
+        // この split=5 は random_batch_specs 関数の汎用挙動 (前半 still_count 件が
+        // Png、それ以降が Mp4) を確認しているだけで、GUI の既定値
+        // GUI_VIDEO_COUNT_DEFAULT (=4) とは独立。
         let specs = random_batch_specs(42, 10, 5);
         assert_eq!(specs.len(), 10);
         for s in &specs[..5] {
-            assert_eq!(s.kind, VariationKind::Png, "first half must be PNG");
+            assert_eq!(s.kind, VariationKind::Png, "first 5 (still_count) must be PNG");
             assert_eq!(s.duration_ms, 0, "PNG specs must have duration_ms=0");
         }
         for s in &specs[5..] {
-            assert_eq!(s.kind, VariationKind::Mp4, "second half must be MP4");
+            assert_eq!(s.kind, VariationKind::Mp4, "remaining must be MP4");
             assert!(
                 (random_ranges::DURATION_MS_MIN..=random_ranges::DURATION_MS_MAX)
                     .contains(&s.duration_ms),
@@ -449,6 +465,31 @@ mod tests {
                 s.duration_ms
             );
         }
+    }
+
+    #[test]
+    fn gui_video_directions_are_unique_and_cover_all_axes() {
+        // #59: 動画タイル 4 枚に LR / RL / TB / BT が 1 枚ずつ重複なく割当てられる。
+        // 配列長は型で GUI_VIDEO_COUNT_DEFAULT に同期されている。
+        assert_eq!(GUI_VIDEO_DIRECTIONS.len(), GUI_VIDEO_COUNT_DEFAULT);
+        use crate::animate::MotionDirection::*;
+        assert_eq!(GUI_VIDEO_DIRECTIONS[0], LeftToRight);
+        assert_eq!(GUI_VIDEO_DIRECTIONS[1], RightToLeft);
+        assert_eq!(GUI_VIDEO_DIRECTIONS[2], TopToBottom);
+        assert_eq!(GUI_VIDEO_DIRECTIONS[3], BottomToTop);
+        let mut sorted = GUI_VIDEO_DIRECTIONS.to_vec();
+        sorted.sort_by_key(|d| match d {
+            LeftToRight => 0,
+            RightToLeft => 1,
+            TopToBottom => 2,
+            BottomToTop => 3,
+        });
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            GUI_VIDEO_COUNT_DEFAULT,
+            "all 4 directions must appear exactly once"
+        );
     }
 
     #[test]
