@@ -26,15 +26,15 @@ const { title = 'orber' } = Astro.props;
       orber#62 — 言語自動切替。
       hydration を待たずに <html lang> を navigator.language に合わせて書き換える
       ことで、スクリーンリーダー / 翻訳ツールが最初から正しい言語で読み上げる。
-      strings.ts 側の reactive な切替 (lang signal) は Studio.tsx の onMount で
-      行うが、これは DOM 属性側の早期同期。
+      strings.ts 側の reactive な切替 (lang signal) は Subtitle.tsx の onMount で
+      行うが、これは DOM 属性側の早期同期 (DESIGN.md §8 参照)。
     -->
     <script is:inline>
       try {
         var nav = navigator.language || '';
         document.documentElement.lang = nav.toLowerCase().indexOf('ja') === 0 ? 'ja' : 'en';
       } catch (_) {
-        // navigator が無い環境では何もしない (SSR / 古い WebView 等)。
+        /* noop — locale read failure must not block render. lang stays "en". */
       }
     </script>
   </head>
