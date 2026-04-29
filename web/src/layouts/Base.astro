@@ -37,6 +37,36 @@ const { title = 'orber' } = Astro.props;
         /* noop — locale read failure must not block render. lang stays "en". */
       }
     </script>
+    <!--
+      orber#60 — Motion tokens & .fade-in class (DESIGN.md §6).
+      duration / easing は CSS 変数で 1 箇所集約。新しく要素が DOM に
+      マウントされる瞬間 (タイル追加 / サムネイル表示 / 進捗テキスト等)
+      に同じ class 1 つで「opacity 0 → 1」フェードを掛ける。
+      `animation: ... both` で初期 opacity:0 を保ちつつ完了状態を維持する。
+    -->
+    <style is:global>
+      :root {
+        --orb-motion-duration: 200ms;
+        --orb-motion-easing: ease-out;
+      }
+      @keyframes orb-fade-in {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+      .fade-in {
+        animation: orb-fade-in var(--orb-motion-duration) var(--orb-motion-easing) both;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        /* belt-and-suspenders — 変数を 0ms にすれば animation-duration も
+           解決時に 0ms になるが、念のため `.fade-in` 側でも明示する。 */
+        :root {
+          --orb-motion-duration: 0ms;
+        }
+        .fade-in {
+          animation-duration: 0ms;
+        }
+      }
+    </style>
   </head>
   <body class="min-h-screen bg-bg text-fg">
     <main class="mx-auto max-w-3xl p-8">

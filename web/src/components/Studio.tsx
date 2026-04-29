@@ -377,33 +377,41 @@ export default function Studio() {
             target.value = '';
           }}
         />
-        {pickedThumbUrl() ? (
-          <div class="relative">
-            <img
-              src={pickedThumbUrl()}
-              alt={t('pickedThumbAlt', { name: pickedName() })}
-              class="mx-auto max-h-40 object-contain"
-            />
-            {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
-                dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 Filled state)。
-                opacity 値 (bg/40, fg/5) は §4 Filled state に明記済み。 */}
-            <div
-              class={
-                'pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity duration-200 ease-out ' +
-                (dragOver()
-                  ? 'opacity-100 bg-fg/5'
-                  : 'opacity-0 bg-bg/40 group-hover:opacity-100 group-focus-within:opacity-100')
-              }
-              aria-hidden="true"
-            >
-              <span class="font-display text-sm tracking-wide text-fg">
-                {t('replaceImageHint')}
-              </span>
+        {/* `Show keyed` で URL が変わると <img> が unmount → 再 mount され、
+            CSS animation `.fade-in` が再発火する (#60 セルフレビュー S1 対応)。
+            通常の三項演算子だと <img> ノードは同一のまま src が更新されるので
+            アニメーションが 1 回目しか走らない。 */}
+        <Show
+          when={pickedThumbUrl()}
+          keyed
+          fallback={<span class="text-fgMuted">{t('dropZonePlaceholder')}</span>}
+        >
+          {(url) => (
+            <div class="relative">
+              <img
+                src={url}
+                alt={t('pickedThumbAlt', { name: pickedName() })}
+                class="fade-in mx-auto max-h-40 object-contain"
+              />
+              {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
+                  dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 Filled state)。
+                  opacity 値 (bg/40, fg/5) は §4 Filled state に明記済み。 */}
+              <div
+                class={
+                  'pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity duration-200 ease-out ' +
+                  (dragOver()
+                    ? 'opacity-100 bg-fg/5'
+                    : 'opacity-0 bg-bg/40 group-hover:opacity-100 group-focus-within:opacity-100')
+                }
+                aria-hidden="true"
+              >
+                <span class="font-display text-sm tracking-wide text-fg">
+                  {t('replaceImageHint')}
+                </span>
+              </div>
             </div>
-          </div>
-        ) : (
-          <span class="text-fgMuted">{t('dropZonePlaceholder')}</span>
-        )}
+          )}
+        </Show>
       </label>
 
       <div class="flex items-center justify-center gap-2">
@@ -480,24 +488,27 @@ export default function Studio() {
       </div>
 
       <Show when={wasmStatus() === 'error'}>
-        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+        <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {t('wasmLoadFailed')}
           <pre class="mt-2 text-xs whitespace-pre-wrap text-fgMuted">{wasmErr()}</pre>
         </div>
       </Show>
 
       <Show when={phase() === 'decoding'}>
-        <p class="text-sm text-fgMuted">{t('decoding')}</p>
+        <p class="fade-in text-sm text-fgMuted">{t('decoding')}</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        <p class="text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
+        {/* progress() の数字が変わっても <p> はマウントされたままなので
+            .fade-in は最初の 1 回 (Show が真になった瞬間) しか走らない。
+            毎刻みフェードすると目障りなので、これは意図通り。 */}
+        <p class="fade-in text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
       </Show>
       <Show when={phase() === 'animating'}>
-        <p class="text-sm text-fgMuted">{t('animating')}</p>
+        <p class="fade-in text-sm text-fgMuted">{t('animating')}</p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
-        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+        <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {errorMsg()}
         </div>
       </Show>
@@ -516,29 +527,32 @@ export default function Studio() {
               <button
                 type="button"
                 onClick={() => toggleTile(i())}
-                class="group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
+                class="fade-in group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
                 }}
               >
-                <Show
-                  when={tile.kind === 'video' && tile.videoBlobUrl}
-                  fallback={
-                    <img
-                      src={tile.blobUrl}
-                      alt={t('variationAlt', { n: i() + 1 })}
-                      class="block h-full w-full object-cover"
-                    />
-                  }
-                >
+                {/* 静止 PNG は常に下敷きとして表示し続ける。動画タイルでは
+                    videoBlobUrl が来たら <video> を上に絶対配置して fade-in
+                    させる (#60)。下敷きを残すことで差し替えの瞬間に空白が
+                    出ない。再ロール (runBatch) は clearTiles で全タイルを
+                    unmount してから push するので、再フェードインも自然に
+                    走る (将来 in-place 差し替えを入れたら Show keyed が要る)。 */}
+                <img
+                  src={tile.blobUrl}
+                  alt={t('variationAlt', { n: i() + 1 })}
+                  class="block h-full w-full object-cover"
+                />
+                <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
+                  {/* poster は冗長 (autoplay 即時 + 下敷き <img> が同等の役割)
+                      なので付けない。 */}
                   <video
                     src={tile.videoBlobUrl}
-                    poster={tile.blobUrl}
                     autoplay
                     muted
                     playsinline
                     loop
-                    class="block h-full w-full object-cover"
+                    class="fade-in absolute inset-0 block h-full w-full object-cover"
                     aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
                   />
                 </Show>

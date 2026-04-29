@@ -161,7 +161,7 @@ Tailwind spacing scale (4px base):
 
 ## 6. Motion
 
-Single transition idiom, used everywhere. In code, this is expressed with the Tailwind defaults `duration-200 ease-out` (no custom theme keys needed):
+Single transition idiom, used everywhere. The **source of truth** for duration / easing is the CSS variables `--orb-motion-duration` / `--orb-motion-easing` defined in `Base.astro`. The Tailwind utilities `duration-200 ease-out` happen to match those values today and are used inline because Tailwind v3 cannot consume CSS variables in `transition-duration` / `transition-timing-function` shorthand. If the variables ever change, update both places (the variables and the Tailwind utilities, or migrate to a Tailwind theme that reads the variables). In code, the transition reads:
 
 ```css
 transition: opacity 200ms ease-out;
@@ -176,11 +176,35 @@ transition:
   border-color 200ms ease-out;
 ```
 
-- New tiles **fade in** (`opacity 0 → 1`, 200ms ease-out) as they arrive from the wasm batch loop. This is the foundation Issue #60 will build on (staggered fade-in of generated tiles).
+- New tiles **fade in** (`opacity 0 → 1`, 200ms ease-out) as they arrive from the wasm batch loop, using the shared `.fade-in` class below (#60).
 - Selection marker fades (`opacity 0 → 1`, 200ms ease-out) on toggle.
-- No translate / scale / rotate transitions. No spring. No keyframes.
+- No translate / scale / rotate transitions. No spring. No keyframes other than the single `orb-fade-in` defined below.
 
-Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transitions to `0ms`. Implementation note: a single Tailwind `motion-reduce:transition-none` on the affected utility is sufficient.
+### `.fade-in` (mount-time fade)
+
+For elements that **appear** in the DOM (rather than toggle visibility), use the shared `.fade-in` class instead of a `transition`. It is one CSS animation, defined once globally in `Base.astro`, and reused everywhere a node is freshly mounted (drop-zone thumbnail, generated tile button, status text, error box, video swap on top of the still PNG, subtitle, future long-press preview overlay).
+
+```css
+:root {
+  --orb-motion-duration: 200ms;
+  --orb-motion-easing: ease-out;
+}
+@keyframes orb-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.fade-in {
+  animation: orb-fade-in var(--orb-motion-duration) var(--orb-motion-easing) both;
+}
+```
+
+Rules:
+- Only `opacity` is animated (no `transform`, no layout). Compositor-only — cheap on mobile.
+- Duration / easing live in CSS variables so the whole house tunes from one place.
+- Use `.fade-in` for **appearance**; use `transition: opacity ...` for **toggling**. Both share the 200ms / ease-out idiom.
+- For PNG → MP4 swap on a video tile: the PNG stays mounted as the bottom layer, and the `<video>` is added above with `.fade-in` so the swap is a crossfade rather than a cut.
+
+Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transitions and the `.fade-in` animation to `0ms` (already wired in `Base.astro` via a media query that overrides `--orb-motion-duration` and `animation-duration`). Tailwind's `motion-reduce:transition-none` may be added per-element as a belt-and-suspenders.
 
 ## 7. Iconography
 
