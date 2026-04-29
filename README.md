@@ -120,7 +120,9 @@ animates as a single coordinated burst rather than staggered pop-ins. Pick
 favorites with the corner-marker toggle and download single (PNG / MP4) or
 multi (mixed-extension ZIP). After drop, the source image stays in the drop
 zone as a thumbnail; hover (or drag a new file over it) to swap it out without
-touching any other control.
+touching any other control. Long-press the thumbnail (~400ms) to peek at the
+source image full-size in an overlay, release to close — handy for verifying
+which photo is loaded without losing the rest of the GUI.
 
 The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
 (measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via

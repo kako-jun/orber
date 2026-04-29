@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+- Drop-zone thumbnail long-press preview: pressing and holding the drop-zone for ~400ms opens a full-viewport overlay showing the source image at up to 90vh × 90vw (`object-contain`). Releasing closes it. A short tap is treated as a normal click and still opens the file picker. The long-press path uses `setPointerCapture` so the gesture stays bound to the label even if the finger slides outside, and the overlay itself is `pointer-events: none` so it never steals the eventual `pointerup`. iOS callout / loupe / drag are suppressed via `select-none touch-none draggable=false -webkit-touch-callout: none` on the thumbnail. Documented in DESIGN.md §4 PreviewOverlay. (#57)
+
 ### Changed
 - Web GUI tile count unified to **12** for both portrait and landscape (`BATCH_TILE_COUNT = 12`, replaces the old portrait-10 / landscape-9 split). 12 was picked because it is divisible by 1/2/3/4/6/12, so the grid lays out cleanly across phone widths. 8 stills + 4 videos. (#61)
 - Web GUI video tiles now start playing **simultaneously** once all four mp4 encodes finish, rather than each tile starting whenever its own encode completes. `<video autoplay>` is removed; references are collected via `ref` callbacks into `videoRefs`, and a single `play()` burst is fired at the end of the run after `await yieldFrame()` flushes the DOM mounts. PNG remains underneath as a still backdrop while encoding is in progress, so tiles read as paused snapshots until the simultaneous start. (#61)

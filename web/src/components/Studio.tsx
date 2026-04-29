@@ -91,6 +91,9 @@ export default function Studio() {
       if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
     }
     if (pickedThumbUrl()) URL.revokeObjectURL(pickedThumbUrl());
+    // #57 — 走行中の長押しタイマーを止める。コンポーネントが消えた後に
+    // setPreviewVisible が呼ばれるのを防ぐ。
+    if (longPressTimer !== undefined) clearTimeout(longPressTimer);
   });
 
   const clearTiles = () => {
@@ -306,20 +309,28 @@ export default function Studio() {
 
   // #57 — 長押しで拡大プレビュー。
   // pointerdown 時に LONG_PRESS_MS のタイマーを仕掛け、満了したらオーバーレイを
-  // 開きつつ isLongPress を立てる。pointerup / cancel / leave で常にタイマー
-  // をクリアし、オーバーレイを閉じる。click は label のネイティブ動作で
-  // ファイル選択を起動するので、isLongPress が立っていたら preventDefault で
-  // 抑止する。サムネイルが無い (空ドロップエリア) ときは何もしない。
-  const cancelLongPress = () => {
+  // 開きつつ isLongPress を立てる。pointerup / cancel で常にタイマーをクリア
+  // しオーバーレイを閉じる。pointerleave は使わない (S1: 押下中に指がラベル外
+  // に少しずれただけで閉じる UX を避けるため)。代わりに pointerdown で
+  // setPointerCapture を取り、指がラベル外に移動しても pointerup が必ず
+  // ラベルに届くようにする。
+  // click は label のネイティブ動作でファイル選択を起動するので、isLongPress
+  // が立っていたら preventDefault で抑止する。サムネイルが無い (空ドロップ
+  // エリア) ときは何もしない。
+  const endLongPress = () => {
     if (longPressTimer !== undefined) {
       clearTimeout(longPressTimer);
       longPressTimer = undefined;
     }
     setPreviewVisible(false);
   };
-  const onDropZonePointerDown = () => {
+  const onDropZonePointerDown = (e: PointerEvent) => {
     if (!pickedThumbUrl()) return;
     isLongPress = false;
+    // ジェスチャ全体を label に閉じ込める。指が外にスライドしても
+    // pointerup / pointercancel が必ず label に届く。
+    const target = e.currentTarget as HTMLElement | null;
+    target?.setPointerCapture?.(e.pointerId);
     longPressTimer = window.setTimeout(() => {
       isLongPress = true;
       setPreviewVisible(true);
@@ -327,7 +338,7 @@ export default function Studio() {
     }, LONG_PRESS_MS);
   };
   const onDropZonePointerEnd = () => {
-    cancelLongPress();
+    endLongPress();
   };
   const onDropZoneClick = (e: MouseEvent) => {
     if (isLongPress) {
@@ -424,10 +435,9 @@ export default function Studio() {
         onPointerDown={onDropZonePointerDown}
         onPointerUp={onDropZonePointerEnd}
         onPointerCancel={onDropZonePointerEnd}
-        onPointerLeave={onDropZonePointerEnd}
         onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
+          'group relative block cursor-pointer touch-manipulation rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
           (dragOver()
             ? 'border-fg bg-glassBg'
             : 'border-hairline hover:border-fgMuted')
@@ -737,7 +747,7 @@ export default function Studio() {
             src={pickedThumbUrl()}
             alt={t('pickedThumbAlt', { name: pickedName() })}
             draggable={false}
-            class="max-h-[90vh] max-w-[90vw] object-contain select-none"
+            class="max-h-[90vh] max-w-[90vw] object-contain select-none touch-none"
           />
         </div>
       </Show>
