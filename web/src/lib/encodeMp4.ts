@@ -20,9 +20,13 @@ export interface AnimationHandleLike {
 }
 
 export const ANIM_FPS = 24;
-// 4 秒ぶん。orber の motion model は t=0 と t=1 がピクセル一致するので、
-// `<video loop>` で継ぎ目なくエンドレス再生される。
-export const ANIM_DURATION_SECONDS = 4;
+// #77: 8 秒ぶん。背景・配信オーバーレイ用途では「ほとんど動いていないように
+// 見える」レベルの遅さが理想。VerySlow (cycle_count=1) なら 1 cross / 8s で
+// 画面端から端まで 8 秒かけて drift する。orber の motion model は t=0 と
+// t=1 がピクセル一致するので `<video loop>` で継ぎ目なくループする。
+// 4 → 8 で frame 数が倍になるため worker 側 mp4 化時間も倍だが、worker
+// 経由なので main thread はブロックしない（#75）。
+export const ANIM_DURATION_SECONDS = 8;
 export const ANIM_TOTAL_FRAMES = ANIM_FPS * ANIM_DURATION_SECONDS;
 
 export function isWebCodecsSupported(): boolean {
