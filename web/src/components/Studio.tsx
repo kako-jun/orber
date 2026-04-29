@@ -38,6 +38,8 @@ export default function Studio() {
   const [aspect, setAspect] = createSignal<Aspect>('portrait');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
+  // ドロップエリアに表示するサムネイル用の object URL。差し替えで revoke する。
+  const [pickedThumbUrl, setPickedThumbUrl] = createSignal<string>('');
   const [phase, setPhase] = createSignal<Phase>('idle');
   const [progress, setProgress] = createSignal<number>(0);
   const [errorMsg, setErrorMsg] = createSignal<string>('');
@@ -76,6 +78,7 @@ export default function Studio() {
       URL.revokeObjectURL(t.blobUrl);
       if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
     }
+    if (pickedThumbUrl()) URL.revokeObjectURL(pickedThumbUrl());
   });
 
   const clearTiles = () => {
@@ -223,6 +226,10 @@ export default function Studio() {
   const acceptFile = async (file: File) => {
     setErrorMsg('');
     setPickedName(file.name);
+    // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
+    const prevThumbUrl = pickedThumbUrl();
+    setPickedThumbUrl(URL.createObjectURL(file));
+    if (prevThumbUrl) URL.revokeObjectURL(prevThumbUrl);
     setPhase('decoding');
     try {
       const dec = await decodeImageToRgb(file);
@@ -339,7 +346,7 @@ export default function Studio() {
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         class={
-          'block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out ' +
+          'group relative block cursor-pointer rounded-xl border border-dashed py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:border-focusRing ' +
           (dragOver()
             ? 'border-fg bg-glassBg'
             : 'border-hairline hover:border-fgMuted')
@@ -357,8 +364,29 @@ export default function Studio() {
             target.value = '';
           }}
         />
-        {pickedName() ? (
-          <span class="text-fg">{pickedName()}</span>
+        {pickedThumbUrl() ? (
+          <div class="relative">
+            <img
+              src={pickedThumbUrl()}
+              alt={pickedName()}
+              class="mx-auto max-h-40 object-contain"
+            />
+            {/* 差し替え overlay — hover (group) で暗幕 + ラベル fade-in。
+                dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 DropArea Filled). */}
+            <div
+              class={
+                'pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity duration-200 ease-out ' +
+                (dragOver()
+                  ? 'opacity-100 bg-fg/5'
+                  : 'opacity-0 bg-bg/40 group-hover:opacity-100')
+              }
+              aria-hidden="true"
+            >
+              <span class="font-display text-sm tracking-wide text-fg">
+                {t('replaceImageHint')}
+              </span>
+            </div>
+          </div>
         ) : (
           <span class="text-fgMuted">{t('dropZonePlaceholder')}</span>
         )}
