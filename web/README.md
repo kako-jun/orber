@@ -5,9 +5,10 @@ Astro 4 + Solid.js + Tailwind + WASM frontend for orber.
 ## UI flow
 
 画像をドロップ → `orber-wasm.generate_batch` で N 枚の静止プレビュー (PNG) を
-生成 → 後半 5 タイルを並行で `start_animation_for_batch_spec` + WebCodecs
-`VideoEncoder` で H.264 mp4 化 → タイルが順次 `<img>` から `<video>` に差し替わる
-（autoplay / muted / playsinline / loop）→ ✓ で気に入ったタイルを選択 → DL
+生成 → 後半 4 タイル（#59, GUI_VIDEO_COUNT_DEFAULT）を並行で
+`start_animation_for_batch_spec` + WebCodecs `VideoEncoder` で H.264 mp4 化 →
+タイルが順次 `<img>` から `<video>` に差し替わる（autoplay / muted / playsinline /
+loop）→ コーナーマーカートグルで気に入ったタイルを選択 → DL
 （1 枚は拡張子に応じた直接 DL、複数は ZIP に PNG / MP4 が混在）。
 
 UI 上の操作は「画像ドロップ」「アスペクト切替（縦長 / 横長アイコン）」
@@ -23,8 +24,10 @@ duration_ms はすべて呼び出しごとに `random_ranges` から一様サン
 
 ## 動画化
 
-後半 5 タイルは `<video muted autoplay playsinline loop>` でグリッド内で勝手に
-動く。フロー:
+後半 4 タイルは `<video muted autoplay playsinline loop>` でグリッド内で勝手に
+動く。direction は wasm 側 `start_animation_for_batch_spec` が
+`GUI_VIDEO_DIRECTIONS` で **LR / RL / TB / BT を 1 枚ずつ重複なく固定割当**
+する（#59）。フロー:
 
 1. `wasm.start_animation_for_batch_spec(params, n, spec_idx, total_frames)` で
    `AnimationHandle` を取得（24fps × 4s = 96 フレーム固定）

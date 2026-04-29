@@ -16,7 +16,7 @@ interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
   blob: Blob;
   blobUrl: string;
-  // タイルの種別。後半 5 枚 = video。
+  // タイルの種別。後半 4 枚 = video（#59 で 5 → 4、4 方向揃い踏み）。
   kind: 'still' | 'video';
   // 動画タイル限定: WebCodecs で生成した mp4。動画化が完了するまで undefined。
   videoBlob?: Blob;
@@ -29,8 +29,9 @@ const BATCH_PORTRAIT = 10;
 const BATCH_LANDSCAPE = 9;
 // `crates/core/src/variations.rs::GUI_VIDEO_COUNT_DEFAULT` と一致させる。
 // wasm バインディング経由で値を引っ張る方法もあるが、コンパイル時定数で済む
-// 軽い値なのでミラーする。
-const VIDEO_TILE_COUNT = 5;
+// 軽い値なのでミラーする。#59 で 5 → 4 に変更（4 方向 LR/RL/TB/BT を
+// 1 枚ずつ重複なく見せる、wasm 側の start_animation_for_batch_spec が固定割当）。
+const VIDEO_TILE_COUNT = 4;
 
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
@@ -167,7 +168,7 @@ export default function Studio() {
       return;
     }
 
-    // 後半 5 タイルを WebCodecs で mp4 化する。終わったタイルから順次 <video>
+    // 後半 4 タイルを WebCodecs で mp4 化する。終わったタイルから順次 <video>
     // に差し替わる。WebCodecs 非対応ブラウザでは static PNG のまま表示される。
     if (!isWebCodecsSupported()) {
       setPhase('done');
