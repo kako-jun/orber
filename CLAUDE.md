@@ -75,7 +75,9 @@ web/                        # Web フロントエンド (#37, #38)
     │                           #  #75 worker 経由化, #80 video pending overlay)
     ├── components/Subtitle.tsx # Solid アイランド。用途提案サブタイトル（i18n, #62）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
-    ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52, #75 で worker 内利用）
+    ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）。
+    │                           # encodeAnimationToMp4 本体は worker 側で呼ばれる (#75)。
+    │                           # ANIM_TOTAL_FRAMES / isWebCodecsSupported は main 側からも import される。
     ├── lib/orberWorker.ts      # #75 wasm 描画 + WebCodecs を実行する Worker 本体
     ├── lib/orberClient.ts      # #75 main 側 Worker クライアント（postMessage を Promise 化）
     ├── lib/strings.ts          # i18n 文言集約 + ja/en 自動切替（#62）

@@ -95,8 +95,17 @@ export async function encodeAnimationToMp4(
       duration: Math.round(microsecondsPerFrame),
     });
     bitmap.close();
-    // 1 秒ごとにキーフレームを入れてシーク・ループ頭出しを安定させる。
-    encoder.encode(frame, { keyFrame: i % ANIM_FPS === 0 });
+    // レビュー S8: VideoEncoder.encode は同期 throw する仕様（encoder の
+    // 状態異常など）。catch せずに放置すると Worker が die して Studio 側
+    // pending が孤児化する。catch して firstError 経由で flush 後に再 throw。
+    try {
+      // 1 秒ごとにキーフレームを入れてシーク・ループ頭出しを安定させる。
+      encoder.encode(frame, { keyFrame: i % ANIM_FPS === 0 });
+    } catch (e) {
+      if (firstError === null) firstError = e;
+      frame.close();
+      break;
+    }
     frame.close();
   }
 

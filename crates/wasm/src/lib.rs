@@ -25,7 +25,9 @@ use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters};
 use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, StyleOptions};
-use orber_core::variations::{random_batch_specs, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS};
+use orber_core::variations::{
+    random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
+};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -138,6 +140,32 @@ fn validate_params(p: &WasmParams) -> Result<(), String> {
 
 fn err_to_js(s: String) -> JsError {
     JsError::new(&s)
+}
+
+/// バッチ index に対応する direction を返す。
+///
+/// 静止画タイル領域 (`spec_idx < still_count`) では spec の direction を
+/// そのまま使い、動画タイル領域 (`spec_idx >= still_count`) では
+/// `GUI_VIDEO_DIRECTIONS` の対応 index で上書きする。これにより GUI 経路
+/// では動画 4 枚に LR/RL/TB/BT が 1 枚ずつ重複なく割り当てられる
+/// （core の `generate_batch` は spec.direction をそのまま使うので、この
+/// 上書きは wasm 入口を通った GUI 経路でのみ発生することに注意）。
+///
+/// `generate_one_at_index` と `start_animation_for_batch_spec` の両方から
+/// 呼ばれることで、両 API が同じ index に対して同じ direction を返すこと
+/// を構造的に保証する（プレビュー静止 PNG と動画の direction が一致）。
+fn direction_for_spec_idx(
+    spec_idx: usize,
+    still_count: usize,
+    spec: &VariationSpec,
+) -> MotionDirection {
+    if spec_idx >= still_count {
+        let video_idx = spec_idx - still_count;
+        debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);
+        GUI_VIDEO_DIRECTIONS[video_idx]
+    } else {
+        spec.direction
+    }
 }
 
 fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
@@ -268,15 +296,10 @@ pub fn generate_one_at_index(
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
 
-    // 動画タイル領域なら start_animation_for_batch_spec と同じ direction 上書き。
-    // 静止画タイルなら spec.direction をそのまま使う。
-    let direction = if spec_idx >= still_count {
-        let video_idx = spec_idx - still_count;
-        debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);
-        GUI_VIDEO_DIRECTIONS[video_idx]
-    } else {
-        spec.direction
-    };
+    // direction の決定は純粋関数 direction_for_spec_idx に集約。
+    // start_animation_for_batch_spec と同じロジックを共有することで、
+    // プレビュー静止 PNG と動画タイルの direction を構造的に揃える。
+    let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
 
     let opts = AnimateOptions {
         width: p.width,
@@ -386,13 +409,10 @@ pub fn start_animation_for_batch_spec(
     let spec = specs[spec_idx];
 
     // #59: 動画タイル 4 枚に LR / RL / TB / BT を 1 枚ずつ重複なく割り当てる。
-    // GUI_VIDEO_DIRECTIONS は型で長さを固定しているので、定数を増やすと配列も
-    // 一緒に長さが合っていないとコンパイルが通らない（取りこぼし防止）。
-    // 静止画タイルは spec の direction をそのまま使うため、上書きは動画タイル
-    // のみ。
-    let video_idx = spec_idx - still_count;
-    debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);
-    let direction = GUI_VIDEO_DIRECTIONS[video_idx];
+    // direction_for_spec_idx を経由することで、`generate_one_at_index` で
+    // 描かれる t=0 PNG と完全に同じ direction を選ぶ（プレビュー静止画と
+    // 動画の整合性を構造的に保証）。
+    let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
 
     let opts = AnimateOptions {
         width: p.width,
@@ -535,5 +555,73 @@ mod tests {
     #[test]
     fn validate_accepts_reasonable_params() {
         assert!(validate_params(&base_params()).is_ok());
+    }
+
+    fn synth_spec(direction: MotionDirection) -> VariationSpec {
+        VariationSpec {
+            direction,
+            speed: MotionSpeed::Slow,
+            count: 10,
+            orb_size: 3.0,
+            blur: 0.5,
+            seed: 1,
+            duration_ms: 0,
+            kind: orber_core::variations::VariationKind::Png,
+            label: "test",
+        }
+    }
+
+    /// 静止画タイル領域では spec.direction をそのまま使う。
+    #[test]
+    fn direction_for_spec_idx_returns_spec_direction_for_still_range() {
+        let still_count = 8;
+        let spec = synth_spec(MotionDirection::TopToBottom);
+        for spec_idx in 0..still_count {
+            assert_eq!(
+                direction_for_spec_idx(spec_idx, still_count, &spec),
+                MotionDirection::TopToBottom,
+                "still tile {spec_idx} must inherit spec.direction"
+            );
+        }
+    }
+
+    /// 動画タイル領域 (8..12) では GUI_VIDEO_DIRECTIONS で上書きされる。
+    /// LR / RL / TB / BT が重複なく 1 枚ずつ割り当てられる。
+    #[test]
+    fn direction_for_spec_idx_overrides_video_range_with_gui_directions() {
+        let still_count = 8;
+        let total = 12;
+        // spec.direction は何を入れても video 領域では無視される。
+        let spec = synth_spec(MotionDirection::LeftToRight);
+        let mut seen: Vec<MotionDirection> = Vec::new();
+        for spec_idx in still_count..total {
+            let dir = direction_for_spec_idx(spec_idx, still_count, &spec);
+            assert_eq!(dir, GUI_VIDEO_DIRECTIONS[spec_idx - still_count]);
+            seen.push(dir);
+        }
+        assert_eq!(seen.len(), GUI_VIDEO_COUNT_DEFAULT);
+        // 重複がない（4 方向揃い踏み）。
+        let mut sorted = seen.clone();
+        sorted.sort_by_key(|d| format!("{d:?}"));
+        sorted.dedup_by_key(|d| format!("{d:?}"));
+        assert_eq!(sorted.len(), GUI_VIDEO_COUNT_DEFAULT);
+    }
+
+    /// 境界: spec_idx == still_count - 1 は静止 (spec.direction)、
+    /// spec_idx == still_count は video (GUI_VIDEO_DIRECTIONS[0])。
+    #[test]
+    fn direction_for_spec_idx_boundary() {
+        let still_count = 8;
+        let spec = synth_spec(MotionDirection::BottomToTop);
+        assert_eq!(
+            direction_for_spec_idx(still_count - 1, still_count, &spec),
+            MotionDirection::BottomToTop,
+            "spec_idx == still_count - 1 is still range"
+        );
+        assert_eq!(
+            direction_for_spec_idx(still_count, still_count, &spec),
+            GUI_VIDEO_DIRECTIONS[0],
+            "spec_idx == still_count is video range index 0"
+        );
     }
 }

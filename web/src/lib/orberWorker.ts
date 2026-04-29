@@ -19,11 +19,18 @@
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationToMp4 } from './encodeMp4';
 
+// レビュー M6: 複数メッセージが同時に到着すると ensureInit が並行に走り、
+// init() が重複実行される。Promise をキャッシュして 1 度きりにする。
 let initialized = false;
-async function ensureInit() {
-  if (initialized) return;
-  await init();
-  initialized = true;
+let initPromise: Promise<void> | null = null;
+function ensureInit(): Promise<void> {
+  if (initialized) return Promise.resolve();
+  if (!initPromise) {
+    initPromise = init().then(() => {
+      initialized = true;
+    });
+  }
+  return initPromise;
 }
 
 // 入力画像の RGB バッファを worker 側にキャッシュ。同じ画像で複数回 wasm を
@@ -97,10 +104,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
       case 'generateOne': {
         const params = mergeParams(req.params);
         const png = wasm.generate_one_at_index(params, req.n, req.index);
-        // png は Uint8Array。基底 ArrayBuffer を Transferable で渡す。
-        // SharedArrayBuffer になるケースは想定しないので slice で実体コピー
-        // → main 側で再構築する。Transferable で zero-copy できれば理想だが、
-        // wasm 線形メモリの ArrayBuffer は detach できないので slice 必須。
+        // png.buffer は wasm 線形メモリへの view → そのまま postMessage で
+        // Transferable に渡すと wasm 側のメモリが detach されて壊れる。
+        // slice() で新規 ArrayBuffer を作って Transferable で main に渡す。
         const buf = png.slice().buffer;
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;

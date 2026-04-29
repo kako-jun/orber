@@ -2,6 +2,7 @@ import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
+  onWorkerCrash,
   workerAnimateOne,
   workerGenerateOne,
   workerInit,
@@ -111,6 +112,16 @@ export default function Studio() {
       setWasmErr(String(e));
       setWasmStatus('error');
     }
+    // レビュー M3: Worker がクラッシュ → 自動再生成された場合、wasm 未初期化
+    // + cachedSource 未設定の状態に戻る。lastSourceRef をリセットして
+    // 次の runBatch で setSource を再送させる。エラー UI も出して操作不能
+    // 感を抑える（リロードを促すサインになる）。
+    const offCrash = onWorkerCrash(() => {
+      lastSourceRef = null;
+      setErrorMsg(t('wasmLoadFailed'));
+      setWasmStatus('error');
+    });
+    onCleanup(offCrash);
   });
 
   onCleanup(() => {
@@ -302,6 +313,10 @@ export default function Studio() {
     // #73: hi-res 再描画中に新しい画像を受け付けると baseSeed が
     // 上書きされて生成中の DL ジョブと食い違う。完了まで弾く。
     if (downloading()) return;
+    // レビュー Q1: worker 起動失敗時はドロップを受け付けても runBatch が
+    // workerSetSource で reject されるだけ。最初の段階で弾いてエラー UI
+    // を据え置く。
+    if (wasmStatus() === 'error') return;
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
@@ -322,6 +337,10 @@ export default function Studio() {
       if (failedThumbUrl) URL.revokeObjectURL(failedThumbUrl);
       setPickedThumbUrl('');
       setPickedName('');
+      // レビュー M4: decoded() を更新せずに失敗すると、ドロップエリアは
+      // 「画像未選択」表示なのにガチャボタンが前画像で動いて UI と内部
+      // 状態が食い違う。decoded を null に戻して整合させる。
+      setDecoded(null);
     }
   };
 
@@ -703,9 +722,6 @@ export default function Studio() {
         <p class="fade-in text-sm text-fgMuted">{t('decoding')}</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        {/* progress() の数字が変わっても <p> はマウントされたままなので
-            .fade-in は最初の 1 回 (Show が真になった瞬間) しか走らない。
-            毎刻みフェードすると目障りなので、これは意図通り。 */}
         <p class="fade-in text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
       </Show>
       <Show when={phase() === 'animating'}>
@@ -788,13 +804,23 @@ export default function Studio() {
                       soft shimmer + コーナーバッジを重ねて「これから動く」
                       ことを示す。skeleton（強い shimmer）= 何もない /
                       skeleton-soft（弱い shimmer）= 静止は出たが動画は処理中
-                      の二段階で進行を表現する。 */}
-                  <Show when={tile.kind === 'video' && !tile.videoBlobUrl}>
+                      の二段階で進行を表現する。
+                      レビュー S3: WebCodecs 非対応環境では videoBlobUrl が
+                      永遠に来ないので、バッジを出すと「処理中」が固着して
+                      しまう。環境チェックで gating する。 */}
+                  <Show
+                    when={
+                      tile.kind === 'video' &&
+                      !tile.videoBlobUrl &&
+                      isWebCodecsSupported()
+                    }
+                  >
                     <div class="skeleton-soft fade-in absolute inset-0" aria-hidden="true" />
-                    <span
-                      class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-[10px] tracking-wide text-fg"
-                      aria-label={t('videoPendingBadge')}
-                    >
+                    {/* レビュー N10/N11: text サイズは DESIGN.md の type scale
+                        最小 (text-xs = 12px) に揃える。aria-label と表示テキスト
+                        の二重指定はスクリーンリーダーで二重読みになるので、
+                        表示テキストだけ残して aria-label を外す。 */}
+                    <span class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-xs tracking-wide text-fg">
                       {t('videoPendingBadge')}…
                     </span>
                   </Show>
@@ -870,7 +896,12 @@ export default function Studio() {
           <button
             type="button"
             onClick={downloadSelected}
-            disabled={selectedCount() === 0 || downloading()}
+            disabled={
+              selectedCount() === 0 ||
+              downloading() ||
+              phase() === 'generating' ||
+              phase() === 'animating'
+            }
             class={GLASS_BTN + ' text-sm'}
           >
             {t('downloadSelected')} ({selectedCount()})

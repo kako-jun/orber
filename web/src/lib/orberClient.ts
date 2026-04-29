@@ -33,6 +33,19 @@ interface BaseParams {
 let worker: Worker | null = null;
 let nextId = 0;
 const pending = new Map<number, PendingResolver>();
+// レビュー M3 + N4: Worker クラッシュで再生成すると wasm 未初期化 +
+// cachedSource 未設定の状態に戻る。main 側で「同じ画像なら setSource
+// 再送しない」最適化が破綻するので、クラッシュ通知を Studio に流して
+// `lastSourceRef` をリセットさせる。同時に UI にエラー表示する導線にも使う。
+type CrashCallback = () => void;
+const crashCallbacks: CrashCallback[] = [];
+export function onWorkerCrash(cb: CrashCallback): () => void {
+  crashCallbacks.push(cb);
+  return () => {
+    const idx = crashCallbacks.indexOf(cb);
+    if (idx >= 0) crashCallbacks.splice(idx, 1);
+  };
+}
 
 function ensureWorker(): Worker {
   if (worker) return worker;
@@ -57,6 +70,15 @@ function ensureWorker(): Worker {
     for (const [, p] of pending) p.reject(new Error('worker crashed'));
     pending.clear();
     worker = null;
+    // クラッシュ通知。次回 ensureWorker で新 worker が立つので、購読者は
+    // setSource キャッシュなどのリセットを行うこと。
+    for (const cb of crashCallbacks) {
+      try {
+        cb();
+      } catch (err) {
+        console.error('orber worker crash callback failed', err);
+      }
+    }
   });
   worker = w;
   return w;
