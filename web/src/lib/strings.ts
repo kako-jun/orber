@@ -29,9 +29,15 @@ export const STRINGS = {
     en: 'Picked image: {name}',
   },
   aspectPortrait: { ja: '縦長', en: 'Portrait' },
-  aspectPortraitTitle: { ja: '縦長 540×960', en: 'Portrait 540×960' },
+  aspectPortraitTitle: {
+    ja: '縦長 9:16（プレビュー 540×960 / DL 1080×1920）',
+    en: 'Portrait 9:16 (preview 540×960, DL 1080×1920)',
+  },
   aspectLandscape: { ja: '横長', en: 'Landscape' },
-  aspectLandscapeTitle: { ja: '横長 960×540', en: 'Landscape 960×540' },
+  aspectLandscapeTitle: {
+    ja: '横長 16:9（プレビュー 960×540 / DL 1920×1080）',
+    en: 'Landscape 16:9 (preview 960×540, DL 1920×1080)',
+  },
   rerollLabel: { ja: '同じ画像でガチャ', en: 'Roll again' },
   rerollTitle: {
     ja: '同じ画像でもう一度ガチャ',
@@ -50,6 +56,14 @@ export const STRINGS = {
   },
   downloadSelected: { ja: '選択を DL', en: 'Download selected' },
   downloadAll: { ja: '全 {n} 枚 DL', en: 'Download all {n}' },
+  preparingDownload: {
+    ja: '高解像度版を準備中… {done} / {total}',
+    en: 'Rendering high-res… {done} / {total}',
+  },
+  downloadFailed: {
+    ja: 'ダウンロード準備に失敗しました',
+    en: 'Failed to prepare download',
+  },
   variationAlt: { ja: 'バリエーション {n}', en: 'Variation {n}' },
   variationAnimatedAlt: {
     ja: 'バリエーション {n} (動画)',
