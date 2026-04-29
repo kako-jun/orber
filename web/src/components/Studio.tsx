@@ -14,7 +14,8 @@ type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error'
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
-  blob: Blob;
+  // skeleton 表示中は null（runBatch 冒頭で 12 個先出しするため）。
+  blob: Blob | null;
   blobUrl: string;
   // タイルの種別。後半 4 枚 = video（#59 で 5 → 4、4 方向揃い踏み）。
   kind: 'still' | 'video';
@@ -98,10 +99,30 @@ export default function Studio() {
 
   const clearTiles = () => {
     for (const t of tiles()) {
-      URL.revokeObjectURL(t.blobUrl);
+      if (t.blobUrl) URL.revokeObjectURL(t.blobUrl);
       if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
     }
     setTiles([]);
+  };
+
+  // runBatch 冒頭で呼ぶ: 既存タイルの URL を revoke し、新しい 12 個の
+  // skeleton で置き換える。clearTiles → setTiles と分けると一瞬グリッドが
+  // 空になって視覚的にちらつくので、1 アクションで差し替える。
+  const seedSkeletons = () => {
+    for (const t of tiles()) {
+      if (t.blobUrl) URL.revokeObjectURL(t.blobUrl);
+      if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
+    }
+    const total = batchN();
+    const stillCount = total - VIDEO_TILE_COUNT;
+    setTiles(
+      Array.from({ length: total }, (_, i) => ({
+        blob: null,
+        blobUrl: '',
+        kind: i < stillCount ? 'still' : 'video',
+        selected: false,
+      })),
+    );
   };
 
   // 1 frame ぶん描画を挟む（setTimeout(0) より意図が明確）。
@@ -119,7 +140,7 @@ export default function Studio() {
     runGen += 1;
     const myGen = runGen;
 
-    clearTiles();
+    seedSkeletons();
     setErrorMsg('');
     setProgress(0);
     setPhase('generating');
@@ -157,6 +178,8 @@ export default function Studio() {
       pngs = result as unknown as Uint8Array[];
     } catch (e) {
       if (myGen !== runGen) return;
+      // skeleton を残すと無限に shimmer して紛らわしい。エラー時は片付ける。
+      clearTiles();
       setErrorMsg(String(e));
       setPhase('error');
       return;
@@ -172,13 +195,21 @@ export default function Studio() {
         const blob = new Blob([png], { type: 'image/png' });
         const blobUrl = URL.createObjectURL(blob);
         const kind: Tile['kind'] = i < stillCount ? 'still' : 'video';
-        setTiles((prev) => [...prev, { blob, blobUrl, kind, selected: false }]);
+        // skeleton 12 個は seedSkeletons で先置きしてあるので、index で
+        // 差し替える。push にすると skeleton が消えずに重なってしまう。
+        setTiles((prev) =>
+          prev.map((t, idx) =>
+            idx === i ? { ...t, blob, blobUrl, kind } : t,
+          ),
+        );
         setProgress((n) => n + 1);
         await yieldFrame();
       }
       if (myGen !== runGen) return;
     } catch (e) {
       if (myGen !== runGen) return;
+      // skeleton を残すと無限に shimmer して紛らわしい。エラー時は片付ける。
+      clearTiles();
       setErrorMsg(String(e));
       setPhase('error');
       return;
@@ -375,27 +406,31 @@ export default function Studio() {
   };
 
   // 動画タイルなら mp4 が出来ていれば mp4、まだなら静止フォールバック PNG。
-  // 静止タイルは常に PNG。
-  const tilePayload = (t: Tile): { blob: Blob; ext: 'png' | 'mp4' } => {
+  // 静止タイルは常に PNG。skeleton 中（blob === null）は呼び出し側で除外
+  // 済みの想定: downloadAll は generating/animating 中は disabled、
+  // downloadSelected は !blob のタイルがそもそも select できない。
+  const tilePayload = (t: Tile): { blob: Blob; ext: 'png' | 'mp4' } | null => {
     if (t.kind === 'video' && t.videoBlob) {
       return { blob: t.videoBlob, ext: 'mp4' };
     }
+    if (!t.blob) return null;
     return { blob: t.blob, ext: 'png' };
   };
 
   const downloadTiles = async (chosen: Tile[]) => {
-    if (chosen.length === 0) return;
-    if (chosen.length === 1) {
-      const { blob, ext } = tilePayload(chosen[0]);
-      triggerDownload(blob, `orber.${ext}`);
+    const ready = chosen
+      .map((t) => tilePayload(t))
+      .filter((p): p is { blob: Blob; ext: 'png' | 'mp4' } => p !== null);
+    if (ready.length === 0) return;
+    if (ready.length === 1) {
+      triggerDownload(ready[0].blob, `orber.${ready[0].ext}`);
       return;
     }
     // jszip は ZIP 化する瞬間にしか使わないので、初回 DL 時に動的読み込みする。
     // 訪問しただけのユーザーに 30KB 余分な JS を読ませない。
     const { default: JSZip } = await import('jszip');
     const zip = new JSZip();
-    chosen.forEach((t, i) => {
-      const { blob, ext } = tilePayload(t);
+    ready.forEach(({ blob, ext }, i) => {
       zip.file(`orber_${String(i + 1).padStart(2, '0')}.${ext}`, blob);
     });
     const zipBlob = await zip.generateAsync({ type: 'blob' });
@@ -613,43 +648,60 @@ export default function Studio() {
             {(tile, i) => (
               <button
                 type="button"
-                onClick={() => toggleTile(i())}
-                class="fade-in group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
+                onClick={() => tile.blob && toggleTile(i())}
+                disabled={!tile.blob}
+                aria-busy={!tile.blob}
+                class="group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
                 }}
               >
-                {/* 静止 PNG は常に下敷きとして表示し続ける。動画タイルでは
-                    videoBlobUrl が来たら <video> を上に絶対配置して fade-in
-                    させる (#60)。下敷きを残すことで差し替えの瞬間に空白が
-                    出ない。再ロール (runBatch) は clearTiles で全タイルを
-                    unmount してから push するので、再フェードインも自然に
-                    走る (将来 in-place 差し替えを入れたら Show keyed が要る)。 */}
-                <img
-                  src={tile.blobUrl}
-                  alt={t('variationAlt', { n: i() + 1 })}
-                  class="block h-full w-full object-cover"
-                />
-                <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
-                  {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
-                      autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
-                      一斉に play() する (動き始めを揃えるため)。 */}
-                  <video
-                    ref={(el) => {
-                      // unmount 時に null/undefined が来るケースを除外して
-                      // 古いスロットを上書きしないようガード (#61 セルフ
-                      // レビュー S4)。リセットは runBatch 冒頭で一括行う。
-                      if (el) videoRefs[i()] = el;
-                    }}
-                    src={tile.videoBlobUrl}
-                    muted
-                    playsinline
-                    loop
-                    class="fade-in absolute inset-0 block h-full w-full object-cover"
-                    aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
+                {/* tile.blob が null の間は skeleton shimmer。runBatch 冒頭で
+                    12 個先出しすることでグリッド形状を確定させ、wasm の
+                    generate_batch（モバイルで数秒ブロッキング）の最中も
+                    ユーザーに「動いている」感を与える。blob 確定後はこの
+                    Show 内に切り替わり、ネイティブ <img> は .fade-in で
+                    入ってくる（β 案: 1 枚ずつ揃っていく）。 */}
+                <Show
+                  when={tile.blob}
+                  fallback={
+                    <div
+                      class="skeleton block h-full w-full"
+                      aria-hidden="true"
+                    />
+                  }
+                >
+                  {/* 静止 PNG は常に下敷きとして表示し続ける。動画タイルでは
+                      videoBlobUrl が来たら <video> を上に絶対配置して fade-in
+                      させる (#60)。下敷きを残すことで差し替えの瞬間に空白が
+                      出ない。 */}
+                  <img
+                    src={tile.blobUrl}
+                    alt={t('variationAlt', { n: i() + 1 })}
+                    class="fade-in block h-full w-full object-cover"
                   />
+                  <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
+                    {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
+                        autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
+                        一斉に play() する (動き始めを揃えるため)。 */}
+                    <video
+                      ref={(el) => {
+                        // unmount 時に null/undefined が来るケースを除外して
+                        // 古いスロットを上書きしないようガード (#61 セルフ
+                        // レビュー S4)。リセットは runBatch 冒頭で一括行う。
+                        if (el) videoRefs[i()] = el;
+                      }}
+                      src={tile.videoBlobUrl}
+                      muted
+                      playsinline
+                      loop
+                      class="fade-in absolute inset-0 block h-full w-full object-cover"
+                      aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
+                    />
+                  </Show>
                 </Show>
-                {/* 4-corner L marker — DESIGN.md §4 SelectionMarker */}
+                {/* 4-corner L marker — DESIGN.md §4 SelectionMarker
+                    skeleton 中は disabled なので hover も発火しない。 */}
                 <span
                   class={
                     'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
