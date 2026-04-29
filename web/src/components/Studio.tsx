@@ -382,7 +382,7 @@ export default function Studio() {
             <img
               src={pickedThumbUrl()}
               alt={t('pickedThumbAlt', { name: pickedName() })}
-              class="mx-auto max-h-40 object-contain"
+              class="fade-in mx-auto max-h-40 object-contain"
             />
             {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
                 dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 Filled state)。
@@ -480,24 +480,24 @@ export default function Studio() {
       </div>
 
       <Show when={wasmStatus() === 'error'}>
-        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+        <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {t('wasmLoadFailed')}
           <pre class="mt-2 text-xs whitespace-pre-wrap text-fgMuted">{wasmErr()}</pre>
         </div>
       </Show>
 
       <Show when={phase() === 'decoding'}>
-        <p class="text-sm text-fgMuted">{t('decoding')}</p>
+        <p class="fade-in text-sm text-fgMuted">{t('decoding')}</p>
       </Show>
       <Show when={phase() === 'generating'}>
-        <p class="text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
+        <p class="fade-in text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
       </Show>
       <Show when={phase() === 'animating'}>
-        <p class="text-sm text-fgMuted">{t('animating')}</p>
+        <p class="fade-in text-sm text-fgMuted">{t('animating')}</p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
-        <div class="rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+        <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {errorMsg()}
         </div>
       </Show>
@@ -516,21 +516,21 @@ export default function Studio() {
               <button
                 type="button"
                 onClick={() => toggleTile(i())}
-                class="group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
+                class="fade-in group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
                 }}
               >
-                <Show
-                  when={tile.kind === 'video' && tile.videoBlobUrl}
-                  fallback={
-                    <img
-                      src={tile.blobUrl}
-                      alt={t('variationAlt', { n: i() + 1 })}
-                      class="block h-full w-full object-cover"
-                    />
-                  }
-                >
+                {/* 静止 PNG は常に下敷きとして表示し続ける。動画タイルでは
+                    videoBlobUrl が来たら <video> を上に絶対配置して fade-in
+                    させる (#60)。下敷きを残すことで差し替えの瞬間に空白が
+                    出ない。 */}
+                <img
+                  src={tile.blobUrl}
+                  alt={t('variationAlt', { n: i() + 1 })}
+                  class="block h-full w-full object-cover"
+                />
+                <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
                   <video
                     src={tile.videoBlobUrl}
                     poster={tile.blobUrl}
@@ -538,7 +538,7 @@ export default function Studio() {
                     muted
                     playsinline
                     loop
-                    class="block h-full w-full object-cover"
+                    class="fade-in absolute inset-0 block h-full w-full object-cover"
                     aria-label={t('variationAnimatedAlt', { n: i() + 1 })}
                   />
                 </Show>

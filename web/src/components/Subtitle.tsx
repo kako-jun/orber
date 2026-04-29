@@ -17,7 +17,7 @@ export default function Subtitle() {
   // t() 内部の lang() 呼び出しで自動的に reactive 化される。
   // 明示的なトリガ (data-lang 等) は不要。
   return (
-    <p class="font-display text-sm tracking-wide text-fgMuted text-center mt-3 mb-10">
+    <p class="fade-in font-display text-sm tracking-wide text-fgMuted text-center mt-3 mb-10">
       {t('subtitle')}
     </p>
   );
