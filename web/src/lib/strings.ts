@@ -24,6 +24,10 @@ export const STRINGS = {
     en: 'Drop an image or click to choose',
   },
   replaceImageHint: { ja: '差し替え', en: 'Replace' },
+  pickedThumbAlt: {
+    ja: '選択した画像: {name}',
+    en: 'Picked image: {name}',
+  },
   aspectPortrait: { ja: '縦長', en: 'Portrait' },
   aspectPortraitTitle: { ja: '縦長 540×960', en: 'Portrait 540×960' },
   aspectLandscape: { ja: '横長', en: 'Landscape' },

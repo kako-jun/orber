@@ -239,6 +239,11 @@ export default function Studio() {
       console.error('decode failed', e);
       setErrorMsg(String(e));
       setPhase('error');
+      // 失敗した画像を「成功扱い」のサムネとしてドロップエリアに残さない。
+      const failedThumbUrl = pickedThumbUrl();
+      if (failedThumbUrl) URL.revokeObjectURL(failedThumbUrl);
+      setPickedThumbUrl('');
+      setPickedName('');
     }
   };
 
@@ -341,7 +346,11 @@ export default function Studio() {
   return (
     <section class="space-y-4" data-lang={lang()}>
       <label
-        aria-label={t('dropZoneLabel')}
+        aria-label={
+          pickedThumbUrl()
+            ? `${t('dropZoneLabel')} — ${t('replaceImageHint')}`
+            : t('dropZoneLabel')
+        }
         onDrop={onDrop}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -352,11 +361,14 @@ export default function Studio() {
             : 'border-hairline hover:border-fgMuted')
         }
       >
+        {/* sr-only で input を視覚的に隠しつつフォーカス可能に保つ。
+            display:none (旧 class="hidden") にすると Tab で focus できず
+            focus-within も発火しないため使わない。 */}
         <input
           ref={fileInput}
           type="file"
           accept="image/*"
-          class="hidden"
+          class="sr-only"
           onChange={(e) => {
             const target = e.currentTarget;
             acceptFiles(target.files);
@@ -368,17 +380,18 @@ export default function Studio() {
           <div class="relative">
             <img
               src={pickedThumbUrl()}
-              alt={pickedName()}
+              alt={t('pickedThumbAlt', { name: pickedName() })}
               class="mx-auto max-h-40 object-contain"
             />
-            {/* 差し替え overlay — hover (group) で暗幕 + ラベル fade-in。
-                dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 DropArea Filled). */}
+            {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
+                dragOver 時は薄い白オーバーレイで強調 (DESIGN.md §4 Filled state)。
+                opacity 値 (bg/40, fg/5) は §4 Filled state に明記済み。 */}
             <div
               class={
                 'pointer-events-none absolute inset-0 flex items-center justify-center transition-opacity duration-200 ease-out ' +
                 (dragOver()
                   ? 'opacity-100 bg-fg/5'
-                  : 'opacity-0 bg-bg/40 group-hover:opacity-100')
+                  : 'opacity-0 bg-bg/40 group-hover:opacity-100 group-focus-within:opacity-100')
               }
               aria-hidden="true"
             >
