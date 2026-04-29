@@ -1,0 +1,123 @@
+// orber#75 — orberWorker のメインスレッド側クライアント。
+//
+// Worker をシングルトンで起動し、postMessage を Promise 化した RPC を提供する。
+// id 採番で複数の in-flight 呼び出しを区別し、各 Promise の resolve / reject
+// を pending Map で照合する。
+//
+// 設計上の選択:
+// - Worker は 1 本のシングルトンを使い回す（wasm 初期化コストを償却）
+// - source RGB は `workerSetSource` で 1 度だけ送り、以降の呼び出しは
+//   index と spec パラメータだけ送る（毎回 RGB 数 MB を送らない）
+// - mp4 / PNG の ArrayBuffer は Transferable で worker → main を zero-copy
+
+import OrberWorker from './orberWorker?worker';
+
+interface PendingResolver {
+  resolve: (v: unknown) => void;
+  reject: (e: unknown) => void;
+}
+
+interface BaseParams {
+  k: number;
+  width: number;
+  height: number;
+  seed: number;
+  direction: string;
+  speed: string;
+  count: number;
+  orb_size: number;
+  blur: number;
+  shape: string;
+}
+
+let worker: Worker | null = null;
+let nextId = 0;
+const pending = new Map<number, PendingResolver>();
+
+function ensureWorker(): Worker {
+  if (worker) return worker;
+  const w = new OrberWorker();
+  w.addEventListener('message', (e: MessageEvent) => {
+    const { id, ok, data, error } = e.data as {
+      id: number;
+      ok: boolean;
+      data?: unknown;
+      error?: string;
+    };
+    const p = pending.get(id);
+    if (!p) return;
+    pending.delete(id);
+    if (ok) p.resolve(data);
+    else p.reject(new Error(error ?? 'worker error (no message)'));
+  });
+  w.addEventListener('error', (e) => {
+    // Worker 全体が落ちると個別の id 照合では拾えないので、pending 全部に
+    // reject を流して呼び出し側が例外で気づけるようにする。
+    console.error('orber worker fatal error', e);
+    for (const [, p] of pending) p.reject(new Error('worker crashed'));
+    pending.clear();
+    worker = null;
+  });
+  worker = w;
+  return w;
+}
+
+function call<T>(req: Record<string, unknown>, transfers: Transferable[] = []): Promise<T> {
+  const w = ensureWorker();
+  const id = ++nextId;
+  return new Promise<T>((resolve, reject) => {
+    pending.set(id, {
+      resolve: resolve as (v: unknown) => void,
+      reject: reject as (e: unknown) => void,
+    });
+    w.postMessage({ ...req, id }, transfers);
+  });
+}
+
+/** Worker を起動して wasm を初期化する。複数回呼んでも安全（worker 側で冪等）。 */
+export async function workerInit(): Promise<void> {
+  await call<void>({ kind: 'init' });
+}
+
+/**
+ * 入力画像の RGB バッファを Worker にキャッシュ。
+ * 以降の `workerGenerateOne` / `workerAnimateOne` はこのキャッシュを使う。
+ *
+ * postMessage の structuredClone で worker 側に複製される（Transferable は
+ * 使わない）。main 側 `decoded()` signal の整合性を壊さないため。コピーは
+ * 1 画像につき 1 度しか発生しないので RGB 数 MB のコピーは許容コスト。
+ */
+export async function workerSetSource(
+  rgb: Uint8Array,
+  width: number,
+  height: number,
+): Promise<void> {
+  await call<void>({ kind: 'setSource', rgb, width, height });
+}
+
+/** 1 タイル分の PNG を hi-res / lo-res のどちらでも返す。 */
+export async function workerGenerateOne(
+  params: BaseParams,
+  n: number,
+  index: number,
+): Promise<Uint8Array> {
+  const buf = await call<ArrayBuffer>({ kind: 'generateOne', params, n, index });
+  return new Uint8Array(buf);
+}
+
+/** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */
+export async function workerAnimateOne(
+  params: BaseParams,
+  n: number,
+  index: number,
+  totalFrames: number,
+): Promise<Blob> {
+  const buf = await call<ArrayBuffer>({
+    kind: 'animateOne',
+    params,
+    n,
+    index,
+    totalFrames,
+  });
+  return new Blob([buf], { type: 'video/mp4' });
+}

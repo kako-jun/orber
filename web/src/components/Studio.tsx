@@ -1,13 +1,13 @@
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
+import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
-  ANIM_TOTAL_FRAMES,
-  encodeAnimationToMp4,
-  isWebCodecsSupported,
-} from '../lib/encodeMp4';
+  workerAnimateOne,
+  workerGenerateOne,
+  workerInit,
+  workerSetSource,
+} from '../lib/orberClient';
 import { t, lang } from '../lib/strings';
-
-type WasmModule = typeof import('../wasm/orber_wasm.js');
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
@@ -72,8 +72,10 @@ export default function Studio() {
     total: 0,
   });
 
-  let wasm: WasmModule | null = null;
   let fileInput: HTMLInputElement | undefined;
+  // #75: 直近 workerSetSource した DecodedImage の参照。同じ画像で reroll
+  // するときは setSource を再送しない（worker 側のキャッシュをそのまま使う）。
+  let lastSourceRef: DecodedImage | null = null;
   // 同時実行中の runBatch を区別するための世代カウンタ。
   // 進行中のループは自分の世代と現世代を比較して食い違ったら抜ける。
   let runGen = 0;
@@ -100,12 +102,12 @@ export default function Studio() {
   // pre-hydration では Base.astro の inline script が <html lang> を確定済み。
   onMount(async () => {
     try {
-      const mod = await import('../wasm/orber_wasm.js');
-      await mod.default();
-      wasm = mod;
+      // #75: wasm は worker 内でロード・実行する。ここで起動して初期化を
+      // 待つことで、初回ドロップ時の体感を「即生成開始」に保つ。
+      await workerInit();
       setWasmStatus('ready');
     } catch (e) {
-      console.error('failed to load orber-wasm', e);
+      console.error('failed to init orber worker', e);
       setWasmErr(String(e));
       setWasmStatus('error');
     }
@@ -156,11 +158,6 @@ export default function Studio() {
   const runBatch = async () => {
     const src = decoded();
     if (!src) return;
-    if (!wasm) {
-      setErrorMsg('wasm not ready');
-      setPhase('error');
-      return;
-    }
 
     runGen += 1;
     const myGen = runGen;
@@ -172,6 +169,22 @@ export default function Studio() {
     // #61: 新しい run の開始でビデオ参照テーブルもリセット。
     videoRefs = [];
 
+    // #75: 入力画像が変わっていれば worker にソースをアップロードする。
+    // 同じ画像で reroll するだけなら再送しない（worker 側キャッシュ流用）。
+    if (lastSourceRef !== src) {
+      try {
+        await workerSetSource(src.rgb, src.width, src.height);
+        if (myGen !== runGen) return;
+        lastSourceRef = src;
+      } catch (e) {
+        if (myGen !== runGen) return;
+        clearTiles();
+        setErrorMsg(String(e));
+        setPhase('error');
+        return;
+      }
+    }
+
     const [w, h] =
       aspect() === 'portrait'
         ? [PREVIEW_W_PORTRAIT, PREVIEW_H_PORTRAIT]
@@ -182,10 +195,10 @@ export default function Studio() {
     const baseSeed = Math.floor(Math.random() * 2 ** 48);
     // DL 時の hi-res 再描画で同じ spec 列を再現できるよう保存（#73）。
     lastBaseSeed = baseSeed;
+    // worker 側で source_* がキャッシュから自動マージされるので、ここでは
+    // spec パラメータだけ渡す（毎回 RGB を送らない）。direction/speed/count/
+    // orb_size/blur は generate_one_at_index ではどのみち spec で上書きされる。
     const params = {
-      source_rgb: src.rgb,
-      source_width: src.width,
-      source_height: src.height,
       k: 5,
       width: w,
       height: h,
@@ -198,35 +211,21 @@ export default function Studio() {
       shape: 'circle',
     };
 
-    // 重い WASM コール前に 1 フレーム描画させる
-    await yieldFrame();
-    if (myGen !== runGen) return;
+    const total = batchN();
+    const stillCount = total - VIDEO_TILE_COUNT;
 
-    let pngs: Uint8Array[];
+    // #75: 12 枚を 1 枚ずつ worker に投げる。1 タイル分の wasm 呼び出しは
+    // 数百 ms なので、各呼び出し完了ごとに main 側 setTiles → DOM 反映 →
+    // 次の postMessage が走る。worker スレッドで動いているのでメインの
+    // タップ・スクロールはブロックされない。
     try {
-      const result = wasm.generate_batch(params, batchN());
-      pngs = result as unknown as Uint8Array[];
-    } catch (e) {
-      if (myGen !== runGen) return;
-      // skeleton を残すと無限に shimmer して紛らわしい。エラー時は片付ける。
-      clearTiles();
-      setErrorMsg(String(e));
-      setPhase('error');
-      return;
-    }
-
-    const total = pngs.length;
-    const stillCount = Math.max(0, total - VIDEO_TILE_COUNT);
-
-    try {
-      for (let i = 0; i < pngs.length; i++) {
+      for (let i = 0; i < total; i++) {
         if (myGen !== runGen) return;
-        const png = pngs[i];
+        const png = await workerGenerateOne(params, total, i);
+        if (myGen !== runGen) return;
         const blob = new Blob([png], { type: 'image/png' });
         const blobUrl = URL.createObjectURL(blob);
         const kind: Tile['kind'] = i < stillCount ? 'still' : 'video';
-        // skeleton 12 個は seedSkeletons で先置きしてあるので、index で
-        // 差し替える。push にすると skeleton が消えずに重なってしまう。
         setTiles((prev) =>
           prev.map((t, idx) =>
             idx === i ? { ...t, blob, blobUrl, kind } : t,
@@ -238,15 +237,14 @@ export default function Studio() {
       if (myGen !== runGen) return;
     } catch (e) {
       if (myGen !== runGen) return;
-      // skeleton を残すと無限に shimmer して紛らわしい。エラー時は片付ける。
       clearTiles();
       setErrorMsg(String(e));
       setPhase('error');
       return;
     }
 
-    // 後半 4 タイルを WebCodecs で mp4 化する。終わったタイルから順次 <video>
-    // に差し替わる。WebCodecs 非対応ブラウザでは static PNG のまま表示される。
+    // 後半 4 タイルを WebCodecs で mp4 化する。worker 側で encodeAnimationToMp4
+    // が走るので、main は postMessage の応答を待つだけ。
     if (!isWebCodecsSupported()) {
       setPhase('done');
       return;
@@ -257,36 +255,16 @@ export default function Studio() {
     for (let i = stillCount; i < total; i++) {
       if (myGen !== runGen) return;
       try {
-        const handle = wasm.start_animation_for_batch_spec(
-          params,
-          batchN(),
-          i,
-          ANIM_TOTAL_FRAMES,
+        const mp4Blob = await workerAnimateOne(params, total, i, ANIM_TOTAL_FRAMES);
+        if (myGen !== runGen) return;
+        const videoBlobUrl = URL.createObjectURL(mp4Blob);
+        setTiles((prev) =>
+          prev.map((t, idx) => {
+            if (idx !== i) return t;
+            if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
+            return { ...t, videoBlob: mp4Blob, videoBlobUrl };
+          }),
         );
-        try {
-          const mp4Blob = await encodeAnimationToMp4(handle);
-          // 並走 run が始まっていたら自分のフレームは捨てる。先行 run の
-          // VideoEncoder / mp4-muxer は close 済み（encodeAnimationToMp4 が
-          // 完了した時点で内部で finalize されている）なので、ここで blob
-          // を流しても整合性は壊れない。ただ古い tile に書き込むのは無意味
-          // なのでそのまま return。
-          if (myGen !== runGen) return;
-          const videoBlobUrl = URL.createObjectURL(mp4Blob);
-          setTiles((prev) =>
-            prev.map((t, idx) => {
-              if (idx !== i) return t;
-              // 既存 videoBlobUrl があれば revoke してから差し替える（再ロール
-              // 時の防御。現状フローでは clearTiles が先に走るので発生しないが、
-              // 将来の挙動変更で漏れないように）。
-              if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
-              return { ...t, videoBlob: mp4Blob, videoBlobUrl };
-            }),
-          );
-        } finally {
-          // free() は wasm-bindgen 自動生成。AnimationHandle 内部の
-          // wasm 線形メモリを解放する。
-          handle.free?.();
-        }
       } catch (e) {
         // 1 タイル分の失敗は残りタイルの動画化を止めない。
         // 最初のエラーだけ表示して continue する。
@@ -448,11 +426,10 @@ export default function Studio() {
   const renderHiResForIndices = async (
     indices: number[],
   ): Promise<Map<number, { blob: Blob; ext: 'png' | 'mp4' }>> => {
-    const src = decoded();
     const out = new Map<number, { blob: Blob; ext: 'png' | 'mp4' }>();
     if (indices.length === 0) return out;
-    if (!src || lastBaseSeed === null || !wasm) {
-      throw new Error('cannot render hi-res: missing source / seed / wasm');
+    if (lastBaseSeed === null || lastSourceRef === null) {
+      throw new Error('cannot render hi-res: missing seed / source');
     }
 
     const a = aspect();
@@ -464,15 +441,10 @@ export default function Studio() {
     const stillCount = total - VIDEO_TILE_COUNT;
     const useWebCodecs = isWebCodecsSupported();
 
-    // wasm の WasmParams は `source_rgb` を `std::mem::take` で持っていく
-    // ので、毎回 JS 側 src.rgb の参照を渡せば serde-wasm-bindgen がコピー
-    // してくれる（src.rgb の中身は壊れない）。direction/speed/count/orb_size/
-    // blur は generate_batch / generate_one_at_index ではどのみち無視され、
-    // spec 側の値で上書きされるので、プレビュー時と同じダミー値で良い。
+    // worker 側に source RGB がキャッシュ済みなので、ここでは spec パラメータ
+    // だけ渡す。direction/speed/count/orb_size/blur は generate_one_at_index
+    // ではどのみち spec で上書きされる。
     const hiParams = {
-      source_rgb: src.rgb,
-      source_width: src.width,
-      source_height: src.height,
       k: 5,
       width: hiW,
       height: hiH,
@@ -487,34 +459,18 @@ export default function Studio() {
 
     setDlProgress({ done: 0, total: indices.length });
     for (const i of indices) {
-      if (i < stillCount) {
-        const png = wasm.generate_one_at_index(hiParams, total, i) as Uint8Array;
+      if (i < stillCount || !useWebCodecs) {
+        // 静止タイル、または WebCodecs 非対応環境では hi-res の t=0 PNG。
+        const png = await workerGenerateOne(hiParams, total, i);
         out.set(i, {
           blob: new Blob([png], { type: 'image/png' }),
           ext: 'png',
         });
-      } else if (useWebCodecs) {
-        // 動画タイルは hi-res で 96 フレーム再描画 → WebCodecs で h264 mp4 化。
-        // 1080×1920 × 96 はモバイルだと数秒〜十数秒かかる。WebCodecs 非対応
-        // ブラウザは else で hi-res の t=0 PNG にフォールバック。
-        const handle = wasm.start_animation_for_batch_spec(
-          hiParams,
-          total,
-          i,
-          ANIM_TOTAL_FRAMES,
-        );
-        try {
-          const mp4 = await encodeAnimationToMp4(handle);
-          out.set(i, { blob: mp4, ext: 'mp4' });
-        } finally {
-          handle.free?.();
-        }
       } else {
-        const png = wasm.generate_one_at_index(hiParams, total, i) as Uint8Array;
-        out.set(i, {
-          blob: new Blob([png], { type: 'image/png' }),
-          ext: 'png',
-        });
+        // 動画タイルは hi-res で 96 フレーム再描画 → WebCodecs で h264 mp4 化。
+        // worker 内で完結するので main 側はメッセージを待つだけ。
+        const mp4 = await workerAnimateOne(hiParams, total, i, ANIM_TOTAL_FRAMES);
+        out.set(i, { blob: mp4, ext: 'mp4' });
       }
       setDlProgress((p) => ({ ...p, done: p.done + 1 }));
       await yieldFrame();
