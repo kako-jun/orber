@@ -61,6 +61,10 @@ export default function Studio() {
   const [phase, setPhase] = createSignal<Phase>('idle');
   const [progress, setProgress] = createSignal<number>(0);
   const [errorMsg, setErrorMsg] = createSignal<string>('');
+  // #94: fatal な errorMsg と分けて、部分失敗（動画化 4 枚のうち一部だけ
+  // mp4 化に失敗、他は完走）を弱めの通知で出すための signal。phase が
+  // 'done' でも表示できるよう、専用の Show ブロックで描画する。
+  const [warningMsg, setWarningMsg] = createSignal<string>('');
   const [tiles, setTiles] = createSignal<Tile[]>([]);
   const [dragOver, setDragOver] = createSignal(false);
   // #57: ドロップエリア長押し中だけ拡大プレビュー。
@@ -175,6 +179,7 @@ export default function Studio() {
 
     seedSkeletons();
     setErrorMsg('');
+    setWarningMsg('');
     setProgress(0);
     setPhase('generating');
     // #61: 新しい run の開始でビデオ参照テーブルもリセット。
@@ -345,7 +350,11 @@ export default function Studio() {
       await Promise.all(animPromises);
       if (myGen !== runGen) return;
       if (firstAnimErr !== null) {
-        setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
+        // #94: 動画化 4 枚のうち一部失敗は fatal ではない（残りタイルは
+        // 静止画として完成済み、phase も 'done' に遷移する）。errorMsg
+        // ではなく warningMsg に入れて、'done' 状態でも見える弱めの
+        // 通知バナーで表示する。
+        setWarningMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
       }
     }
 
@@ -798,6 +807,16 @@ export default function Studio() {
       <Show when={errorMsg() && phase() === 'error'}>
         <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
           {errorMsg()}
+        </div>
+      </Show>
+
+      {/* #94: 部分失敗の弱め通知。phase='done' でも残しておく。 */}
+      <Show when={warningMsg() && phase() === 'done'}>
+        <div
+          role="status"
+          class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fgMuted"
+        >
+          {warningMsg()}
         </div>
       </Show>
 
