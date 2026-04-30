@@ -330,6 +330,13 @@ export default function Studio() {
               // 最初のエラーだけ後段で表示する。
               console.error('mp4 encode failed for tile', animI, e);
               if (firstAnimErr === null) firstAnimErr = e;
+              // #95 レビュー Q2: 失敗パスでも animProgress をクリアして
+              // 進捗リングを消す（残ったままだと「中途半端な進捗」が固まる）。
+              if (myGen === runGen) {
+                setTiles((prev) =>
+                  prev.map((t, idx) => (idx === animI ? { ...t, animProgress: undefined } : t)),
+                );
+              }
             }
           })();
           animPromises.push(p);
@@ -952,7 +959,11 @@ export default function Studio() {
                           <svg
                             viewBox="0 0 24 24"
                             class="fade-in pointer-events-none absolute right-1 top-1 h-6 w-6 text-fgMuted"
-                            aria-label={`${Math.floor(pct() * 100)}%`}
+                            role="progressbar"
+                            aria-valuenow={Math.floor(pct() * 100)}
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-label={t('animating')}
                           >
                             <circle
                               cx="12"

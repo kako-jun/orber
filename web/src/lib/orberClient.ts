@@ -107,20 +107,17 @@ function ensureWorker(ch: Channel): Worker {
   if (st.worker) return st.worker;
   const w = new OrberWorker();
   w.addEventListener('message', (e: MessageEvent) => {
-    const msg = e.data as {
-      kind?: string;
-      id: number;
-      ok?: boolean;
-      data?: unknown;
-      error?: string;
-      frame?: number;
-      total?: number;
-    };
-    // #95: フレーム進捗は本体応答とは別 kind。pending は消さず onProgress
-    // のみ発火する。本体の resolve/reject は kind なしの message が来るまで待つ。
-    if (msg.kind === 'animateProgress') {
+    // #95: 応答メッセージは 2 種類の union。
+    //   - 本体応答: `kind` プロパティなし。`{ id, ok, data?, error? }`
+    //   - 進捗通知: `{ kind: 'animateProgress', id, frame, total }`
+    // 将来 kind が増えるなら明示分岐を追加すること。
+    type Resp =
+      | { id: number; ok: boolean; data?: unknown; error?: string }
+      | { kind: 'animateProgress'; id: number; frame: number; total: number };
+    const msg = e.data as Resp;
+    if ('kind' in msg && msg.kind === 'animateProgress') {
       const pp = st.pending.get(msg.id);
-      if (pp && pp.onProgress && typeof msg.frame === 'number' && typeof msg.total === 'number') {
+      if (pp && pp.onProgress) {
         try {
           pp.onProgress(msg.frame, msg.total);
         } catch (err) {
