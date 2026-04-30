@@ -688,12 +688,17 @@ export default function Studio() {
           {(url) => (
             <div class="relative">
               {/* select-none / touch-none / draggable=false で iOS の長押し
-                  callout・拡大鏡・テキスト選択・ドラッグを抑止 (#57)。 */}
+                  callout・拡大鏡・テキスト選択・ドラッグを抑止 (#57)。
+                  Android Chrome の「画像を保存」コンテキストメニューは
+                  touch-action では止まらないので oncontextmenu で抑止 (#87)。
+                  pointer-events-none で pointerdown を img ではなく親 label に
+                  届け、長押しタイマーを確実に発火させる (#87)。 */}
               <img
                 src={url}
                 alt={t('pickedThumbAlt', { name: pickedName() })}
                 draggable={false}
-                class="fade-in mx-auto max-h-40 object-contain select-none touch-none"
+                onContextMenu={(e) => e.preventDefault()}
+                class="fade-in pointer-events-none mx-auto max-h-40 object-contain select-none touch-none"
                 style={{ '-webkit-touch-callout': 'none' }}
               />
               {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
