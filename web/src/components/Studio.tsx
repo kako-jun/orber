@@ -353,8 +353,11 @@ export default function Studio() {
         // #94: 動画化 4 枚のうち一部失敗は fatal ではない（残りタイルは
         // 静止画として完成済み、phase も 'done' に遷移する）。errorMsg
         // ではなく warningMsg に入れて、'done' 状態でも見える弱めの
-        // 通知バナーで表示する。
-        setWarningMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
+        // 通知バナーで表示する。エラー詳細（DOMException メッセージ等）
+        // は end user に意味が薄いので console に留め、UI には事実
+        // ベースの warning 文言だけを出す。
+        console.error('animation partial failure detail:', firstAnimErr);
+        setWarningMsg(t('animatePartialFailure'));
       }
     }
 
@@ -805,13 +808,19 @@ export default function Studio() {
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
-        <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
+        <div
+          role="alert"
+          class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg"
+        >
           {errorMsg()}
         </div>
       </Show>
 
-      {/* #94: 部分失敗の弱め通知。phase='done' でも残しておく。 */}
-      <Show when={warningMsg() && phase() === 'done'}>
+      {/* #94: 部分失敗の弱め通知。fatal な error ではないので
+          phase !== 'error' のとき表示する（'done' に限らず将来の
+          他フェーズでも残す）。fatal が同時発生した場合は error バナーが
+          優先されて warning は隠れる。 */}
+      <Show when={warningMsg() && phase() !== 'error'}>
         <div
           role="status"
           class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fgMuted"
