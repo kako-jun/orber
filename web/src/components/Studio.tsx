@@ -909,10 +909,11 @@ export default function Studio() {
                     />
                   </Show>
                   {/* 動画タイル限定: 静止 PNG は出たが mp4 がまだ来てない間、
-                      soft shimmer + コーナーバッジを重ねて「これから動く」
-                      ことを示す。skeleton（強い shimmer）= 何もない /
-                      skeleton-soft（弱い shimmer）= 静止は出たが動画は処理中
-                      の二段階で進行を表現する。
+                      コーナーバッジ + #95 進捗リングを重ねて「これから動く」
+                      ことを示す。以前は skeleton-soft の shimmer も重ねていたが、
+                      フレーム単位の進捗リングが出来た今は shimmer が点滅に
+                      見えるため除去（静止 PNG は既に出ているので点滅させる
+                      必然性がない）。
                       レビュー S3: WebCodecs 非対応環境では videoBlobUrl が
                       永遠に来ないので、バッジを出すと「処理中」が固着して
                       しまう。環境チェックで gating する。 */}
@@ -923,7 +924,6 @@ export default function Studio() {
                       isWebCodecsSupported()
                     }
                   >
-                    <div class="skeleton-soft fade-in absolute inset-0" aria-hidden="true" />
                     {/* レビュー N10/N11: text サイズは DESIGN.md の type scale
                         最小 (text-xs = 12px) に揃える。aria-label と表示テキスト
                         の二重指定はスクリーンリーダーで二重読みになるので、
