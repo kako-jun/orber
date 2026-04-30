@@ -631,7 +631,7 @@ export default function Studio() {
         onPointerCancel={onDropZonePointerEnd}
         onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer touch-manipulation rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
+          'group relative block cursor-pointer touch-none rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
           (dragOver()
             ? 'text-fg bg-glassBg'
             : 'text-hairline hover:text-fgMuted')
