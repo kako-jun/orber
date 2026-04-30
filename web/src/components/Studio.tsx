@@ -276,14 +276,26 @@ export default function Studio() {
             return { ...t, videoBlob: mp4Blob, videoBlobUrl };
           }),
         );
-        // #88: できた順に再生する。setTiles → DOM mount → ref 確定 を
-        // 1 フレーム回してから当該タイルだけ play() する。4 枚揃うのを
-        // 待たないので、1 枚目が完成した瞬間から動き始めて待たされ感が消える。
-        // play() は muted ならまず通るが、user gesture 等で reject しうる
-        // ため握りつぶす（静止のままでも許容）。
+        // #88: できた順に再生する。各タイルの setTiles → DOM mount → ref
+        // 確定 のサイクルを 1 フレーム回してから当該タイルだけ play() する。
+        // 最初の 1 枚から順次動き出し、待たされ感が消える。
+        // yieldFrame は「mount 完了を保証する」ため毎回必要（4 枚なら累計
+        // 4 frame ≒ 67ms。worker の mp4 化（数百ms〜秒）に対しては誤差）。
+        // 直後の myGen check は yieldFrame 中に reroll → unmount された
+        // race を吸収する（古い ref への play() を防ぐ）。
+        // play() の戻り Promise は await しない（次タイルの mp4 化を
+        // ブロックしないため）。reject は muted 動画ではほぼ起きないが、
+        // user gesture 要件等で発生しうるので warn だけ残して握りつぶす。
         await yieldFrame();
         if (myGen !== runGen) return;
-        videoRefs[i]?.play().catch(() => {});
+        const videoEl = videoRefs[i];
+        if (!videoEl) {
+          console.warn('video ref missing for tile', i);
+        } else {
+          videoEl.play().catch((err) => {
+            console.warn('play() rejected for tile', i, err);
+          });
+        }
       } catch (e) {
         // 1 タイル分の失敗は残りタイルの動画化を止めない。
         // 最初のエラーだけ表示して continue する。
@@ -797,9 +809,9 @@ export default function Studio() {
                   />
                   <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
                     {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
-                        autoplay は #61 で外し、#88 で「できた順に再生」に戻した。
-                        runBatch のループ内で各 mp4 が出来た直後に該当 ref を
-                        .play() している。 */}
+                        autoplay 属性は #61 で外したまま。runBatch のループ内
+                        で各 mp4 が完成した直後に該当 ref を明示的に .play()
+                        する方式 (#88 でできた順再生に変更)。 */}
                     <video
                       ref={(el) => {
                         // unmount 時に null/undefined が来るケースを除外して
