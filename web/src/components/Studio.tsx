@@ -23,10 +23,6 @@ interface Tile {
   // 動画タイル限定: WebCodecs で生成した mp4。動画化が完了するまで undefined。
   videoBlob?: Blob;
   videoBlobUrl?: string;
-  // #95: 動画タイル限定。mp4 化のフレーム単位進捗。worker 側 encodeMp4 から
-  // 1 フレームごとに更新される。完成（videoBlobUrl 設定）と同時に undefined
-  // にクリアする。
-  animProgress?: { frame: number; total: number };
   selected: boolean;
 }
 
@@ -70,6 +66,15 @@ export default function Studio() {
   // 'done' でも表示できるよう、専用の Show ブロックで描画する。
   const [warningMsg, setWarningMsg] = createSignal<string>('');
   const [tiles, setTiles] = createSignal<Tile[]>([]);
+  // #95 + flicker fix: 動画タイルの mp4 化進捗を tiles とは別の signal で
+  // 持つ。tiles に animProgress を埋めると 1 フレームごとに setTiles で
+  // タイル参照が変わり、Solid の <For> がボタン全体を unmount/remount して
+  // <img class="fade-in"> の CSS アニメーションが再発火 → 静止 PNG が
+  // 点滅して見える。進捗だけ別 signal にすれば tile 参照は不変のまま、
+  // SVG リング部分だけが反応的に再描画される。Map のキーはタイル index。
+  const [animProgressMap, setAnimProgressMap] = createSignal<
+    Map<number, { frame: number; total: number }>
+  >(new Map());
   const [dragOver, setDragOver] = createSignal(false);
   // #57: ドロップエリア長押し中だけ拡大プレビュー。
   const [previewVisible, setPreviewVisible] = createSignal(false);
@@ -149,6 +154,7 @@ export default function Studio() {
       if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
     }
     setTiles([]);
+    setAnimProgressMap(new Map());
   };
 
   // runBatch 冒頭で呼ぶ: 既存タイルの URL を revoke し、新しい 12 個の
@@ -300,13 +306,11 @@ export default function Studio() {
           // 古い世代の更新は無視する（runGen ガード）。
           (frame, totalFrames) => {
             if (myGen !== runGen) return;
-            setTiles((prev) =>
-              prev.map((tile, idx) =>
-                idx === i
-                  ? { ...tile, animProgress: { frame, total: totalFrames } }
-                  : tile,
-              ),
-            );
+            setAnimProgressMap((prev) => {
+              const next = new Map(prev);
+              next.set(i, { frame, total: totalFrames });
+              return next;
+            });
           },
         );
         if (myGen !== runGen) return;
@@ -315,10 +319,16 @@ export default function Studio() {
           prev.map((t, idx) => {
             if (idx !== i) return t;
             if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
-            // #95: 完成と同時に animProgress をクリア。
-            return { ...t, videoBlob: mp4Blob, videoBlobUrl, animProgress: undefined };
+            return { ...t, videoBlob: mp4Blob, videoBlobUrl };
           }),
         );
+        // #95: 完成と同時に進捗リングをクリア。
+        setAnimProgressMap((prev) => {
+          if (!prev.has(i)) return prev;
+          const next = new Map(prev);
+          next.delete(i);
+          return next;
+        });
         // #61 + #88: setTiles → DOM mount → ref 確定 のサイクルを
         // 1 フレーム回してから play() を呼ぶ。myGen check は yieldFrame
         // 後にも入れて、再 run で世代が進んだら play() を抑止する。
@@ -348,12 +358,15 @@ export default function Studio() {
         // 最初のエラーだけ後段で表示する。
         console.error('mp4 encode failed for tile', i, e);
         if (firstAnimErr === null) firstAnimErr = e;
-        // #95 レビュー Q2: 失敗パスでも animProgress をクリアして
-        // 進捗リングを消す（残ったままだと「中途半端な進捗」が固まる）。
+        // #95 レビュー Q2: 失敗パスでも進捗リングをクリア
+        // （残ったままだと「中途半端な進捗」が固まる）。
         if (myGen === runGen) {
-          setTiles((prev) =>
-            prev.map((t, idx) => (idx === i ? { ...t, animProgress: undefined } : t)),
-          );
+          setAnimProgressMap((prev) => {
+            if (!prev.has(i)) return prev;
+            const next = new Map(prev);
+            next.delete(i);
+            return next;
+          });
         }
       }
     }
@@ -449,25 +462,19 @@ export default function Studio() {
     setPreviewVisible(false);
   };
   const onDropZonePointerDown = (e: PointerEvent) => {
-    console.log('[orber#87] pointerdown', { pointerType: e.pointerType, hasThumb: !!pickedThumbUrl(), target: (e.target as HTMLElement)?.tagName, currentTarget: (e.currentTarget as HTMLElement)?.tagName });
     if (!pickedThumbUrl()) return;
     isLongPress = false;
+    // ジェスチャ全体を label に閉じ込める。指が外にスライドしても
+    // pointerup / pointercancel が必ず label に届く。
     const target = e.currentTarget as HTMLElement | null;
-    try {
-      target?.setPointerCapture?.(e.pointerId);
-      console.log('[orber#87] setPointerCapture ok', e.pointerId);
-    } catch (err) {
-      console.log('[orber#87] setPointerCapture failed', err);
-    }
+    target?.setPointerCapture?.(e.pointerId);
     longPressTimer = window.setTimeout(() => {
-      console.log('[orber#87] timer fired → showing preview');
       isLongPress = true;
       setPreviewVisible(true);
       longPressTimer = undefined;
     }, LONG_PRESS_MS);
   };
-  const onDropZonePointerEnd = (e: PointerEvent) => {
-    console.log('[orber#87] pointerend', { type: e.type, pointerType: e.pointerType, timerActive: longPressTimer !== undefined });
+  const onDropZonePointerEnd = () => {
     endLongPress();
   };
   const onDropZoneClick = (e: MouseEvent) => {
@@ -941,7 +948,7 @@ export default function Studio() {
                         accent color なし、currentColor + text-fgMuted で淡く
                         重ねる。orb と被らない右上配置。SVG だけなので
                         glass-bg の塗りつぶしは付けない。 */}
-                    <Show when={tile.animProgress}>
+                    <Show when={animProgressMap().get(i())}>
                       {(progress) => {
                         const pct = () =>
                           progress().total > 0
