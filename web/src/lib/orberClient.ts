@@ -24,6 +24,10 @@ import OrberWorker from './orberWorker?worker';
 interface PendingResolver {
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
+  // #95: animateOne のフレーム単位進捗。worker からは本体応答とは別の
+  // 'animateProgress' kind の message が届くので、その経路で発火する。
+  // pending は消さない（resolve は本体メッセージで行う）。
+  onProgress?: (frame: number, total: number) => void;
 }
 
 interface BaseParams {
@@ -103,12 +107,26 @@ function ensureWorker(ch: Channel): Worker {
   if (st.worker) return st.worker;
   const w = new OrberWorker();
   w.addEventListener('message', (e: MessageEvent) => {
-    const { id, ok, data, error } = e.data as {
-      id: number;
-      ok: boolean;
-      data?: unknown;
-      error?: string;
-    };
+    // #95: 応答メッセージは 2 種類の union。
+    //   - 本体応答: `kind` プロパティなし。`{ id, ok, data?, error? }`
+    //   - 進捗通知: `{ kind: 'animateProgress', id, frame, total }`
+    // 将来 kind が増えるなら明示分岐を追加すること。
+    type Resp =
+      | { id: number; ok: boolean; data?: unknown; error?: string }
+      | { kind: 'animateProgress'; id: number; frame: number; total: number };
+    const msg = e.data as Resp;
+    if ('kind' in msg && msg.kind === 'animateProgress') {
+      const pp = st.pending.get(msg.id);
+      if (pp && pp.onProgress) {
+        try {
+          pp.onProgress(msg.frame, msg.total);
+        } catch (err) {
+          console.error('orber onProgress callback failed', err);
+        }
+      }
+      return;
+    }
+    const { id, ok, data, error } = msg;
     const p = st.pending.get(id);
     if (!p) return;
     st.pending.delete(id);
@@ -129,6 +147,7 @@ function call<T>(
   ch: Channel,
   req: Record<string, unknown>,
   transfers: Transferable[] = [],
+  onProgress?: (frame: number, total: number) => void,
 ): Promise<T> {
   const w = ensureWorker(ch);
   const st = channels[ch];
@@ -137,6 +156,7 @@ function call<T>(
     st.pending.set(id, {
       resolve: resolve as (v: unknown) => void,
       reject: reject as (e: unknown) => void,
+      onProgress,
     });
     w.postMessage({ ...req, id }, transfers);
   });
@@ -200,14 +220,22 @@ export async function workerAnimateOne(
   n: number,
   index: number,
   totalFrames: number,
+  onProgress?: (frame: number, total: number) => void,
 ): Promise<Blob> {
   // #92: 動画化は channel 'video' に固定。channel 'still' の静止画ループと並走する。
-  const buf = await call<ArrayBuffer>('video', {
-    kind: 'animateOne',
-    params,
-    n,
-    index,
-    totalFrames,
-  });
+  // #95: onProgress を渡すと encodeAnimationToMp4 のフレームループから
+  // フレーム単位の進捗が流れてくる。省略時は従来どおり何も発火しない。
+  const buf = await call<ArrayBuffer>(
+    'video',
+    {
+      kind: 'animateOne',
+      params,
+      n,
+      index,
+      totalFrames,
+    },
+    [],
+    onProgress,
+  );
   return new Blob([buf], { type: 'video/mp4' });
 }

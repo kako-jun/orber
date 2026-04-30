@@ -120,7 +120,18 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
           req.totalFrames,
         );
         try {
-          const blob = await encodeAnimationToMp4(handle);
+          // #95: フレーム単位の進捗を main に流す。本体応答（id + ok）と
+          // 別 kind で送るので、main 側は pending を消さずに onProgress
+          // だけ発火させる経路で受ける。
+          // レビュー S2: フレーム毎に postMessage + main 側 setTiles すると
+          // 192 frames × 4 タイル並走で setTiles が高頻度化し、特にスマホ
+          // で reconcile が重い。PROGRESS_STRIDE 毎に間引き、最終フレームは
+          // 必ず送る（リングが 100% で停止するため）。
+          const PROGRESS_STRIDE = 4;
+          const blob = await encodeAnimationToMp4(handle, (frame, total) => {
+            if (frame !== total && frame % PROGRESS_STRIDE !== 0) return;
+            post({ kind: 'animateProgress', id: req.id, frame, total });
+          });
           const buf = await blob.arrayBuffer();
           post({ id: req.id, ok: true, data: buf }, [buf]);
         } finally {
