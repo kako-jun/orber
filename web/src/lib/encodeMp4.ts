@@ -71,14 +71,18 @@ export async function encodeAnimationToMp4(
       if (firstError === null) firstError = e;
     },
   });
-  // avc1.42E01F = H.264 Baseline Level 3.1。540×960 / 960×540 のサイズで
-  // 大半の環境がハードウェアデコード対応している。bitrate 2Mbps は 24fps
-  // でも余裕がありつつファイル ~1MB に収まる目安。
+  // 解像度に応じて AVC level を選択する。
+  //   - Level 3.1 (0x1F): coded area 上限 921,600px（≈ 720p まで）
+  //   - Level 4.2 (0x2A): coded area 上限 2,228,224px（1080p で余裕）
+  // hi-res DL 1080×1920 は coded area が 1088×1920 = 2,088,960 になり 3.1
+  // を超えるため、preview 解像度より広い場合は 4.2 を使う。Baseline profile
+  // の互換性維持のまま level だけ上げる: avc1.42E0{XX}。
+  // bitrate 2Mbps は 24fps でも余裕がありつつファイル ~1MB に収まる目安。
   // 仕様上 `configure` は同期で完了し、直後の `encode` 呼び出しは合法。
-  // 内部的にはハードウェアエンコーダの初期化が走るが、それは encoder の
-  // ジョブキューでシリアライズされるので呼び出し側は意識不要。
+  const codedArea = Math.ceil(width / 16) * 16 * Math.ceil(height / 16) * 16;
+  const codecString = codedArea <= 921_600 ? 'avc1.42E01F' : 'avc1.42E02A';
   encoder.configure({
-    codec: 'avc1.42E01F',
+    codec: codecString,
     width,
     height,
     framerate: ANIM_FPS,
