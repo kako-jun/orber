@@ -85,8 +85,8 @@ export default function Studio() {
   // 同じバリエーション（spec 列）を解像度違いで再現する。
   // null は「まだ runBatch していない / 失敗した」状態。
   let lastBaseSeed: number | null = null;
-  // #61: 動画タイル <video> の参照を tile index で集める。すべての mp4 化が
-  // 完了した時点で一斉に play() を呼び、4 枚の動き始めを揃える。
+  // #61: 動画タイル <video> の参照を tile index で集める。
+  // 動画タイル毎の mp4 化完了直後に該当 ref を play() する（#88, #92）。
   let videoRefs: (HTMLVideoElement | undefined)[] = [];
   // #57: 長押し検出。pointerdown から 400ms 経つと拡大プレビューを開く。
   // タイマーが発火した = 長押し成立した時に isLongPress を立て、
@@ -230,11 +230,14 @@ export default function Studio() {
     // 次の postMessage が走る。worker スレッドで動いているのでメインの
     // タップ・スクロールはブロックされない。
     //
-    // #92: 動画タイルに到達したら、その場で workerAnimateOne を fire-and-forget
-    // で起動し animPromises[] に積む。channel 'b'（動画専用 worker）で並走
-    // するので、静止画ループ（channel 'a'）はブロックされない。各 animate の
+    // #92: 動画タイルの静止 PNG が出来た直後に worker B（channel 'video'）へ
+    // animate を投げる。fire-and-forget で animPromises[] に積み、静止画
+    // ループ（channel 'still'）はそのまま次のタイルへ進む。各 animate の
     // 完了後に「できた順に」 setTiles → play() する（#88 の挙動を継承）。
     const animPromises: Promise<void>[] = [];
+    // レビュー M2: 「最初に完了したエラー」を記録する。同 worker での直列
+    // 実行なので実際には index 順で完了することが多いが、完了順は保証しない
+    // ため、ここに入るのは「レース的に最初に reject した」エラー。
     let firstAnimErr: unknown = null;
     const animateSupported = isWebCodecsSupported();
 
@@ -281,9 +284,17 @@ export default function Studio() {
               // 後にも入れて、再 run で世代が進んだら play() を抑止する。
               await yieldFrame();
               if (myGen !== runGen) return;
-              const videoEl = videoRefs[animI];
+              // レビュー S3: setTiles 直後の 1 frame 待ちでも ref が確定して
+              // いないことが稀にある（Solid の reconcile タイミング差）。
+              // 1 度だけ追加で yieldFrame して再取得するリトライを入れる。
+              let videoEl = videoRefs[animI];
               if (!videoEl) {
-                console.warn('video ref missing for tile', animI);
+                await yieldFrame();
+                if (myGen !== runGen) return;
+                videoEl = videoRefs[animI];
+              }
+              if (!videoEl) {
+                console.warn('video ref still missing for tile after retry', animI);
               } else {
                 videoEl.play().catch((err) => {
                   // play() は user gesture 要件等で reject しうる。muted な
@@ -304,6 +315,13 @@ export default function Studio() {
       }
     } catch (e) {
       if (myGen !== runGen) return;
+      // レビュー M4: 静止画ループでこの catch に入った時点で、すでに発射した
+      // 動画化の inner async が裏で走り続けている可能性がある。それらは
+      // 後から setTiles / play() を呼んでしまい、UI が「error フェーズなのに
+      // 動画タイルだけ後追いで現れる」不整合を起こす。runGen を進めることで
+      // in-flight の `myGen !== runGen` ガードを発火させ、後続 setTiles を
+      // 抑止する（再 run は呼ばれていないので myGen は古いまま）。
+      runGen += 1;
       clearTiles();
       setErrorMsg(String(e));
       setPhase('error');
@@ -315,6 +333,13 @@ export default function Studio() {
     // #92: 静止画ループが終わった時点で動画化はまだ進行中の可能性。
     // animPromises が空（= 動画タイルなし or WebCodecs 非対応）ならそのまま
     // 'done' に遷移、そうでなければ 'animating' に切り替えて全完了を待つ。
+    // レビュー S1: WebCodecs 非対応では animateSupported=false で animPromises
+    // を積まないので、ここで 'animating' ラベルを飛ばすのが意図通り（動画化
+    // 自体が行われないため）。
+    // レビュー S2: 並走中は phase は 'generating' のままで、静止画ループ
+    // 完走後に animation の最終待ち合わせを 'animating' で表現する。
+    // 「静止画フェーズ → 動画フェーズ」の見え方を維持しつつ、内部では
+    // 並走している、というのが UX 上の建て付け。
     if (animPromises.length > 0) {
       setPhase('animating');
       await Promise.all(animPromises);
@@ -825,9 +850,9 @@ export default function Studio() {
                   />
                   <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
                     {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
-                        autoplay 属性は #61 で外したまま。runBatch のループ内
-                        で各 mp4 が完成した直後に該当 ref を明示的に .play()
-                        する方式 (#88 でできた順再生に変更)。 */}
+                        autoplay は #61 で外し、runBatch ループ内で各 mp4 完成
+                        直後に明示 .play()（#88 でできた順、#92 で worker B
+                        並走）。 */}
                     <video
                       ref={(el) => {
                         // unmount 時に null/undefined が来るケースを除外して
