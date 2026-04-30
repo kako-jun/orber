@@ -631,7 +631,7 @@ export default function Studio() {
         onPointerCancel={onDropZonePointerEnd}
         onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer touch-manipulation rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
+          'group relative block cursor-pointer touch-none rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
           (dragOver()
             ? 'text-fg bg-glassBg'
             : 'text-hairline hover:text-fgMuted')
@@ -687,13 +687,17 @@ export default function Studio() {
         >
           {(url) => (
             <div class="relative">
-              {/* select-none / touch-none / draggable=false で iOS の長押し
-                  callout・拡大鏡・テキスト選択・ドラッグを抑止 (#57)。 */}
+              {/* select-none / touch-none / draggable=false / oncontextmenu /
+                  pointer-events-none で iOS の長押し callout・拡大鏡・
+                  テキスト選択・ドラッグ・Android の画像保存メニューを
+                  全て抑止し (#57 / #87)、pointerdown を確実に親 label の
+                  onPointerDown に届けて 400ms 長押しタイマーを発火させる。 */}
               <img
                 src={url}
                 alt={t('pickedThumbAlt', { name: pickedName() })}
                 draggable={false}
-                class="fade-in mx-auto max-h-40 object-contain select-none touch-none"
+                onContextMenu={(e) => e.preventDefault()}
+                class="fade-in pointer-events-none mx-auto max-h-40 object-contain select-none touch-none"
                 style={{ '-webkit-touch-callout': 'none' }}
               />
               {/* 差し替え overlay — hover / focus (group) で暗幕 + ラベル fade-in。
