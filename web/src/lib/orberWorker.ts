@@ -120,7 +120,12 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
           req.totalFrames,
         );
         try {
-          const blob = await encodeAnimationToMp4(handle);
+          // #95: フレーム単位の進捗を main に流す。本体応答（id + ok）と
+          // 別 kind で送るので、main 側は pending を消さずに onProgress
+          // だけ発火させる経路で受ける。
+          const blob = await encodeAnimationToMp4(handle, (frame, total) => {
+            post({ kind: 'animateProgress', id: req.id, frame, total });
+          });
           const buf = await blob.arrayBuffer();
           post({ id: req.id, ok: true, data: buf }, [buf]);
         } finally {

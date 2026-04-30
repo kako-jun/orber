@@ -23,6 +23,10 @@ interface Tile {
   // 動画タイル限定: WebCodecs で生成した mp4。動画化が完了するまで undefined。
   videoBlob?: Blob;
   videoBlobUrl?: string;
+  // #95: 動画タイル限定。mp4 化のフレーム単位進捗。worker 側 encodeMp4 から
+  // 1 フレームごとに更新される。完成（videoBlobUrl 設定）と同時に undefined
+  // にクリアする。
+  animProgress?: { frame: number; total: number };
   selected: boolean;
 }
 
@@ -274,6 +278,18 @@ export default function Studio() {
                 total,
                 animI,
                 ANIM_TOTAL_FRAMES,
+                // #95: フレーム単位の進捗を該当タイルに反映する。
+                // 古い世代の更新は無視する（runGen ガード）。
+                (frame, totalFrames) => {
+                  if (myGen !== runGen) return;
+                  setTiles((prev) =>
+                    prev.map((t, idx) =>
+                      idx === animI
+                        ? { ...t, animProgress: { frame, total: totalFrames } }
+                        : t,
+                    ),
+                  );
+                },
               );
               if (myGen !== runGen) return;
               const videoBlobUrl = URL.createObjectURL(mp4Blob);
@@ -281,7 +297,8 @@ export default function Studio() {
                 prev.map((t, idx) => {
                   if (idx !== animI) return t;
                   if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
-                  return { ...t, videoBlob: mp4Blob, videoBlobUrl };
+                  // #95: 完成と同時に animProgress をクリア。
+                  return { ...t, videoBlob: mp4Blob, videoBlobUrl, animProgress: undefined };
                 }),
               );
               // #61 + #88: setTiles → DOM mount → ref 確定 のサイクルを
@@ -919,6 +936,49 @@ export default function Studio() {
                     <span class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-xs tracking-wide text-fg">
                       {t('videoPendingBadge')}…
                     </span>
+                    {/* #95: フレーム単位の mp4 化進捗をリングで表示。
+                        accent color なし、currentColor + text-fgMuted で淡く
+                        重ねる。orb と被らない右上配置。SVG だけなので
+                        glass-bg の塗りつぶしは付けない。 */}
+                    <Show when={tile.animProgress}>
+                      {(progress) => {
+                        const pct = () =>
+                          progress().total > 0
+                            ? Math.min(1, Math.max(0, progress().frame / progress().total))
+                            : 0;
+                        const r = 10;
+                        const c = 2 * Math.PI * r;
+                        return (
+                          <svg
+                            viewBox="0 0 24 24"
+                            class="fade-in pointer-events-none absolute right-1 top-1 h-6 w-6 text-fgMuted"
+                            aria-label={`${Math.floor(pct() * 100)}%`}
+                          >
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r={r}
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                              stroke-opacity="0.2"
+                            />
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r={r}
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                              stroke-dasharray={c}
+                              stroke-dashoffset={c * (1 - pct())}
+                              stroke-linecap="round"
+                              transform="rotate(-90 12 12)"
+                            />
+                          </svg>
+                        );
+                      }}
+                    </Show>
                   </Show>
                 </Show>
                 {/* 4-corner L marker — DESIGN.md §4 SelectionMarker

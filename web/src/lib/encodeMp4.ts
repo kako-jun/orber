@@ -41,6 +41,7 @@ export function isWebCodecsSupported(): boolean {
  */
 export async function encodeAnimationToMp4(
   handle: AnimationHandleLike,
+  onProgress?: (frame: number, total: number) => void,
 ): Promise<Blob> {
   if (!isWebCodecsSupported()) {
     throw new Error('WebCodecs (VideoEncoder/VideoFrame) is not available');
@@ -111,6 +112,11 @@ export async function encodeAnimationToMp4(
       break;
     }
     frame.close();
+    // #95: フレーム単位の進捗を呼び出し側に通知。encode は非同期だが、
+    // ここではループ内で「キューに投入し終えたフレーム数」を進捗として
+    // 報告する（実エンコード完了を待たないため、UI 上のリングはやや
+    // 早めに 100% に達する可能性があるが、体感としては十分滑らか）。
+    onProgress?.(i + 1, totalFrames);
   }
 
   await encoder.flush();
