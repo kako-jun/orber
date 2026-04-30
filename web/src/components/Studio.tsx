@@ -449,19 +449,25 @@ export default function Studio() {
     setPreviewVisible(false);
   };
   const onDropZonePointerDown = (e: PointerEvent) => {
+    console.log('[orber#87] pointerdown', { pointerType: e.pointerType, hasThumb: !!pickedThumbUrl(), target: (e.target as HTMLElement)?.tagName, currentTarget: (e.currentTarget as HTMLElement)?.tagName });
     if (!pickedThumbUrl()) return;
     isLongPress = false;
-    // ジェスチャ全体を label に閉じ込める。指が外にスライドしても
-    // pointerup / pointercancel が必ず label に届く。
     const target = e.currentTarget as HTMLElement | null;
-    target?.setPointerCapture?.(e.pointerId);
+    try {
+      target?.setPointerCapture?.(e.pointerId);
+      console.log('[orber#87] setPointerCapture ok', e.pointerId);
+    } catch (err) {
+      console.log('[orber#87] setPointerCapture failed', err);
+    }
     longPressTimer = window.setTimeout(() => {
+      console.log('[orber#87] timer fired → showing preview');
       isLongPress = true;
       setPreviewVisible(true);
       longPressTimer = undefined;
     }, LONG_PRESS_MS);
   };
-  const onDropZonePointerEnd = () => {
+  const onDropZonePointerEnd = (e: PointerEvent) => {
+    console.log('[orber#87] pointerend', { type: e.type, pointerType: e.pointerType, timerActive: longPressTimer !== undefined });
     endLongPress();
   };
   const onDropZoneClick = (e: MouseEvent) => {
