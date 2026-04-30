@@ -239,17 +239,14 @@ export default function Studio() {
     // 次の postMessage が走る。worker スレッドで動いているのでメインの
     // タップ・スクロールはブロックされない。
     //
-    // #92: 動画タイルの静止 PNG が出来た直後に worker B（channel 'video'）へ
-    // animate を投げる。fire-and-forget で animPromises[] に積み、静止画
-    // ループ（channel 'still'）はそのまま次のタイルへ進む。各 animate の
-    // 完了後に「できた順に」 setTiles → play() する（#88 の挙動を継承）。
-    const animPromises: Promise<void>[] = [];
-    // レビュー M2: 「最初に完了したエラー」を記録する。同 worker での直列
-    // 実行なので実際には index 順で完了することが多いが、完了順は保証しない
-    // ため、ここに入るのは「レース的に最初に reject した」エラー。
-    let firstAnimErr: unknown = null;
-    const animateSupported = isWebCodecsSupported();
-
+    // #99: 一時期 #92 で「動画タイルの静止 PNG が出来た直後に動画化を
+    // fire-and-forget で並走させる」設計を試したが、worker 2 本起動 +
+    // RGB 2 回 clone + wasm 2 回 init のオーバーヘッドで静止画 1〜12 の
+    // 表示が遅くなり、並走によるレースで「9 の進捗が完了しても再生されず
+    // 10 の進捗が先に出る」「完成済み静止画に shimmer が残る」等の
+    // リグレッションが出たためロールバック。
+    // 現在は post-loop 直列構成: 静止画ループを完走 → 動画化ループを直列。
+    // 各タイル mp4 完成直後に play() する #88 のロジックは内側で維持する。
     try {
       for (let i = 0; i < total; i++) {
         if (myGen !== runGen) return;
@@ -265,91 +262,13 @@ export default function Studio() {
         );
         setProgress((n) => n + 1);
         await yieldFrame();
-
-        // #92: 動画タイルに到達した時点で animate を fire-and-forget で
-        // 起動。await しないので静止画ループはそのまま次のタイルへ進む。
-        // 完了後に「できた順に」<video> へ反映 + play() する（#88 継承）。
-        if (kind === 'video' && animateSupported) {
-          const animI = i;
-          const p = (async () => {
-            try {
-              const mp4Blob = await workerAnimateOne(
-                params,
-                total,
-                animI,
-                ANIM_TOTAL_FRAMES,
-                // #95: フレーム単位の進捗を該当タイルに反映する。
-                // 古い世代の更新は無視する（runGen ガード）。
-                (frame, totalFrames) => {
-                  if (myGen !== runGen) return;
-                  setTiles((prev) =>
-                    prev.map((t, idx) =>
-                      idx === animI
-                        ? { ...t, animProgress: { frame, total: totalFrames } }
-                        : t,
-                    ),
-                  );
-                },
-              );
-              if (myGen !== runGen) return;
-              const videoBlobUrl = URL.createObjectURL(mp4Blob);
-              setTiles((prev) =>
-                prev.map((t, idx) => {
-                  if (idx !== animI) return t;
-                  if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
-                  // #95: 完成と同時に animProgress をクリア。
-                  return { ...t, videoBlob: mp4Blob, videoBlobUrl, animProgress: undefined };
-                }),
-              );
-              // #61 + #88: setTiles → DOM mount → ref 確定 のサイクルを
-              // 1 フレーム回してから play() を呼ぶ。myGen check は yieldFrame
-              // 後にも入れて、再 run で世代が進んだら play() を抑止する。
-              await yieldFrame();
-              if (myGen !== runGen) return;
-              // レビュー S3: setTiles 直後の 1 frame 待ちでも ref が確定して
-              // いないことが稀にある（Solid の reconcile タイミング差）。
-              // 1 度だけ追加で yieldFrame して再取得するリトライを入れる。
-              let videoEl = videoRefs[animI];
-              if (!videoEl) {
-                await yieldFrame();
-                if (myGen !== runGen) return;
-                videoEl = videoRefs[animI];
-              }
-              if (!videoEl) {
-                console.warn('video ref still missing for tile after retry', animI);
-              } else {
-                videoEl.play().catch((err) => {
-                  // play() は user gesture 要件等で reject しうる。muted な
-                  // <video> なら通るはずだが、保険で warn のみ（無音動画が
-                  // 視覚的に静止しても許容）。
-                  console.warn('play() rejected for tile', animI, err);
-                });
-              }
-            } catch (e) {
-              // 1 タイル分の失敗は残りタイルの動画化を止めない。
-              // 最初のエラーだけ後段で表示する。
-              console.error('mp4 encode failed for tile', animI, e);
-              if (firstAnimErr === null) firstAnimErr = e;
-              // #95 レビュー Q2: 失敗パスでも animProgress をクリアして
-              // 進捗リングを消す（残ったままだと「中途半端な進捗」が固まる）。
-              if (myGen === runGen) {
-                setTiles((prev) =>
-                  prev.map((t, idx) => (idx === animI ? { ...t, animProgress: undefined } : t)),
-                );
-              }
-            }
-          })();
-          animPromises.push(p);
-        }
       }
     } catch (e) {
       if (myGen !== runGen) return;
-      // レビュー M4: 静止画ループでこの catch に入った時点で、すでに発射した
-      // 動画化の inner async が裏で走り続けている可能性がある。それらは
-      // 後から setTiles / play() を呼んでしまい、UI が「error フェーズなのに
-      // 動画タイルだけ後追いで現れる」不整合を起こす。runGen を進めることで
-      // in-flight の `myGen !== runGen` ガードを発火させ、後続 setTiles を
-      // 抑止する（再 run は呼ばれていないので myGen は古いまま）。
+      // レビュー M4: 静止画ループでこの catch に入った時点で、ガードのため
+      // runGen を進めて in-flight の `myGen !== runGen` を発火させる。
+      // post-loop 直列構成では並走 inner async は無いが、将来どこかで
+      // setTimeout 等が動いていても抑止できるよう保守的に維持する。
       runGen += 1;
       clearTiles();
       setErrorMsg(String(e));
@@ -359,32 +278,97 @@ export default function Studio() {
 
     if (myGen !== runGen) return;
 
-    // #92: 静止画ループが終わった時点で動画化はまだ進行中の可能性。
-    // animPromises が空（= 動画タイルなし or WebCodecs 非対応）ならそのまま
-    // 'done' に遷移、そうでなければ 'animating' に切り替えて全完了を待つ。
-    // レビュー S1: WebCodecs 非対応では animateSupported=false で animPromises
-    // を積まないので、ここで 'animating' ラベルを飛ばすのが意図通り（動画化
-    // 自体が行われないため）。
-    // レビュー S2: 並走中は phase は 'generating' のままで、静止画ループ
-    // 完走後に animation の最終待ち合わせを 'animating' で表現する。
-    // 「静止画フェーズ → 動画フェーズ」の見え方を維持しつつ、内部では
-    // 並走している、というのが UX 上の建て付け。
-    if (animPromises.length > 0) {
-      setPhase('animating');
-      await Promise.all(animPromises);
+    if (!isWebCodecsSupported()) {
+      setPhase('done');
+      return;
+    }
+
+    // #88 + #99: 動画化ループ（直列、できた順に play）。
+    // 1 タイル分の mp4 が出来た時点で <video> に反映 + play() し、
+    // 次のタイルの動画化に進む。
+    setPhase('animating');
+    let firstAnimErr: unknown = null;
+    for (let i = stillCount; i < total; i++) {
       if (myGen !== runGen) return;
-      if (firstAnimErr !== null) {
-        // #94: 動画化 4 枚のうち一部失敗は fatal ではない（残りタイルは
-        // 静止画として完成済み、phase も 'done' に遷移する）。errorMsg
-        // ではなく warningMsg に入れて、'done' 状態でも見える弱めの
-        // 通知バナーで表示する。エラー詳細（DOMException メッセージ等）
-        // は end user に意味が薄いので console に留め、UI には事実
-        // ベースの warning 文言だけを出す。
-        console.error('animation partial failure detail:', firstAnimErr);
-        setWarningMsg(t('animatePartialFailure'));
+      try {
+        const mp4Blob = await workerAnimateOne(
+          params,
+          total,
+          i,
+          ANIM_TOTAL_FRAMES,
+          // #95: フレーム単位の進捗を該当タイルに反映する。
+          // 古い世代の更新は無視する（runGen ガード）。
+          (frame, totalFrames) => {
+            if (myGen !== runGen) return;
+            setTiles((prev) =>
+              prev.map((tile, idx) =>
+                idx === i
+                  ? { ...tile, animProgress: { frame, total: totalFrames } }
+                  : tile,
+              ),
+            );
+          },
+        );
+        if (myGen !== runGen) return;
+        const videoBlobUrl = URL.createObjectURL(mp4Blob);
+        setTiles((prev) =>
+          prev.map((t, idx) => {
+            if (idx !== i) return t;
+            if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
+            // #95: 完成と同時に animProgress をクリア。
+            return { ...t, videoBlob: mp4Blob, videoBlobUrl, animProgress: undefined };
+          }),
+        );
+        // #61 + #88: setTiles → DOM mount → ref 確定 のサイクルを
+        // 1 フレーム回してから play() を呼ぶ。myGen check は yieldFrame
+        // 後にも入れて、再 run で世代が進んだら play() を抑止する。
+        await yieldFrame();
+        if (myGen !== runGen) return;
+        // レビュー S3: setTiles 直後の 1 frame 待ちでも ref が確定して
+        // いないことが稀にある（Solid の reconcile タイミング差）。
+        // 1 度だけ追加で yieldFrame して再取得するリトライを入れる。
+        let videoEl = videoRefs[i];
+        if (!videoEl) {
+          await yieldFrame();
+          if (myGen !== runGen) return;
+          videoEl = videoRefs[i];
+        }
+        if (!videoEl) {
+          console.warn('video ref still missing for tile after retry', i);
+        } else {
+          videoEl.play().catch((err) => {
+            // play() は user gesture 要件等で reject しうる。muted な
+            // <video> なら通るはずだが、保険で warn のみ（無音動画が
+            // 視覚的に静止しても許容）。
+            console.warn('play() rejected for tile', i, err);
+          });
+        }
+      } catch (e) {
+        // 1 タイル分の失敗は残りタイルの動画化を止めない。
+        // 最初のエラーだけ後段で表示する。
+        console.error('mp4 encode failed for tile', i, e);
+        if (firstAnimErr === null) firstAnimErr = e;
+        // #95 レビュー Q2: 失敗パスでも animProgress をクリアして
+        // 進捗リングを消す（残ったままだと「中途半端な進捗」が固まる）。
+        if (myGen === runGen) {
+          setTiles((prev) =>
+            prev.map((t, idx) => (idx === i ? { ...t, animProgress: undefined } : t)),
+          );
+        }
       }
     }
 
+    if (myGen !== runGen) return;
+    if (firstAnimErr !== null) {
+      // #94: 動画化 4 枚のうち一部失敗は fatal ではない（残りタイルは
+      // 静止画として完成済み、phase も 'done' に遷移する）。errorMsg
+      // ではなく warningMsg に入れて、'done' 状態でも見える弱めの
+      // 通知バナーで表示する。エラー詳細（DOMException メッセージ等）
+      // は end user に意味が薄いので console に留め、UI には事実
+      // ベースの warning 文言だけを出す。
+      console.error('animation partial failure detail:', firstAnimErr);
+      setWarningMsg(t('animatePartialFailure'));
+    }
     setPhase('done');
   };
 
