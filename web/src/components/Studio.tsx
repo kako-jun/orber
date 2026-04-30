@@ -276,6 +276,14 @@ export default function Studio() {
             return { ...t, videoBlob: mp4Blob, videoBlobUrl };
           }),
         );
+        // #88: できた順に再生する。setTiles → DOM mount → ref 確定 を
+        // 1 フレーム回してから当該タイルだけ play() する。4 枚揃うのを
+        // 待たないので、1 枚目が完成した瞬間から動き始めて待たされ感が消える。
+        // play() は muted ならまず通るが、user gesture 等で reject しうる
+        // ため握りつぶす（静止のままでも許容）。
+        await yieldFrame();
+        if (myGen !== runGen) return;
+        videoRefs[i]?.play().catch(() => {});
       } catch (e) {
         // 1 タイル分の失敗は残りタイルの動画化を止めない。
         // 最初のエラーだけ表示して continue する。
@@ -287,24 +295,6 @@ export default function Studio() {
     if (firstAnimErr !== null) {
       setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
     }
-
-    // #61: 4 枚揃ってから一斉に play()。<video autoplay> を切ってあるので
-    // ここまでは静止 (PNG 下敷きが見える) で待機し、全 mp4 化が終わった瞬間
-    // に 4 枚同時に動き始める。yieldFrame で setTiles → DOM mount → ref 確定
-    // のサイクルを 1 フレーム回してから play() を呼ぶ。
-    // Promise.all で全 play() が解決するまで待つことで、4 枚の readyState
-    // 解消タイミングを揃える (個々の play() は内部的に readyState 待ちを
-    // 含むため、await を挟まないとタイル間のずれが見える可能性)。
-    await yieldFrame();
-    if (myGen !== runGen) return;
-    await Promise.all(
-      videoRefs.map((v) =>
-        // play() は user gesture 要件等で reject しうる。muted な <video> なら
-        // 通るはずだが、保険で握りつぶす (無音動画が視覚的に静止しても許容)。
-        v ? v.play().catch(() => {}) : Promise.resolve(),
-      ),
-    );
-    if (myGen !== runGen) return;
 
     setPhase('done');
   };
@@ -807,8 +797,9 @@ export default function Studio() {
                   />
                   <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
                     {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
-                        autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
-                        一斉に play() する (動き始めを揃えるため)。 */}
+                        autoplay は #61 で外し、#88 で「できた順に再生」に戻した。
+                        runBatch のループ内で各 mp4 が出来た直後に該当 ref を
+                        .play() している。 */}
                     <video
                       ref={(el) => {
                         // unmount 時に null/undefined が来るケースを除外して
