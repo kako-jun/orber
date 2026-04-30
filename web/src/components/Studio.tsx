@@ -229,6 +229,15 @@ export default function Studio() {
     // 数百 ms なので、各呼び出し完了ごとに main 側 setTiles → DOM 反映 →
     // 次の postMessage が走る。worker スレッドで動いているのでメインの
     // タップ・スクロールはブロックされない。
+    //
+    // #92: 動画タイルに到達したら、その場で workerAnimateOne を fire-and-forget
+    // で起動し animPromises[] に積む。channel 'b'（動画専用 worker）で並走
+    // するので、静止画ループ（channel 'a'）はブロックされない。各 animate の
+    // 完了後に「できた順に」 setTiles → play() する（#88 の挙動を継承）。
+    const animPromises: Promise<void>[] = [];
+    let firstAnimErr: unknown = null;
+    const animateSupported = isWebCodecsSupported();
+
     try {
       for (let i = 0; i < total; i++) {
         if (myGen !== runGen) return;
@@ -244,8 +253,55 @@ export default function Studio() {
         );
         setProgress((n) => n + 1);
         await yieldFrame();
+
+        // #92: 動画タイルに到達した時点で animate を fire-and-forget で
+        // 起動。await しないので静止画ループはそのまま次のタイルへ進む。
+        // 完了後に「できた順に」<video> へ反映 + play() する（#88 継承）。
+        if (kind === 'video' && animateSupported) {
+          const animI = i;
+          const p = (async () => {
+            try {
+              const mp4Blob = await workerAnimateOne(
+                params,
+                total,
+                animI,
+                ANIM_TOTAL_FRAMES,
+              );
+              if (myGen !== runGen) return;
+              const videoBlobUrl = URL.createObjectURL(mp4Blob);
+              setTiles((prev) =>
+                prev.map((t, idx) => {
+                  if (idx !== animI) return t;
+                  if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
+                  return { ...t, videoBlob: mp4Blob, videoBlobUrl };
+                }),
+              );
+              // #61 + #88: setTiles → DOM mount → ref 確定 のサイクルを
+              // 1 フレーム回してから play() を呼ぶ。myGen check は yieldFrame
+              // 後にも入れて、再 run で世代が進んだら play() を抑止する。
+              await yieldFrame();
+              if (myGen !== runGen) return;
+              const videoEl = videoRefs[animI];
+              if (!videoEl) {
+                console.warn('video ref missing for tile', animI);
+              } else {
+                videoEl.play().catch((err) => {
+                  // play() は user gesture 要件等で reject しうる。muted な
+                  // <video> なら通るはずだが、保険で warn のみ（無音動画が
+                  // 視覚的に静止しても許容）。
+                  console.warn('play() rejected for tile', animI, err);
+                });
+              }
+            } catch (e) {
+              // 1 タイル分の失敗は残りタイルの動画化を止めない。
+              // 最初のエラーだけ後段で表示する。
+              console.error('mp4 encode failed for tile', animI, e);
+              if (firstAnimErr === null) firstAnimErr = e;
+            }
+          })();
+          animPromises.push(p);
+        }
       }
-      if (myGen !== runGen) return;
     } catch (e) {
       if (myGen !== runGen) return;
       clearTiles();
@@ -254,58 +310,18 @@ export default function Studio() {
       return;
     }
 
-    // 後半 4 タイルを WebCodecs で mp4 化する。worker 側で encodeAnimationToMp4
-    // が走るので、main は postMessage の応答を待つだけ。
-    if (!isWebCodecsSupported()) {
-      setPhase('done');
-      return;
-    }
-
-    setPhase('animating');
-    let firstAnimErr: unknown = null;
-    for (let i = stillCount; i < total; i++) {
-      if (myGen !== runGen) return;
-      try {
-        const mp4Blob = await workerAnimateOne(params, total, i, ANIM_TOTAL_FRAMES);
-        if (myGen !== runGen) return;
-        const videoBlobUrl = URL.createObjectURL(mp4Blob);
-        setTiles((prev) =>
-          prev.map((t, idx) => {
-            if (idx !== i) return t;
-            if (t.videoBlobUrl) URL.revokeObjectURL(t.videoBlobUrl);
-            return { ...t, videoBlob: mp4Blob, videoBlobUrl };
-          }),
-        );
-        // #88: できた順に再生する。各タイルの setTiles → DOM mount → ref
-        // 確定 のサイクルを 1 フレーム回してから当該タイルだけ play() する。
-        // 最初の 1 枚から順次動き出し、待たされ感が消える。
-        // yieldFrame は「mount 完了を保証する」ため毎回必要（4 枚なら累計
-        // 4 frame ≒ 67ms。worker の mp4 化（数百ms〜秒）に対しては誤差）。
-        // 直後の myGen check は yieldFrame 中に reroll → unmount された
-        // race を吸収する（古い ref への play() を防ぐ）。
-        // play() の戻り Promise は await しない（次タイルの mp4 化を
-        // ブロックしないため）。reject は muted 動画ではほぼ起きないが、
-        // user gesture 要件等で発生しうるので warn だけ残して握りつぶす。
-        await yieldFrame();
-        if (myGen !== runGen) return;
-        const videoEl = videoRefs[i];
-        if (!videoEl) {
-          console.warn('video ref missing for tile', i);
-        } else {
-          videoEl.play().catch((err) => {
-            console.warn('play() rejected for tile', i, err);
-          });
-        }
-      } catch (e) {
-        // 1 タイル分の失敗は残りタイルの動画化を止めない。
-        // 最初のエラーだけ表示して continue する。
-        console.error('mp4 encode failed for tile', i, e);
-        if (firstAnimErr === null) firstAnimErr = e;
-      }
-    }
     if (myGen !== runGen) return;
-    if (firstAnimErr !== null) {
-      setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
+
+    // #92: 静止画ループが終わった時点で動画化はまだ進行中の可能性。
+    // animPromises が空（= 動画タイルなし or WebCodecs 非対応）ならそのまま
+    // 'done' に遷移、そうでなければ 'animating' に切り替えて全完了を待つ。
+    if (animPromises.length > 0) {
+      setPhase('animating');
+      await Promise.all(animPromises);
+      if (myGen !== runGen) return;
+      if (firstAnimErr !== null) {
+        setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
+      }
     }
 
     setPhase('done');
