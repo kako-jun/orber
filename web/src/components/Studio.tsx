@@ -687,12 +687,11 @@ export default function Studio() {
         >
           {(url) => (
             <div class="relative">
-              {/* select-none / touch-none / draggable=false で iOS の長押し
-                  callout・拡大鏡・テキスト選択・ドラッグを抑止 (#57)。
-                  Android Chrome の「画像を保存」コンテキストメニューは
-                  touch-action では止まらないので oncontextmenu で抑止 (#87)。
-                  pointer-events-none で pointerdown を img ではなく親 label に
-                  届け、長押しタイマーを確実に発火させる (#87)。 */}
+              {/* select-none / touch-none / draggable=false / oncontextmenu /
+                  pointer-events-none で iOS の長押し callout・拡大鏡・
+                  テキスト選択・ドラッグ・Android の画像保存メニューを
+                  全て抑止し (#57 / #87)、pointerdown を確実に親 label の
+                  onPointerDown に届けて 400ms 長押しタイマーを発火させる。 */}
               <img
                 src={url}
                 alt={t('pickedThumbAlt', { name: pickedName() })}
