@@ -276,6 +276,26 @@ export default function Studio() {
             return { ...t, videoBlob: mp4Blob, videoBlobUrl };
           }),
         );
+        // #88: できた順に再生する。各タイルの setTiles → DOM mount → ref
+        // 確定 のサイクルを 1 フレーム回してから当該タイルだけ play() する。
+        // 最初の 1 枚から順次動き出し、待たされ感が消える。
+        // yieldFrame は「mount 完了を保証する」ため毎回必要（4 枚なら累計
+        // 4 frame ≒ 67ms。worker の mp4 化（数百ms〜秒）に対しては誤差）。
+        // 直後の myGen check は yieldFrame 中に reroll → unmount された
+        // race を吸収する（古い ref への play() を防ぐ）。
+        // play() の戻り Promise は await しない（次タイルの mp4 化を
+        // ブロックしないため）。reject は muted 動画ではほぼ起きないが、
+        // user gesture 要件等で発生しうるので warn だけ残して握りつぶす。
+        await yieldFrame();
+        if (myGen !== runGen) return;
+        const videoEl = videoRefs[i];
+        if (!videoEl) {
+          console.warn('video ref missing for tile', i);
+        } else {
+          videoEl.play().catch((err) => {
+            console.warn('play() rejected for tile', i, err);
+          });
+        }
       } catch (e) {
         // 1 タイル分の失敗は残りタイルの動画化を止めない。
         // 最初のエラーだけ表示して continue する。
@@ -287,24 +307,6 @@ export default function Studio() {
     if (firstAnimErr !== null) {
       setErrorMsg(`${t('animateError')}: ${String(firstAnimErr)}`);
     }
-
-    // #61: 4 枚揃ってから一斉に play()。<video autoplay> を切ってあるので
-    // ここまでは静止 (PNG 下敷きが見える) で待機し、全 mp4 化が終わった瞬間
-    // に 4 枚同時に動き始める。yieldFrame で setTiles → DOM mount → ref 確定
-    // のサイクルを 1 フレーム回してから play() を呼ぶ。
-    // Promise.all で全 play() が解決するまで待つことで、4 枚の readyState
-    // 解消タイミングを揃える (個々の play() は内部的に readyState 待ちを
-    // 含むため、await を挟まないとタイル間のずれが見える可能性)。
-    await yieldFrame();
-    if (myGen !== runGen) return;
-    await Promise.all(
-      videoRefs.map((v) =>
-        // play() は user gesture 要件等で reject しうる。muted な <video> なら
-        // 通るはずだが、保険で握りつぶす (無音動画が視覚的に静止しても許容)。
-        v ? v.play().catch(() => {}) : Promise.resolve(),
-      ),
-    );
-    if (myGen !== runGen) return;
 
     setPhase('done');
   };
@@ -807,8 +809,9 @@ export default function Studio() {
                   />
                   <Show when={tile.kind === 'video' && tile.videoBlobUrl}>
                     {/* poster は冗長 (下敷き <img> が同等の役割) なので付けない。
-                        autoplay は #61 で外し、4 枚揃ってから runBatch 末尾で
-                        一斉に play() する (動き始めを揃えるため)。 */}
+                        autoplay 属性は #61 で外したまま。runBatch のループ内
+                        で各 mp4 が完成した直後に該当 ref を明示的に .play()
+                        する方式 (#88 でできた順再生に変更)。 */}
                     <video
                       ref={(el) => {
                         // unmount 時に null/undefined が来るケースを除外して
