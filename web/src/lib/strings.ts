@@ -20,8 +20,8 @@ export const STRINGS = {
     en: 'Choose or drop an image',
   },
   dropZonePlaceholder: {
-    ja: '画像を 1 つドロップ / クリックして選択',
-    en: 'Drop an image or click to choose',
+    ja: '画像をドロップ / クリック',
+    en: 'Drop or click an image',
   },
   replaceImageHint: { ja: '差し替え', en: 'Replace' },
   pickedThumbAlt: {
