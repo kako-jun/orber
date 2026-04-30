@@ -55,6 +55,12 @@ export const STRINGS = {
     ja: '動画生成に失敗したタイルがあります',
     en: 'Some tiles failed to encode to video',
   },
+  // #94: 部分失敗 warning 用。fatal 風に響かないよう「一部のタイルは
+  // 静止画のままです」という事実ベースの言い回しに分けてある。
+  animatePartialFailure: {
+    ja: '一部のタイルは動画化できず、静止画のままです',
+    en: 'Some tiles could not be animated and remain as stills',
+  },
   downloadSelected: { ja: '選択を DL', en: 'Download selected' },
   downloadAll: { ja: '全 {n} 枚 DL', en: 'Download all {n}' },
   preparingDownload: {
