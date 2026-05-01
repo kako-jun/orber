@@ -14,7 +14,7 @@ No accent color. The generated artwork supplies all color; the chrome stays in m
 
 | Token            | Value                       | Usage                                                   |
 | ---------------- | --------------------------- | ------------------------------------------------------- |
-| `bg`             | `#000000`                   | Page / canvas background                                |
+| `bg`             | `#040404`                   | Page / canvas background. PWA splash / theme-color / manifest と同値（icon 右上 1px の実測値で SOT 集約） |
 | `fg`             | `#FFFFFF`                   | Primary text, logo, active control text                 |
 | `fg-muted`       | `rgba(255,255,255,0.55)`    | Subtitle, status text, inactive control text            |
 | `fg-subtle`      | `rgba(255,255,255,0.32)`    | Placeholder text, disabled label                        |

@@ -1,0 +1,16 @@
+# Cloudflare Pages headers (#126)
+# manifest.webmanifest は古い CF 環境で MIME が application/octet-stream に
+# 落ちることがあるため明示。max-age=3600 は manifest 更新を一時間以内に反映。
+/manifest.webmanifest
+  Content-Type: application/manifest+json; charset=utf-8
+  Cache-Control: public, max-age=3600
+
+# OGP 画像とアイコンは長期キャッシュ。差し替え時はファイル名を変える運用。
+/og-image.png
+  Cache-Control: public, max-age=604800, immutable
+/icon-*.png
+  Cache-Control: public, max-age=604800, immutable
+/apple-touch-icon.png
+  Cache-Control: public, max-age=604800, immutable
+/favicon.ico
+  Cache-Control: public, max-age=604800, immutable

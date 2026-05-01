@@ -4,8 +4,11 @@ export default {
   theme: {
     extend: {
       colors: {
-        // DESIGN.md §2 — black-canvas gothic, no accent hue
-        bg: '#000000',
+        // DESIGN.md §2 — black-canvas gothic, no accent hue.
+        // #126: 厳密な #000000 ではなく orber.png 右上 1px の実測値 #040404 に揃え、
+        // PWA splash / theme-color / アイコン背景全てを単一値に集約 (SOT)。
+        // 4 階調差は人間の目には不可視だが、OLED で icon を貼った時の境目を消す。
+        bg: '#040404',
         fg: '#FFFFFF',
         fgMuted: 'rgba(255,255,255,0.55)',
         fgSubtle: 'rgba(255,255,255,0.32)',
