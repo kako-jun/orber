@@ -17,7 +17,7 @@
 
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
-import { createGlRenderer, type GlRenderer } from './orberGl';
+import { createGlRenderer, GLYPH_MASK_SIZE, type GlRenderer } from './orberGl';
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -38,6 +38,13 @@ let cachedSource: { rgb: Uint8Array; width: number; height: number } | null = nu
 // 切替でも、同じサイズなら再利用したい。WebGL の context 生成は重い。
 let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number; height: number } | null = null;
 
+// Phase B (#55): Glyph alpha mask の wasm 生成 + GPU upload を 1 度だけにする
+// ためのキャッシュ。同じ (ch, size) なら再 upload しない。worker は固定 size
+// (GLYPH_MASK_SIZE) でしか呼ばないので size をキーから外しても良いが、将来
+// 切替の余地を残すために含める。getRenderer で renderer を作り直したときも
+// invalidate する必要がある（テクスチャも一緒に dispose されるため）。
+let cachedGlyph: { ch: string; size: number } | null = null;
+
 function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; renderer: GlRenderer } {
   if (cachedCanvas && cachedCanvas.width === width && cachedCanvas.height === height) {
     return { canvas: cachedCanvas.canvas, renderer: cachedCanvas.renderer };
@@ -45,6 +52,9 @@ function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; 
   if (cachedCanvas) {
     cachedCanvas.renderer.dispose();
     cachedCanvas = null;
+    // Phase B (#55): renderer を作り直すとテクスチャも消えるので Glyph
+    // キャッシュも無効化する（次の ensureGlyphMaskUploaded で再 upload）。
+    cachedGlyph = null;
   }
   const canvas = new OffscreenCanvas(width, height);
   const renderer = createGlRenderer(canvas);
@@ -64,6 +74,20 @@ interface BaseParams {
   orb_size: number;
   blur: number;
   shape: string;
+  // Phase B (#55): UI から流れる advanced 軸。空文字は "未指定（既存挙動）"。
+  glyph_char?: string;
+  count_preset?: string;
+  speed_preset?: string;
+  contrast_preset?: string;
+}
+
+function ensureGlyphMaskUploaded(renderer: GlRenderer, ch: string): void {
+  const size = GLYPH_MASK_SIZE;
+  if (cachedGlyph && cachedGlyph.ch === ch && cachedGlyph.size === size) return;
+  // wasm 側で生成 → Uint8Array で受ける。同じ ch なら wasm 側もキャッシュヒット。
+  const mask = wasm.get_glyph_alpha_mask(ch, size);
+  renderer.setGlyphMask(mask, size);
+  cachedGlyph = { ch, size };
 }
 
 function mergeParams(p: BaseParams) {
@@ -95,7 +119,10 @@ type Req =
       n: number;
       index: number;
       totalFrames: number;
-    };
+    }
+  // Phase B (#55): UI が typed-in glyph 文字が同梱フォントに収録されているか
+  // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
+  | { kind: 'glyphSupported'; id: number; ch: string };
 
 function post(msg: unknown, transfers: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfers);
@@ -119,6 +146,12 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
         const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
+        // Phase B (#55): Glyph 形状なら alpha mask を 1 度アップロードする。
+        // setRenderData の前に呼ぶことで shape_id=1 の uniform が立つ前から
+        // テクスチャは正しい状態になる（順序依存はないが、明示的に先に行う）。
+        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+          ensureGlyphMaskUploaded(renderer, req.params.glyph_char);
+        }
         renderer.setRenderData(data);
         renderer.renderFrame(0);
         const blob = await canvas.convertToBlob({ type: 'image/png' });
@@ -132,6 +165,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const width = req.params.width;
         const height = req.params.height;
         const { canvas, renderer } = getRenderer(width, height);
+        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+          ensureGlyphMaskUploaded(renderer, req.params.glyph_char);
+        }
         renderer.setRenderData(data);
         const PROGRESS_STRIDE = 4;
         const blob = await encodeAnimationFromCanvas(
@@ -147,6 +183,13 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         );
         const buf = await blob.arrayBuffer();
         post({ id: req.id, ok: true, data: buf }, [buf]);
+        break;
+      }
+      case 'glyphSupported': {
+        // 1 char の Unicode scalar 1 つを判定する軽量パス。wasm は init 済み
+        // なので I/O コストはゼロに近い。
+        const ok = wasm.glyph_supported(req.ch);
+        post({ id: req.id, ok: true, data: ok });
         break;
       }
       default: {
