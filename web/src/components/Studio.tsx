@@ -731,7 +731,7 @@ export default function Studio() {
           'group relative block cursor-pointer touch-none rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
           (dragOver()
             ? 'text-fg bg-glassBg'
-            : 'text-hairline hover:text-fgMuted')
+            : 'text-fgSubtle hover:text-fgMuted')
         }
       >
         {/* #79: 丸ドット周回ボーダー — orb との視覚統一。
