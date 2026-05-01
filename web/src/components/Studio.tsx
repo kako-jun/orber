@@ -301,7 +301,7 @@ export default function Studio() {
         if (myGen !== runGen) return;
         const png = await workerGenerateOne(params, total, i);
         if (myGen !== runGen) return;
-        const blob = new Blob([png], { type: 'image/png' });
+        const blob = new Blob([new Uint8Array(png)], { type: 'image/png' });
         const blobUrl = URL.createObjectURL(blob);
         const kind: Tile['kind'] = i < stillCount ? 'still' : 'video';
         setTiles((prev) =>
@@ -595,6 +595,17 @@ export default function Studio() {
     URL.revokeObjectURL(url);
   };
 
+  // #122: ローカル時刻ベースの YYYYMMDD-HHMMSS。連続 DL で上書き確認が
+  // 出ないよう毎回ユニークなファイル名にする。zip 内のエントリ名にも
+  // 同じ ts を埋めて、複数 zip を同じフォルダに展開しても衝突しないようにする。
+  const downloadTimestamp = (d = new Date()) => {
+    const p = (n: number) => String(n).padStart(2, '0');
+    return (
+      `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+      `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    );
+  };
+
   // #73: DL 時の hi-res 再描画。プレビュー（#99 で 360×640）とは別に、同じ
   // baseSeed + (total, index) で `generate_one_at_index` / `start_animation_for_batch_spec`
   // を呼び、1080×1920 の PNG / mp4 を作る。プレビューと同じバリエーションが
@@ -642,7 +653,7 @@ export default function Studio() {
         // 静止タイル、または WebCodecs 非対応環境では hi-res の t=0 PNG。
         const png = await workerGenerateOne(hiParams, total, i);
         out.set(i, {
-          blob: new Blob([png], { type: 'image/png' }),
+          blob: new Blob([new Uint8Array(png)], { type: 'image/png' }),
           ext: 'png',
         });
       } else {
@@ -665,17 +676,18 @@ export default function Studio() {
       const rendered = await renderHiResForIndices(indices);
       // index 順を保ってファイル名を 01, 02, ... に振る。
       const sorted = Array.from(rendered.entries()).sort((a, b) => a[0] - b[0]);
+      const ts = downloadTimestamp();
       if (sorted.length === 1) {
-        triggerDownload(sorted[0][1].blob, `orber.${sorted[0][1].ext}`);
+        triggerDownload(sorted[0][1].blob, `orber-${ts}.${sorted[0][1].ext}`);
         return;
       }
       const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       sorted.forEach(([, { blob, ext }], n) => {
-        zip.file(`orber_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
+        zip.file(`orber-${ts}_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
       });
       const zipBlob = await zip.generateAsync({ type: 'blob' });
-      triggerDownload(zipBlob, 'orber.zip');
+      triggerDownload(zipBlob, `orber-${ts}.zip`);
     } catch (e) {
       console.error('hi-res download failed', e);
       setErrorMsg(`${t('downloadFailed')}: ${String(e)}`);
@@ -911,14 +923,27 @@ export default function Studio() {
         </div>
       </Show>
 
-      <Show when={phase() === 'decoding'}>
-        <p class="fade-in text-sm text-fgMuted">{t('decoding')}</p>
-      </Show>
-      <Show when={phase() === 'generating'}>
-        <p class="fade-in text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
-      </Show>
-      <Show when={phase() === 'animating'}>
-        <p class="fade-in text-sm text-fgMuted">{t('animating')}</p>
+      {/* #121: 進捗行は常に同じ高さを確保し、phase 完了後も消さない（消すと
+          下のサムネイルグリッドがガクッと上に詰まる）。done/idle/error では
+          中身を空にして高さだけ残し、テキストはセンタリングする。 */}
+      <Show
+        when={
+          phase() === 'decoding' ||
+          phase() === 'generating' ||
+          phase() === 'animating' ||
+          tiles().length > 0
+        }
+      >
+        <p
+          class="fade-in text-center text-sm text-fgMuted h-5 leading-5"
+          aria-live="polite"
+        >
+          <Show when={phase() === 'decoding'}>{t('decoding')}</Show>
+          <Show when={phase() === 'generating'}>
+            {t('generating')} {progress()} / {batchN()}
+          </Show>
+          <Show when={phase() === 'animating'}>{t('animating')}</Show>
+        </p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
@@ -1075,8 +1100,8 @@ export default function Studio() {
                               fill="none"
                               stroke="currentColor"
                               stroke-width="1.5"
-                              stroke-dasharray={c}
-                              stroke-dashoffset={c * (1 - pct())}
+                              stroke-dasharray={String(c)}
+                              stroke-dashoffset={String(c * (1 - pct()))}
                               stroke-linecap="round"
                               transform="rotate(-90 12 12)"
                             />

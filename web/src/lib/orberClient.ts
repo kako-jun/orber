@@ -83,9 +83,9 @@ function ensureWorker(): Worker {
     //   - 本体応答: `kind` プロパティなし。`{ id, ok, data?, error? }`
     //   - 進捗通知: `{ kind: 'animateProgress', id, frame, total }`
     // 将来 kind が増えるなら明示分岐を追加すること。
-    type Resp =
-      | { id: number; ok: boolean; data?: unknown; error?: string }
-      | { kind: 'animateProgress'; id: number; frame: number; total: number };
+    type RespResult = { id: number; ok: boolean; data?: unknown; error?: string };
+    type RespProgress = { kind: 'animateProgress'; id: number; frame: number; total: number };
+    type Resp = RespResult | RespProgress;
     const msg = e.data as Resp;
     if ('kind' in msg && msg.kind === 'animateProgress') {
       const pp = pending.get(msg.id);
@@ -98,7 +98,7 @@ function ensureWorker(): Worker {
       }
       return;
     }
-    const { id, ok, data, error } = msg;
+    const { id, ok, data, error } = msg as RespResult;
     const p = pending.get(id);
     if (!p) return;
     pending.delete(id);
