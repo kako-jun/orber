@@ -368,8 +368,11 @@ document.getElementById("stop").onclick = () => {
 document.getElementById("bench").onclick = () => {
   cancelAnimationFrame(raf); raf = 0;
   const N = 192;
-  // warmup
-  draw(0); gl.finish();
+  // review N5: warmup を 5 frame に。shader compile / driver の JIT を確実に踏ませる。
+  for (let w = 0; w < 5; w++) { draw(w / N); }
+  gl.finish();
+
+  // review S1: throughput 計測 (gl.finish は最後 1 回のみ。GPU はキューイングしてバッチ処理する)
   const t0 = performance.now();
   for (let i = 0; i < N; i++) {
     draw(i / N);
@@ -377,7 +380,19 @@ document.getElementById("bench").onclick = () => {
   gl.finish();
   const t1 = performance.now();
   const total = t1 - t0;
-  log(`bench ${curW}x${curH} N=${N}  total=${total.toFixed(1)}ms  per-frame=${(total/N).toFixed(2)}ms  FPS=${(1000/(total/N)).toFixed(1)}`);
+
+  // review S1: per-frame 計測 (毎 frame gl.finish。本当の per-frame 発行コストが見える)
+  const t2 = performance.now();
+  for (let i = 0; i < N; i++) {
+    draw(i / N);
+    gl.finish();
+  }
+  const t3 = performance.now();
+  const totalSync = t3 - t2;
+
+  log(`bench ${curW}x${curH} N=${N}`);
+  log(`  throughput  total=${total.toFixed(1)}ms  per-frame=${(total/N).toFixed(2)}ms  FPS=${(1000/(total/N)).toFixed(1)} (gl.finish 1 回のみ。実用合計時間に近い)`);
+  log(`  per-frame   total=${totalSync.toFixed(1)}ms  per-frame=${(totalSync/N).toFixed(2)}ms (毎 frame 同期。真の発行コスト)`);
 };
 
 // ---------------------------------------------------------------
@@ -517,6 +532,11 @@ log(`max uniform vectors (frag) = ${gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECT
 log(`VideoEncoder: ${typeof VideoEncoder !== "undefined" ? "available" : "NOT available"}`);
 log(`MediaRecorder: ${typeof MediaRecorder !== "undefined" ? "available" : "NOT available"}`);
 log("初期描画 OK。「▶ 再生」で 4 秒ループ、「全 192 frame レンダ計測」で速度測定。");
+// review N4: file:// で開くと一部ブラウザで WebCodecs が制限される。簡易サーバ推奨。
+if (location.protocol === "file:") {
+  log("⚠ file:// で開いています。一部ブラウザで WebCodecs が制限される可能性があります。");
+  log("  推奨: cd web/poc && python3 -m http.server 8000 → http://localhost:8000/webgl-orb.html");
+}
 </script>
 </body>
 </html>
