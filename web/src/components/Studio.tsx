@@ -595,6 +595,16 @@ export default function Studio() {
     URL.revokeObjectURL(url);
   };
 
+  // #122: ローカル時刻ベースの YYYYMMDD-HHMMSS。連続 DL で上書き確認が
+  // 出ないよう毎回ユニークなファイル名にする。machigai-salad と揃える。
+  const downloadTimestamp = (d = new Date()) => {
+    const p = (n: number) => String(n).padStart(2, '0');
+    return (
+      `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+      `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    );
+  };
+
   // #73: DL 時の hi-res 再描画。プレビュー（#99 で 360×640）とは別に、同じ
   // baseSeed + (total, index) で `generate_one_at_index` / `start_animation_for_batch_spec`
   // を呼び、1080×1920 の PNG / mp4 を作る。プレビューと同じバリエーションが
@@ -665,8 +675,9 @@ export default function Studio() {
       const rendered = await renderHiResForIndices(indices);
       // index 順を保ってファイル名を 01, 02, ... に振る。
       const sorted = Array.from(rendered.entries()).sort((a, b) => a[0] - b[0]);
+      const ts = downloadTimestamp();
       if (sorted.length === 1) {
-        triggerDownload(sorted[0][1].blob, `orber.${sorted[0][1].ext}`);
+        triggerDownload(sorted[0][1].blob, `orber-${ts}.${sorted[0][1].ext}`);
         return;
       }
       const { default: JSZip } = await import('jszip');
@@ -675,7 +686,7 @@ export default function Studio() {
         zip.file(`orber_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
       });
       const zipBlob = await zip.generateAsync({ type: 'blob' });
-      triggerDownload(zipBlob, 'orber.zip');
+      triggerDownload(zipBlob, `orber-${ts}.zip`);
     } catch (e) {
       console.error('hi-res download failed', e);
       setErrorMsg(`${t('downloadFailed')}: ${String(e)}`);
