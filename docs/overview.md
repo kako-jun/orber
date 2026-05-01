@@ -51,6 +51,14 @@ from the k-means clusters of the input image:
 - if k-means returns zero clusters (degenerate input), the canvas falls back to
   opaque black
 
+Internally `extract_clusters` downsamples the input to a longest-edge of 256 px
+(Triangle filter, aspect preserved, with a minimum-edge floor of 8 px) before
+running k-means. The output (centroids in normalized [0,1] coordinates, LAB
+colors, weight ratios) is scale-invariant, so this purely reduces compute cost
+on large input photos without changing the visual result. Both the CLI and the
+web GUI share this path; the web GUI additionally pre-resizes on the JS side
+to keep the JS→Worker→wasm RGB transfer constant.
+
 Concretely:
 
 - a nightscape (mostly dark sky) → black canvas + bright neon points
