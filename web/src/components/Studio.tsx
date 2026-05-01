@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import AdvancedSection from './AdvancedSection';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
@@ -943,280 +944,27 @@ export default function Studio() {
       </div>
 
       {/* Phase B (#55): アドバンスト折りたたみセクション。
-          デフォルトは閉。展開時に shape / glyph 文字 / count / speed / contrast の
-          5 行が縦積みで現れる。
+          PR #130 review S4: 約 265 行の JSX を AdvancedSection.tsx に分離した。
+          signal は Studio.tsx 側で所有したまま accessor + setter を props で渡す。
           DESIGN.md §13 (AdvancedSection) — glass-bg / hairline で囲み、
           segmented control で 2-3 段階を選ばせる。 */}
-      <div class="rounded border border-hairline">
-        <button
-          type="button"
-          aria-expanded={advancedOpen()}
-          aria-controls="advanced-panel"
-          onClick={() => setAdvancedOpen((v) => !v)}
-          class={
-            'flex w-full items-center justify-between px-3 py-2 text-sm text-fgMuted ' +
-            'hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-            'transition-colors duration-200 ease-out'
-          }
-        >
-          <span class="inline-flex items-center gap-2">
-            {/* 歯車アイコン (DESIGN.md §7 stroke 1.5 / round) */}
-            <svg
-              viewBox="0 0 24 24"
-              width="16"
-              height="16"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="3" />
-              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
-            </svg>
-            {t('advancedHeading')}
-          </span>
-          {/* 開閉インジケータ ▾ / ▸ — opacity だけで状態切替 */}
-          <svg
-            viewBox="0 0 24 24"
-            width="14"
-            height="14"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-            class={
-              'transition-transform duration-200 ease-out ' +
-              (advancedOpen() ? 'rotate-180' : '')
-            }
-          >
-            <path d="M6 9l6 6 6-6" />
-          </svg>
-        </button>
-        <Show when={advancedOpen()}>
-          <div
-            id="advanced-panel"
-            class="fade-in space-y-3 border-t border-hairline px-3 py-3"
-          >
-            {/* 形状 (Shape) — 2 択 segmented */}
-            <div class="flex items-center gap-3">
-              <span class="w-20 shrink-0 text-sm text-fgMuted">
-                {t('shapeLabel')}
-              </span>
-              <div class="flex flex-wrap gap-1">
-                <button
-                  type="button"
-                  aria-pressed={shape() === 'circle'}
-                  onClick={() => setShape('circle')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (shape() === 'circle' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('shapeOptionCircle')}
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={shape() === 'glyph'}
-                  onClick={() => setShape('glyph')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (shape() === 'glyph' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('shapeOptionGlyph')}
-                </button>
-              </div>
-            </div>
-
-            {/* Glyph 文字入力欄 — Glyph 選択時のみ */}
-            <Show when={shape() === 'glyph'}>
-              <div class="flex items-center gap-3">
-                <span class="w-20 shrink-0 text-sm text-fgMuted">
-                  {t('glyphCharLabel')}
-                </span>
-                <input
-                  type="text"
-                  aria-label={t('glyphCharLabel')}
-                  value={glyphChar()}
-                  placeholder={t('glyphCharPlaceholder')}
-                  // 1 char 制限（grapheme cluster の細かい区別はせず、Unicode
-                  // scalar 1 個に丸める。CJK / 記号は通常 1 char）。
-                  maxLength={2}
-                  onInput={(e) => {
-                    const raw = e.currentTarget.value;
-                    // 先頭 char のみ採用（IME 中の合成中間値で複数 char に
-                    // なってもサニタイズで 1 char に戻す）。
-                    const first = raw.length > 0 ? raw[0] : '';
-                    setGlyphChar(first);
-                    // 入力欄の表示も同期（サニタイズ反映）。
-                    if (raw !== first) e.currentTarget.value = first;
-                  }}
-                  class={
-                    'w-16 rounded border bg-glassBg backdrop-blur-glass px-2 py-1 text-center text-sm text-fg ' +
-                    'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-                    (glyphCharSupported()
-                      ? 'border-glassBorder'
-                      : 'border-fgMuted')
-                  }
-                />
-                <Show when={!glyphCharSupported() && glyphChar().length > 0}>
-                  <span class="text-xs text-fgMuted">
-                    {t('glyphCharUnsupported')}
-                  </span>
-                </Show>
-              </div>
-            </Show>
-
-            {/* 数 (Count) */}
-            <div class="flex items-center gap-3">
-              <span class="w-20 shrink-0 text-sm text-fgMuted">{t('countLabel')}</span>
-              <div class="flex flex-wrap gap-1">
-                <button
-                  type="button"
-                  aria-pressed={countPreset() === 'low'}
-                  onClick={() => setCountPreset('low')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (countPreset() === 'low' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('countOptionLow')}
-                </button>
-                <button
-                  type="button"
-                  // M1: '' (initial identity) と 'mid' (明示選択) のどちらでも
-                  // 「標準」を押下表示する。どちらも wasm 側で identity 扱いになる。
-                  aria-pressed={countPreset() === '' || countPreset() === 'mid'}
-                  onClick={() => setCountPreset('mid')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (countPreset() === '' || countPreset() === 'mid'
-                      ? GLASS_BTN_TOGGLED
-                      : '')
-                  }
-                >
-                  {t('countOptionMid')}
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={countPreset() === 'high'}
-                  onClick={() => setCountPreset('high')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (countPreset() === 'high' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('countOptionHigh')}
-                </button>
-              </div>
-            </div>
-
-            {/* 速さ (Speed) */}
-            <div class="flex items-center gap-3">
-              <span class="w-20 shrink-0 text-sm text-fgMuted">{t('speedLabel')}</span>
-              <div class="flex flex-wrap gap-1">
-                <button
-                  type="button"
-                  aria-pressed={speedPreset() === 'slow'}
-                  onClick={() => setSpeedPreset('slow')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (speedPreset() === 'slow' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('speedOptionSlow')}
-                </button>
-                <button
-                  type="button"
-                  // M1: '' / 'mid' どちらも標準扱い。'' は spec.speed / GUI_VIDEO_SPEEDS
-                  // を温存、'mid' も identity（parse_speed_preset で None）。
-                  aria-pressed={speedPreset() === '' || speedPreset() === 'mid'}
-                  onClick={() => setSpeedPreset('mid')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (speedPreset() === '' || speedPreset() === 'mid'
-                      ? GLASS_BTN_TOGGLED
-                      : '')
-                  }
-                >
-                  {t('speedOptionMid')}
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={speedPreset() === 'fast'}
-                  onClick={() => setSpeedPreset('fast')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (speedPreset() === 'fast' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('speedOptionFast')}
-                </button>
-              </div>
-            </div>
-
-            {/* コントラスト (Contrast) */}
-            <div class="flex items-center gap-3">
-              <span class="w-20 shrink-0 text-sm text-fgMuted">
-                {t('contrastLabel')}
-              </span>
-              <div class="flex flex-wrap gap-1">
-                <button
-                  type="button"
-                  aria-pressed={contrastPreset() === 'low'}
-                  onClick={() => setContrastPreset('low')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (contrastPreset() === 'low' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('contrastOptionLow')}
-                </button>
-                <button
-                  type="button"
-                  // M1: '' / 'mid' どちらも標準扱い。ContrastPreset::Mid と等価。
-                  aria-pressed={contrastPreset() === '' || contrastPreset() === 'mid'}
-                  onClick={() => setContrastPreset('mid')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (contrastPreset() === '' || contrastPreset() === 'mid'
-                      ? GLASS_BTN_TOGGLED
-                      : '')
-                  }
-                >
-                  {t('contrastOptionMid')}
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={contrastPreset() === 'high'}
-                  onClick={() => setContrastPreset('high')}
-                  class={
-                    GLASS_BTN +
-                    ' text-sm ' +
-                    (contrastPreset() === 'high' ? GLASS_BTN_TOGGLED : '')
-                  }
-                >
-                  {t('contrastOptionHigh')}
-                </button>
-              </div>
-            </div>
-          </div>
-        </Show>
-      </div>
+      <AdvancedSection
+        shape={shape}
+        setShape={setShape}
+        glyphChar={glyphChar}
+        setGlyphChar={setGlyphChar}
+        glyphCharSupported={glyphCharSupported}
+        countPreset={countPreset}
+        setCountPreset={setCountPreset}
+        speedPreset={speedPreset}
+        setSpeedPreset={setSpeedPreset}
+        contrastPreset={contrastPreset}
+        setContrastPreset={setContrastPreset}
+        open={advancedOpen}
+        setOpen={setAdvancedOpen}
+        GLASS_BTN={GLASS_BTN}
+        GLASS_BTN_TOGGLED={GLASS_BTN_TOGGLED}
+      />
 
       {/* Phase B (#55): ガチャボタンを唯一の生成トリガーに昇格。
           aspect / advanced を変えてから「ガチャを引く」流れに統一する。
