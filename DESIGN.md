@@ -117,7 +117,7 @@ Not used in this iteration; reserved. The aspect Portrait / Landscape pair is in
 
 - Flat. **No glass, no ring, no rounded corners beyond `0.125rem` (2px) for sub-pixel cleanup**
 - `aspect-ratio` follows current canvas (540/960 portrait, 960/540 landscape)
-- Background: `#000` while loading
+- Background: `bg` token (`#040404`) while loading
 - `<img>` / `<video>` fills with `object-cover`
 - Cursor: `pointer`
 
