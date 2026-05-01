@@ -29,11 +29,14 @@ CSS / SVG output is attractive because it is essentially zero-byte, infinitely l
 The CLI exposes the following flags (run `orber --help` for the authoritative list):
 
 - `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
-- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused)
+- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). Ignored when `--shape glyph`.
 - `--count` — orbs visible on screen at once (1..=200, default 20)
+- `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 35). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
-- `--speed` — conveyor pace: `very-slow` / `slow` (cross counts per clip)
-- `--shape` — `circle` or `aquarelle` (watercolor bleed)
+- `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
+- `--shape` — `circle`, `aquarelle` (watercolor bleed), or `glyph` (text character)
+- `--glyph-char` — single character used when `--shape glyph` (default `☆`)
+- `--contrast` — visual contrast preset: `low` / `mid` / `high` (default `mid`, existing behavior)
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
@@ -95,14 +98,16 @@ phase offset and looping once per clip duration:
 Each orb is also assigned an integer **speed multiplier** (`1x` / `2x`)
 deterministically from the seed, so individual orbs visibly travel at different
 paces inside the same clip. Combined with the global `--speed` cycle count
-(`very-slow` / `slow` = 1 / 2), per-orb effective traversal counts spread over
-`{1, 2, 4}` per clip. Because every factor is an integer, the loop closure at
-`t = 0 ≡ t = 1` remains pixel-exact.
+(`very-slow` / `slow` / `mid` / `fast` = 1 / 2 / 3 / 4), per-orb effective
+traversal counts spread over `{cycle, 2 × cycle}` per clip. Because every
+factor is an integer, the loop closure at `t = 0 ≡ t = 1` remains pixel-exact
+regardless of which cycle count is chosen — Phase A added the `Mid` (3) and
+`Fast` (4) variants without breaking that invariant.
 
-`--speed` itself is the global cycle count (1 / 2 screen-crosses per clip for
-the slowest orbs). Real-time pacing is set by `--duration-ms`: `--speed slow
---duration-ms 8000` means the slowest orbs cross the screen twice in 8 seconds
-(4 s/cross), with `2x` orbs proportionally faster.
+`--speed` itself is the global cycle count (1 / 2 / 3 / 4 screen-crosses per
+clip for the slowest orbs). Real-time pacing is set by `--duration-ms`:
+`--speed slow --duration-ms 8000` means the slowest orbs cross the screen twice
+in 8 seconds (4 s/cross), with `2x` orbs proportionally faster.
 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap. Its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen wrap buffer would interfere with
@@ -294,3 +299,51 @@ language picker — users do not choose. The `<html lang>` attribute is set
 pre-hydration by an inline script in `Base.astro` so screen readers pick the
 right voice from first paint, and the Solid `lang` signal is synced
 post-hydration by `Subtitle.tsx` for reactive UI text.
+
+## Glyph rendering pipeline (Phase A)
+
+`--shape glyph` swaps each orb for a **glyph character** filled with the orb's
+color. The pipeline:
+
+1. A bundled font subset — **Noto Sans Symbols 2** (~177 KB, embedded with
+   `include_bytes!` from `crates/core/assets/fonts/NotoSansSymbols2-Regular.ttf`)
+   — covers ASCII, digits, punctuation, arrows, and geometric shapes. Anything
+   outside the subset (emoji etc.) is **silently skipped** rather than drawing
+   tofu / `.notdef`, so unknown inputs never visually break a render.
+2. The font face is parsed once via `ttf-parser` (`0.25`) and cached in a
+   process-global `OnceLock<Face<'static>>` per `GlyphFontId` enum variant.
+   Going through an enum + global cache (instead of `Arc<Face>` per orb) keeps
+   `OrbShape: Copy`, which is required so `OrbShape` can flow through the
+   `Copy`-bound spec and per-orb param paths without API churn.
+3. For each orb, the glyph outline is extracted via `Face::outline_glyph` and
+   converted into a `tiny-skia::Path`. The path is filled (not stroked) with
+   the orb's color at the orb's center, scaled to the orb's radius.
+4. Because Glyph is an outline-fill primitive, the **`--blur` parameter is
+   ignored in this mode**. Softness comes from the contrast preset's edge
+   softness rather than a gaussian post-pass.
+
+The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
+dependency itself is small and pure-Rust (no shaping, no FreeType).
+
+## Contrast axis (Phase A)
+
+`--contrast {low, mid, high}` is a **single user-facing axis** that bundles
+three internal knobs (alpha, blur strength, edge sharpness) into a 3-stop
+preset. The intent is to give one knob covering the realistic range of "how
+loud should the orbs be" without exposing each underlying parameter:
+
+| preset | alpha | blur | edge | use case |
+|---|---|---|---|---|
+| `low`  | weak   | strong | soft   | sit underneath text overlay |
+| `mid`  | (default) | (default) | (default) | standalone backdrop, default |
+| `high` | strong | weak   | sharp  | rich wallpaper, single hero plate |
+
+`mid` is the **identity preset** — its alpha / blur / edge values are exactly
+the existing defaults, so passing `--contrast mid` (or omitting the flag) is
+guaranteed to match the pre-Phase-A render bit-for-bit. A regression test in
+`crates/core` pins this behavior so the `mid = identity` invariant cannot drift
+silently.
+
+The preset is implemented as `ContrastPreset { Low, Mid, High }` in
+`crates/core/src/style.rs` and consumed by the orb rendering path; CLI parsing
+is via `clap`'s `ValueEnum`.
