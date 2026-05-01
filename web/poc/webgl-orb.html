@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>orber WebGL2 PoC (#112)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; background: #0b0a14; color: #e8e8f0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { padding: 12px; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+  button { padding: 8px 12px; font-size: 14px; background: #2a2540; color: #e8e8f0; border: 1px solid #4a4368; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #3a3458; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.active { background: #6b4d99; border-color: #8a6cb8; }
+  input[type="text"] { padding: 6px 8px; font-size: 14px; background: #1a1530; color: #e8e8f0; border: 1px solid #4a4368; border-radius: 4px; width: 160px; }
+  label { font-size: 13px; opacity: 0.8; }
+  #stage { background: #000; max-width: 100%; height: auto; display: block; border: 1px solid #2a2540; }
+  #stageWrap { max-width: 480px; margin-bottom: 8px; }
+  pre { background: #14101f; padding: 10px; border-radius: 6px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; max-height: 320px; overflow: auto; border: 1px solid #2a2540; }
+  .small { font-size: 11px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<h1>orber WebGL2 fragment shader PoC — issue #112</h1>
+
+<div class="row">
+  <label>解像度:</label>
+  <button id="res360" class="active">360 × 640</button>
+  <button id="res1080">1080 × 1920</button>
+</div>
+
+<div class="row">
+  <label>seed:</label>
+  <input type="text" id="seed" value="orber">
+  <button id="reseed">再生成</button>
+  <button id="play">▶ 再生</button>
+  <button id="stop">■ 停止</button>
+</div>
+
+<div class="row">
+  <button id="bench">全 192 frame レンダ計測</button>
+  <button id="enc">mp4/webm エンコードテスト</button>
+  <button id="clear">log clear</button>
+</div>
+
+<div id="stageWrap"><canvas id="stage" width="360" height="640"></canvas></div>
+
+<pre id="log"></pre>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------
+// log helper (画面 + console)
+// ---------------------------------------------------------------
+const logEl = document.getElementById("log");
+function log(...args) {
+  const s = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  logEl.textContent += s + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(...args);
+}
+function logErr(...args) {
+  const s = "[ERR] " + args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  logEl.textContent += s + "\n";
+  console.error(...args);
+}
+document.getElementById("clear").onclick = () => { logEl.textContent = ""; };
+
+// ---------------------------------------------------------------
+// WebGL2 setup
+// ---------------------------------------------------------------
+const canvas = document.getElementById("stage");
+const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true, antialias: false, alpha: false });
+if (!gl) {
+  document.body.innerHTML = "<h1 style='color:#f88'>WebGL2 が使えません</h1>";
+  throw new Error("no webgl2");
+}
+
+const VS = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+// K=5 orbs。位置・色・半径・style・呼吸位相・速度ゆらぎ
+// direction: 0=LR, 1=RL, 2=TB, 3=BT (全 orb 共通)
+const FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+
+#define K 5
+uniform vec2 u_resolution;     // (w, h)
+uniform float u_time;          // 0..1
+uniform int u_direction;       // 0..3
+uniform vec3 u_bg;
+uniform vec2 u_pos[K];         // initial position 0..1
+uniform vec3 u_col[K];
+uniform float u_radius[K];
+uniform int u_style[K];        // 0=rim, 1=soft
+uniform vec3 u_phase[K];       // (rad, blur, opa)
+uniform float u_speed[K];      // 0.8..1.2
+
+const float TAU = 6.28318530718;
+
+vec2 advect(vec2 p, float t) {
+  // 全 orb 共通方向 + 個別速度ゆらぎは呼び出し側で t に乗算
+  if (u_direction == 0) p.x = fract(p.x + t);
+  else if (u_direction == 1) p.x = fract(p.x - t + 1.0);
+  else if (u_direction == 2) p.y = fract(p.y + t);
+  else                       p.y = fract(p.y - t + 1.0);
+  return p;
+}
+
+float gauss(float d2, float sigma) {
+  float s2 = max(sigma * sigma, 1e-6);
+  return exp(-d2 / (2.0 * s2));
+}
+
+void main() {
+  // 縦横比補正: 短辺基準で半径が画面比になるよう uv をアスペクト平面へ
+  float aspect = u_resolution.x / u_resolution.y;
+  vec2 uv = v_uv;
+  vec2 p_uv = uv;
+  // distance を計算する空間: 短辺 = 1 になるよう x をアスペクト倍する
+  // (h > w なら aspect < 1 で x をアスペクトで割らず素直に)
+  float shortSide = min(u_resolution.x, u_resolution.y);
+  vec2 px = uv * u_resolution;  // pixel coord
+  px /= shortSide;              // 短辺 = 1.0 単位
+
+  vec3 acc = vec3(0.0);
+  float covered = 0.0;
+
+  for (int i = 0; i < K; i++) {
+    vec2 ip = u_pos[i];
+    float t = u_time * u_speed[i];
+    ip = advect(ip, t);
+    vec2 ip_px = ip * u_resolution / shortSide;
+
+    float br_r = u_radius[i] * (1.0 + 0.10 * sin(TAU * u_time + u_phase[i].x));
+    float sigma = br_r * (0.7 + 0.15 * sin(TAU * u_time + u_phase[i].y));
+    float opa = (0.95 + 0.05 * sin(TAU * u_time + u_phase[i].z));
+
+    // 画面端ラップ: 仮想的に上下左右 1 タイル分も評価して最近接距離を取る
+    float bestD2 = 1e9;
+    for (int dx = -1; dx <= 1; dx++) {
+      for (int dy = -1; dy <= 1; dy++) {
+        vec2 off = vec2(float(dx), float(dy)) * (u_resolution / shortSide);
+        vec2 cp = ip_px + off;
+        float d2 = dot(px - cp, px - cp);
+        if (d2 < bestD2) bestD2 = d2;
+      }
+    }
+
+    float w;
+    if (u_style[i] == 1) {
+      // soft
+      w = gauss(bestD2, sigma);
+    } else {
+      // rim: 中心暗く、輪郭強調
+      float outer = gauss(bestD2, sigma);
+      float inner = gauss(bestD2, sigma * 0.4);
+      w = outer * (1.0 - inner * 0.85);
+    }
+    w *= opa;
+    acc += u_col[i] * w;
+    covered += w;
+  }
+
+  // 背景ブレンド: orb で覆われていない分を bg で埋める
+  float bgw = clamp(1.0 - covered, 0.0, 1.0);
+  vec3 col = acc + u_bg * bgw;
+  // 過露光抑制
+  col = col / (1.0 + max(max(col.r, col.g), col.b) * 0.3);
+  outColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(sh);
+    logErr("shader compile error", info);
+    throw new Error(info);
+  }
+  return sh;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  logErr("link error", gl.getProgramInfoLog(prog));
+  throw new Error("link");
+}
+gl.useProgram(prog);
+
+// full-screen triangle (covers viewport)
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,  3, -1,  -1,  3,
+]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uLoc = {
+  resolution: gl.getUniformLocation(prog, "u_resolution"),
+  time:       gl.getUniformLocation(prog, "u_time"),
+  direction:  gl.getUniformLocation(prog, "u_direction"),
+  bg:         gl.getUniformLocation(prog, "u_bg"),
+  pos:        gl.getUniformLocation(prog, "u_pos"),
+  col:        gl.getUniformLocation(prog, "u_col"),
+  radius:     gl.getUniformLocation(prog, "u_radius"),
+  style:      gl.getUniformLocation(prog, "u_style"),
+  phase:      gl.getUniformLocation(prog, "u_phase"),
+  speed:      gl.getUniformLocation(prog, "u_speed"),
+};
+
+// ---------------------------------------------------------------
+// orb model (K=5)
+// ---------------------------------------------------------------
+const PALETTE = [
+  [0xff/255, 0x6b/255, 0x9d/255], // pink
+  [0x4e/255, 0xcd/255, 0xc4/255], // cyan
+  [0xff/255, 0xe6/255, 0x6d/255], // yellow
+  [0xa8/255, 0xda/255, 0xdc/255], // pale aqua
+  [0xe0/255, 0x7a/255, 0x5f/255], // orange
+];
+const BG = [0x1a/255, 0x15/255, 0x30/255];
+
+// xorshift32
+function makeRng(seedStr) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  let s = h || 1;
+  return () => {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    return (s >>> 0) / 4294967296;
+  };
+}
+
+let orbs = null;
+let direction = 0;
+
+function buildOrbs(seed) {
+  const rng = makeRng(seed);
+  const K = 5;
+  const arr = [];
+  for (let i = 0; i < K; i++) {
+    arr.push({
+      pos: [rng(), rng()],
+      col: PALETTE[i],
+      radius: 0.18 + rng() * 0.28,         // 0.18..0.46
+      style: rng() < 0.5 ? 0 : 1,          // 0=rim, 1=soft
+      phase: [rng() * Math.PI * 2, rng() * Math.PI * 2, rng() * Math.PI * 2],
+      speed: 0.8 + rng() * 0.4,            // 0.8..1.2
+    });
+  }
+  direction = Math.floor(rng() * 4);
+  return arr;
+}
+
+function uploadUniforms(orbs) {
+  const K = 5;
+  const pos = new Float32Array(K * 2);
+  const col = new Float32Array(K * 3);
+  const rad = new Float32Array(K);
+  const sty = new Int32Array(K);
+  const pha = new Float32Array(K * 3);
+  const spd = new Float32Array(K);
+  for (let i = 0; i < K; i++) {
+    pos[i * 2] = orbs[i].pos[0]; pos[i * 2 + 1] = orbs[i].pos[1];
+    col[i * 3] = orbs[i].col[0]; col[i * 3 + 1] = orbs[i].col[1]; col[i * 3 + 2] = orbs[i].col[2];
+    rad[i] = orbs[i].radius;
+    sty[i] = orbs[i].style;
+    pha[i * 3] = orbs[i].phase[0]; pha[i * 3 + 1] = orbs[i].phase[1]; pha[i * 3 + 2] = orbs[i].phase[2];
+    spd[i] = orbs[i].speed;
+  }
+  gl.uniform2fv(uLoc.pos, pos);
+  gl.uniform3fv(uLoc.col, col);
+  gl.uniform1fv(uLoc.radius, rad);
+  gl.uniform1iv(uLoc.style, sty);
+  gl.uniform3fv(uLoc.phase, pha);
+  gl.uniform1fv(uLoc.speed, spd);
+  gl.uniform3fv(uLoc.bg, new Float32Array(BG));
+  gl.uniform1i(uLoc.direction, direction);
+}
+
+function setResolution(w, h) {
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+  gl.uniform2f(uLoc.resolution, w, h);
+}
+
+function draw(t) {
+  gl.uniform1f(uLoc.time, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ---------------------------------------------------------------
+// initial state
+// ---------------------------------------------------------------
+let curW = 360, curH = 640;
+function reseed() {
+  const seed = document.getElementById("seed").value || "orber";
+  orbs = buildOrbs(seed);
+  setResolution(curW, curH);
+  uploadUniforms(orbs);
+  draw(0);
+  log(`reseed seed="${seed}" direction=${["LR","RL","TB","BT"][direction]} K=5`);
+}
+reseed();
+
+document.getElementById("reseed").onclick = reseed;
+document.getElementById("res360").onclick = () => {
+  curW = 360; curH = 640;
+  document.getElementById("res360").classList.add("active");
+  document.getElementById("res1080").classList.remove("active");
+  setResolution(curW, curH); uploadUniforms(orbs); draw(0);
+  log("解像度: 360 x 640");
+};
+document.getElementById("res1080").onclick = () => {
+  curW = 1080; curH = 1920;
+  document.getElementById("res1080").classList.add("active");
+  document.getElementById("res360").classList.remove("active");
+  setResolution(curW, curH); uploadUniforms(orbs); draw(0);
+  log("解像度: 1080 x 1920");
+};
+
+// ---------------------------------------------------------------
+// realtime preview
+// ---------------------------------------------------------------
+let raf = 0;
+let playStart = 0;
+function loop(now) {
+  const t = ((now - playStart) / 4000) % 1.0;  // 4 秒 1 ループ
+  draw(t);
+  raf = requestAnimationFrame(loop);
+}
+document.getElementById("play").onclick = () => {
+  cancelAnimationFrame(raf);
+  playStart = performance.now();
+  raf = requestAnimationFrame(loop);
+};
+document.getElementById("stop").onclick = () => {
+  cancelAnimationFrame(raf); raf = 0;
+};
+
+// ---------------------------------------------------------------
+// 192 frame benchmark
+// ---------------------------------------------------------------
+document.getElementById("bench").onclick = () => {
+  cancelAnimationFrame(raf); raf = 0;
+  const N = 192;
+  // review N5: warmup を 5 frame に。shader compile / driver の JIT を確実に踏ませる。
+  for (let w = 0; w < 5; w++) { draw(w / N); }
+  gl.finish();
+
+  // review S1: throughput 計測 (gl.finish は最後 1 回のみ。GPU はキューイングしてバッチ処理する)
+  const t0 = performance.now();
+  for (let i = 0; i < N; i++) {
+    draw(i / N);
+  }
+  gl.finish();
+  const t1 = performance.now();
+  const total = t1 - t0;
+
+  // review S1: per-frame 計測 (毎 frame gl.finish。本当の per-frame 発行コストが見える)
+  const t2 = performance.now();
+  for (let i = 0; i < N; i++) {
+    draw(i / N);
+    gl.finish();
+  }
+  const t3 = performance.now();
+  const totalSync = t3 - t2;
+
+  log(`bench ${curW}x${curH} N=${N}`);
+  log(`  throughput  total=${total.toFixed(1)}ms  per-frame=${(total/N).toFixed(2)}ms  FPS=${(1000/(total/N)).toFixed(1)} (gl.finish 1 回のみ。実用合計時間に近い)`);
+  log(`  per-frame   total=${totalSync.toFixed(1)}ms  per-frame=${(totalSync/N).toFixed(2)}ms (毎 frame 同期。真の発行コスト)`);
+};
+
+// ---------------------------------------------------------------
+// encode test (WebCodecs first, fallback MediaRecorder)
+// ---------------------------------------------------------------
+async function encodeWebCodecs() {
+  if (typeof VideoEncoder === "undefined") return null;
+  const N = 192;
+  const fps = 48; // 4 秒 / 192 frame
+  // h264 level: 1080p には 4.2 (avc1.42E02A), 360p には 3.0 (avc1.42E01E)
+  const codec = curH >= 1080 || curW >= 1080 ? "avc1.42E02A" : "avc1.42E01E";
+  const chunks = [];
+  let cfg = null;
+  let supported = null;
+  try {
+    supported = await VideoEncoder.isConfigSupported({
+      codec, width: curW, height: curH, bitrate: 8_000_000, framerate: fps,
+      hardwareAcceleration: "prefer-hardware",
+    });
+  } catch (e) {
+    logErr("isConfigSupported failed", String(e));
+    return null;
+  }
+  if (!supported || !supported.supported) {
+    log("VideoEncoder: codec not supported", codec);
+    return null;
+  }
+  log(`VideoEncoder supported codec=${codec} hw-pref ok`);
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      const buf = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(buf);
+      chunks.push({ buf, meta, type: chunk.type, ts: chunk.timestamp });
+      if (!cfg && meta && meta.decoderConfig) cfg = meta.decoderConfig;
+    },
+    error: (e) => logErr("encoder error", String(e)),
+  });
+  enc.configure(supported.config);
+
+  const t0 = performance.now();
+  let renderMs = 0, vfMs = 0, encMs = 0;
+  for (let i = 0; i < N; i++) {
+    const r0 = performance.now();
+    draw(i / N);
+    gl.finish();
+    const r1 = performance.now();
+    const vf = new VideoFrame(canvas, {
+      timestamp: Math.round((i * 1_000_000) / fps),
+      duration: Math.round(1_000_000 / fps),
+    });
+    const r2 = performance.now();
+    enc.encode(vf, { keyFrame: i === 0 });
+    vf.close();
+    const r3 = performance.now();
+    renderMs += r1 - r0;
+    vfMs += r2 - r1;
+    encMs += r3 - r2;
+  }
+  await enc.flush();
+  enc.close();
+  const t1 = performance.now();
+  const total = t1 - t0;
+  const totalBytes = chunks.reduce((a, c) => a + c.buf.length, 0);
+  log(`WebCodecs ${curW}x${curH} N=${N} total=${total.toFixed(1)}ms`);
+  log(`  render=${renderMs.toFixed(1)}ms (${(renderMs/N).toFixed(2)}/f)  VideoFrame(canvas)=${vfMs.toFixed(1)}ms (${(vfMs/N).toFixed(2)}/f)  encode=${encMs.toFixed(1)}ms (${(encMs/N).toFixed(2)}/f)`);
+  log(`  chunks=${chunks.length} bytes=${totalBytes} keyframes=${chunks.filter(c=>c.type==="key").length}`);
+
+  // 生 h264 bitstream を Blob で download (再生はできないが完走確認用)
+  const blob = new Blob(chunks.map(c => c.buf), { type: "application/octet-stream" });
+  return { blob, ext: "h264.bin", note: "raw H.264 bitstream (再生不可・完走確認用)" };
+}
+
+async function encodeMediaRecorder() {
+  if (typeof MediaRecorder === "undefined") return null;
+  const N = 192;
+  const fps = 48;
+  const stream = canvas.captureStream(fps);
+  let mimeType = "video/webm;codecs=vp9";
+  if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "video/webm;codecs=vp8";
+  if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "video/webm";
+  const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
+  const blobs = [];
+  rec.ondataavailable = e => { if (e.data.size) blobs.push(e.data); };
+  const done = new Promise(res => { rec.onstop = res; });
+  rec.start();
+  const t0 = performance.now();
+  for (let i = 0; i < N; i++) {
+    draw(i / N);
+    gl.finish();
+    // pace でフレーム提示
+    await new Promise(r => setTimeout(r, 1000 / fps));
+  }
+  rec.stop();
+  await done;
+  const t1 = performance.now();
+  const blob = new Blob(blobs, { type: mimeType });
+  log(`MediaRecorder ${curW}x${curH} N=${N} total=${(t1-t0).toFixed(1)}ms blob=${blob.size}B mime=${mimeType}`);
+  return { blob, ext: "webm", note: "MediaRecorder webm" };
+}
+
+document.getElementById("enc").onclick = async () => {
+  cancelAnimationFrame(raf); raf = 0;
+  const btn = document.getElementById("enc");
+  btn.disabled = true;
+  try {
+    let out = await encodeWebCodecs();
+    if (!out) {
+      log("WebCodecs 不可、MediaRecorder にフォールバック");
+      out = await encodeMediaRecorder();
+    }
+    if (out) {
+      const url = URL.createObjectURL(out.blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `orber-poc-${curW}x${curH}.${out.ext}`;
+      a.textContent = `download ${a.download} (${out.blob.size}B) — ${out.note}`;
+      a.style.cssText = "display:block;margin:6px 0;color:#8af";
+      logEl.appendChild(a);
+    } else {
+      log("どちらのエンコーダも使えませんでした");
+    }
+  } catch (e) {
+    logErr("encode failed", String(e), e.stack || "");
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ---------------------------------------------------------------
+// 環境情報
+// ---------------------------------------------------------------
+log(`UA: ${navigator.userAgent}`);
+const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+if (dbg) log(`GPU: ${gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)}`);
+log(`WebGL2 vendor=${gl.getParameter(gl.VENDOR)} version=${gl.getParameter(gl.VERSION)}`);
+log(`max uniform vectors (frag) = ${gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS)}`);
+log(`VideoEncoder: ${typeof VideoEncoder !== "undefined" ? "available" : "NOT available"}`);
+log(`MediaRecorder: ${typeof MediaRecorder !== "undefined" ? "available" : "NOT available"}`);
+log("初期描画 OK。「▶ 再生」で 4 秒ループ、「全 192 frame レンダ計測」で速度測定。");
+// review N4: file:// で開くと一部ブラウザで WebCodecs が制限される。簡易サーバ推奨。
+if (location.protocol === "file:") {
+  log("⚠ file:// で開いています。一部ブラウザで WebCodecs が制限される可能性があります。");
+  log("  推奨: cd web/poc && python3 -m http.server 8000 → http://localhost:8000/webgl-orb.html");
+}
+</script>
+</body>
+</html>
