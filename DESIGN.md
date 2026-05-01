@@ -269,9 +269,11 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 | --- | --- | --- | --- | --- |
 | 形状 | `circle` / `glyph` | 円 (Circle) / 文字 (Glyph) | `circle` | `shape` |
 | Glyph 文字 | 1 char | 1 文字入力（Glyph 選択時のみ） | `☆` | `glyph_char` |
-| 数 | `low` / `mid` / `high` | 少なめ (Few) / 標準 (Standard) / 多め (Many) | `mid` | `count_preset` (内部 10 / 20 / 35) |
-| 速さ | `slow` / `mid` / `fast` | ゆっくり (Slow) / 標準 (Standard) / 速め (Fast) | `mid` | `speed_preset`（`very-slow` は UI 非露出） |
-| コントラスト | `low` / `mid` / `high` | 弱め (Soft) / 標準 (Standard) / 強め (Strong) | `mid` | `contrast_preset` |
+| 数 | `''` / `low` / `mid` / `high` | 少なめ (Few) / 標準 (Standard) / 多め (Many) | `''` (= identity) | `count_preset` (内部 `''`/`mid` は spec.count を温存、`low`/`high` は 10 / 35 で上書き) |
+| 速さ | `''` / `slow` / `mid` / `fast` | ゆっくり (Slow) / 標準 (Standard) / 速め (Fast) | `''` (= identity) | `speed_preset`（UI 経路は `slow`/`mid`/`fast` の 3 値のみ受理。`very-slow` は CLI 専用） |
+| コントラスト | `''` / `low` / `mid` / `high` | 弱め (Soft) / 標準 (Standard) / 強め (Strong) | `''` (= identity) | `contrast_preset`（`''` / `mid` は `ContrastPreset::Mid`） |
+
+「標準」segmented button は内部値 `''`（初期状態）と `'mid'`（明示選択）の両方で `aria-pressed=true` になる。どちらも wasm 入口で identity（spec.count / spec.speed / `GUI_VIDEO_SPEEDS` / `ContrastPreset::Mid`）に解決される。M1 (#130 review): 初期値を `'mid'` にすると `count_preset='mid' → 20 固定` / `speed_preset='mid' → MotionSpeed::Mid 固定` で全タイル同一値になり、Phase A の `random_batch_specs` ばらけ（10..=50）と動画 4 枚の `GUI_VIDEO_SPEEDS` 割当が壊れる。これを避けるため初期値は `''`。
 
 ### Glyph 文字入力
 

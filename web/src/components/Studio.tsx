@@ -17,10 +17,19 @@ type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
 // Phase B (#55): advanced 軸の preset 値。表示は strings.ts 経由、内部値は
 // wasm の WasmParams.{count,speed,contrast}_preset と 1:1 対応する文字列。
+//
+// レビュー M1: 「未指定（identity）」を空文字 `''` で表現する。`'mid'` を
+// デフォルトに据えると wasm 側で `count_preset='mid' → count=20 固定` /
+// `speed_preset='mid' → MotionSpeed::Mid 固定` で全タイル同一値になり、
+// Phase A の `random_batch_specs` ばらけ（count 10..=50, video=GUI_VIDEO_SPEEDS）
+// が壊れる。`''` を渡せば wasm 側 `parse_*_preset` が `Ok(None)` を返して
+// spec.count / spec.speed / GUI_VIDEO_SPEEDS の identity 経路に乗る。
+// UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにして、
+// 明示的にユーザが「標準」を選んだら `'mid'` を入れる（明示選択も identity）。
 type ShapeChoice = 'circle' | 'glyph';
-type CountPreset = 'low' | 'mid' | 'high';
-type SpeedPreset = 'slow' | 'mid' | 'fast';
-type ContrastPreset = 'low' | 'mid' | 'high';
+type CountPreset = '' | 'low' | 'mid' | 'high';
+type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
+type ContrastPreset = '' | 'low' | 'mid' | 'high';
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
@@ -74,9 +83,12 @@ export default function Studio() {
   const [shape, setShape] = createSignal<ShapeChoice>('circle');
   const [glyphChar, setGlyphChar] = createSignal<string>('☆');
   const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
-  const [countPreset, setCountPreset] = createSignal<CountPreset>('mid');
-  const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('mid');
-  const [contrastPreset, setContrastPreset] = createSignal<ContrastPreset>('mid');
+  // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
+  // 見えるが、内部 signal は空文字 = wasm 側で no-op = spec.count / spec.speed /
+  // GUI_VIDEO_SPEEDS / ContrastPreset::Mid を維持。Phase A の見た目を正確に再現する。
+  const [countPreset, setCountPreset] = createSignal<CountPreset>('');
+  const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('');
+  const [contrastPreset, setContrastPreset] = createSignal<ContrastPreset>('');
   const [advancedOpen, setAdvancedOpen] = createSignal<boolean>(false);
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
@@ -1079,12 +1091,16 @@ export default function Studio() {
                 </button>
                 <button
                   type="button"
-                  aria-pressed={countPreset() === 'mid'}
+                  // M1: '' (initial identity) と 'mid' (明示選択) のどちらでも
+                  // 「標準」を押下表示する。どちらも wasm 側で identity 扱いになる。
+                  aria-pressed={countPreset() === '' || countPreset() === 'mid'}
                   onClick={() => setCountPreset('mid')}
                   class={
                     GLASS_BTN +
                     ' text-sm ' +
-                    (countPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
+                    (countPreset() === '' || countPreset() === 'mid'
+                      ? GLASS_BTN_TOGGLED
+                      : '')
                   }
                 >
                   {t('countOptionMid')}
@@ -1122,12 +1138,16 @@ export default function Studio() {
                 </button>
                 <button
                   type="button"
-                  aria-pressed={speedPreset() === 'mid'}
+                  // M1: '' / 'mid' どちらも標準扱い。'' は spec.speed / GUI_VIDEO_SPEEDS
+                  // を温存、'mid' も identity（parse_speed_preset で None）。
+                  aria-pressed={speedPreset() === '' || speedPreset() === 'mid'}
                   onClick={() => setSpeedPreset('mid')}
                   class={
                     GLASS_BTN +
                     ' text-sm ' +
-                    (speedPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
+                    (speedPreset() === '' || speedPreset() === 'mid'
+                      ? GLASS_BTN_TOGGLED
+                      : '')
                   }
                 >
                   {t('speedOptionMid')}
@@ -1167,12 +1187,15 @@ export default function Studio() {
                 </button>
                 <button
                   type="button"
-                  aria-pressed={contrastPreset() === 'mid'}
+                  // M1: '' / 'mid' どちらも標準扱い。ContrastPreset::Mid と等価。
+                  aria-pressed={contrastPreset() === '' || contrastPreset() === 'mid'}
                   onClick={() => setContrastPreset('mid')}
                   class={
                     GLASS_BTN +
                     ' text-sm ' +
-                    (contrastPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
+                    (contrastPreset() === '' || contrastPreset() === 'mid'
+                      ? GLASS_BTN_TOGGLED
+                      : '')
                   }
                 >
                   {t('contrastOptionMid')}

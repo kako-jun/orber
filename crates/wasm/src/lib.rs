@@ -119,13 +119,24 @@ fn parse_speed(s: &str) -> Result<MotionSpeed, String> {
     }
 }
 
-/// Phase B (#55): preset 文字列を `Option<MotionSpeed>` に変換。空文字は
-/// 「上書きしない」を意味する `Ok(None)`。
+/// Phase B (#55): preset 文字列を `Option<MotionSpeed>` に変換。
+///
+/// UI 経路は `slow` / `mid` / `fast` の **3 値のみ** を受理する。空文字 / `mid`
+/// は identity（= 上書きしない、`Ok(None)`）を意味し、`spec.speed` と
+/// `GUI_VIDEO_SPEEDS` の固定割当を温存する（M1/M2: identity 不変条件）。
+/// `very-slow` は CLI 専用なのでここでは reject する（DESIGN.md §13 / CHANGELOG）。
 fn parse_speed_preset(s: &str) -> Result<Option<MotionSpeed>, String> {
-    if s.is_empty() {
-        return Ok(None);
+    match s {
+        // identity: spec.speed / GUI_VIDEO_SPEEDS を温存
+        "" | "mid" => Ok(None),
+        "slow" => Ok(Some(MotionSpeed::Slow)),
+        "fast" => Ok(Some(MotionSpeed::Fast)),
+        // very-slow は UI 経路では受け付けない（CLI 専用）。`parse_speed` は
+        // 4 値を受け付けるので CLI / generate_single 側で個別に使うこと。
+        other => Err(format!(
+            "invalid speed_preset: {other} (expected one of '' / slow / mid / fast)"
+        )),
     }
-    parse_speed(s).map(Some)
 }
 
 /// Phase B (#55): count preset 文字列を絶対値に変換。`""` は `Ok(None)` で
@@ -790,16 +801,75 @@ mod tests {
 
     #[test]
     fn parse_speed_preset_handles_empty_and_values() {
+        // M1/M2: 空文字 / "mid" は identity（None）を返す。spec.speed と
+        // GUI_VIDEO_SPEEDS が温存されるための不変条件。
         assert!(matches!(parse_speed_preset(""), Ok(None)));
+        assert!(matches!(parse_speed_preset("mid"), Ok(None)));
         assert!(matches!(
-            parse_speed_preset("mid"),
-            Ok(Some(MotionSpeed::Mid))
+            parse_speed_preset("slow"),
+            Ok(Some(MotionSpeed::Slow))
         ));
         assert!(matches!(
             parse_speed_preset("fast"),
             Ok(Some(MotionSpeed::Fast))
         ));
+        // M2: very-slow は UI 経路では受け付けない（CLI 専用、parse_speed が担当）。
+        assert!(parse_speed_preset("very-slow").is_err());
         assert!(parse_speed_preset("xxx").is_err());
+    }
+
+    /// M1: count_preset='' のとき effective_count == spec.count を保つ。
+    /// `parse_count_preset` が `None` を返し、`get_render_data` 内で
+    /// `count_override.unwrap_or(spec.count)` がそのまま spec.count を採用する。
+    #[test]
+    fn count_preset_empty_or_unspecified_uses_spec_count() {
+        let count_override = parse_count_preset("").unwrap();
+        assert!(count_override.is_none());
+        // identity 不変条件: count_override.unwrap_or(spec_count) == spec_count
+        let spec_count: usize = 27;
+        assert_eq!(count_override.unwrap_or(spec_count), spec_count);
+    }
+
+    /// M1: speed_preset='' / 'mid' のとき speed_for_spec_idx の戻り値（
+    /// still=spec.speed / video=GUI_VIDEO_SPEEDS）を温存する。
+    #[test]
+    fn speed_preset_empty_or_unspecified_uses_spec_idx() {
+        for empty_input in ["", "mid"] {
+            let speed_override = parse_speed_preset(empty_input).unwrap();
+            assert!(
+                speed_override.is_none(),
+                "speed_preset={empty_input:?} must be identity (None)"
+            );
+        }
+        // identity 経路: get_render_data の match arm が
+        // `speed_for_spec_idx(spec_idx, still_count, &spec)` を採用する。
+        let still_count = 8;
+        let total = 12;
+        let mut spec = synth_spec(MotionDirection::TopToBottom);
+        spec.speed = MotionSpeed::Slow;
+        // still 領域は spec.speed を保つ。
+        for spec_idx in 0..still_count {
+            assert_eq!(
+                speed_for_spec_idx(spec_idx, still_count, &spec),
+                MotionSpeed::Slow
+            );
+        }
+        // video 領域は GUI_VIDEO_SPEEDS の固定割当を保つ。
+        for spec_idx in still_count..total {
+            assert_eq!(
+                speed_for_spec_idx(spec_idx, still_count, &spec),
+                GUI_VIDEO_SPEEDS[spec_idx - still_count]
+            );
+        }
+    }
+
+    /// M1: contrast_preset='' のとき ContrastPreset::Mid と一致する（identity）。
+    #[test]
+    fn contrast_preset_empty_is_mid_identity() {
+        assert_eq!(parse_contrast_preset("").unwrap(), ContrastPreset::Mid);
+        assert_eq!(parse_contrast_preset("mid").unwrap(), ContrastPreset::Mid);
+        // Mid は alpha_mul=1.0 / blur_offset=0.0 で既存挙動と完全同値であることが
+        // crates/core/src/style.rs の regression test で固定されている。
     }
 
     #[test]
