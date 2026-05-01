@@ -1,8 +1,21 @@
 ---
 interface Props {
   title?: string;
+  description?: string;
 }
-const { title = 'orber' } = Astro.props;
+// #126: SEO/OGP は SSR 段階で読まれるので静的英語に固定する。strings.ts の
+// reactive な subtitle は client-side で <html lang> に追従するが、検索 bot や
+// SNS scraper は hydration 前の静的 HTML しか見ない。多言語 SEO は
+// og:locale:alternate で示唆する。
+const SITE_URL = 'https://orber.llll-ll.com';
+const SITE_DESCRIPTION =
+  'Extract city lights from any image. Use as a video or stream background. Browser-only, no upload.';
+const OG_IMAGE = `${SITE_URL}/og-image.png`;
+const OG_IMAGE_ALT =
+  'orber — abstract bokeh orbs on dark background, with title and tagline';
+const TWITTER_HANDLE = '@kako_jun_42';
+const { title = 'orber', description = SITE_DESCRIPTION } = Astro.props;
+const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
 ---
 <!doctype html>
 <html lang="en">
@@ -11,6 +24,53 @@ const { title = 'orber' } = Astro.props;
     <meta name="viewport" content="width=device-width" />
     <meta name="generator" content={Astro.generator} />
     <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalUrl} />
+    <meta name="robots" content="index, follow" />
+
+    {/* #126: PWA / favicon. background_color と theme_color は manifest 側と
+        statusbar の両方で #040404 に揃える。これは orber.png 右上 1px の実値であり、
+        DESIGN.md §2 の bg トークンと同一。favicon.ico は 16/24/32/48/64 multi-resolution。 */}
+    <link rel="icon" sizes="any" href="/favicon.ico" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#040404" />
+
+    {/* #126: iOS Safari は manifest.display を見ないため、Apple 専用 meta で
+        standalone モードと statusbar 色を別途指定する。black-translucent で
+        statusbar が背景と一体化し、splash の #040404 から site bg #040404 への
+        遷移がシームレスになる。 */}
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="orber" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    {/* #126: OGP (Facebook / Slack / Discord / LinkedIn). og:image は絶対 URL 必須、
+        Twitter scraper も同じ image を参照する。og:image:alt はスクリーンリーダー
+        と画像表示できない環境向けの alt text。 */}
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={OG_IMAGE} />
+    <meta property="og:image:alt" content={OG_IMAGE_ALT} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:locale:alternate" content="ja_JP" />
+    <meta property="og:site_name" content="orber" />
+
+    {/* #126: Twitter Card. summary_large_image は 1200x630 を full-width で出す。
+        twitter:creator は llll-ll 公式パターンに合わせて kako-jun の X アカウント。 */}
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={OG_IMAGE} />
+    <meta name="twitter:image:alt" content={OG_IMAGE_ALT} />
+    <meta name="twitter:creator" content={TWITTER_HANDLE} />
+
+
     <!--
       DESIGN.md §3 — ロゴ専用フォント Space Grotesk を Google Fonts CDN から
       読み込む。本文は system sans のままなので weights は 300 / 400 / 500 のみ。
