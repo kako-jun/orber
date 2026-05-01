@@ -17,6 +17,7 @@
 
 use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
+use crate::glyph::{render_glyph_orb, GlyphFontId};
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -38,24 +39,35 @@ pub enum OrbStyle {
 }
 
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
-/// 質感セット（[`crate::aquarelle`]）を有効にする。
+/// 質感セット（[`crate::aquarelle`]）、`Glyph` は同梱フォント 1 文字のアウトライン
+/// 塗りを有効にする。
+///
+/// `Glyph` のフォントは [`GlyphFontId`] enum で識別する設計のため、`OrbShape` は
+/// 引き続き `Copy + Send + Sync`。実体の `Face` パースはモジュール側の
+/// `OnceLock` キャッシュに任せ、`OrbShape` 自体に重い state を持たせない。
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OrbShape {
     #[default]
     Circle,
     Aquarelle(AquarelleParams),
+    /// 1 文字のグリフを orb として描く。`ch` は描画する文字、`font` は同梱フォント識別子。
+    Glyph { ch: char, font: GlyphFontId },
 }
 
 impl PartialEq for OrbShape {
     // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
-    // ここでの "等価" は「形が同じか（Circle vs Aquarelle）」だけを判定する用途を
-    // 想定している。bleed / bloom / offset / halo まで含めて区別したい場合は
-    // AquarelleParams を直接比較すること。
+    // ここでの "等価" は「形が同じか」だけを判定する用途を想定している。
+    // Glyph は文字とフォント識別子まで含めて比較する（軽い値なので）。
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (OrbShape::Circle, OrbShape::Circle) | (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_))
-        )
+        match (self, other) {
+            (OrbShape::Circle, OrbShape::Circle) => true,
+            (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_)) => true,
+            (
+                OrbShape::Glyph { ch: a, font: fa },
+                OrbShape::Glyph { ch: b, font: fb },
+            ) => a == b && fa == fb,
+            _ => false,
+        }
     }
 }
 
@@ -134,6 +146,13 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
         if let OrbShape::Aquarelle(params) = opts.shape {
             // i (cluster index) を seed の差分にして orb 同士で異なるオフセットを得る。
             render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
+            continue;
+        }
+
+        // Glyph: 1 文字のアウトラインを fill。半径は Circle と同じ意味で渡す。
+        // render_static の opacity=1.0 を踏襲。
+        if let OrbShape::Glyph { ch, font } = opts.shape {
+            render_glyph_orb(&mut pixmap, (cx, cy), radius, [r, g, b], 1.0, font, ch);
             continue;
         }
 

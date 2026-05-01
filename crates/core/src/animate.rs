@@ -406,8 +406,17 @@ pub fn render_frame_with_params(
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
         let opacity = opacity_factor.clamp(0.0, 1.0);
 
-        // 各 orb のスタイル（Rim / Soft）を seed 由来で振り分け、フレーム内に混在させる。
-        render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
+        // shape による分岐:
+        // - Glyph: 円グラデ ではなく 1 文字のフォントアウトラインを fill。blur と style は使わない
+        // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
+        match opts.shape {
+            OrbShape::Glyph { ch, font } => {
+                crate::glyph::render_glyph_orb(&mut pixmap, (cx, cy), radius, rgb, opacity, font, ch);
+            }
+            _ => {
+                render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
+            }
+        }
     }
 
     finalize_pixmap(pixmap, width, height)
