@@ -4,6 +4,7 @@ import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
   hasInFlight,
   onWorkerCrash,
+  onWorkerDebug,
   terminateAndRespawn,
   workerAnimateOne,
   workerGenerateOne,
@@ -60,6 +61,9 @@ const DL_H_LANDSCAPE = 1080;
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
   const [wasmErr, setWasmErr] = createSignal<string>('');
+  // 実機（Android）で console を拾えないため、worker からの per-stage 計測ログを
+  // 画面 <pre> に出して kako-jun が確認できるようにする。直近 20 件保持。
+  const [debugLog, setDebugLog] = createSignal<string[]>([]);
   const [aspect, setAspect] = createSignal<Aspect>('portrait');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
@@ -153,6 +157,14 @@ export default function Studio() {
       setWasmStatus('error');
     });
     onCleanup(offCrash);
+    // perf 診断ログ: worker から流れる per-stage 計測を画面に表示
+    const offDebug = onWorkerDebug((text) => {
+      setDebugLog((prev) => {
+        const next = [...prev, text];
+        return next.length > 20 ? next.slice(-20) : next;
+      });
+    });
+    onCleanup(offDebug);
   });
 
   onCleanup(() => {
@@ -728,7 +740,12 @@ export default function Studio() {
         onPointerCancel={onDropZonePointerEnd}
         onClick={onDropZoneClick}
         class={
-          'group relative block cursor-pointer touch-none rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
+          // touch-pan-y: 縦スクロールはブラウザに任せる（指を縦に動かすと
+          // pointercancel が来て endLongPress が走る → スクロール開始）。
+          // 静止押下のみ 400ms タイマーで長押しオーバーレイ起動。
+          // 旧 touch-none は Android で「ドロップエリアからのフリックで
+          // ページがスクロールできない」副作用があったため pan-y に変更。
+          'group relative block cursor-pointer touch-pan-y rounded-xl py-10 px-8 text-center transition-colors duration-200 ease-out focus-within:text-focusRing ' +
           (dragOver()
             ? 'text-fg bg-glassBg'
             : 'text-fgSubtle hover:text-fgMuted')
@@ -960,7 +977,7 @@ export default function Studio() {
                 onContextMenu={(e) => e.preventDefault()}
                 disabled={!tile.blob}
                 aria-busy={!tile.blob}
-                class="group relative block w-full overflow-hidden rounded touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
+                class="group relative block w-full overflow-hidden rounded touch-pan-y focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '9 / 16' : '16 / 9',
                 }}
@@ -1235,6 +1252,16 @@ export default function Studio() {
             </Show>
           </div>
         )}
+      </Show>
+      {/* perf 診断ログ。実機 (Android) では console を拾えないため画面に表示。
+          落ち着いたら消す。 */}
+      <Show when={debugLog().length > 0}>
+        <pre
+          class="fixed bottom-0 left-0 right-0 z-50 max-h-[40vh] overflow-auto bg-black/80 p-2 text-[10px] leading-tight text-fgMuted whitespace-pre-wrap break-all"
+          aria-hidden="true"
+        >
+          {debugLog().join('\n')}
+        </pre>
       </Show>
     </section>
   );
