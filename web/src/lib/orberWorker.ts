@@ -17,7 +17,7 @@
 
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
-import { createGlRenderer, GLYPH_MASK_SIZE, type GlRenderer } from './orberGl';
+import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -38,9 +38,9 @@ let cachedSource: { rgb: Uint8Array; width: number; height: number } | null = nu
 // 切替でも、同じサイズなら再利用したい。WebGL の context 生成は重い。
 let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number; height: number } | null = null;
 
-// Phase B (#55): Glyph alpha mask の wasm 生成 + GPU upload を 1 度だけにする
+// Glyph SDF の wasm 生成 + GPU upload を 1 度だけにする
 // ためのキャッシュ。同じ (ch, size) なら再 upload しない。worker は固定 size
-// (GLYPH_MASK_SIZE) でしか呼ばないので size をキーから外しても良いが、将来
+// (GLYPH_SDF_SIZE) でしか呼ばないので size をキーから外しても良いが、将来
 // 切替の余地を残すために含める。getRenderer で renderer を作り直したときも
 // invalidate する必要がある（テクスチャも一緒に dispose されるため）。
 let cachedGlyph: { ch: string; size: number } | null = null;
@@ -81,12 +81,12 @@ interface BaseParams {
   softness_preset?: string;
 }
 
-function ensureGlyphMaskUploaded(renderer: GlRenderer, ch: string): void {
-  const size = GLYPH_MASK_SIZE;
+function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
+  const size = GLYPH_SDF_SIZE;
   if (cachedGlyph && cachedGlyph.ch === ch && cachedGlyph.size === size) return;
   // wasm 側で生成 → Uint8Array で受ける。同じ ch なら wasm 側もキャッシュヒット。
-  const mask = wasm.get_glyph_alpha_mask(ch, size);
-  renderer.setGlyphMask(mask, size);
+  const sdf = wasm.get_glyph_sdf(ch, size);
+  renderer.setGlyphSdf(sdf, size);
   cachedGlyph = { ch, size };
 }
 
@@ -146,11 +146,11 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
         const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
-        // Phase B (#55): Glyph 形状なら alpha mask を 1 度アップロードする。
+        // Glyph 形状なら SDF を 1 度アップロードする。
         // setRenderData の前に呼ぶことで shape_id=1 の uniform が立つ前から
         // テクスチャは正しい状態になる（順序依存はないが、明示的に先に行う）。
         if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphMaskUploaded(renderer, req.params.glyph_char);
+          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(data);
         renderer.renderFrame(0);
@@ -166,7 +166,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const height = req.params.height;
         const { canvas, renderer } = getRenderer(width, height);
         if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphMaskUploaded(renderer, req.params.glyph_char);
+          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(data);
         const PROGRESS_STRIDE = 4;

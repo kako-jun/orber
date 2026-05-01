@@ -64,6 +64,69 @@ impl SoftnessPreset {
     }
 }
 
+/// orb の減衰プロファイル。shape ではなく「alpha をどう落とすか」を表す。
+///
+/// `Rim` は中間 stop を 1 つ持つ輪郭強調型、`Soft` は中心保持の単純フェード型。
+/// Circle / Glyph のどちらでも同じプロファイルを使えるよう、shape から分離して
+/// style モジュールに置く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FalloffProfile {
+    Rim,
+    Soft,
+}
+
+/// Rim プロファイルの中間 stop 位置。blur=0 で外寄り、blur=1 で中心寄り。
+#[inline]
+pub fn rim_mid_stop(blur: f32) -> f32 {
+    (1.0 - blur.clamp(0.0, 1.0) * 0.8).clamp(0.05, 0.95)
+}
+
+/// Soft プロファイルの中心保持終端。blur=0 で外寄り、blur=1 で中心寄り。
+#[inline]
+pub fn soft_hold_stop(blur: f32) -> f32 {
+    (1.0 - blur.clamp(0.0, 1.0)).clamp(0.05, 0.95)
+}
+
+/// `r`（0=中心/深部、1=edge、>1=外側）から alpha を返す共通 falloff。
+///
+/// WebGL Glyph SDF 経路は、glyph 形状から得た signed-distance をこの `r` に変換して
+/// Circle と同じ減衰式へ流し込む。`opacity` は中心 alpha の倍率。
+#[inline]
+pub fn falloff_curve(profile: FalloffProfile, r: f32, blur: f32, opacity: f32) -> f32 {
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return 0.0;
+    }
+    let r = r.max(0.0);
+    if r >= 1.0 {
+        return 0.0;
+    }
+    match profile {
+        FalloffProfile::Rim => {
+            let mid_a = opacity * (80.0 / 255.0);
+            let mid_stop = rim_mid_stop(blur);
+            if r <= mid_stop {
+                let u = if mid_stop > 0.0 { r / mid_stop } else { 1.0 };
+                opacity + (mid_a - opacity) * u
+            } else {
+                let denom = (1.0 - mid_stop).max(1e-6);
+                let u = (r - mid_stop) / denom;
+                mid_a * (1.0 - u)
+            }
+        }
+        FalloffProfile::Soft => {
+            let hold_stop = soft_hold_stop(blur);
+            if r <= hold_stop {
+                opacity
+            } else {
+                let denom = (1.0 - hold_stop).max(1e-6);
+                let u = (r - hold_stop) / denom;
+                opacity * (1.0 - u)
+            }
+        }
+    }
+}
+
 /// SVG / CSS 描画オプション。
 ///
 /// 解像度は SVG では viewBox 固定、CSS では % 指定なのでフィールドを持たない。
@@ -110,7 +173,7 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
 
     // mid_offset: blur=0 で外寄り（中心の不透明領域が広い）、blur=1 で中心寄り。
     // PNG 側 (1.0 - blur*0.8) と意味的に整合させ、% 表記の中間 stop を作る。
-    let mid_pct = ((1.0 - blur * 0.8).clamp(0.05, 0.95) * 100.0).round() as i32;
+    let mid_pct = (rim_mid_stop(blur) * 100.0).round() as i32;
     // softness 軸: alpha 全体に倍率を掛ける（0% は 1.0×alpha_mul、mid は 0.5×alpha_mul、外周 0）。
     let stop0_a = alpha_mul;
     let stop_mid_a = 0.5 * alpha_mul;
@@ -197,7 +260,7 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
     // mid_factor: PNG/SVG と同じ意味で「中間 stop が gradient 終端からどの程度内側か」。
     // blur=0 → mid=end の 95% （中心の不透明領域が広い、急峻に縁が落ちる）
     // blur=1 → mid=end の 20% （中心が点に近く、緩やかに減衰）
-    let mid_factor = (1.0 - blur * 0.8).clamp(0.05, 0.95);
+    let mid_factor = rim_mid_stop(blur);
 
     let [bg_r, bg_g, bg_b, bg_a] = opts.background;
     let bg_css = if bg_a == 0 {
@@ -337,6 +400,27 @@ mod tests {
         let a = render_css(&clusters, &opts);
         let b = render_css(&clusters, &opts);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn falloff_curve_rim_matches_expected_stops() {
+        let blur = 0.5;
+        let opacity = 1.0;
+        assert_eq!(falloff_curve(FalloffProfile::Rim, 0.0, blur, opacity), 1.0);
+        assert_eq!(falloff_curve(FalloffProfile::Rim, 1.0, blur, opacity), 0.0);
+        let mid = rim_mid_stop(blur);
+        let alpha_mid = falloff_curve(FalloffProfile::Rim, mid, blur, opacity);
+        assert!((alpha_mid - (80.0 / 255.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn falloff_curve_soft_holds_then_fades() {
+        let blur = 0.25;
+        let opacity = 0.8;
+        let hold = soft_hold_stop(blur);
+        assert!((falloff_curve(FalloffProfile::Soft, 0.0, blur, opacity) - opacity).abs() < 1e-6);
+        assert!((falloff_curve(FalloffProfile::Soft, hold, blur, opacity) - opacity).abs() < 1e-6);
+        assert_eq!(falloff_curve(FalloffProfile::Soft, 1.0, blur, opacity), 0.0);
     }
 
     #[test]

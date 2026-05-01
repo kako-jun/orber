@@ -21,7 +21,7 @@ const MAX_DIM: u32 = 8192;
 use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
-use orber_core::glyph::{has_glyph, render_glyph_alpha_mask, GlyphFontId};
+use orber_core::glyph::{has_glyph, render_glyph_sdf, GlyphFontId};
 use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, SoftnessPreset, StyleOptions};
 use orber_core::variations::{
@@ -503,7 +503,7 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// per-orb の rng シーケンスも `crates/core::animate::generate_orb_params` と
 /// 同じ ChaCha8Rng + 同じドロー順で再現するので、同じ seed なら同じ
 /// (phase, phi_radius, phi_blur, phi_opacity, cross_axis, style, cluster_idx,
-/// speed_mult) が得られる。
+/// speed_mult, base_angle, rot_dir) が得られる。
 ///
 /// # Float32Array レイアウト
 ///
@@ -529,7 +529,9 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// - `[+8]`: cross_axis (0..1)
 /// - `[+9]`: style_bit (0=rim, 1=soft)
 /// - `[+10]`: speed_mult (1..3)
-/// - `[+11..+16]`: 予約（0 詰め）
+/// - `[+11]`: base_angle (0..2π)
+/// - `[+12]`: rot_speed_signed (±1..±3)
+/// - `[+13..+16]`: 予約（0 詰め）
 #[wasm_bindgen]
 pub fn get_render_data(
     params_js: JsValue,
@@ -680,6 +682,8 @@ fn pack_render_data(
         let style_bit: f32 = if rng.gen::<u32>() & 1 == 0 { 0.0 } else { 1.0 };
         let cluster_idx = pick_weighted(&mut rng, &cluster_weights, total_w);
         let speed_mult: u32 = rng.gen_range(1..=3);
+        let base_angle: f32 = rng.gen_range(0.0..TAU);
+        let rot_dir: f32 = if rng.gen::<u32>() & 1 == 0 { 1.0 } else { -1.0 };
 
         let c = &clusters[cluster_idx.min(clusters.len() - 1)];
 
@@ -695,20 +699,22 @@ fn pack_render_data(
         buf[off + 8] = cross_axis;
         buf[off + 9] = style_bit;
         buf[off + 10] = speed_mult as f32;
-        // [+11..+16] reserved
+        buf[off + 11] = base_angle;
+        buf[off + 12] = speed_mult as f32 * rot_dir;
+        // [+13..+16] reserved
     }
     buf
 }
 
-/// Phase B (#55): Glyph 1 文字の alpha mask を JS 側に返す wasm wrapper。
+/// Glyph 1 文字の SDF texture を JS 側に返す wasm wrapper。
 ///
-/// 実体は [`orber_core::glyph::render_glyph_alpha_mask`] を参照。本関数は
+/// 実体は [`orber_core::glyph::render_glyph_sdf`] を参照。本関数は
 /// その上に `(font, ch, size)` キャッシュ + size validation + JS 型変換だけを
 /// 加える。size は `[16, 1024]` の範囲のみ受理（GUI は 256 固定の想定）。
-/// 戻り値は長さ `size * size` の `Uint8Array`（行優先 alpha 0..255）。
+/// 戻り値は長さ `size * size` の `Uint8Array`（行優先 SDF 0..255）。
 /// 同梱フォントに無い文字は全 0 を返し panic しない。
 #[wasm_bindgen]
-pub fn get_glyph_alpha_mask(ch: &str, size: u32) -> Result<js_sys::Uint8Array, JsError> {
+pub fn get_glyph_sdf(ch: &str, size: u32) -> Result<js_sys::Uint8Array, JsError> {
     // 入力 validation。size は 16..=1024 の範囲を許可（GUI は 256 を使う想定）。
     if !(16..=1024).contains(&size) {
         return Err(JsError::new(&format!(
@@ -716,7 +722,7 @@ pub fn get_glyph_alpha_mask(ch: &str, size: u32) -> Result<js_sys::Uint8Array, J
         )));
     }
     let ch = first_char_of(ch).map_err(err_to_js)?;
-    let bytes = glyph_alpha_mask_bytes(GlyphFontId::NotoSymbols2, ch, size);
+    let bytes = glyph_sdf_bytes(GlyphFontId::NotoSymbols2, ch, size);
     Ok(js_sys::Uint8Array::from(&bytes[..]))
 }
 
@@ -734,30 +740,30 @@ pub fn glyph_supported(ch: &str) -> bool {
 /// HashMap キーは `(font, ch as u32, size)`。
 ///
 /// レビュー S2: worker の `getRenderer` は (w, h) 切替時に renderer を作り直すが
-/// この wasm 側 `glyph_mask_cache` は wasm モジュール再ロード（HMR / 再起動）まで
+/// この wasm 側 `glyph_sdf_cache` は wasm モジュール再ロード（HMR / 再起動）まで
 /// 残る。同一 size + 同一 ch なら毎回同じ bytes が返るので決定論的に問題は
 /// 無いが、開発時 HMR で再ロードしない場合に古いキャッシュエントリが残ったまま
-/// になる点だけ注意。実運用では size=GLYPH_MASK_SIZE=256 に固定なので、
+/// になる点だけ注意。実運用では size=GLYPH_SDF_SIZE=256 に固定なので、
 /// glyph 文字数 ×サイズ 1 通りで メモリ上限は数十エントリ程度。
-type GlyphMaskKey = (GlyphFontId, u32, u32);
+type GlyphSdfKey = (GlyphFontId, u32, u32);
 
 /// レビュー S1: `static mut CACHE` を `OnceLock<WasmSingleThreadCell<HashMap<...>>>`
 /// に置換。`#[allow(static_mut_refs)]` を削除し、`unsafe` も無くなる。
-fn glyph_mask_cache() -> &'static WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>> {
-    static CELL: OnceLock<WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>>> = OnceLock::new();
+fn glyph_sdf_cache() -> &'static WasmSingleThreadCell<HashMap<GlyphSdfKey, Vec<u8>>> {
+    static CELL: OnceLock<WasmSingleThreadCell<HashMap<GlyphSdfKey, Vec<u8>>>> = OnceLock::new();
     CELL.get_or_init(|| WasmSingleThreadCell::new(HashMap::new()))
 }
 
-fn glyph_alpha_mask_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+fn glyph_sdf_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     let key = (font, ch as u32, size);
     {
-        let cache = glyph_mask_cache().borrow_mut();
+        let cache = glyph_sdf_cache().borrow_mut();
         if let Some(v) = cache.get(&key) {
             return v.clone();
         }
     }
-    let v = render_glyph_alpha_mask(font, ch, size);
-    glyph_mask_cache().borrow_mut().insert(key, v.clone());
+    let v = render_glyph_sdf(font, ch, size);
+    glyph_sdf_cache().borrow_mut().insert(key, v.clone());
     v
 }
 
@@ -946,22 +952,22 @@ mod tests {
     }
 
     #[test]
-    fn glyph_alpha_mask_paints_known_char() {
-        // ☆ は同梱 NotoSansSymbols2 にある。alpha が立っているピクセルが
-        // 一定数以上あること（少なくとも全ピクセルの 5% は塗られる想定）。
-        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', 64);
+    fn glyph_sdf_paints_known_char() {
+        // ☆ は同梱 NotoSansSymbols2 にある。inside 側サンプルが一定数以上あること
+        // （少なくとも全ピクセルの 5% は 0.5 超になる想定）。
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', 64);
         assert_eq!(bytes.len(), 64 * 64);
-        let lit = bytes.iter().filter(|&&b| b > 0).count();
+        let lit = bytes.iter().filter(|&&b| b > 127).count();
         assert!(
             lit > 64 * 64 / 20,
-            "rendering ☆ at 64x64 should produce >=5% lit pixels, got {lit}"
+            "rendering ☆ at 64x64 should produce >=5% inside pixels, got {lit}"
         );
     }
 
     #[test]
-    fn glyph_alpha_mask_unknown_char_returns_empty() {
+    fn glyph_sdf_unknown_char_returns_empty() {
         // 絵文字 (Symbols 2 subset 外) は全 0 を返す。
-        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
         assert_eq!(bytes.len(), 32 * 32);
         assert!(bytes.iter().all(|&b| b == 0));
     }

@@ -18,7 +18,7 @@
 use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
-use crate::style::SoftnessPreset;
+use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -166,9 +166,12 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
                 (cx, cy),
                 radius,
                 [r, g, b],
+                blur,
                 alpha_mul,
+                FalloffProfile::Rim,
                 font,
                 ch,
+                0.0,
             );
             continue;
         }
@@ -262,7 +265,7 @@ pub fn render_one_orb(
             // blur=0 で中間 stop が外寄り（不透明領域広い）、blur=1 で中心寄り（点に近い）。
             let mid_a = ((opacity * 80.0).round().clamp(0.0, 255.0)) as u8;
             let mid_color = Color::from_rgba8(r, g, b, mid_a);
-            let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
+            let mid_stop = rim_mid_stop(blur);
             vec![
                 GradientStop::new(0.0, center_color),
                 GradientStop::new(mid_stop, mid_color),
@@ -273,7 +276,7 @@ pub fn render_one_orb(
             // 単純な中心 → 透明グラデーション。中間 stop なし。
             // blur=0 では中心 alpha を保つ範囲が広くなるよう、フェード開始位置を
             // 外側に寄せた中間 stop（同じ alpha）を 1 つ挟む。
-            let hold_stop = (1.0 - blur).clamp(0.05, 0.95);
+            let hold_stop = soft_hold_stop(blur);
             vec![
                 GradientStop::new(0.0, center_color),
                 GradientStop::new(hold_stop, center_color),

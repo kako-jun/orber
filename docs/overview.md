@@ -371,20 +371,20 @@ speed / softness without dropping to the terminal.
   `speed_preset`, `softness_preset`) all defaulting to `""` (= "use the spec
   / Phase A behaviour"). `parse_shape` accepts `"glyph"` in addition to
   `"circle"`.
-- The browser baked Glyph alpha masks via the new
-  `orber_core::glyph::render_glyph_alpha_mask(font, ch, size) -> Vec<u8>`
-  helper. The wasm wrapper exports it as
-  `get_glyph_alpha_mask(ch, size) -> Uint8Array` and caches per
-  `(font_id, ch as u32, size)`. The browser worker uploads the mask exactly
+- The browser now bakes Glyph **signed-distance fields** via
+  `orber_core::glyph::render_glyph_sdf(font, ch, size) -> Vec<u8>`. The wasm
+  wrapper exports it as `get_glyph_sdf(ch, size) -> Uint8Array` and caches per
+  `(font_id, ch as u32, size)`. The browser worker uploads the SDF exactly
   once per `(ch, size)` change to a `gl.R8 / gl.RED` texture and re-uses it
   across the 96-frame `<video>` encode loop; subsequent frames only update
   `u_t`.
-- The fragment shader gains `u_glyph_mask: sampler2D`, `u_shape_id: int`
-  (`0=Circle`, `1=Glyph`), and `u_alpha_mul: float` (the softness preset's
-  alpha multiplier, baked into per-orb opacity). When `u_shape_id == 0` the
-  Phase A radial-gradient rim/soft path is preserved bit-for-bit; the
-  glyph-mask texture lookup is fully gated behind the `u_shape_id == 1`
-  branch, so Circle output is unchanged.
+- The fragment shader gains `u_glyph_sdf: sampler2D`, `u_shape_id: int`
+  (`0=Circle`, `1=Glyph`), and a per-orb rotation lane
+  (`base_angle`, `rot_speed_signed`). Circle still computes `r` from
+  `distance(center, px) / radius`; Glyph computes `r` from the sampled SDF and
+  then feeds the **same rim/soft falloff curve**. Because `rot_speed_signed`
+  is an integer multiple of the existing `speed_mult`, glyph rotation stays
+  loop-closed at `t = 0 ≡ 1`.
 - `get_render_data`'s 16-word header schema reserves words 9 and 10 for
   `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
   per-orb 16-word slots are unchanged.

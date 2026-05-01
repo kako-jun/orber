@@ -111,8 +111,11 @@ Glyphs are rendered from a bundled **Noto Sans Symbols 2 subset** (~177 KB,
 embedded via `include_bytes!`) covering ASCII, digits, punctuation, arrows,
 geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
 and other characters outside this subset are silently skipped instead of
-drawing tofu. Glyph rendering uses outline fill rather than gaussian blur, so
-the `--blur` parameter has no effect in this mode.
+drawing tofu. The glyph outline is converted to a cached **signed-distance
+field**, so `--blur` and `--softness` now affect glyphs with the same visual
+meaning as circle orbs: soft edge falloff, not a hard text fill. Animated
+glyphs also get a seed-derived base angle and continuous per-orb rotation, so
+the batch does not line up as a wall of identically oriented symbols.
 
 > **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
 > Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license

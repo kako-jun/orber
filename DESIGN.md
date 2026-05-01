@@ -288,6 +288,10 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - `compositionstart` / `compositionend` 中は `glyph_supported()` RPC を飛ばさない
 - 同梱フォントに無い文字は小さな muted warning を 1 行出す
 - シンボルピッカーは実際に `glyph_supported()` が `true` な文字だけ残す
+- glyph の描画 backend は alpha mask ではなく **SDF + 共通 falloff**。picker UI は
+  変えず、見た目だけ circle と同じ「ぼけた光」に寄せる
+- 動画中の glyph は seed 由来の `base_angle` で始まり、orb ごとに異なる向き・
+  回転方向・回転速度で連続回転する
 
 ### 生成トリガー
 

@@ -39,12 +39,12 @@
 //!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
 //!   t で 100% 同一フレームが返る。
-//! - 描画は [`crate::orb::render_one_orb`] を per-orb で呼ぶ。背景塗りと
-//!   un-premultiply は animate 側で同等の処理を行う。
+//! - 描画は [`crate::orb::render_one_orb`] / [`crate::glyph::render_glyph_orb`] を
+//!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
 
 use crate::cluster::Cluster;
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
-use crate::style::SoftnessPreset;
+use crate::style::{FalloffProfile, SoftnessPreset};
 use image::RgbaImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -166,6 +166,8 @@ const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 /// せず、画面全体に散らせるためのオフセット。
 /// `speed_mult` は整数倍速度 (1 / 2 / 3)。`cycle_count * speed_mult` も整数
 /// なので `t=1` でループが閉じる。視覚的なバラつきの主因（#53 で 2 → 3 段階）。
+/// `base_angle` / `rot_speed_signed` は glyph 用の回転で、`cycle_count` と同じ
+/// 整数周期に乗せることで `t=0 ≡ t=1` を保つ。
 #[derive(Debug, Clone, Copy)]
 struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
@@ -184,6 +186,10 @@ struct OrbParams {
     cross_axis: f32,
     /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
     speed_mult: u32,
+    /// glyph がある場合の初期回転角 [0, 2π)。
+    base_angle: f32,
+    /// glyph の signed 回転速度。±{1, 2, 3} で、絶対値は speed_mult と一致する。
+    rot_speed_signed: f32,
 }
 
 /// 重み比例の 1 サンプルをもらう抽選器。
@@ -240,6 +246,8 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
             // 混在する。cycle_count {1, 2} × speed_mult {1, 2, 3} で実効周回は
             // {1, 2, 3, 4, 6} の 5 段階。全部整数なのでループ性は保たれる。
             let speed_mult = rng.gen_range(1..=3);
+            let base_angle = rng.gen_range(0.0..TAU);
+            let rot_dir = if rng.gen::<u32>() & 1 == 0 { 1.0 } else { -1.0 };
             OrbParams {
                 phase,
                 phi_radius,
@@ -249,6 +257,8 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
                 cluster_idx,
                 cross_axis,
                 speed_mult,
+                base_angle,
+                rot_speed_signed: speed_mult as f32 * rot_dir,
             }
         })
         .collect()
@@ -263,6 +273,12 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
 fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
     let raw = (f as f32 * t * scale as f32).fract();
     (raw * TAU + phi).sin()
+}
+
+#[inline]
+fn glyph_rotation_angle(cycle: u32, t: f32, base_angle: f32, rot_speed_signed: f32) -> f32 {
+    let turns = (cycle as f32 * rot_speed_signed * t).rem_euclid(1.0);
+    base_angle + turns * TAU
 }
 
 /// 時間 `t` における 1 フレームを描画する。
@@ -438,9 +454,15 @@ pub fn render_frame_with_params(
                     (cx, cy),
                     radius,
                     rgb,
+                    blur,
                     opacity,
+                    match p.style {
+                        OrbStyle::Rim => FalloffProfile::Rim,
+                        OrbStyle::Soft => FalloffProfile::Soft,
+                    },
                     font,
                     ch,
+                    glyph_rotation_angle(cycle, t, p.base_angle, p.rot_speed_signed),
                 );
             }
             _ => {
@@ -933,6 +955,46 @@ mod tests {
                 "speed_mult must be 1, 2, or 3; got {}",
                 q.speed_mult
             );
+        }
+    }
+
+    #[test]
+    fn glyph_rotation_speed_correlates_with_translation_speed() {
+        let p = generate_orb_params(99, 120, &[1.0]);
+        for q in &p {
+            assert!(
+                (q.rot_speed_signed.abs() - q.speed_mult as f32).abs() < 1e-6,
+                "glyph rotation speed must match speed_mult: rot={} speed_mult={}",
+                q.rot_speed_signed,
+                q.speed_mult
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_rotation_direction_is_mixed() {
+        let p = generate_orb_params(7, 64, &[1.0]);
+        let cw = p.iter().filter(|q| q.rot_speed_signed > 0.0).count();
+        let ccw = p.iter().filter(|q| q.rot_speed_signed < 0.0).count();
+        assert!((20..=44).contains(&cw), "clockwise count out of band: cw={cw} ccw={ccw}");
+        assert!((20..=44).contains(&ccw), "counter-clockwise count out of band: cw={cw} ccw={ccw}");
+    }
+
+    #[test]
+    fn glyph_rotation_loop_closure_at_t_one() {
+        let p = generate_orb_params(42, 16, &[1.0]);
+        for cycle in 1..=4 {
+            for q in &p {
+                let a0 = glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed);
+                let a1 = glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed);
+                let delta = (a1 - a0).rem_euclid(TAU);
+                assert!(
+                    delta.abs() < 1e-5 || (TAU - delta).abs() < 1e-5,
+                    "rotation must close at t=1: cycle={cycle} base={} rot={} delta={delta}",
+                    q.base_angle,
+                    q.rot_speed_signed
+                );
+            }
         }
     }
 

@@ -6,8 +6,8 @@
 // (`crates/core::animate::render_frame_with_params`) と同じ数式・同じ per-orb
 // パラメータを使うので、視覚パリティは「最終的な見た目が同じ」が保たれる。
 //
-// shape == "glyph" のときは、`u_glyph_mask` (256x256 alpha texture) を `(cx, cy)`
-// 中心 + 半径 r の正方領域で sampling して alpha を決める。Circle 経路は
+// shape == "glyph" のときは、`u_glyph_sdf` (256x256 SDF texture) を `(cx, cy)`
+// 中心 + 半径 r の正方領域で sampling し、Circle と同じ falloff に流す。Circle 経路は
 // 既存の rim/soft グラデを維持し、`if u_shape_id == 0` 分岐で texture lookup を
 // skip して regression を避ける。
 // softness の alpha_mul は per-orb opacity に乗算（CPU 経路と同式）、
@@ -46,11 +46,10 @@ const MAX_ORBS = 64;
 const HEADER_WORDS = 16;
 const PER_ORB_WORDS = 16;
 
-/// Phase B (#55): Glyph alpha mask テクスチャの解像度（縦 = 横）。
-/// wasm `get_glyph_alpha_mask` の `size` 引数と一致させる必要がある。
-/// 256 は GUI のプレビュー (360x640 / 640x360) でもタイルあたり orb 半径 ~50px
-/// 程度に収まるので、texture サイズ 256 で十分なシャープさを得る。
-export const GLYPH_MASK_SIZE = 256;
+/// Glyph SDF テクスチャの解像度（縦 = 横）。
+/// wasm `get_glyph_sdf` の `size` 引数と一致させる必要がある。
+/// 256 は GUI のプレビュー (360x640 / 640x360) でも十分な精度を保てる。
+export const GLYPH_SDF_SIZE = 256;
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -78,14 +77,37 @@ uniform int u_n_orbs;
 // Phase B (#55):
 uniform float u_alpha_mul;     // softness.alpha_mul (Mid=1.0)
 uniform int u_shape_id;        // 0=Circle, 1=Glyph
-uniform sampler2D u_glyph_mask;
+uniform sampler2D u_glyph_sdf;
 
 // per-orb uniforms (length MAX_ORBS = 64). Float で詰める。
 uniform vec4 u_orb_color[${MAX_ORBS}];     // (r, g, b, weight)
 uniform vec4 u_orb_phase[${MAX_ORBS}];     // (phase, phi_radius, phi_blur, phi_opacity)
 uniform vec4 u_orb_misc[${MAX_ORBS}];      // (cross_axis, style_bit, speed_mult, _)
+uniform vec4 u_orb_rot[${MAX_ORBS}];       // (base_angle, rot_speed_signed, _, _)
 
 float clampf(float x, float a, float b) { return min(max(x, a), b); }
+
+float falloff_curve(float style_bit, float r, float blur, float opacity) {
+  if (opacity <= 0.0 || r >= 1.0) return 0.0;
+  r = max(r, 0.0);
+  if (style_bit < 0.5) {
+    float center_a = opacity;
+    float mid_a = opacity * (80.0 / 255.0);
+    float mid_stop = clampf(1.0 - blur * 0.8, 0.05, 0.95);
+    if (r <= mid_stop) {
+      float u = (mid_stop > 0.0) ? (r / mid_stop) : 1.0;
+      return mix(center_a, mid_a, u);
+    }
+    float denom = max(1.0 - mid_stop, 1e-6);
+    float u = (r - mid_stop) / denom;
+    return mix(mid_a, 0.0, u);
+  }
+  float hold_stop = clampf(1.0 - blur, 0.05, 0.95);
+  if (r <= hold_stop) return opacity;
+  float denom = max(1.0 - hold_stop, 1e-6);
+  float u = (r - hold_stop) / denom;
+  return mix(opacity, 0.0, u);
+}
 
 void main() {
   vec2 px = gl_FragCoord.xy;
@@ -108,6 +130,7 @@ void main() {
     vec4 col = u_orb_color[i];
     vec4 ph = u_orb_phase[i];
     vec4 misc = u_orb_misc[i];
+    vec4 rot = u_orb_rot[i];
 
     float weight = col.w;
     float phase = ph.x;
@@ -117,6 +140,8 @@ void main() {
     float cross_axis = misc.x;
     float style_bit = misc.y;       // 0=rim, 1=soft
     float speed_mult = misc.z;
+    float base_angle = rot.x;
+    float rot_speed_signed = rot.y;
 
     float r_pixels_max = u_base_radius * sqrt(max(weight, 0.0)) * BREATH_RADIUS_MAX_FACTOR;
     float r_normalized = (progress_axis > 0.0) ? (r_pixels_max / progress_axis) : 0.0;
@@ -155,55 +180,26 @@ void main() {
     float cx = nx * u_resolution.x;
     float cy = ny * u_resolution.y;
 
-    // alpha 計算: shape == 0 (Circle) は rim/soft グラデ、shape == 1 (Glyph) は
-    // alpha mask テクスチャ sampling。Phase B (#55)。
+    // alpha 計算: shape == 0 (Circle) は既存の r=distance/radius、shape == 1
+    // (Glyph) は SDF sampling 後に同じ falloff_curve へ流す。
     float alpha = 0.0;
     if (u_shape_id == 1) {
-      // Glyph: sample the alpha texture in a 2*radius square centred on the
-      // orb. The CPU path (build_glyph_path) scales the glyph uniformly into a
-      // 2*radius square, so we build the UV as (px - center) / (2 * radius) + 0.5.
-      // The texture (uploaded with top-left origin via the row-major writer in
-      // build_glyph_alpha_mask) and the screen space (already flipped to
-      // top-left above) agree on Y axis.
-      vec2 d = px - vec2(cx, cy);
-      vec2 uv = d / (2.0 * radius) + 0.5;
+      vec2 local = px - vec2(cx, cy);
+      float angle = base_angle + u_t * rot_speed_signed * TAU * u_cycle;
+      float c = cos(angle);
+      float s = sin(angle);
+      vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
+      vec2 uv = rotated / (2.0 * radius) + 0.5;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-        // R8 internal format -> sample .r for the alpha value (LUMINANCE_ALPHA
-        // does not pair cleanly with WebGL2 + GLSL ES 3.00 sized internal
-        // formats; R8 + .r is the shortest reliable pairing).
-        float mask_a = texture(u_glyph_mask, uv).r;
-        alpha = mask_a * opacity;
+        float sdf01 = texture(u_glyph_sdf, uv).r;
+        float signed_unit = sdf01 * 2.0 - 1.0;
+        float r = 1.0 - signed_unit;
+        alpha = falloff_curve(style_bit, r, blur, opacity);
       }
     } else {
-      // Circle: 既存パス (rim / soft グラデ)。
       float dist = distance(px, vec2(cx, cy));
-      float dnorm = dist / radius;        // 0..1 が orb 内、>1 は外
-      if (dnorm < 1.0) {
-        float center_a = opacity;
-        float mid_a = opacity * (80.0 / 255.0);
-        if (style_bit < 0.5) {
-          // rim: 3-stop
-          float mid_stop = clampf(1.0 - blur * 0.8, 0.05, 0.95);
-          if (dnorm <= mid_stop) {
-            float u = (mid_stop > 0.0) ? (dnorm / mid_stop) : 1.0;
-            alpha = mix(center_a, mid_a, u);
-          } else {
-            float denom = max(1.0 - mid_stop, 1e-6);
-            float u = (dnorm - mid_stop) / denom;
-            alpha = mix(mid_a, 0.0, u);
-          }
-        } else {
-          // soft: 2-stop (center .. hold_stop は center_a 一定 → hold_stop..1 で 0 へ)
-          float hold_stop = clampf(1.0 - blur, 0.05, 0.95);
-          if (dnorm <= hold_stop) {
-            alpha = center_a;
-          } else {
-            float denom = max(1.0 - hold_stop, 1e-6);
-            float u = (dnorm - hold_stop) / denom;
-            alpha = mix(center_a, 0.0, u);
-          }
-        }
-      }
+      float r = dist / radius;
+      alpha = falloff_curve(style_bit, r, blur, opacity);
     }
 
     if (alpha > 0.0) {
@@ -226,13 +222,13 @@ export interface GlRenderer {
   /** wasm の get_render_data 出力を 1 回だけ uniform に流す。 */
   setRenderData(data: Float32Array): void;
   /**
-   * Phase B (#55): Glyph alpha mask テクスチャをアップロードする。
-   * `mask` は長さ `size * size` の `Uint8Array`（各バイトが alpha 0..255）。
+   * Glyph SDF テクスチャをアップロードする。
+   * `mask` は長さ `size * size` の `Uint8Array`（各バイトが SDF 0..255）。
    * shape == "glyph" のときに必須。Circle のときは呼ばなくても安全だが、
    * 既存テクスチャを上書きしても害はない。同じ glyph + size なら呼び出し側で
    * キャッシュして再 upload を避けることを推奨。
    */
-  setGlyphMask(mask: Uint8Array, size: number): void;
+  setGlyphSdf(mask: Uint8Array, size: number): void;
   /** u_t を書き換えて 1 フレーム描画する。 */
   renderFrame(t: number): void;
   /** リソース解放（canvas を捨てるとき）。 */
@@ -307,16 +303,17 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     nOrbs: gl.getUniformLocation(prog, 'u_n_orbs'),
     alphaMul: gl.getUniformLocation(prog, 'u_alpha_mul'),
     shapeId: gl.getUniformLocation(prog, 'u_shape_id'),
-    glyphMask: gl.getUniformLocation(prog, 'u_glyph_mask'),
+    glyphMask: gl.getUniformLocation(prog, 'u_glyph_sdf'),
     orbColor: gl.getUniformLocation(prog, 'u_orb_color'),
     orbPhase: gl.getUniformLocation(prog, 'u_orb_phase'),
     orbMisc: gl.getUniformLocation(prog, 'u_orb_misc'),
+    orbRot: gl.getUniformLocation(prog, 'u_orb_rot'),
   };
 
-  // Phase B (#55): u_glyph_mask は texture unit 0 に固定。Circle 経路でも
+  // u_glyph_sdf は texture unit 0 に固定。Circle 経路でも
   // shader 側で `if u_shape_id == 0` で sampling を skip するため、初期は
   // 空 (1x1 黒) のテクスチャをバインドしておけば Circle 経路で uninitialized
-  // sampler 警告が出ない。setGlyphMask が呼ばれたら中身が差し替わる。
+  // sampler 警告が出ない。setGlyphSdf が呼ばれたら中身が差し替わる。
   const glyphTex = gl.createTexture()!;
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, glyphTex);
@@ -346,6 +343,7 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
   const colorBuf = new Float32Array(MAX_ORBS * 4);
   const phaseBuf = new Float32Array(MAX_ORBS * 4);
   const miscBuf = new Float32Array(MAX_ORBS * 4);
+  const rotBuf = new Float32Array(MAX_ORBS * 4);
 
   // blend は使わない（fragment 内で per-orb Source-Over を完結させるため、
   // GL の blend で重ねると 2 重ブレンドになる）。
@@ -402,6 +400,7 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     colorBuf.fill(0);
     phaseBuf.fill(0);
     miscBuf.fill(0);
+    rotBuf.fill(0);
     for (let i = 0; i < nOrbs; i++) {
       const off = HEADER_WORDS + PER_ORB_WORDS * i;
       // color rgb + weight
@@ -419,22 +418,27 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
       miscBuf[i * 4 + 1] = data[off + 9];
       miscBuf[i * 4 + 2] = data[off + 10];
       miscBuf[i * 4 + 3] = 0;
+      rotBuf[i * 4 + 0] = data[off + 11];
+      rotBuf[i * 4 + 1] = data[off + 12];
+      rotBuf[i * 4 + 2] = 0;
+      rotBuf[i * 4 + 3] = 0;
     }
     gl!.uniform4fv(uLoc.orbColor, colorBuf);
     gl!.uniform4fv(uLoc.orbPhase, phaseBuf);
     gl!.uniform4fv(uLoc.orbMisc, miscBuf);
+    gl!.uniform4fv(uLoc.orbRot, rotBuf);
   }
 
-  function setGlyphMask(mask: Uint8Array, size: number): void {
+  function setGlyphSdf(mask: Uint8Array, size: number): void {
     if (mask.length !== size * size) {
       throw new Error(
-        `glyph mask length mismatch: got ${mask.length}, expected ${size * size}`,
+        `glyph sdf length mismatch: got ${mask.length}, expected ${size * size}`,
       );
     }
     gl!.activeTexture(gl!.TEXTURE0);
     gl!.bindTexture(gl!.TEXTURE_2D, glyphTex);
     // R8 / RED 1 ch でアップロード。`UNPACK_FLIP_Y_WEBGL` は default false で
-    // OK。CPU 経路 (build_glyph_alpha_mask) は左上原点で行優先に書き出している
+    // OK。CPU 経路 (render_glyph_sdf) は左上原点で行優先に書き出している
     // ので、shader 側の UV (top-left = (0,0)) と一致する。
     gl!.pixelStorei(gl!.UNPACK_ALIGNMENT, 1);
     gl!.texImage2D(
@@ -466,5 +470,5 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     gl!.deleteProgram(prog);
   }
 
-  return { setResolution, setRenderData, setGlyphMask, renderFrame, dispose };
+  return { setResolution, setRenderData, setGlyphSdf, renderFrame, dispose };
 }

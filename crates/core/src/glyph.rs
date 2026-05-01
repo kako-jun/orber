@@ -20,9 +20,16 @@
 //! - センタリングは `glyph_bounding_box` の中央を orb 中心に合わせ、半径 × 2 の正方領域に
 //!   収まるよう em-square 基準でスケールする
 
-use std::sync::OnceLock;
+use crate::style::{falloff_curve, FalloffProfile};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform};
 use ttf_parser::{Face, OutlineBuilder, Rect};
+
+/// Web / CLI / core が共有する canonical Glyph SDF texture size。
+pub const DEFAULT_GLYPH_SDF_SIZE: u32 = 256;
+const GLYPH_SDF_RADIUS_FACTOR: f32 = 0.45;
+const GLYPH_SDF_MAX_DIST_FACTOR: f32 = 0.06;
 
 /// orber-core が同梱するフォント識別子。
 ///
@@ -174,27 +181,14 @@ pub fn build_glyph_path(
     builder.pb.finish()
 }
 
-/// Phase B (#55): Glyph 1 文字のアウトラインを `size × size` の正方領域に
-/// 中心揃えで fill し、alpha チャネルだけを `Vec<u8>` で返す。
-///
-/// 用途: WebGL2 fragment shader が `shape == "glyph"` のときに texture
-/// sampling で orb の alpha を決めるためのプリベイク済みマスク。`R8` ないし
-/// `RGBA(alpha のみ意味)` として GPU にアップロードする想定。
-///
-/// `size` は `1..=4096` の範囲を想定（呼び出し側で validate する）。
-/// 同梱フォントに収録されていない文字を渡すと全 0 を返す（panic しない）。
-/// 生成は決定的（同じ入力なら毎回同じバイト列）。キャッシュは呼び出し側で行う。
-pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+fn render_glyph_binary_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     let s = size.max(1);
     let mut pix = match Pixmap::new(s, s) {
         Some(p) => p,
         None => return vec![0u8; (s as usize) * (s as usize)],
     };
     let center = (s as f32 * 0.5, s as f32 * 0.5);
-    // 余白を残しつつ正方領域いっぱいに描く: 半径は size の 0.45 倍。
-    // build_glyph_path は半径 × 2 の正方領域に等比スケールするので、
-    // radius = size * 0.45 にすれば文字の bbox 最大辺が 0.9 * size に揃う。
-    let radius = (s as f32) * 0.45;
+    let radius = (s as f32) * GLYPH_SDF_RADIUS_FACTOR;
     let path = match build_glyph_path(font, ch, center, radius) {
         Some(p) => p,
         None => return vec![0u8; (s as usize) * (s as usize)],
@@ -211,8 +205,6 @@ pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8
         Transform::identity(),
         None,
     );
-    // tiny-skia は premultiplied alpha だが、white(255) を fill しているので
-    // alpha と RGB が一致する。alpha チャネルだけ抽出する。
     let raw = pix.data();
     let mut out = Vec::with_capacity((s as usize) * (s as usize));
     for px in raw.chunks_exact(4) {
@@ -221,19 +213,176 @@ pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8
     out
 }
 
+fn edt_1d(f: &[f32]) -> Vec<f32> {
+    let n = f.len();
+    let mut d = vec![0.0; n];
+    let mut v = vec![0usize; n];
+    let mut z = vec![0.0f32; n + 1];
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    for q in 1..n {
+        let qf = q as f32;
+        let mut s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2)))
+            / (2.0 * (qf - v[k] as f32));
+        while k > 0 && s <= z[k] {
+            k -= 1;
+            s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2)))
+                / (2.0 * (qf - v[k] as f32));
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f32::INFINITY;
+    }
+    k = 0;
+    for (q, out) in d.iter_mut().enumerate() {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let dx = q as f32 - v[k] as f32;
+        *out = dx * dx + f[v[k]];
+    }
+    d
+}
+
+fn edt_2d(features: &[bool], size: usize) -> Vec<f32> {
+    const INF: f32 = 1.0e12;
+    let mut tmp = vec![0.0f32; size * size];
+    for x in 0..size {
+        let mut col = vec![INF; size];
+        for y in 0..size {
+            if features[y * size + x] {
+                col[y] = 0.0;
+            }
+        }
+        let dist = edt_1d(&col);
+        for y in 0..size {
+            tmp[y * size + x] = dist[y];
+        }
+    }
+    let mut out = vec![0.0f32; size * size];
+    for y in 0..size {
+        let row = &tmp[y * size..(y + 1) * size];
+        let dist = edt_1d(row);
+        out[y * size..(y + 1) * size].copy_from_slice(&dist);
+    }
+    out
+}
+
+/// Glyph 1 文字の signed-distance field を `size × size` の 8-bit R texture として返す。
+///
+/// 値域は `[-1, +1]` を `[0, 255]` に写したもの。0.5 (= 128 前後) が輪郭、
+/// 1.0 側ほど内側、0.0 側ほど外側を表す。距離は glyph 全半径ではなく
+/// `size * GLYPH_SDF_MAX_DIST_FACTOR` の「エッジ近傍 falloff 幅」で正規化する。
+/// これにより `r = 1 - signed_unit` が「edge からどれだけ内側か」の共通尺度になる。
+pub fn render_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+    let s = size.max(1) as usize;
+    let mask = render_glyph_binary_mask(font, ch, size);
+    if mask.iter().all(|&b| b == 0) {
+        return vec![0u8; s * s];
+    }
+    let inside: Vec<bool> = mask.iter().map(|&b| b >= 128).collect();
+    let outside: Vec<bool> = inside.iter().map(|&on| !on).collect();
+    let dist_to_inside = edt_2d(&inside, s);
+    let dist_to_outside = edt_2d(&outside, s);
+    let norm = (size as f32 * GLYPH_SDF_MAX_DIST_FACTOR).max(1.0);
+    let mut out = Vec::with_capacity(s * s);
+    for i in 0..(s * s) {
+        let signed_px = if inside[i] {
+            dist_to_outside[i].sqrt() - 0.5
+        } else {
+            0.5 - dist_to_inside[i].sqrt()
+        };
+        let signed_unit = (signed_px / norm).clamp(-1.0, 1.0);
+        let byte = ((signed_unit * 0.5 + 0.5) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        out.push(byte);
+    }
+    out
+}
+
+type GlyphSdfKey = (GlyphFontId, u32, u32);
+
+fn glyph_sdf_cache() -> &'static Mutex<HashMap<GlyphSdfKey, Arc<[u8]>>> {
+    static CELL: OnceLock<Mutex<HashMap<GlyphSdfKey, Arc<[u8]>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Arc<[u8]> {
+    let key = (font, ch as u32, size);
+    if let Some(v) = glyph_sdf_cache().lock().expect("glyph sdf cache poisoned").get(&key) {
+        return Arc::clone(v);
+    }
+    let sdf: Arc<[u8]> = Arc::from(render_glyph_sdf(font, ch, size));
+    glyph_sdf_cache()
+        .lock()
+        .expect("glyph sdf cache poisoned")
+        .insert(key, Arc::clone(&sdf));
+    sdf
+}
+
+fn sample_sdf_bilinear(bytes: &[u8], size: usize, u: f32, v: f32) -> f32 {
+    let x = u.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
+    let y = v.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(size - 1);
+    let y1 = (y0 + 1).min(size - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let idx = |xx: usize, yy: usize| yy * size + xx;
+    let p00 = bytes[idx(x0, y0)] as f32 / 255.0;
+    let p10 = bytes[idx(x1, y0)] as f32 / 255.0;
+    let p01 = bytes[idx(x0, y1)] as f32 / 255.0;
+    let p11 = bytes[idx(x1, y1)] as f32 / 255.0;
+    let top = p00 + (p10 - p00) * tx;
+    let bottom = p01 + (p11 - p01) * tx;
+    top + (bottom - top) * ty
+}
+
+fn blend_source_over(pixmap: &mut Pixmap, x: u32, y: u32, rgb: [u8; 3], alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return;
+    }
+    let width = pixmap.width() as usize;
+    let idx = ((y as usize) * width + x as usize) * 4;
+    let dst = &mut pixmap.data_mut()[idx..idx + 4];
+    let dst_a = dst[3] as f32 / 255.0;
+    let one_minus_a = 1.0 - alpha;
+    let src_r = rgb[0] as f32 / 255.0 * alpha;
+    let src_g = rgb[1] as f32 / 255.0 * alpha;
+    let src_b = rgb[2] as f32 / 255.0 * alpha;
+    let dst_r = dst[0] as f32 / 255.0;
+    let dst_g = dst[1] as f32 / 255.0;
+    let dst_b = dst[2] as f32 / 255.0;
+    dst[0] = ((src_r + dst_r * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[1] = ((src_g + dst_g * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[2] = ((src_b + dst_b * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[3] = ((alpha + dst_a * one_minus_a) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+}
+
 /// 単一の Glyph orb を pixmap に SourceOver で重ねる。
 ///
-/// `radius` は orb の見た目半径相当（円 orb と揃える）。`opacity` ∈ [0, 1] は
-/// 中心の不透明度（softness / animate 軸で揺らされた最終値）。`blur` パラメータは
-/// グリフでは使わない（グリフはアウトライン fill で表現するため）。
+/// Circle と同じ `falloff_curve` を使うため、入力は `blur` / `style` / `opacity`
+/// をそのまま受ける。`rotation` は glyph テクスチャ空間に対する回転角 (rad)。
+#[allow(clippy::too_many_arguments)]
 pub fn render_glyph_orb(
     pixmap: &mut Pixmap,
     center: (f32, f32),
     radius: f32,
     rgb: [u8; 3],
+    blur: f32,
     opacity: f32,
+    profile: FalloffProfile,
     font: GlyphFontId,
     ch: char,
+    rotation: f32,
 ) {
     if radius <= 0.0 {
         return;
@@ -242,25 +391,40 @@ pub fn render_glyph_orb(
     if opacity <= 0.0 {
         return;
     }
-    let Some(path) = build_glyph_path(font, ch, center, radius) else {
+    let sdf = cached_glyph_sdf(font, ch, DEFAULT_GLYPH_SDF_SIZE);
+    if sdf.iter().all(|&b| b == 0) {
         return;
-    };
-
-    let alpha_u8 = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
-    let [r, g, b] = rgb;
-    let paint = Paint {
-        shader: Shader::SolidColor(Color::from_rgba8(r, g, b, alpha_u8)),
-        anti_alias: true,
-        ..Default::default()
-    };
-
-    pixmap.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    }
+    let size = DEFAULT_GLYPH_SDF_SIZE as usize;
+    let (cx, cy) = center;
+    let cos_a = rotation.cos();
+    let sin_a = rotation.sin();
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let min_x = (cx - radius).floor().max(0.0) as u32;
+    let min_y = (cy - radius).floor().max(0.0) as u32;
+    let max_x = (cx + radius).ceil().min(width as f32) as u32;
+    let max_y = (cy + radius).ceil().min(height as f32) as u32;
+    for y in min_y..max_y {
+        let py = y as f32 + 0.5;
+        for x in min_x..max_x {
+            let px = x as f32 + 0.5;
+            let dx = px - cx;
+            let dy = py - cy;
+            let rx = cos_a * dx - sin_a * dy;
+            let ry = sin_a * dx + cos_a * dy;
+            let u = rx / (2.0 * radius) + 0.5;
+            let v = ry / (2.0 * radius) + 0.5;
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let sdf01 = sample_sdf_bilinear(&sdf, size, u, v);
+            let signed_unit = sdf01 * 2.0 - 1.0;
+            let r = 1.0 - signed_unit;
+            let alpha = falloff_curve(profile, r, blur, opacity);
+            blend_source_over(pixmap, x, y, rgb, alpha);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,9 +472,12 @@ mod tests {
             (32.0, 32.0),
             20.0,
             [255, 255, 255],
+            0.5,
             1.0,
+            FalloffProfile::Rim,
             GlyphFontId::NotoSymbols2,
             '☆',
+            0.0,
         );
         let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(
@@ -327,9 +494,12 @@ mod tests {
             (8.0, 8.0),
             0.0,
             [255, 255, 255],
+            0.5,
             1.0,
+            FalloffProfile::Rim,
             GlyphFontId::NotoSymbols2,
             '☆',
+            0.0,
         );
         // 何も描かれていないことを確認。
         let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
@@ -344,22 +514,24 @@ mod tests {
             (32.0, 32.0),
             20.0,
             [255, 255, 255],
+            0.5,
             0.0,
+            FalloffProfile::Rim,
             GlyphFontId::NotoSymbols2,
             '☆',
+            0.0,
         );
         let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
         assert_eq!(lit, 0, "opacity=0 must not paint anything");
     }
 
-    // レビュー S3: render_glyph_alpha_mask の単体テスト 3 件
-    // (Phase B WebGL 経路で texture sampling に使われるバイト列の保証)。
+    // Glyph SDF の単体テスト群。WebGL / CPU の両 glyph 経路で使う canonical texture。
 
     /// size を変えれば長さが size² になる。基本契約。
     #[test]
-    fn glyph_alpha_mask_size_matches_input() {
+    fn glyph_sdf_size_matches_input() {
         for size in [16u32, 32, 64, 128, 256] {
-            let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', size);
+            let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', size);
             assert_eq!(
                 bytes.len(),
                 (size as usize) * (size as usize),
@@ -369,20 +541,18 @@ mod tests {
         }
     }
 
-    /// 既知文字 ☆ で alpha 非ゼロ ≥ 32px (5% 以上塗られる)。
-    /// shader 側で texture(...).r > 0 のピクセルが orb の見た目を作る。
+    /// 既知文字 ☆ で inside 側のサンプルが一定数以上あること。
     #[test]
-    fn glyph_alpha_mask_known_char_has_lit_pixels() {
-        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', 64);
-        let lit = bytes.iter().filter(|&&b| b > 0).count();
+    fn glyph_sdf_known_char_has_inside_pixels() {
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', 64);
+        let lit = bytes.iter().filter(|&&b| b > 127).count();
         assert!(
             lit >= 32,
-            "rendering ☆ at 64x64 should produce >=32 lit pixels, got {lit}"
+            "rendering ☆ at 64x64 should produce >=32 inside pixels, got {lit}"
         );
-        // 5% 以上の閾値も併せて確認（より厳しい下限）。
         assert!(
             lit > 64 * 64 / 20,
-            "rendering ☆ at 64x64 should produce >=5% lit pixels, got {lit}"
+            "rendering ☆ at 64x64 should produce >=5% inside pixels, got {lit}"
         );
     }
 
@@ -390,12 +560,19 @@ mod tests {
     /// tofu 出力ではなく「何も描かない」が Phase A の方針。WebGL 経路でも
     /// 同じ契約を保つことで、shape='glyph' + 未収録文字 = 完全透明 orb になる。
     #[test]
-    fn glyph_alpha_mask_unknown_char_returns_empty_or_zero() {
-        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
+    fn glyph_sdf_unknown_char_returns_empty_or_zero() {
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
         assert_eq!(bytes.len(), 32 * 32);
         assert!(
             bytes.iter().all(|&b| b == 0),
-            "unknown char must produce all-zero alpha mask"
+            "unknown char must produce all-zero sdf"
         );
+    }
+
+    #[test]
+    fn glyph_sdf_has_both_inside_and_outside_regions() {
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', 64);
+        assert!(bytes.iter().any(|&b| b < 120), "must contain outside samples");
+        assert!(bytes.iter().any(|&b| b > 136), "must contain inside samples");
     }
 }
