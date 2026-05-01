@@ -48,16 +48,23 @@ export async function decodeImageToRgb(file: File): Promise<DecodedImage> {
   try {
     const longest = Math.max(bitmap.width, bitmap.height);
     const scale = Math.min(1, KMEANS_TARGET_LONG_EDGE / longest);
-    const dw = Math.max(1, Math.round(bitmap.width * scale));
-    const dh = Math.max(1, Math.round(bitmap.height * scale));
+    // review S2: 極端アスペクト (10000×100 のパノラマ等) で短辺が 1-3 px に
+    // 潰れて kmeans サンプル数が枯れるのを防ぐ。8 px は kmeans K=5 のとき
+    // サンプル枯渇の安全側下限。
+    const MIN_EDGE = 8;
+    const dw = Math.max(MIN_EDGE, Math.round(bitmap.width * scale));
+    const dh = Math.max(MIN_EDGE, Math.round(bitmap.height * scale));
 
     const canvas = document.createElement('canvas');
     canvas.width = dw;
     canvas.height = dh;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('canvas 2d context unavailable');
-    // drawImage の dw/dh 引数で縮小描画する。canvas 2D のリサンプリングは
-    // imageSmoothingQuality='medium' 既定で高速・十分な品質。
+    // review S1: imageSmoothingQuality の既定は実装依存 (Chromium 'low')。
+    // kmeans 入力としては low でもサンプル分布はほぼ保たれるが、明示的に
+    // 'medium' を立てて将来のブラウザ既定変更に左右されないようにする。
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'medium';
     ctx.drawImage(bitmap, 0, 0, dw, dh);
     const imgData = ctx.getImageData(0, 0, dw, dh);
     const px = dw * dh;
