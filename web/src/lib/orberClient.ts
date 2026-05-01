@@ -142,6 +142,47 @@ export async function workerInit(): Promise<void> {
   await call<void>({ kind: 'init' });
 }
 
+/** in-flight な RPC が 1 つでもあれば true。 */
+export function hasInFlight(): boolean {
+  return pending.size > 0;
+}
+
+/**
+ * #108: Worker を物理的に terminate して新しい worker で再初期化する。
+ *
+ * `runBatch` 連打時に旧 run の wasm 同期呼び出し（generate_one_at_index）と
+ * WebCodecs encode ループを **本当に止める** 唯一の確実な手段。論理的中断
+ * （runGen ガード）では旧 12 個が完走するまで CPU が二重に走り、新 run の
+ * 開始が遅延する。
+ *
+ * - pending は全て reject し、呼び出し側の await に例外を流す
+ *   （呼び出し側は myGen ガードで吸収する）
+ * - worker.terminate() で wasm 同期処理含めて殺す
+ * - 新しい worker を立てて wasm を再初期化（数百 ms）
+ *
+ * 注意: terminate 後は worker 側の cachedSource も消えるので、呼び出し側で
+ * `lastSourceRef = null` 等のキャッシュ無効化を行うこと（onWorkerCrash の
+ * 経路と同じ）。
+ */
+export async function terminateAndRespawn(): Promise<void> {
+  if (!worker) {
+    await workerInit();
+    return;
+  }
+  for (const [, p] of pending) {
+    p.reject(new Error('worker terminated for new run'));
+  }
+  pending.clear();
+  try {
+    worker.terminate();
+  } catch (err) {
+    console.error('orber worker terminate failed', err);
+  }
+  worker = null;
+  // 連打時のみ払うコスト。新 worker を立てて wasm 再初期化まで終わらせる。
+  await workerInit();
+}
+
 /**
  * 入力画像の RGB バッファを Worker にキャッシュ。
  * 以降の `workerGenerateOne` / `workerAnimateOne` はこのキャッシュを使う。

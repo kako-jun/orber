@@ -2,7 +2,9 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-j
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
+  hasInFlight,
   onWorkerCrash,
+  terminateAndRespawn,
   workerAnimateOne,
   workerGenerateOne,
   workerInit,
@@ -205,6 +207,28 @@ export default function Studio() {
 
     runGen += 1;
     const myGen = runGen;
+
+    // #108: 前の run が走っている最中なら worker を物理的に殺して立て直す。
+    // 論理的中断（myGen ガード）だけでは旧 12 個の wasm 同期呼び出しと
+    // WebCodecs encode ループが完走するまで止まらず、CPU が二重に走り
+    // 新 run の開始が遅延する。runGen は既に進めた後なので、reject で
+    // 投げられる旧 run の例外は catch 内の myGen ガードで安全に吸収される。
+    // 連打しなければ通常コストはかからない（hasInFlight=false で no-op）。
+    if (hasInFlight()) {
+      try {
+        await terminateAndRespawn();
+      } catch (e) {
+        if (myGen !== runGen) return;
+        clearTiles();
+        setErrorMsg(String(e));
+        setPhase('error');
+        return;
+      }
+      if (myGen !== runGen) return;
+      // worker を作り直したので worker 側の cachedSource も消えている。
+      // 次の workerSetSource を再送させる（onWorkerCrash 経路と同じ後始末）。
+      lastSourceRef = null;
+    }
 
     seedSkeletons();
     setErrorMsg('');
