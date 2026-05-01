@@ -50,6 +50,14 @@ export const STRINGS = {
   decoding: { ja: '画像をデコード中…', en: 'Decoding image…' },
   generating: { ja: '生成中…', en: 'Generating…' },
   animating: { ja: '動画化中…', en: 'Animating…' },
+  // #124: 生成完了後、進捗行を空白にせず長押し拡大の操作ヒントとして再利用する。
+  // 用語は DESIGN.md §4 PreviewOverlay と既存コード（LONG_PRESS_MS / isLongPress）に
+  // 合わせて "Long-press" / 「長押し」を採用。"Long tap" は touch を強く示唆するため
+  // マウス/トラックパッドでも動く現実装には不適。
+  longPressEnlargeHint: {
+    ja: '長押しで拡大',
+    en: 'Long-press to enlarge',
+  },
   videoPendingBadge: { ja: '動画化中', en: 'Animating' },
   animateError: {
     ja: '動画生成に失敗したタイルがあります',

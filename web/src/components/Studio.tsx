@@ -924,8 +924,12 @@ export default function Studio() {
       </Show>
 
       {/* #121: 進捗行は常に同じ高さを確保し、phase 完了後も消さない（消すと
-          下のサムネイルグリッドがガクッと上に詰まる）。done/idle/error では
-          中身を空にして高さだけ残し、テキストはセンタリングする。 */}
+          下のサムネイルグリッドがガクッと上に詰まる）。idle/error では中身を
+          空にして高さだけ残し、テキストはセンタリングする。
+          #124: 生成完了 (phase === 'done') 時のみ、空白の代わりに「長押しで拡大」
+          の操作ヒントを表示し、進捗行を導線として再利用する。error の時は
+          下のエラーバナーと意味的に衝突するため hint を出さない（前回タイルが
+          残っていても「いま失敗した画像」のヒントだとユーザーが誤認するため）。 */}
       <Show
         when={
           phase() === 'decoding' ||
@@ -943,6 +947,9 @@ export default function Studio() {
             {t('generating')} {progress()} / {batchN()}
           </Show>
           <Show when={phase() === 'animating'}>{t('animating')}</Show>
+          <Show when={phase() === 'done' && tiles().length > 0}>
+            {t('longPressEnlargeHint')}
+          </Show>
         </p>
       </Show>
 
