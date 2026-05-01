@@ -40,6 +40,7 @@
 /// uniform 配列の上限。`crates/core::animate::MAX_ORB_COUNT = 1024` ほど大きく
 /// する必要はなく、GUI 経路では `random_batch_specs` の count_range
 /// (COUNT_MAX = 50) が事実上の上限。バッファ余裕を持たせて 64 とする。
+// SYNC WITH crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS
 const MAX_ORBS = 64;
 
 const HEADER_WORDS = 16;
@@ -88,8 +89,10 @@ float clampf(float x, float a, float b) { return min(max(x, a), b); }
 
 void main() {
   vec2 px = gl_FragCoord.xy;
-  // gl_FragCoord は左下原点。CPU 経路は左上原点 (image::RgbaImage) なので
-  // y を反転して合わせる。
+  // N4: shader-internal comments are kept English for RenderDoc / Spector.js
+  // capture readability (multibyte source comments may not survive extraction).
+  // gl_FragCoord origin is bottom-left, but CPU path uses top-left
+  // (image::RgbaImage). Flip y to match.
   px.y = u_resolution.y - px.y;
 
   // 進行軸長 (LR/RL=width, TB/BT=height)
@@ -121,8 +124,8 @@ void main() {
 
     float advance_steps = fract(u_cycle * speed_mult * u_t);
     float raw = phase * extent + advance_steps * extent;
-    // GLSL の mod() は負を出さない (mod(x, y) = x - y * floor(x/y))。Rust の
-    // rem_euclid と一致するので、Rust 側と同じ pos が出る。
+    // GLSL mod() never returns a negative value (mod(x, y) = x - y * floor(x/y)),
+    // matching the Rust rem_euclid result so the resulting pos is identical to the CPU path.
     float pos = mod(raw, extent) - r_normalized;
 
     float nx, ny;
@@ -156,17 +159,18 @@ void main() {
     // alpha mask テクスチャ sampling。Phase B (#55)。
     float alpha = 0.0;
     if (u_shape_id == 1) {
-      // Glyph: orb 中心 (cx, cy) を中心に半径 radius の正方領域で texture を sample。
-      // CPU 経路 (build_glyph_path) は半径 × 2 の正方領域に等比スケールするので、
-      // local 座標 (px - center) / (2 * radius) + 0.5 で UV を作る。Y 軸はテクスチャ
-      // (左下原点想定だが UNPACK_FLIP_Y_WEBGL=true でアップロード済み = top-left
-      // 原点扱い) と画面空間 (top-left 原点に補正済み) を一致させてある。
+      // Glyph: sample the alpha texture in a 2*radius square centred on the
+      // orb. The CPU path (build_glyph_path) scales the glyph uniformly into a
+      // 2*radius square, so we build the UV as (px - center) / (2 * radius) + 0.5.
+      // The texture (uploaded with top-left origin via the row-major writer in
+      // build_glyph_alpha_mask) and the screen space (already flipped to
+      // top-left above) agree on Y axis.
       vec2 d = px - vec2(cx, cy);
       vec2 uv = d / (2.0 * radius) + 0.5;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-        // R8 内部フォーマットでアップロードしているので .r で alpha 値を取る
-        // (LUMINANCE_ALPHA を使うと WebGL2 + GLSL ES 3.00 で sized internal
-        //  format との組み合わせが面倒。R8 + .r が最も短く確実)。
+        // R8 internal format -> sample .r for the alpha value (LUMINANCE_ALPHA
+        // does not pair cleanly with WebGL2 + GLSL ES 3.00 sized internal
+        // formats; R8 + .r is the shortest reliable pairing).
         float mask_a = texture(u_glyph_mask, uv).r;
         alpha = mask_a * opacity;
       }

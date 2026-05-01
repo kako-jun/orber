@@ -1005,7 +1005,8 @@ export default function Studio() {
             (shape() === 'glyph' && glyphChar().trim() === '')
           }
           aria-label={t('gachaLabel')}
-          title={t('gachaTitle')}
+          // N5: ガチャ枚数は BATCH_TILE_COUNT を文字列に注入する（マジックナンバー禁止）。
+          title={t('gachaTitle', { n: BATCH_TILE_COUNT })}
           class={
             'inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded ' +
             'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
@@ -1186,7 +1187,8 @@ export default function Studio() {
                         の二重指定はスクリーンリーダーで二重読みになるので、
                         表示テキストだけ残して aria-label を外す。 */}
                     <span class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-xs tracking-wide text-fg">
-                      {t('videoPendingBadge')}…
+                      {/* N2: "…" は strings.ts 側に内包済み。Studio.tsx で重ねない。 */}
+                      {t('videoPendingBadge')}
                     </span>
                     {/* #95: フレーム単位の mp4 化進捗をリングで表示。
                         accent color なし、currentColor + text-fgMuted で淡く

@@ -45,6 +45,7 @@ const MAX_ORB_COUNT: usize = 1024;
 /// shader アップロード時に黙って切り詰められるのを防ぐ。GUI の
 /// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
 /// 将来 GUI の COUNT_MAX を増やす場合は両方同時に上げること。
+// SYNC WITH web/src/lib/orberGl.ts::MAX_ORBS
 const GL_RENDERER_MAX_ORBS: usize = 64;
 
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
@@ -626,6 +627,8 @@ pub fn get_render_data(
 /// core 側 `generate_orb_params` を呼び出さずに同じシーケンスを **再現** する
 /// （core の `OrbParams` は private struct で wasm から読めないため）。順序を
 /// 1 つでも変えると同じ seed でも別の orb 列になり、視覚パリティが壊れる。
+// TODO(orber#future): pack_render_data の引数が 10 個に達した。Phase C で
+// orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
 #[allow(clippy::too_many_arguments)]
 fn pack_render_data(
     clusters: &[Cluster],
@@ -695,21 +698,13 @@ fn pack_render_data(
     buf
 }
 
-/// Phase B (#55): Glyph 1 文字のアウトラインを `size × size` の正方領域に
-/// 中心揃えで fill し、alpha チャネルだけを `Vec<u8>` で返す。
+/// Phase B (#55): Glyph 1 文字の alpha mask を JS 側に返す wasm wrapper。
 ///
-/// JS 側 (`orberGl.ts`) はこれを `R8` (`gl.LUMINANCE` 互換) または
-/// `RGBA` (alpha のみ意味) として WebGL2 texture にアップロードして、
-/// shape == "glyph" のとき texture sampling で orb の alpha を決める。
-///
-/// キャッシュ: `(font_id, ch, size)` キーで一度だけ生成。同じ glyph + size
-/// で連続呼び出ししても tiny-skia / ttf-parser の往復は走らない。wasm は
-/// single-threaded なので静的可変 HashMap で十分（lock 不要）。
-///
-/// # 戻り値
-///
-/// 長さ `size * size` の `Vec<u8>`。各バイトが 0..255 の alpha。文字が
-/// 同梱フォントに収録されていない場合は全 0 を返す（panic しない）。
+/// 実体は [`orber_core::glyph::render_glyph_alpha_mask`] を参照。本関数は
+/// その上に `(font, ch, size)` キャッシュ + size validation + JS 型変換だけを
+/// 加える。size は `[16, 1024]` の範囲のみ受理（GUI は 256 固定の想定）。
+/// 戻り値は長さ `size * size` の `Uint8Array`（行優先 alpha 0..255）。
+/// 同梱フォントに無い文字は全 0 を返し panic しない。
 #[wasm_bindgen]
 pub fn get_glyph_alpha_mask(ch: &str, size: u32) -> Result<js_sys::Uint8Array, JsError> {
     // 入力 validation。size は 16..=1024 の範囲を許可（GUI は 256 を使う想定）。
