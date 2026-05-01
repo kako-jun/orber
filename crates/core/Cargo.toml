@@ -23,6 +23,9 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 tiny-skia = { workspace = true }
+# OrbShape::Glyph 用のフォントパース。'static lifetime のスライスから Face::parse で
+# 読めるので、include_bytes! 経路と相性がよい。
+ttf-parser = "0.25"
 
 # wasm32: getrandom needs the `wasm_js` backend so kmeans_colors' thread_rng compiles.
 # kmeans_colors 0.7 経由で getrandom 0.2 が、rand 0.9 経由で 0.3 が引かれるため両方を明示する。

@@ -2,9 +2,10 @@ use clap::{Parser, ValueEnum};
 use orber_core::animate::{MotionDirection, MotionSpeed};
 use orber_core::aquarelle::AquarelleParams;
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
+use orber_core::glyph::{has_glyph, GlyphFontId};
 use orber_core::orb::{OrbShape, RenderOptions};
 use orber_core::output_mode::OutputMode;
-use orber_core::style::{render_css, render_svg, StyleOptions};
+use orber_core::style::{render_css, render_svg, ContrastPreset, StyleOptions};
 use orber_core::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,13 +37,17 @@ impl From<CliDirection> for MotionDirection {
     }
 }
 
-/// Conveyor-belt speed (`--speed`). Coarse 2-step preset; per-orb phase scatter is automatic.
+/// Conveyor-belt speed (`--speed`). Four-step preset; per-orb phase scatter is automatic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSpeed {
     /// One screen-cross over the whole clip (most calm).
     VerySlow,
-    /// Two screen-crosses over the whole clip (default).
+    /// Two screen-crosses over the whole clip (previous default).
     Slow,
+    /// Three screen-crosses over the whole clip (#55, default).
+    Mid,
+    /// Four screen-crosses over the whole clip (#55, lively).
+    Fast,
 }
 
 impl From<CliSpeed> for MotionSpeed {
@@ -50,6 +55,51 @@ impl From<CliSpeed> for MotionSpeed {
         match s {
             CliSpeed::VerySlow => MotionSpeed::VerySlow,
             CliSpeed::Slow => MotionSpeed::Slow,
+            CliSpeed::Mid => MotionSpeed::Mid,
+            CliSpeed::Fast => MotionSpeed::Fast,
+        }
+    }
+}
+
+/// Visual contrast preset (`--contrast`). Single axis, three steps (#55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliContrast {
+    /// Faint orbs with softer edges (good for text overlays).
+    Low,
+    /// Same look as before (default; no regression).
+    Mid,
+    /// Bold orbs with crisper edges (good for stand-alone viewing).
+    High,
+}
+
+impl From<CliContrast> for ContrastPreset {
+    fn from(c: CliContrast) -> Self {
+        match c {
+            CliContrast::Low => ContrastPreset::Low,
+            CliContrast::Mid => ContrastPreset::Mid,
+            CliContrast::High => ContrastPreset::High,
+        }
+    }
+}
+
+/// Coarse `--count-preset` for users who do not want a numeric value.
+/// Mutually exclusive with `--count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliCountPreset {
+    /// Fewer orbs (10).
+    Low,
+    /// Medium (20).
+    Mid,
+    /// Many (35).
+    High,
+}
+
+impl CliCountPreset {
+    fn to_count(self) -> usize {
+        match self {
+            CliCountPreset::Low => 10,
+            CliCountPreset::Mid => 20,
+            CliCountPreset::High => 35,
         }
     }
 }
@@ -79,15 +129,36 @@ enum Shape {
     Circle,
     /// Cel-painted nightscape texture set: bleed + bloom + offset + halo.
     Aquarelle,
+    /// One bundled-font glyph filled per orb (#55). Pick the glyph with --glyph-char.
+    Glyph,
 }
 
 impl Shape {
-    fn to_orb_shape(self, params: AquarelleParams) -> OrbShape {
+    fn to_orb_shape(self, params: AquarelleParams, glyph_char: char) -> OrbShape {
         match self {
             Shape::Circle => OrbShape::Circle,
             Shape::Aquarelle => OrbShape::Aquarelle(params),
+            Shape::Glyph => OrbShape::Glyph {
+                ch: glyph_char,
+                font: GlyphFontId::NotoSymbols2,
+            },
         }
     }
+}
+
+/// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
+fn parse_single_char(s: &str) -> Result<char, String> {
+    let mut chars = s.chars();
+    let first = chars
+        .next()
+        .ok_or_else(|| "must be a single character (got empty)".to_string())?;
+    if chars.next().is_some() {
+        return Err(format!(
+            "must be a single character (got {} chars in {s:?})",
+            s.chars().count()
+        ));
+    }
+    Ok(first)
 }
 
 /// f32 のパース + 有限性 + 範囲チェックを 1 つにまとめた値パーサ。
@@ -184,20 +255,37 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliDirection::Lr)]
     direction: CliDirection,
 
-    /// Conveyor-belt speed. Coarse 2-step preset over the whole clip.
+    /// Conveyor-belt speed. 4-step preset (very-slow / slow / mid / fast)
+    /// controlling cycle count per clip.
     #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
     speed: CliSpeed,
 
     /// Number of orbs visible on screen at once (1..=1024, default 20).
+    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=35).
     /// Clusters are expanded to this count by weight-proportional color sampling
     /// and per-orb scattering on the cross axis. Higher count fills more of the
     /// frame; ~20 fills roughly 70% on the default size.
-    #[arg(long, default_value_t = 20, value_parser = parse_count)]
+    /// Mutually exclusive with --count-preset.
+    #[arg(long, default_value_t = 20, value_parser = parse_count, conflicts_with = "count_preset")]
     count: usize,
+
+    /// Coarse orb-count preset (#55): low=10 / mid=20 / high=35.
+    /// Mutually exclusive with --count.
+    #[arg(long, value_enum)]
+    count_preset: Option<CliCountPreset>,
 
     /// Orb rendering shape.
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
     shape: Shape,
+
+    /// Glyph character used when --shape glyph (#55). Must be a single character.
+    /// Defaults to ☆ (U+2606). Use a character covered by Noto Sans Symbols 2.
+    #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
+    glyph_char: char,
+
+    /// Visual contrast preset (#55): low / mid / high. Mid keeps the legacy look.
+    #[arg(long, value_enum, default_value_t = CliContrast::Mid)]
+    contrast: CliContrast,
 
     /// Saturation multiplier (0.0..=4.0; 1.0 = unchanged).
     #[arg(long, default_value_t = 1.0, value_parser = parse_saturation)]
@@ -235,12 +323,29 @@ impl Cli {
     }
 
     fn orb_shape(&self) -> OrbShape {
-        self.shape.to_orb_shape(self.aquarelle_params())
+        self.shape
+            .to_orb_shape(self.aquarelle_params(), self.glyph_char)
+    }
+
+    /// Resolved orb count. `--count-preset` wins over `--count` when both are present
+    /// (clap already enforces mutual exclusion via `conflicts_with`).
+    fn resolved_count(&self) -> usize {
+        match self.count_preset {
+            Some(p) => p.to_count(),
+            None => self.count,
+        }
+    }
+
+    /// Resolved contrast preset for any rendering path.
+    fn resolved_contrast(&self) -> ContrastPreset {
+        self.contrast.into()
     }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    warn_if_glyph_char_unsupported(&cli);
 
     if let Some(n) = cli.variations {
         return render_variations(&cli, n);
@@ -298,6 +403,23 @@ fn warn_if_orb_pool_empty(orb_clusters: &[Cluster]) {
 /// Aquarelle 経路は cluster 数だけ orb を描画する設計（per-orb の独立揺らぎを
 /// 入れると bleed/bloom/halo の質感セットが壊れるため）。CLI からは aquarelle の
 /// ときだけ count が無視される事実が見えないので、ここで明示的に教える。
+/// `--shape glyph` で指定された `--glyph-char` が同梱フォント (Noto Sans Symbols 2)
+/// に収録されていなければ stderr で警告する。出力は走るが Glyph 描画は静かに
+/// スキップされるため、「絵文字を入れたら何も出ない」という挙動の理由が
+/// CLI 利用者には分からない。起動直後に 1 回だけ出すことで原因を明示する。
+fn warn_if_glyph_char_unsupported(cli: &Cli) {
+    if !matches!(cli.shape, Shape::Glyph) {
+        return;
+    }
+    let ch = cli.glyph_char;
+    if !has_glyph(GlyphFontId::NotoSymbols2, ch) {
+        eprintln!(
+            "orber: warning: '{}' (U+{:04X}) は同梱フォントに収録されていません。Glyph 描画はスキップされます。",
+            ch, ch as u32
+        );
+    }
+}
+
 fn warn_if_aquarelle_count_ignored(cli: &Cli) {
     if matches!(cli.shape, Shape::Aquarelle) {
         eprintln!(
@@ -336,6 +458,7 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
         blur: cli.blur,
         saturation: cli.saturation,
         background,
+        contrast: cli.resolved_contrast(),
     };
 
     // 5. mode で書き出しを分岐。
@@ -387,9 +510,10 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         direction,
         speed,
         seed: cli.seed,
-        count: Some(cli.count),
+        count: Some(cli.resolved_count()),
         background,
         shape: cli.orb_shape(),
+        contrast: cli.resolved_contrast(),
     };
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -440,9 +564,10 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         direction,
         speed,
         seed: cli.seed,
-        count: Some(cli.count),
+        count: Some(cli.resolved_count()),
         background,
         shape: cli.orb_shape(),
+        contrast: cli.resolved_contrast(),
     };
     let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
@@ -496,6 +621,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     }
 
     let orb_shape = cli.orb_shape();
+    let contrast = cli.resolved_contrast();
     // クラスタ抽出は preset 全 spec で 1 回だけ（K は VARIATIONS_KMEANS_K で固定）。
     // パレットを spec ごとに変えると入力画像の色が崩れるので、ここはキャッシュではなく
     // 単一パレットを使い回す方針。
@@ -520,7 +646,8 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
 
-        let result = render_one_variation(&orb_clusters, spec, &out_path, background, orb_shape);
+        let result =
+            render_one_variation(&orb_clusters, spec, &out_path, background, orb_shape, contrast);
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -541,6 +668,7 @@ fn render_one_variation(
     out_path: &std::path::Path,
     bg_rgba: [u8; 4],
     orb_shape: OrbShape,
+    contrast: ContrastPreset,
 ) -> Result<(), String> {
     // saturation は preset で揺らさない（同一画像から作る複数バリエーションでは
     // 入力色をそのまま使う方針）。CLI の単発経路と揃えるため 1.0 固定。
@@ -560,6 +688,7 @@ fn render_one_variation(
                 count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
+                contrast,
             };
             let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
@@ -575,6 +704,7 @@ fn render_one_variation(
                 count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
+                contrast,
             };
             render_video(
                 clusters,
@@ -696,6 +826,146 @@ mod tests {
     fn count_default_is_twenty() {
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
         assert_eq!(cli.count, 20);
+    }
+
+    #[test]
+    fn shape_glyph_with_default_char() {
+        // --shape glyph で --glyph-char 省略時は ☆ (U+2606) になる。
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "glyph",
+        ])
+        .expect("--shape glyph should parse");
+        assert_eq!(cli.glyph_char, '☆');
+        match cli.orb_shape() {
+            OrbShape::Glyph { ch, .. } => assert_eq!(ch, '☆'),
+            other => panic!("expected OrbShape::Glyph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glyph_char_rejects_multi_char() {
+        // --glyph-char には 1 文字しか入れられない。
+        assert!(try_parse(&["--glyph-char", "abc"]).is_err());
+        assert!(try_parse(&["--glyph-char", ""]).is_err());
+        assert!(try_parse(&["--glyph-char", "a"]).is_ok());
+        assert!(try_parse(&["--glyph-char", "♪"]).is_ok());
+    }
+
+    #[test]
+    fn count_preset_resolves_to_table() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        // デフォルトは数値 20。
+        assert_eq!(cli.resolved_count(), 20);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 10);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "mid",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 20, "--count-preset mid must map to 20");
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 35);
+    }
+
+    #[test]
+    fn count_and_count_preset_are_mutually_exclusive() {
+        // clap の conflicts_with で --count と --count-preset の同時指定は弾かれる。
+        let res = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count",
+            "30",
+            "--count-preset",
+            "low",
+        ]);
+        assert!(res.is_err(), "--count + --count-preset must be rejected");
+    }
+
+    #[test]
+    fn speed_mid_and_fast_parse() {
+        let cli = Cli::try_parse_from([
+            "orber", "--input", "x", "--output", "x.png", "--speed", "mid",
+        ])
+        .unwrap();
+        assert!(matches!(cli.speed, CliSpeed::Mid));
+        assert_eq!(MotionSpeed::from(cli.speed), MotionSpeed::Mid);
+
+        let cli = Cli::try_parse_from([
+            "orber", "--input", "x", "--output", "x.png", "--speed", "fast",
+        ])
+        .unwrap();
+        assert!(matches!(cli.speed, CliSpeed::Fast));
+        assert_eq!(MotionSpeed::from(cli.speed), MotionSpeed::Fast);
+    }
+
+    #[test]
+    fn contrast_default_is_mid() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        assert!(matches!(cli.contrast, CliContrast::Mid));
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::Mid);
+    }
+
+    #[test]
+    fn contrast_low_high_parse() {
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--contrast",
+            "low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::Low);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--contrast",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::High);
     }
 
     #[test]

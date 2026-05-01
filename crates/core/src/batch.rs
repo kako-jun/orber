@@ -74,6 +74,7 @@ pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, BatchError> {
                 saturation: 1.0,
                 background: bg,
                 shape: input.shape,
+                contrast: crate::style::ContrastPreset::Mid,
             };
             let frame = render_frame(&clusters, &opts, 0.0);
             let mut buf = Vec::new();

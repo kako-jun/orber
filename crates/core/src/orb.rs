@@ -17,6 +17,8 @@
 
 use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
+use crate::glyph::{render_glyph_orb, GlyphFontId};
+use crate::style::ContrastPreset;
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -38,24 +40,35 @@ pub enum OrbStyle {
 }
 
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
-/// 質感セット（[`crate::aquarelle`]）を有効にする。
+/// 質感セット（[`crate::aquarelle`]）、`Glyph` は同梱フォント 1 文字のアウトライン
+/// 塗りを有効にする。
+///
+/// `Glyph` のフォントは [`GlyphFontId`] enum で識別する設計のため、`OrbShape` は
+/// 引き続き `Copy + Send + Sync`。実体の `Face` パースはモジュール側の
+/// `OnceLock` キャッシュに任せ、`OrbShape` 自体に重い state を持たせない。
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OrbShape {
     #[default]
     Circle,
     Aquarelle(AquarelleParams),
+    /// 1 文字のグリフを orb として描く。`ch` は描画する文字、`font` は同梱フォント識別子。
+    Glyph { ch: char, font: GlyphFontId },
 }
 
 impl PartialEq for OrbShape {
     // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
-    // ここでの "等価" は「形が同じか（Circle vs Aquarelle）」だけを判定する用途を
-    // 想定している。bleed / bloom / offset / halo まで含めて区別したい場合は
-    // AquarelleParams を直接比較すること。
+    // ここでの "等価" は「形が同じか」だけを判定する用途を想定している。
+    // Glyph は文字とフォント識別子まで含めて比較する（軽い値なので）。
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (OrbShape::Circle, OrbShape::Circle) | (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_))
-        )
+        match (self, other) {
+            (OrbShape::Circle, OrbShape::Circle) => true,
+            (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_)) => true,
+            (
+                OrbShape::Glyph { ch: a, font: fa },
+                OrbShape::Glyph { ch: b, font: fb },
+            ) => a == b && fa == fb,
+            _ => false,
+        }
     }
 }
 
@@ -76,6 +89,8 @@ pub struct RenderOptions {
     pub background: [u8; 4],
     /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
     pub shape: OrbShape,
+    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    pub contrast: ContrastPreset,
 }
 
 impl Default for RenderOptions {
@@ -88,6 +103,7 @@ impl Default for RenderOptions {
             saturation: 1.0,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
+            contrast: ContrastPreset::Mid,
         }
     }
 }
@@ -101,9 +117,12 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
     // 不正・極端な値を握りつぶさず、最低限の防衛だけ行う。
     let width = opts.width.max(1);
     let height = opts.height.max(1);
-    let blur = opts.blur.clamp(0.0, 1.0);
+    // contrast offset を blur に積算してから clamp。Mid なら既存と完全同値。
+    let blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
+    // contrast による中心 alpha 倍率。Circle / Glyph 経路で共通に使う。
+    let alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
 
     // Pixmap::new は uninit を 0 埋めしてくれる（つまり全画面が透明）。
     // 透過 (alpha=0) 指定なら fill をスキップしてその透明初期値を活かす。
@@ -137,15 +156,23 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             continue;
         }
 
-        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・opacity=1.0
-        // で固定（既存挙動の互換）。動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
+        // Glyph: 1 文字のアウトラインを fill。半径は Circle と同じ意味で渡す。
+        // contrast の alpha 倍率は適用、blur は使わない（グリフはアウトライン fill のため）。
+        if let OrbShape::Glyph { ch, font } = opts.shape {
+            render_glyph_orb(&mut pixmap, (cx, cy), radius, [r, g, b], alpha_mul, font, ch);
+            continue;
+        }
+
+        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
+        // contrast 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
+        // 動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
         render_one_orb(
             &mut pixmap,
             (cx, cy),
             radius,
             [r, g, b],
             blur,
-            1.0,
+            alpha_mul,
             OrbStyle::Rim,
         );
     }
@@ -483,5 +510,130 @@ mod tests {
         let img = render_static(&[cluster([100, 150, 200], 0.5, 0.5, 1.0)], &opts);
         assert_eq!(img.width(), 1080);
         assert_eq!(img.height(), 1920);
+    }
+
+    /// 平均 alpha（厳密には平均 R）を計算するヘルパ。contrast preset の比較で使う。
+    fn mean_red(img: &RgbaImage) -> f64 {
+        let mut s = 0u64;
+        for px in img.pixels() {
+            s += px[0] as u64;
+        }
+        s as f64 / (img.width() as f64 * img.height() as f64)
+    }
+
+    #[test]
+    fn contrast_low_lower_alpha_than_high_circle() {
+        // Circle 経路で Low は High より中央輝度（≒ alpha）が低い。
+        // 入力色は赤、背景は黒（R=0）。Low ほど orb 中心の R が抑えられ、
+        // 平均 R も小さくなる。
+        let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
+        let make = |contrast: ContrastPreset| {
+            render_static(
+                &[c],
+                &RenderOptions {
+                    width: 100,
+                    height: 100,
+                    blur: 0.5,
+                    saturation: 1.0,
+                    orb_size: 1.0,
+                    contrast,
+                    ..Default::default()
+                },
+            )
+        };
+        let low = mean_red(&make(ContrastPreset::Low));
+        let mid = mean_red(&make(ContrastPreset::Mid));
+        let high = mean_red(&make(ContrastPreset::High));
+        assert!(
+            low < mid,
+            "contrast=Low mean R ({low}) must be < Mid ({mid})"
+        );
+        assert!(
+            high >= mid,
+            "contrast=High mean R ({high}) must be >= Mid ({mid}) (sharper edges keep more red near center)"
+        );
+        assert!(
+            low < high,
+            "contrast=Low ({low}) must be visibly less bright than High ({high})"
+        );
+    }
+
+    #[test]
+    fn contrast_mid_matches_default_render() {
+        // contrast=Mid を明示しても RenderOptions::default() と同じピクセルが出る（regression なし）。
+        let c = cluster([200, 50, 50], 0.5, 0.5, 1.0);
+        let opts_default = RenderOptions {
+            width: 64,
+            height: 64,
+            ..Default::default()
+        };
+        let opts_mid = RenderOptions {
+            width: 64,
+            height: 64,
+            contrast: ContrastPreset::Mid,
+            ..Default::default()
+        };
+        let a = render_static(&[c], &opts_default);
+        let b = render_static(&[c], &opts_mid);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "contrast=Mid must be byte-exact identical to default"
+        );
+    }
+
+    #[test]
+    fn glyph_render_differs_from_circle_for_same_cluster() {
+        // 同じ cluster / opts を Circle と Glyph で別々に描画したとき、出力 RGBA が
+        // pixel-level で異なる必要がある。これが一致してしまうと、Glyph 経路を通って
+        // いても実際には Circle と同じ絵が出ているという退化に気付けない。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let base = RenderOptions {
+            width: 96,
+            height: 96,
+            ..Default::default()
+        };
+        let circle_opts = RenderOptions {
+            shape: OrbShape::Circle,
+            ..base.clone()
+        };
+        let glyph_opts = RenderOptions {
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..base
+        };
+        let img_circle = render_static(std::slice::from_ref(&c), &circle_opts);
+        let img_glyph = render_static(std::slice::from_ref(&c), &glyph_opts);
+        assert_ne!(
+            img_circle.as_raw(),
+            img_glyph.as_raw(),
+            "Glyph rendering must produce a different pixmap than Circle for the same cluster"
+        );
+    }
+
+    #[test]
+    fn glyph_shape_renders_via_render_static() {
+        // OrbShape::Glyph が render_static 経由でも一定数のピクセルを描く。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 100,
+            height: 100,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[c], &opts);
+        // 背景は黒。グリフの白塗りピクセルが一定数立っているはず。
+        let lit = img.pixels().filter(|p| p[0] > 32).count();
+        assert!(
+            lit > 32,
+            "OrbShape::Glyph via render_static should paint visible pixels, lit={lit}"
+        );
     }
 }

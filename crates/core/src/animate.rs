@@ -44,6 +44,7 @@
 
 use crate::cluster::Cluster;
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
+use crate::style::ContrastPreset;
 use image::RgbaImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -65,18 +66,27 @@ pub enum MotionDirection {
     BottomToTop,
 }
 
-/// 流れの速さ。動画全体（duration）で何回画面を横断するかを整数 2 段階で表す。
+/// 流れの速さ。動画全体（duration）で何回画面を横断するかを整数で表す。
 ///
 /// 整数横断回数にすることで `t=0` と `t=1` のフレームが完全一致する（ループ性）。
-/// 8 秒クリップで VerySlow なら 8 秒で 1 回横断、Slow なら 4 秒で 1 回横断。
-/// 実時間で「ずっと遅い」感を出すには、長めの `duration_ms`（6000〜10000 ms 程度）
-/// と組み合わせること。
+/// `cycle_count` は単調増加: VerySlow < Slow < Mid < Fast。各 variant の意味は:
+///
+/// - VerySlow: 全クリップで 1 回横断（最も穏やか）
+/// - Slow: 全クリップで 2 回横断（旧デフォルト、既定）
+/// - Mid: 全クリップで 3 回横断（#55 で追加、新デフォルト想定）
+/// - Fast: 全クリップで 4 回横断（#55 で追加、リッチ鑑賞用）
+///
+/// #55 で Mid / Fast を追加。既存の VerySlow / Slow は値変更なし（regression なし）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionSpeed {
-    /// 動画全体で画面 1 回横断（最も穏やか、既定相当）。
+    /// 動画全体で画面 1 回横断（最も穏やか）。
     VerySlow,
-    /// 動画全体で画面 2 回横断（既定）。
+    /// 動画全体で画面 2 回横断（旧既定）。
     Slow,
+    /// 動画全体で画面 3 回横断（#55 で追加）。
+    Mid,
+    /// 動画全体で画面 4 回横断（#55 で追加）。
+    Fast,
 }
 
 impl MotionSpeed {
@@ -88,6 +98,8 @@ impl MotionSpeed {
         match self {
             MotionSpeed::VerySlow => 1,
             MotionSpeed::Slow => 2,
+            MotionSpeed::Mid => 3,
+            MotionSpeed::Fast => 4,
         }
     }
 }
@@ -114,6 +126,8 @@ pub struct AnimateOptions {
     pub background: [u8; 4],
     /// orb の描画形式。
     pub shape: OrbShape,
+    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    pub contrast: ContrastPreset,
 }
 
 impl Default for AnimateOptions {
@@ -130,6 +144,7 @@ impl Default for AnimateOptions {
             count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
+            contrast: ContrastPreset::Mid,
         }
     }
 }
@@ -341,7 +356,10 @@ pub fn render_frame_with_params(
 
     let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
     let saturation = opts.saturation.max(0.0);
-    let base_blur = opts.blur.clamp(0.0, 1.0);
+    // contrast 軸: blur は事前に offset を加算、alpha は per-orb opacity_factor に乗じる。
+    // Mid なら blur_offset=0, alpha_mul=1.0 で既存挙動と完全同値。
+    let base_blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
+    let contrast_alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
 
     // 進行軸の長さ（ピクセル）。LR/RL では width、TB/BT では height。
     // r_normalized を計算する基準になる。
@@ -404,10 +422,23 @@ pub fn render_frame_with_params(
         let cy = ny * height as f32;
         let rgb = adjust_saturation_pub(c.color, saturation);
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
-        let opacity = opacity_factor.clamp(0.0, 1.0);
+        // contrast の alpha 倍率を per-orb の opacity_factor に積算（Mid なら ×1.0 で同値）。
+        let opacity = (opacity_factor * contrast_alpha_mul).clamp(0.0, 1.0);
 
-        // 各 orb のスタイル（Rim / Soft）を seed 由来で振り分け、フレーム内に混在させる。
-        render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
+        // shape による分岐:
+        // - Glyph: 円グラデ ではなく 1 文字のフォントアウトラインを fill。blur と style は使わない
+        // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
+        match opts.shape {
+            OrbShape::Glyph { ch, font } => {
+                // OrbShape::Glyph はアウトライン fill 描画のため、Rim / Soft の grad stop 演出は
+                // 適用しない。RNG の `style` 引きは継続して per-orb sequence の互換性を維持する
+                // (Circle/Glyph 切替で seed 由来の他パラメータ列がズレないようにするため)。
+                crate::glyph::render_glyph_orb(&mut pixmap, (cx, cy), radius, rgb, opacity, font, ch);
+            }
+            _ => {
+                render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
+            }
+        }
     }
 
     finalize_pixmap(pixmap, width, height)
@@ -529,6 +560,7 @@ fn render_frame_aquarelle(
         saturation: opts.saturation,
         background: opts.background,
         shape: opts.shape,
+        contrast: opts.contrast,
     };
     render_static(&modulated, &render_opts)
 }
@@ -589,6 +621,7 @@ mod tests {
             count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
+            contrast: ContrastPreset::Mid,
         }
     }
 
@@ -674,7 +707,12 @@ mod tests {
             MotionDirection::TopToBottom,
             MotionDirection::BottomToTop,
         ] {
-            for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+            for speed in [
+                MotionSpeed::VerySlow,
+                MotionSpeed::Slow,
+                MotionSpeed::Mid,
+                MotionSpeed::Fast,
+            ] {
                 let opts = opts_with(dir, speed);
                 let a = render_frame(&clusters, &opts, 0.0);
                 let b = render_frame(&clusters, &opts, 1.0);
@@ -771,7 +809,12 @@ mod tests {
         // 1 周期分進んだ orb は元の位置に戻ってくる（rem_euclid による wrap）。
         // 既に t_zero_and_t_one_match で確認済みだが、Slow 以外も含めて再確認する。
         let clusters = sample_clusters();
-        for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+        for speed in [
+            MotionSpeed::VerySlow,
+            MotionSpeed::Slow,
+            MotionSpeed::Mid,
+            MotionSpeed::Fast,
+        ] {
             let opts = opts_with(MotionDirection::LeftToRight, speed);
             let a = render_frame(&clusters, &opts, 0.0);
             let b = render_frame(&clusters, &opts, 1.0);

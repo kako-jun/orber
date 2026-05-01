@@ -32,7 +32,12 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed), saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph), `--glyph-char`, `--count` (or `--count-preset`), `--contrast`, saturation, and clip duration. See all flags via `orber --help`.
+
+```bash
+orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --contrast low
+orber --input photo.jpg --output dense.png --count-preset high --speed fast
+```
 
 ### Background color
 
@@ -52,15 +57,15 @@ orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
 ```
 
-`--speed` is the **global** cycle count (`very-slow` / `slow` = 1 / 2 screen-crosses
-per clip for the slowest orbs). Each orb also gets a per-orb integer **speed
-multiplier** (`1x` / `2x`) assigned deterministically from the seed, so individual
-orbs visibly travel at different paces inside the same clip — effective traversal
-counts spread over `{1, 2, 4}` per clip. All factors are integers, so the loop
-closure at `t = 0 ≡ t = 1` stays pixel-exact. Combined with a long `--duration-ms`,
-this gives the characteristic gentle, layered drift. Every orb also gets three
-independent breathing pulses (radius ±10%, blur ±15%, opacity ±5%) applied
-automatically — there is no opt-in flag for that.
+`--speed` is the **global** cycle count (`very-slow` / `slow` / `mid` / `fast`
+= 1 / 2 / 3 / 4 screen-crosses per clip for the slowest orbs). Each orb also gets
+a per-orb integer **speed multiplier** (`1x` / `2x`) assigned deterministically
+from the seed, so individual orbs visibly travel at different paces inside the
+same clip — effective traversal counts spread over `{cycle, 2×cycle}` per clip.
+All factors are integers, so the loop closure at `t = 0 ≡ t = 1` stays pixel-exact.
+Combined with a long `--duration-ms`, this gives the characteristic gentle, layered
+drift. Every orb also gets three independent breathing pulses (radius ±10%,
+blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for that.
 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen buffer would interfere with the
@@ -85,9 +90,52 @@ random count in the GUI) is the caller's responsibility, not a CLI feature. Each
 is also assigned one of two visual styles (rim or soft) deterministically from the
 seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
 
+`--count-preset low|mid|high` is a shorthand alternative to `--count <N>` (mapped
+to 10 / 20 / 35). The two flags are mutually exclusive — pass one or the other.
+
 > Note: the aquarelle shape ignores `--count` (palette-only rendering). It always
 > renders one orb per cluster from the k-means palette so the bleed / bloom / halo
 > texture set stays coherent.
+
+### Glyph shape
+
+`--shape glyph` swaps the round orb for a **glyph character** (default `☆`). Pick
+the character with `--glyph-char <CHAR>` (exactly one character):
+
+```bash
+orber --input photo.jpg --output stars.png --shape glyph --glyph-char "★"
+orber --input photo.jpg --output arrows.mp4 --shape glyph --glyph-char "→" --direction lr
+```
+
+Glyphs are rendered from a bundled **Noto Sans Symbols 2 subset** (~177 KB,
+embedded via `include_bytes!`) covering ASCII, digits, punctuation, arrows,
+geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
+and other characters outside this subset are silently skipped instead of
+drawing tofu. Glyph rendering uses outline fill rather than gaussian blur, so
+the `--blur` parameter has no effect in this mode.
+
+> **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
+> Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
+> text shipped alongside the TTF.
+
+### Contrast
+
+`--contrast low|mid|high` (default `mid`) is a single axis that bundles alpha,
+blur, and edge sharpness:
+
+- `low` — weak alpha + strong blur + soft edges. Tuned for sitting **underneath
+  text overlays**: the orbs read as ambient color rather than competing with the
+  foreground.
+- `mid` — identical to the previous default. Existing renders are unchanged.
+- `high` — reduced blur + sharper rim. Tuned for **standalone viewing** as a
+  wallpaper or background plate. Alpha is held at the same value as `mid` to
+  preserve the `mid = identity` invariant; `high` differs from `mid` purely on
+  the blur / edge axis.
+
+```bash
+orber --input photo.jpg --output backdrop.png --contrast low
+orber --input photo.jpg --output wallpaper.png --contrast high
+```
 
 ### Variation preset
 
