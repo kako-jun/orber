@@ -156,10 +156,10 @@ fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
 /// キャッシュヒットして O(1)、違う画像なら kmeans 実行 + キャッシュ更新。
 ///
 /// SAFETY: wasm は single-threaded なので静的可変参照は問題ない。
+type ClustersBundle = (Vec<Cluster>, [u8; 4], Vec<Cluster>);
+
 #[allow(static_mut_refs)]
-fn get_or_build_clusters(
-    p: &mut WasmParams,
-) -> Result<(Vec<Cluster>, [u8; 4], Vec<Cluster>), String> {
+fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
     let fp = fingerprint(&p.source_rgb, p.source_width, p.source_height, p.k);
     unsafe {
         if let Some(c) = &SOURCE_CACHE {
@@ -475,6 +475,7 @@ pub fn get_render_data(
 /// core 側 `generate_orb_params` を呼び出さずに同じシーケンスを **再現** する
 /// （core の `OrbParams` は private struct で wasm から読めないため）。順序を
 /// 1 つでも変えると同じ seed でも別の orb 列になり、視覚パリティが壊れる。
+#[allow(clippy::too_many_arguments)]
 fn pack_render_data(
     clusters: &[Cluster],
     bg: [u8; 4],
