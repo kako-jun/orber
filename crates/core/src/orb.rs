@@ -583,6 +583,38 @@ mod tests {
     }
 
     #[test]
+    fn glyph_render_differs_from_circle_for_same_cluster() {
+        // 同じ cluster / opts を Circle と Glyph で別々に描画したとき、出力 RGBA が
+        // pixel-level で異なる必要がある。これが一致してしまうと、Glyph 経路を通って
+        // いても実際には Circle と同じ絵が出ているという退化に気付けない。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let base = RenderOptions {
+            width: 96,
+            height: 96,
+            ..Default::default()
+        };
+        let circle_opts = RenderOptions {
+            shape: OrbShape::Circle,
+            ..base.clone()
+        };
+        let glyph_opts = RenderOptions {
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..base
+        };
+        let img_circle = render_static(std::slice::from_ref(&c), &circle_opts);
+        let img_glyph = render_static(std::slice::from_ref(&c), &glyph_opts);
+        assert_ne!(
+            img_circle.as_raw(),
+            img_glyph.as_raw(),
+            "Glyph rendering must produce a different pixmap than Circle for the same cluster"
+        );
+    }
+
+    #[test]
     fn glyph_shape_renders_via_render_static() {
         // OrbShape::Glyph が render_static 経由でも一定数のピクセルを描く。
         use crate::glyph::GlyphFontId;

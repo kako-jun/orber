@@ -315,6 +315,7 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
         saturation: 1.0,
         background: bg,
         shape,
+        contrast: orber_core::style::ContrastPreset::Mid,
     };
     let frame = render_frame(&clusters, &opts, 0.0);
     let png = encode_png_rgba(&frame)?;
@@ -576,6 +577,7 @@ pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
         blur: p.blur,
         saturation: 1.0,
         background: bg,
+        contrast: orber_core::style::ContrastPreset::Mid,
     };
     Ok(core_render_svg(&clusters, &opts))
 }
@@ -766,6 +768,7 @@ mod tests {
             match s {
                 MotionSpeed::VerySlow => very_slow += 1,
                 MotionSpeed::Slow => slow += 1,
+                MotionSpeed::Mid | MotionSpeed::Fast => panic!("not yet exposed in wasm"),
             }
         }
         // 4 タイルで 2 + 2 のばらけが固定で保証される。

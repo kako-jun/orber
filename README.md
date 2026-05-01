@@ -108,10 +108,15 @@ orber --input photo.jpg --output arrows.mp4 --shape glyph --glyph-char "→" --d
 ```
 
 Glyphs are rendered from a bundled **Noto Sans Symbols 2 subset** (~177 KB,
-embedded via `include_bytes!`) covering ASCII, digits, punctuation, arrows, and
-geometric shapes. Characters outside the subset (emoji etc.) are silently
-skipped instead of drawing tofu. Glyph rendering uses outline fill rather than
-gaussian blur, so the `--blur` parameter has no effect in this mode.
+embedded via `include_bytes!`) covering ASCII, digits, punctuation, arrows,
+geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
+and other characters outside this subset are silently skipped instead of
+drawing tofu. Glyph rendering uses outline fill rather than gaussian blur, so
+the `--blur` parameter has no effect in this mode.
+
+> **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
+> Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
+> text shipped alongside the TTF.
 
 ### Contrast
 
@@ -122,9 +127,10 @@ blur, and edge sharpness:
   text overlays**: the orbs read as ambient color rather than competing with the
   foreground.
 - `mid` — identical to the previous default. Existing renders are unchanged.
-- `high` — strong alpha + reduced blur + sharper rim. Tuned for **standalone
-  viewing** as a wallpaper or background plate, where richer contrast carries
-  the composition on its own.
+- `high` — reduced blur + sharper rim. Tuned for **standalone viewing** as a
+  wallpaper or background plate. Alpha is held at the same value as `mid` to
+  preserve the `mid = identity` invariant; `high` differs from `mid` purely on
+  the blur / edge axis.
 
 ```bash
 orber --input photo.jpg --output backdrop.png --contrast low

@@ -430,6 +430,9 @@ pub fn render_frame_with_params(
         // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
         match opts.shape {
             OrbShape::Glyph { ch, font } => {
+                // OrbShape::Glyph はアウトライン fill 描画のため、Rim / Soft の grad stop 演出は
+                // 適用しない。RNG の `style` 引きは継続して per-orb sequence の互換性を維持する
+                // (Circle/Glyph 切替で seed 由来の他パラメータ列がズレないようにするため)。
                 crate::glyph::render_glyph_orb(&mut pixmap, (cx, cy), radius, rgb, opacity, font, ch);
             }
             _ => {
@@ -704,7 +707,12 @@ mod tests {
             MotionDirection::TopToBottom,
             MotionDirection::BottomToTop,
         ] {
-            for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+            for speed in [
+                MotionSpeed::VerySlow,
+                MotionSpeed::Slow,
+                MotionSpeed::Mid,
+                MotionSpeed::Fast,
+            ] {
                 let opts = opts_with(dir, speed);
                 let a = render_frame(&clusters, &opts, 0.0);
                 let b = render_frame(&clusters, &opts, 1.0);
@@ -801,7 +809,12 @@ mod tests {
         // 1 周期分進んだ orb は元の位置に戻ってくる（rem_euclid による wrap）。
         // 既に t_zero_and_t_one_match で確認済みだが、Slow 以外も含めて再確認する。
         let clusters = sample_clusters();
-        for speed in [MotionSpeed::VerySlow, MotionSpeed::Slow] {
+        for speed in [
+            MotionSpeed::VerySlow,
+            MotionSpeed::Slow,
+            MotionSpeed::Mid,
+            MotionSpeed::Fast,
+        ] {
             let opts = opts_with(MotionDirection::LeftToRight, speed);
             let a = render_frame(&clusters, &opts, 0.0);
             let b = render_frame(&clusters, &opts, 1.0);

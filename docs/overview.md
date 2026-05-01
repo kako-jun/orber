@@ -95,14 +95,28 @@ phase offset and looping once per clip duration:
 - blur: ±15%
 - opacity: ±5%
 
-Each orb is also assigned an integer **speed multiplier** (`1x` / `2x`)
+Each orb is also assigned an integer **speed multiplier** (`1x` / `2x` / `3x`)
 deterministically from the seed, so individual orbs visibly travel at different
 paces inside the same clip. Combined with the global `--speed` cycle count
 (`very-slow` / `slow` / `mid` / `fast` = 1 / 2 / 3 / 4), per-orb effective
-traversal counts spread over `{cycle, 2 × cycle}` per clip. Because every
-factor is an integer, the loop closure at `t = 0 ≡ t = 1` remains pixel-exact
-regardless of which cycle count is chosen — Phase A added the `Mid` (3) and
-`Fast` (4) variants without breaking that invariant.
+traversal counts spread over `{1×cycle, 2×cycle, 3×cycle}` per clip. Because
+every factor is an integer, the loop closure at `t = 0 ≡ t = 1` remains
+pixel-exact regardless of which cycle count is chosen — Phase A added the
+`Mid` (3) and `Fast` (4) variants without breaking that invariant.
+
+The full `--speed × per-orb multiplier` matrix of effective screen crossings
+per clip:
+
+| `--speed` (cycle) | `1x` | `2x` | `3x` |
+|---|---|---|---|
+| `very-slow` (1) | 1 | 2 | 3 |
+| `slow` (2)      | 2 | 4 | 6 |
+| `mid` (3)       | 3 | 6 | 9 |
+| `fast` (4)      | 4 | 8 | 12 |
+
+All twelve cells are integer products, so each is independently a valid loop
+period of the clip; the union is also an integer-period system, which is what
+guarantees pixel-exact wrap at `t = 1`.
 
 `--speed` itself is the global cycle count (1 / 2 / 3 / 4 screen-crosses per
 clip for the slowest orbs). Real-time pacing is set by `--duration-ms`:
@@ -306,10 +320,15 @@ post-hydration by `Subtitle.tsx` for reactive UI text.
 color. The pipeline:
 
 1. A bundled font subset — **Noto Sans Symbols 2** (~177 KB, embedded with
-   `include_bytes!` from `crates/core/assets/fonts/NotoSansSymbols2-Regular.ttf`)
-   — covers ASCII, digits, punctuation, arrows, and geometric shapes. Anything
-   outside the subset (emoji etc.) is **silently skipped** rather than drawing
-   tofu / `.notdef`, so unknown inputs never visually break a render.
+   `include_bytes!` from `crates/core/assets/fonts/NotoSansSymbols2-Regular.ttf`,
+   © Google Inc., SIL Open Font License 1.1; full license text shipped at
+   `crates/core/assets/fonts/OFL.txt`) — covers ASCII, digits, punctuation,
+   arrows, geometric shapes, Dingbats, and supplemental symbols. Hiragana,
+   kanji, emoji, and anything else outside the subset is **silently skipped**
+   rather than drawing tofu / `.notdef`, so unknown inputs never visually break
+   a render. The CLI emits a one-shot stderr warning at startup whenever
+   `--shape glyph --glyph-char <CH>` is invoked with a `CH` the bundled font
+   does not cover, so users see why their output is empty.
 2. The font face is parsed once via `ttf-parser` (`0.25`) and cached in a
    process-global `OnceLock<Face<'static>>` per `GlyphFontId` enum variant.
    Going through an enum + global cache (instead of `Arc<Face>` per orb) keeps
@@ -334,9 +353,16 @@ loud should the orbs be" without exposing each underlying parameter:
 
 | preset | alpha | blur | edge | use case |
 |---|---|---|---|---|
-| `low`  | weak   | strong | soft   | sit underneath text overlay |
+| `low`  | weak      | strong    | soft      | sit underneath text overlay |
 | `mid`  | (default) | (default) | (default) | standalone backdrop, default |
-| `high` | strong | weak   | sharp  | rich wallpaper, single hero plate |
+| `high` | (= `mid`) | weak      | sharp     | rich wallpaper, single hero plate |
+
+`high` deliberately keeps alpha at the same value as `mid`. The user-facing
+preset still reads as "richer", but on the alpha axis specifically the contrast
+is purely on the blur / edge sharpness side. This is required by the `mid =
+identity` invariant: if `high` boosted alpha above `mid`, an asymmetric range
+("`mid` is the floor of alpha rather than the center") would make follow-up
+auto-tuning of the contrast knob harder.
 
 `mid` is the **identity preset** — its alpha / blur / edge values are exactly
 the existing defaults, so passing `--contrast mid` (or omitting the flag) is

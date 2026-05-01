@@ -25,10 +25,11 @@ pub(crate) const STYLE_HEIGHT: u32 = 1920;
 ///
 /// - `Low`: alpha 弱め + blur 強め + 縁ソフト → 文字オーバーレイ用、目立たない
 /// - `Mid`: 既存の振る舞いと同じ（regression なし、デフォルト）
-/// - `High`: alpha 強め + blur 弱め + 縁シャープ → 単独鑑賞用、リッチ
+/// - `High`: blur 弱め + 縁シャープ（alpha は Mid 同等で固定、`Mid = identity`
+///   不変条件を保つため High でも alpha は持ち上げない）
 ///
 /// 内部効果:
-/// - alpha 倍率: Low=0.55, Mid=1.0, High=1.0
+/// - alpha 倍率: Low=0.55, Mid=1.0, High=1.0（High と Mid は同値）
 /// - blur オフセット: Low=+0.25, Mid=0.0, High=-0.25
 ///
 /// PNG (animate / render_static) と SVG / CSS の全経路で同じ意味で適用する。
@@ -39,7 +40,7 @@ pub enum ContrastPreset {
     /// 既存の振る舞いと完全同値（デフォルト）。
     #[default]
     Mid,
-    /// alpha 強め + blur 弱め。単独鑑賞向け。
+    /// blur 弱めで縁をシャープに。alpha は Mid と同値（identity 不変条件）。
     High,
 }
 

@@ -53,6 +53,10 @@ pub fn font_bytes(id: GlyphFontId) -> &'static [u8] {
 /// `Face<'static>` を `OnceLock` に保持できる根拠:
 /// - フォントバイト列が `include_bytes!` 由来の `'static`
 /// - `ttf_parser::Face<'static>` は `Send + Sync`（内部は不変な参照のみ）
+///
+/// 同梱 TTF が破損していた場合は `None` を返し、Glyph 描画は静かにスキップされる。
+/// 同梱フォントは `include_bytes!` 由来の固定バイト列なので通常はパース失敗しない。
+/// 万一 Phase B で外部フォント切替対応する場合は fail-fast 化を検討する。
 fn face_for(id: GlyphFontId) -> Option<&'static Face<'static>> {
     match id {
         GlyphFontId::NotoSymbols2 => {
@@ -113,6 +117,17 @@ impl OutlineBuilder for GlyphPathBuilder {
     fn close(&mut self) {
         self.pb.close();
     }
+}
+
+/// 同梱フォント `font` に文字 `ch` のグリフが収録されているかを返す。
+///
+/// CLI が起動直後に「`--glyph-char` の文字が同梱 subset に無い」ことを警告するための
+/// public ヘルパ。`Face::glyph_index(ch)` だけで判定し、bbox / outline までは取りに
+/// 行かない（warning 用途には十分）。フォント読み込みに失敗した場合は `false`。
+pub fn has_glyph(font: GlyphFontId, ch: char) -> bool {
+    face_for(font)
+        .and_then(|f| f.glyph_index(ch))
+        .is_some()
 }
 
 /// 1 文字分のグリフを `tiny_skia::Path` に焼き、orb 中心に center 揃えで返す。

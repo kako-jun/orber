@@ -2,7 +2,7 @@ use clap::{Parser, ValueEnum};
 use orber_core::animate::{MotionDirection, MotionSpeed};
 use orber_core::aquarelle::AquarelleParams;
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
-use orber_core::glyph::GlyphFontId;
+use orber_core::glyph::{has_glyph, GlyphFontId};
 use orber_core::orb::{OrbShape, RenderOptions};
 use orber_core::output_mode::OutputMode;
 use orber_core::style::{render_css, render_svg, ContrastPreset, StyleOptions};
@@ -255,11 +255,13 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliDirection::Lr)]
     direction: CliDirection,
 
-    /// Conveyor-belt speed. Coarse 2-step preset over the whole clip.
+    /// Conveyor-belt speed. 4-step preset (very-slow / slow / mid / fast)
+    /// controlling cycle count per clip.
     #[arg(long, value_enum, default_value_t = CliSpeed::Slow)]
     speed: CliSpeed,
 
     /// Number of orbs visible on screen at once (1..=1024, default 20).
+    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=35).
     /// Clusters are expanded to this count by weight-proportional color sampling
     /// and per-orb scattering on the cross axis. Higher count fills more of the
     /// frame; ~20 fills roughly 70% on the default size.
@@ -343,6 +345,8 @@ impl Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    warn_if_glyph_char_unsupported(&cli);
+
     if let Some(n) = cli.variations {
         return render_variations(&cli, n);
     }
@@ -399,6 +403,23 @@ fn warn_if_orb_pool_empty(orb_clusters: &[Cluster]) {
 /// Aquarelle 経路は cluster 数だけ orb を描画する設計（per-orb の独立揺らぎを
 /// 入れると bleed/bloom/halo の質感セットが壊れるため）。CLI からは aquarelle の
 /// ときだけ count が無視される事実が見えないので、ここで明示的に教える。
+/// `--shape glyph` で指定された `--glyph-char` が同梱フォント (Noto Sans Symbols 2)
+/// に収録されていなければ stderr で警告する。出力は走るが Glyph 描画は静かに
+/// スキップされるため、「絵文字を入れたら何も出ない」という挙動の理由が
+/// CLI 利用者には分からない。起動直後に 1 回だけ出すことで原因を明示する。
+fn warn_if_glyph_char_unsupported(cli: &Cli) {
+    if !matches!(cli.shape, Shape::Glyph) {
+        return;
+    }
+    let ch = cli.glyph_char;
+    if !has_glyph(GlyphFontId::NotoSymbols2, ch) {
+        eprintln!(
+            "orber: warning: '{}' (U+{:04X}) は同梱フォントに収録されていません。Glyph 描画はスキップされます。",
+            ch, ch as u32
+        );
+    }
+}
+
 fn warn_if_aquarelle_count_ignored(cli: &Cli) {
     if matches!(cli.shape, Shape::Aquarelle) {
         eprintln!(
@@ -853,6 +874,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.resolved_count(), 10);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "mid",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 20, "--count-preset mid must map to 20");
 
         let cli = Cli::try_parse_from([
             "orber",
