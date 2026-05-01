@@ -228,6 +228,16 @@ unavailable.
   on top of the still PNG until the mp4 is delivered, signalling that they will
   start moving shortly.
 
+**Re-roll cancellation.** When the user re-rolls (or drops a new image / flips
+aspect) while the previous batch is still in flight, `runBatch` terminates the
+Worker (`worker.terminate()`) and respawns it with a fresh wasm instance. A
+logical generation guard (`runGen` / `myGen`) alone is not enough because the
+in-flight wasm calls (`generate_one_at_index`) and the WebCodecs encode loop
+keep running to completion otherwise, doubling CPU usage and delaying the new
+batch. After respawn the cached source RGB is invalidated and re-uploaded on
+the next `workerSetSource`. The cost (a few hundred ms of wasm re-init) is paid
+only when re-rolling mid-batch; single, sequential runs see no overhead.
+
 ## Design system & i18n (web GUI)
 
 The web GUI (`web/`) follows a single design system documented in `DESIGN.md` at the
