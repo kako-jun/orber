@@ -29,6 +29,11 @@ interface PendingResolver {
   // 'animateProgress' kind の message が届くので、その経路で発火する。
   // pending は消さない（resolve は本体メッセージで行う）。
   onProgress?: (frame: number, total: number) => void;
+  // #108: 元リクエストの kind。`hasInFlight()` で init / setSource を
+  // 「ユーザー操作の進行中扱い」から除外して、再ガチャ判定の精度を上げる
+  // ために使う。init は wasm 起動だけ、setSource はキャッシュ更新だけで
+  // 旧 run の 12 個生成とは無関係。
+  kind: string;
 }
 
 interface BaseParams {
@@ -60,6 +65,14 @@ export function onWorkerCrash(cb: CrashCallback): () => void {
     const idx = crashCallbacks.indexOf(cb);
     if (idx >= 0) crashCallbacks.splice(idx, 1);
   };
+}
+
+// #108 (review s1): pending を全件 reject + clear する内部ヘルパ。
+// crash パスと terminateAndRespawn の両方で使い、reject 文言と
+// 副作用順序の食い違いを防ぐ。
+function drainPending(reason: string): void {
+  for (const [, p] of pending) p.reject(new Error(reason));
+  pending.clear();
 }
 
 function ensureWorker(): Worker {
@@ -96,8 +109,7 @@ function ensureWorker(): Worker {
     // Worker 全体が落ちると個別の id 照合では拾えないので、pending 全部に
     // reject を流して呼び出し側が例外で気づけるようにする。
     console.error('orber worker fatal error', e);
-    for (const [, p] of pending) p.reject(new Error('worker crashed'));
-    pending.clear();
+    drainPending('worker crashed');
     if (worker) {
       try {
         worker.terminate();
@@ -121,7 +133,7 @@ function ensureWorker(): Worker {
 }
 
 function call<T>(
-  req: Record<string, unknown>,
+  req: Record<string, unknown> & { kind: string },
   transfers: Transferable[] = [],
   onProgress?: (frame: number, total: number) => void,
 ): Promise<T> {
@@ -132,6 +144,7 @@ function call<T>(
       resolve: resolve as (v: unknown) => void,
       reject: reject as (e: unknown) => void,
       onProgress,
+      kind: req.kind,
     });
     w.postMessage({ ...req, id }, transfers);
   });
@@ -142,9 +155,21 @@ export async function workerInit(): Promise<void> {
   await call<void>({ kind: 'init' });
 }
 
-/** in-flight な RPC が 1 つでもあれば true。 */
+/**
+ * runBatch の 12 個生成系 RPC（generateOne / animateOne）が in-flight
+ * かどうか。init / setSource は除外する。
+ *
+ * #108 review m1: onMount の `workerInit()` が解決する前に decode が
+ * 終わって runBatch に入るレース（軽い PNG + 低速デバイス等）で、
+ * 単純な `pending.size > 0` だと init pending を巻き添え reject して
+ * しまい wasmStatus が 'error' で固着する。kind フィルタで「実作業」
+ * の有無だけを判定する。
+ */
 export function hasInFlight(): boolean {
-  return pending.size > 0;
+  for (const [, p] of pending) {
+    if (p.kind === 'generateOne' || p.kind === 'animateOne') return true;
+  }
+  return false;
 }
 
 /**
@@ -169,10 +194,7 @@ export async function terminateAndRespawn(): Promise<void> {
     await workerInit();
     return;
   }
-  for (const [, p] of pending) {
-    p.reject(new Error('worker terminated for new run'));
-  }
-  pending.clear();
+  drainPending('worker terminated for new run');
   try {
     worker.terminate();
   } catch (err) {

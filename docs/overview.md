@@ -235,8 +235,10 @@ logical generation guard (`runGen` / `myGen`) alone is not enough because the
 in-flight wasm calls (`generate_one_at_index`) and the WebCodecs encode loop
 keep running to completion otherwise, doubling CPU usage and delaying the new
 batch. After respawn the cached source RGB is invalidated and re-uploaded on
-the next `workerSetSource`. The cost (a few hundred ms of wasm re-init) is paid
-only when re-rolling mid-batch; single, sequential runs see no overhead.
+the next `workerSetSource`. The cost (a small wasm re-init) is paid only when
+re-rolling mid-batch; single, sequential runs see no overhead. Note the
+in-flight check excludes `init` / `setSource` RPCs so a re-roll triggered
+during early-mount initialization does not respawn the worker prematurely.
 
 ## Design system & i18n (web GUI)
 
