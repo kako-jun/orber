@@ -30,13 +30,13 @@ export const STRINGS = {
   },
   aspectPortrait: { ja: '縦長', en: 'Portrait' },
   aspectPortraitTitle: {
-    ja: '縦長 9:16（プレビュー 540×960 / DL 1080×1920）',
-    en: 'Portrait 9:16 (preview 540×960, DL 1080×1920)',
+    ja: '縦長 9:16（プレビュー 360×640 / DL 1080×1920）',
+    en: 'Portrait 9:16 (preview 360×640, DL 1080×1920)',
   },
   aspectLandscape: { ja: '横長', en: 'Landscape' },
   aspectLandscapeTitle: {
-    ja: '横長 16:9（プレビュー 960×540 / DL 1920×1080）',
-    en: 'Landscape 16:9 (preview 960×540, DL 1920×1080)',
+    ja: '横長 16:9（プレビュー 640×360 / DL 1920×1080）',
+    en: 'Landscape 16:9 (preview 640×360, DL 1920×1080)',
   },
   rerollLabel: { ja: '同じ画像でガチャ', en: 'Roll again' },
   rerollTitle: {

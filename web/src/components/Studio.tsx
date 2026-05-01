@@ -41,10 +41,15 @@ const VIDEO_TILE_COUNT = 4;
 // すべて 9:16 / 16:9 を厳守。`generate_one_at_index` / `start_animation_for_batch_spec`
 // は同じ baseSeed + (total, index) で同じ spec を再現するので、width/height だけ
 // 上げれば「同じバリエーションの高解像版」が得られる（決定論性は wasm 側で担保）。
-const PREVIEW_W_PORTRAIT = 540;
-const PREVIEW_H_PORTRAIT = 960;
-const PREVIEW_W_LANDSCAPE = 960;
-const PREVIEW_H_LANDSCAPE = 540;
+//
+// #99: プレビュー解像度を 540x960 (518,400px) → 360x640 (230,400px) に
+// 下げる（≒ 44% コスト削減）。DL 時は #73 の hi-res 再描画で 1080x1920
+// を出すので最終成果物は変わらない。タイル UI は max 200dvh 程度の
+// グリッドで縮小表示されるため 360x640 でも視認上の差は小さい。
+const PREVIEW_W_PORTRAIT = 360;
+const PREVIEW_H_PORTRAIT = 640;
+const PREVIEW_W_LANDSCAPE = 640;
+const PREVIEW_H_LANDSCAPE = 360;
 const DL_W_PORTRAIT = 1080;
 const DL_H_PORTRAIT = 1920;
 const DL_W_LANDSCAPE = 1920;
@@ -566,7 +571,7 @@ export default function Studio() {
     URL.revokeObjectURL(url);
   };
 
-  // #73: DL 時の hi-res 再描画。プレビュー（540×960）とは別に、同じ
+  // #73: DL 時の hi-res 再描画。プレビュー（#99 で 360×640）とは別に、同じ
   // baseSeed + (total, index) で `generate_one_at_index` / `start_animation_for_batch_spec`
   // を呼び、1080×1920 の PNG / mp4 を作る。プレビューと同じバリエーションが
   // 再現される（決定論性は wasm 側 random_batch_specs が担保）。
