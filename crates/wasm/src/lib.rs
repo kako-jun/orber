@@ -115,6 +115,76 @@ fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
     })
 }
 
+/// kmeans 結果のキャッシュ。同じソース画像 + 同じ K なら kmeans を skip する。
+///
+/// Android 計測 (kako-jun, 2026-05-01) で `extract_clusters` が 1 spec あたり
+/// ~3 秒かかり、12 stills + 4 mp4 = 16 呼び出しで合計 ~50 秒のロスになって
+/// いた（PC では合計 ~1 秒）。kmeans 結果はソース画像が変わらない限り同じ
+/// なので、(source_rgb の長さ + 4 隅 8 byte サンプル + width + height + k)
+/// を fingerprint にして再利用する。
+///
+/// wasm は single-threaded なので静的可変状態で問題ない。
+struct CachedClusters {
+    fingerprint: u64,
+    clusters_full: Vec<Cluster>,
+    bg: [u8; 4],
+    clusters: Vec<Cluster>,
+}
+
+static mut SOURCE_CACHE: Option<CachedClusters> = None;
+
+fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
+    // 完全一致は不要。長さ + dims + k + 4 隅サンプルで衝突は実用上ゼロ。
+    let mut acc: u64 = 0xcbf29ce484222325; // FNV offset basis
+    let mix = |acc: u64, b: u64| acc.wrapping_mul(0x100000001b3).wrapping_add(b);
+    acc = mix(acc, rgb.len() as u64);
+    acc = mix(acc, w as u64);
+    acc = mix(acc, h as u64);
+    acc = mix(acc, k as u64);
+    if rgb.len() >= 12 {
+        for i in 0..3 {
+            acc = mix(acc, rgb[i] as u64);
+            acc = mix(acc, rgb[rgb.len() / 2 + i] as u64);
+            acc = mix(acc, rgb[rgb.len() - 1 - i] as u64);
+            acc = mix(acc, rgb[rgb.len() / 4 + i] as u64);
+        }
+    }
+    acc
+}
+
+/// kmeans 結果（clusters_full / bg / clusters）を取得する。同じソース画像なら
+/// キャッシュヒットして O(1)、違う画像なら kmeans 実行 + キャッシュ更新。
+///
+/// SAFETY: wasm は single-threaded なので静的可変参照は問題ない。
+#[allow(static_mut_refs)]
+fn get_or_build_clusters(
+    p: &mut WasmParams,
+) -> Result<(Vec<Cluster>, [u8; 4], Vec<Cluster>), String> {
+    let fp = fingerprint(&p.source_rgb, p.source_width, p.source_height, p.k);
+    unsafe {
+        if let Some(c) = &SOURCE_CACHE {
+            if c.fingerprint == fp {
+                return Ok((c.clusters_full.clone(), c.bg, c.clusters.clone()));
+            }
+        }
+    }
+    let source = build_source_image(p)?;
+    let clusters_full =
+        extract_clusters(&source, p.k).map_err(|e| format!("cluster extraction failed: {e}"))?;
+    let bg = derive_background_rgba(&clusters_full);
+    let clusters = drop_dominant(&clusters_full);
+    let cached = CachedClusters {
+        fingerprint: fp,
+        clusters_full: clusters_full.clone(),
+        bg,
+        clusters: clusters.clone(),
+    };
+    unsafe {
+        SOURCE_CACHE = Some(cached);
+    }
+    Ok((clusters_full, bg, clusters))
+}
+
 fn deserialize_params(params_js: JsValue) -> Result<WasmParams, String> {
     let p: WasmParams = serde_wasm_bindgen::from_value(params_js)
         .map_err(|e| format!("failed to parse params: {e}"))?;
@@ -348,11 +418,11 @@ pub fn get_render_data(
     }
     let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
 
-    let source = build_source_image(&mut p).map_err(err_to_js)?;
-    let clusters_full = extract_clusters(&source, p.k)
-        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
-    let bg = derive_background_rgba(&clusters_full);
-    let clusters = drop_dominant(&clusters_full);
+    // kmeans は同じソース画像なら同じ結果になるのでキャッシュする。
+    // Android では kmeans が ~3 秒かかり、これがタイル毎に走ることで
+    // 12 stills + 4 mp4 = 16 呼び出しで合計 ~50 秒の律速になっていた。
+    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p).map_err(err_to_js)?;
+    let _ = clusters_full; // 現在は未使用だが将来 spec に diversity 等で使う可能性
 
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
