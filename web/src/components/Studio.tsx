@@ -78,6 +78,9 @@ export default function Studio() {
   const [dragOver, setDragOver] = createSignal(false);
   // #57: ドロップエリア長押し中だけ拡大プレビュー。
   const [previewVisible, setPreviewVisible] = createSignal(false);
+  // 出力 orb タイルの長押し拡大プレビュー（入力サムネ #57 と同じ UX）。
+  // null = 非表示。number = 該当タイル index を全画面プレビュー中。
+  const [tilePreviewIdx, setTilePreviewIdx] = createSignal<number | null>(null);
   // #73: DL 時の hi-res 再描画進捗。downloading=true の間 DL ボタンを
   // ロックし、進捗テキスト「高解像度版を準備中… {done} / {total}」を出す。
   const [downloading, setDownloading] = createSignal(false);
@@ -486,6 +489,42 @@ export default function Studio() {
     }
   };
 
+  // 出力 orb タイル長押し: 入力サムネ #57 と同じ UX。
+  // 400ms 押し続けたら該当タイルを全画面プレビュー、release で閉じる。
+  // 通常クリック（toggleTile による選択切替）は短いクリックでのみ発火。
+  let tileLongPressTimer: number | undefined;
+  let isTileLongPress = false;
+  const endTileLongPress = () => {
+    if (tileLongPressTimer !== undefined) {
+      clearTimeout(tileLongPressTimer);
+      tileLongPressTimer = undefined;
+    }
+    setTilePreviewIdx(null);
+  };
+  const onTilePointerDown = (e: PointerEvent, idx: number) => {
+    const target = e.currentTarget as HTMLElement | null;
+    target?.setPointerCapture?.(e.pointerId);
+    isTileLongPress = false;
+    tileLongPressTimer = window.setTimeout(() => {
+      isTileLongPress = true;
+      setTilePreviewIdx(idx);
+      tileLongPressTimer = undefined;
+    }, LONG_PRESS_MS);
+  };
+  const onTilePointerEnd = () => {
+    endTileLongPress();
+  };
+  const onTileClick = (e: MouseEvent, idx: number) => {
+    if (isTileLongPress) {
+      e.preventDefault();
+      e.stopPropagation();
+      isTileLongPress = false;
+      return;
+    }
+    const tile = tiles()[idx];
+    if (tile?.blob) toggleTile(idx);
+  };
+
   const setAspectAndMaybeRerun = (a: Aspect) => {
     if (aspect() === a) return;
     setAspect(a);
@@ -869,10 +908,14 @@ export default function Studio() {
             {(tile, i) => (
               <button
                 type="button"
-                onClick={() => tile.blob && toggleTile(i())}
+                onClick={(e) => onTileClick(e, i())}
+                onPointerDown={(e) => tile.blob && onTilePointerDown(e, i())}
+                onPointerUp={onTilePointerEnd}
+                onPointerCancel={onTilePointerEnd}
+                onContextMenu={(e) => e.preventDefault()}
                 disabled={!tile.blob}
                 aria-busy={!tile.blob}
-                class="group relative block w-full overflow-hidden rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
+                class="group relative block w-full overflow-hidden rounded touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
                 style={{
                   'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
                 }}
@@ -1114,6 +1157,46 @@ export default function Studio() {
             class="max-h-[90vh] max-w-[90vw] object-contain select-none touch-none"
           />
         </div>
+      </Show>
+
+      {/* 出力 orb タイル長押し時の全画面プレビュー。動画タイルで mp4 が
+          完成済みなら video を、それ以外は静止 PNG を表示する。
+          pointer-events-none で下のボタンが pointerup を受けられる。 */}
+      <Show
+        when={(() => {
+          const idx = tilePreviewIdx();
+          if (idx === null) return null;
+          const tile = tiles()[idx];
+          return tile?.blob ? tile : null;
+        })()}
+      >
+        {(tile) => (
+          <div
+            class="fade-in pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-bg/80"
+            aria-hidden="true"
+          >
+            <Show
+              when={tile().kind === 'video' && tile().videoBlobUrl}
+              fallback={
+                <img
+                  src={tile().blobUrl}
+                  alt=""
+                  draggable={false}
+                  class="max-h-[90vh] max-w-[90vw] object-contain select-none touch-none"
+                />
+              }
+            >
+              <video
+                src={tile().videoBlobUrl}
+                muted
+                playsinline
+                loop
+                autoplay
+                class="max-h-[90vh] max-w-[90vw] object-contain select-none touch-none"
+              />
+            </Show>
+          </div>
+        )}
       </Show>
     </section>
   );
