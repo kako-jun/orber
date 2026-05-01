@@ -81,12 +81,18 @@ export async function encodeAnimationToMp4(
   // 仕様上 `configure` は同期で完了し、直後の `encode` 呼び出しは合法。
   const codedArea = Math.ceil(width / 16) * 16 * Math.ceil(height / 16) * 16;
   const codecString = codedArea <= 921_600 ? 'avc1.42E01F' : 'avc1.42E02A';
+  // `hardwareAcceleration: 'prefer-hardware'` で HW h264 エンコーダがあれば
+  // それを使う。Android Chrome や iOS Safari の最近の機種は MediaCodec /
+  // VideoToolbox 経由で大幅に速い。HW 不在環境では仕様上ソフトウェアに
+  // フォールバックする（`require` ではなく `prefer` なので throw しない）。
+  // 1080×1920 × 192 frame の DL hi-res で体感差が出る。
   encoder.configure({
     codec: codecString,
     width,
     height,
     framerate: ANIM_FPS,
     bitrate: 2_000_000,
+    hardwareAcceleration: 'prefer-hardware',
   });
 
   const microsecondsPerFrame = 1_000_000 / ANIM_FPS;
