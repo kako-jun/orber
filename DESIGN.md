@@ -280,7 +280,7 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - `<input type="text" maxLength=2>` を `w-16` の中央寄せで配置。padding は `px-2 py-1`
 - IME や grapheme cluster で複数 char になっても `onInput` で先頭 char に丸める
 - 同梱フォント (Noto Sans Symbols 2) に収録されていない文字は wasm の `glyph_supported(ch)` が `false` を返す。UI は `border-fgMuted` に切り替え + `fg-muted` の小さい注記「同梱フォントに収録されていません / Not in bundled font」を右に並べる
-- ガチャボタンは disable しない（押せば「描画されない」結果が出るのを許容、意図的な monochrome シグナリング）
+- ガチャボタンは未収録文字（フォントに無いがコードポイントは存在する）では disable しない — 押せば「描画されない orb」が出るのを許容する monochrome シグナリング。ただし **shape=glyph かつ glyphChar が空文字** のときは、wasm 入口の `parse_shape("glyph", "")` が `glyph_char is empty` の fatal error を返してしまうため、UI 側で disable する（PR #130 review Q2）。空文字を受理する shape=circle 経路には影響しない
 
 ### 「Mid = identity」不変条件
 

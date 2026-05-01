@@ -78,6 +78,13 @@ export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
   const [wasmErr, setWasmErr] = createSignal<string>('');
   const [aspect, setAspect] = createSignal<Aspect>('portrait');
+  // PR #130 review Q1: 「現在表示中のタイルが生成されたときの aspect」を別 signal で
+  // 持つ。aspect トグル → ガチャ未実行 → DL の順で操作されると、aspect() は新値
+  // (=表示中タイルと食い違う) なのに renderHiResForIndices が aspect() を読んで
+  // hi-res 解像度を新 aspect でレンダリングしてしまう。tilesAspect は runBatch
+  // 開始時に aspect() のスナップショットを取り、DL 経路はこちらを使うことで
+  // プレビューと DL の aspect を必ず一致させる。
+  const [tilesAspect, setTilesAspect] = createSignal<Aspect>('portrait');
   // Phase B (#55): advanced 軸の signal。デフォルトは「現状（Mid / Standard）」と
   // 完全同値。これにより既存の Circle 出力に regression が無いことを保証する
   // （wasm 側の preset 上書きは empty / mid のとき no-op）。
@@ -188,6 +195,11 @@ export default function Studio() {
   // Phase B (#55): glyph 文字の収録状況を非同期で確認し、警告フラグに反映する。
   // wasm 起動前は楽観的に true（警告非表示）。空文字も true（実際にガチャを
   // 引くまでは警告しない、UI は「文字が描かれない」状態で済む）。
+  //
+  // PR #130 review Q3: wasm 起動前 (wasmStatus !== 'ready') は楽観的に true に
+  // して警告を抑制する。status が 'ready' に変わるとこの effect が再評価され
+  // workerGlyphSupported が走る。createEffect が wasmStatus と glyphChar の
+  // 両方を読むため Solid が依存追跡し、どちらかの変化で再評価される。
   createEffect(() => {
     const ch = glyphChar();
     const status = wasmStatus();
@@ -280,6 +292,10 @@ export default function Studio() {
     setWarningMsg('');
     setProgress(0);
     setPhase('generating');
+    // Q1: ここで「タイル群が生成されるときの aspect」をスナップショット。
+    // 以後 aspect() が変わっても tilesAspect() は変わらないので、DL の
+    // hi-res 再描画は表示中タイルと一致した aspect で必ず描かれる。
+    setTilesAspect(aspect());
     // #61: 新しい run の開始でビデオ参照テーブルもリセット。
     videoRefs = [];
 
@@ -675,7 +691,10 @@ export default function Studio() {
       throw new Error('cannot render hi-res: missing seed / source');
     }
 
-    const a = aspect();
+    // Q1: aspect() ではなく tilesAspect() を使う。プレビュー生成時の aspect
+    // をスナップショットしてあるので、aspect トグル後に DL してもタイル群と
+    // 食い違った解像度で hi-res 再描画されない。
+    const a = tilesAspect();
     const [hiW, hiH] =
       a === 'portrait'
         ? [DL_W_PORTRAIT, DL_H_PORTRAIT]
@@ -979,7 +998,11 @@ export default function Studio() {
             phase() === 'decoding' ||
             phase() === 'generating' ||
             phase() === 'animating' ||
-            downloading()
+            downloading() ||
+            // Q2: shape='glyph' かつ glyphChar 空のときは wasm 入口で
+            // `glyph_char is empty` の fatal error になるためガチャを disable する。
+            // shape='circle' のときは glyphChar の中身は使われないので無視。
+            (shape() === 'glyph' && glyphChar().trim() === '')
           }
           aria-label={t('gachaLabel')}
           title={t('gachaTitle')}
