@@ -301,7 +301,7 @@ export default function Studio() {
         if (myGen !== runGen) return;
         const png = await workerGenerateOne(params, total, i);
         if (myGen !== runGen) return;
-        const blob = new Blob([png], { type: 'image/png' });
+        const blob = new Blob([new Uint8Array(png)], { type: 'image/png' });
         const blobUrl = URL.createObjectURL(blob);
         const kind: Tile['kind'] = i < stillCount ? 'still' : 'video';
         setTiles((prev) =>
@@ -642,7 +642,7 @@ export default function Studio() {
         // 静止タイル、または WebCodecs 非対応環境では hi-res の t=0 PNG。
         const png = await workerGenerateOne(hiParams, total, i);
         out.set(i, {
-          blob: new Blob([png], { type: 'image/png' }),
+          blob: new Blob([new Uint8Array(png)], { type: 'image/png' }),
           ext: 'png',
         });
       } else {
@@ -1075,8 +1075,8 @@ export default function Studio() {
                               fill="none"
                               stroke="currentColor"
                               stroke-width="1.5"
-                              stroke-dasharray={c}
-                              stroke-dashoffset={c * (1 - pct())}
+                              stroke-dasharray={String(c)}
+                              stroke-dashoffset={String(c * (1 - pct()))}
                               stroke-linecap="round"
                               transform="rotate(-90 12 12)"
                             />
