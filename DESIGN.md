@@ -18,7 +18,7 @@ No accent color. The generated artwork supplies all color; the chrome stays in m
 | `fg`             | `#FFFFFF`                   | Primary text, logo, active control text                 |
 | `fg-muted`       | `rgba(255,255,255,0.55)`    | Subtitle, status text, inactive control text            |
 | `fg-subtle`      | `rgba(255,255,255,0.32)`    | Placeholder text, disabled label                        |
-| `hairline`       | `rgba(255,255,255,0.12)`    | Drop-area dashed border, separators                     |
+| `hairline`       | `rgba(255,255,255,0.12)`    | Separators, glass borders                               |
 | `glass-bg`       | `rgba(255,255,255,0.06)`    | Default button / toggle / segmented surface             |
 | `glass-bg-hover` | `rgba(255,255,255,0.10)`    | Hover state for glass surfaces                          |
 | `glass-blur`     | `blur(12px)`                | `backdrop-filter` on glass surfaces                     |
@@ -61,7 +61,8 @@ No bold anywhere. Headers are deliberately light.
 
 - Flat, **not** glass (acts as content surface, not control)
 - Background: transparent
-- Border: `1px dashed hairline`, radius `0.75rem`
+- Border: dotted ring (SVG `stroke-dasharray="0 14"` + `stroke-linecap="round"`),
+  default color `fg-subtle` (`rgba(255,255,255,0.32)`), radius `0.75rem`
 - Padding: `2.5rem` (40px) vertical, `2rem` (32px) horizontal
 - Hover state (empty): border swaps to `fg-muted`
 - Drag-over state: border swaps to `fg`, fill `glass-bg`
