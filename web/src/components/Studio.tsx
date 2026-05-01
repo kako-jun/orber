@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
@@ -81,6 +81,14 @@ export default function Studio() {
   // 出力 orb タイルの長押し拡大プレビュー（入力サムネ #57 と同じ UX）。
   // null = 非表示。number = 該当タイル index を全画面プレビュー中。
   const [tilePreviewIdx, setTilePreviewIdx] = createSignal<number | null>(null);
+  // プレビュー対象タイルを `createMemo` で集約し、Show 側で IIFE を避ける。
+  // tile.blob が無いタイル (skeleton) は対象外。
+  const previewTile = createMemo(() => {
+    const idx = tilePreviewIdx();
+    if (idx === null) return null;
+    const tile = tiles()[idx];
+    return tile?.blob ? tile : null;
+  });
   // #73: DL 時の hi-res 再描画進捗。downloading=true の間 DL ボタンを
   // ロックし、進捗テキスト「高解像度版を準備中… {done} / {total}」を出す。
   const [downloading, setDownloading] = createSignal(false);
@@ -178,6 +186,9 @@ export default function Studio() {
         selected: false,
       })),
     );
+    // S1: 前回 run の stale な進捗が新タイルに表示されるのを防ぐ。
+    // clearTiles 経由でない直接 runBatch 連打パスでも確実にリセット。
+    setAnimProgressMap(new Map());
   };
 
   // 1 frame ぶん描画を挟む（setTimeout(0) より意図が明確）。
@@ -492,6 +503,8 @@ export default function Studio() {
   // 出力 orb タイル長押し: 入力サムネ #57 と同じ UX。
   // 400ms 押し続けたら該当タイルを全画面プレビュー、release で閉じる。
   // 通常クリック（toggleTile による選択切替）は短いクリックでのみ発火。
+  // 単一ポインタ前提（複数指で同時に複数タイルを掴むケースは想定外、
+  // 後発の pointerdown で前のタイマーは上書きされ自然に最後の操作が勝つ）。
   let tileLongPressTimer: number | undefined;
   let isTileLongPress = false;
   const endTileLongPress = () => {
@@ -499,9 +512,12 @@ export default function Studio() {
       clearTimeout(tileLongPressTimer);
       tileLongPressTimer = undefined;
     }
-    setTilePreviewIdx(null);
+    if (tilePreviewIdx() !== null) setTilePreviewIdx(null);
   };
   const onTilePointerDown = (e: PointerEvent, idx: number) => {
+    // 生成済みタイルでのみ長押しを受け付ける。skeleton 中は何もしない
+    // （button disabled でほぼ届かないが念のため）。
+    if (!tiles()[idx]?.blob) return;
     const target = e.currentTarget as HTMLElement | null;
     target?.setPointerCapture?.(e.pointerId);
     isTileLongPress = false;
@@ -909,7 +925,7 @@ export default function Studio() {
               <button
                 type="button"
                 onClick={(e) => onTileClick(e, i())}
-                onPointerDown={(e) => tile.blob && onTilePointerDown(e, i())}
+                onPointerDown={(e) => onTilePointerDown(e, i())}
                 onPointerUp={onTilePointerEnd}
                 onPointerCancel={onTilePointerEnd}
                 onContextMenu={(e) => e.preventDefault()}
@@ -1162,14 +1178,7 @@ export default function Studio() {
       {/* 出力 orb タイル長押し時の全画面プレビュー。動画タイルで mp4 が
           完成済みなら video を、それ以外は静止 PNG を表示する。
           pointer-events-none で下のボタンが pointerup を受けられる。 */}
-      <Show
-        when={(() => {
-          const idx = tilePreviewIdx();
-          if (idx === null) return null;
-          const tile = tiles()[idx];
-          return tile?.blob ? tile : null;
-        })()}
-      >
+      <Show when={previewTile()}>
         {(tile) => (
           <div
             class="fade-in pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-bg/80"
