@@ -18,9 +18,16 @@
 //   - pos = mod(phase * extent + advance_steps * extent, extent) - r_normalized
 //   - 3 軸独立呼吸: radius ±10%, blur ±15, opacity ±5%
 //   - rim: 3-stop alpha gradient (mid_stop = clamp(1 - blur*0.8, 0.05, 0.95))
+//          center_a = opacity, mid_a = opacity * 80/255 ≈ 0.3137
 //   - soft: 2-stop alpha gradient (hold_stop = clamp(1 - blur, 0.05, 0.95))
 //   - Source-Over: out.rgb = src.rgb * src.a + out.rgb * (1 - src.a)
 //                  out.a   = src.a + out.a * (1 - src.a)
+//
+// review S1: CPU 側 (crates/core::orb) は alpha を `(opacity * 255).round() as u8`
+// と `(opacity * 80).round() as u8` で 1/255 ステップに量子化してから tiny-skia
+// に渡している。本 shader は raw float のまま blend する。差分は最大 ≤ 1/255
+// (≒ 0.4% の輝度差) で肉眼識別不能。kako-jun 合意の「最終的な見た目が同じ」
+// 合格ラインを守る前提で量子化は省略している。
 
 /// uniform 配列の上限。`crates/core::animate::MAX_ORB_COUNT = 1024` ほど大きく
 /// する必要はなく、GUI 経路では `random_batch_specs` の count_range

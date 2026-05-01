@@ -36,6 +36,13 @@ use wasm_bindgen::prelude::*;
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
 const MAX_ORB_COUNT: usize = 1024;
 
+/// WebGL2 fragment shader 側の uniform array サイズ上限
+/// (`web/src/lib/orberGl.ts::MAX_ORBS`)。ここで超過を早期エラーにし、
+/// shader アップロード時に黙って切り詰められるのを防ぐ。GUI の
+/// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
+/// 将来 GUI の COUNT_MAX を増やす場合は両方同時に上げること。
+const GL_RENDERER_MAX_ORBS: usize = 64;
+
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
 #[wasm_bindgen(start)]
 pub fn init_panic_hook() {
@@ -364,6 +371,16 @@ pub fn get_render_data(
         .count
         .min(MAX_ORB_COUNT)
         .max(if clusters.is_empty() { 0 } else { 1 });
+
+    // review S2: WebGL fragment shader の uniform 配列上限を超えると黙って
+    // 切り詰められて視覚パリティが壊れる。発見が遅れないよう wasm 側で
+    // 早期 throw する。spec.count > 64 になる経路は現 GUI には無いが、
+    // random_ranges を将来弄る際の保険。
+    if n_orbs > GL_RENDERER_MAX_ORBS {
+        return Err(JsError::new(&format!(
+            "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
+        )));
+    }
 
     let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
     let base_blur = spec.blur.clamp(0.0, 1.0);
