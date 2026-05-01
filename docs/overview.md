@@ -30,13 +30,13 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 
 - `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
 - `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). Ignored when `--shape glyph`.
-- `--count` — orbs visible on screen at once (1..=200, default 20)
-- `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 35). Mutually exclusive with `--count`.
+- `--count` — orbs visible on screen at once (1..=1024, default 20)
+- `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
 - `--shape` — `circle`, `aquarelle` (watercolor bleed), or `glyph` (text character)
 - `--glyph-char` — single character used when `--shape glyph` (default `☆`)
-- `--contrast` — visual contrast preset: `low` / `mid` / `high` (default `mid`, existing behavior)
+- `--softness` — blur/edge-softness preset: `low` / `mid` / `high` (default `mid`, existing behavior)
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
@@ -338,53 +338,39 @@ color. The pipeline:
    converted into a `tiny-skia::Path`. The path is filled (not stroked) with
    the orb's color at the orb's center, scaled to the orb's radius.
 4. Because Glyph is an outline-fill primitive, the **`--blur` parameter is
-   ignored in this mode**. Softness comes from the contrast preset's edge
-   softness rather than a gaussian post-pass.
+   ignored in this mode**. Softness comes from the `--softness` preset's edge
+   falloff rather than a gaussian post-pass.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
 
-## Contrast axis (Phase A)
+## Softness axis
 
-`--contrast {low, mid, high}` is a **single user-facing axis** that bundles
-three internal knobs (alpha, blur strength, edge sharpness) into a 3-stop
-preset. The intent is to give one knob covering the realistic range of "how
-loud should the orbs be" without exposing each underlying parameter:
+`--softness {low, mid, high}` is a **single user-facing axis** that bundles
+three internal knobs (alpha, blur strength, edge softness) into a 3-stop
+preset.
 
 | preset | alpha | blur | edge | use case |
 |---|---|---|---|---|
-| `low`  | weak      | strong    | soft      | sit underneath text overlay |
-| `mid`  | (default) | (default) | (default) | standalone backdrop, default |
-| `high` | (= `mid`) | weak      | sharp     | rich wallpaper, single hero plate |
-
-`high` deliberately keeps alpha at the same value as `mid`. The user-facing
-preset still reads as "richer", but on the alpha axis specifically the contrast
-is purely on the blur / edge sharpness side. This is required by the `mid =
-identity` invariant: if `high` boosted alpha above `mid`, an asymmetric range
-("`mid` is the floor of alpha rather than the center") would make follow-up
-auto-tuning of the contrast knob harder.
+| `low`  | default | weak   | sharp | crisp plate / wallpaper |
+| `mid`  | default | default | default | legacy default |
+| `high` | weak    | strong | soft  | sit underneath text overlay |
 
 `mid` is the **identity preset** — its alpha / blur / edge values are exactly
-the existing defaults, so passing `--contrast mid` (or omitting the flag) is
-guaranteed to match the pre-Phase-A render bit-for-bit. A regression test in
-`crates/core` pins this behavior so the `mid = identity` invariant cannot drift
-silently.
-
-The preset is implemented as `ContrastPreset { Low, Mid, High }` in
-`crates/core/src/style.rs` and consumed by the orb rendering path; CLI parsing
-is via `clap`'s `ValueEnum`.
+the existing defaults, so passing `--softness mid` (or omitting the flag) is
+guaranteed to match the pre-preset render bit-for-bit. The preset is
+implemented as `SoftnessPreset { Low, Mid, High }` in `crates/core/src/style.rs`.
 
 ## Phase B — Web GUI parity (#55)
 
 Phase B propagates the four CLI advanced axes to the Studio surface and
 WebGL2 fragment-shader path so a browser user can drive shape / count /
-speed / contrast without dropping to the terminal.
+speed / softness without dropping to the terminal.
 
 - `WasmParams` gains four optional string fields (`glyph_char`, `count_preset`,
-  `speed_preset`, `contrast_preset`) all defaulting to `""` (= "use the spec
-  / Phase A behaviour"). The wasm crate keeps Phase A's `panic!` for
-  `MotionSpeed::Mid | Fast` removed, and `parse_speed` now accepts all four
-  variants. `parse_shape` accepts `"glyph"` in addition to `"circle"`.
+  `speed_preset`, `softness_preset`) all defaulting to `""` (= "use the spec
+  / Phase A behaviour"). `parse_shape` accepts `"glyph"` in addition to
+  `"circle"`.
 - The browser baked Glyph alpha masks via the new
   `orber_core::glyph::render_glyph_alpha_mask(font, ch, size) -> Vec<u8>`
   helper. The wasm wrapper exports it as
@@ -394,7 +380,7 @@ speed / contrast without dropping to the terminal.
   across the 96-frame `<video>` encode loop; subsequent frames only update
   `u_t`.
 - The fragment shader gains `u_glyph_mask: sampler2D`, `u_shape_id: int`
-  (`0=Circle`, `1=Glyph`), and `u_alpha_mul: float` (the contrast preset's
+  (`0=Circle`, `1=Glyph`), and `u_alpha_mul: float` (the softness preset's
   alpha multiplier, baked into per-orb opacity). When `u_shape_id == 0` the
   Phase A radial-gradient rim/soft path is preserved bit-for-bit; the
   glyph-mask texture lookup is fully gated behind the `u_shape_id == 1`
@@ -402,13 +388,16 @@ speed / contrast without dropping to the terminal.
 - `get_render_data`'s 16-word header schema reserves words 9 and 10 for
   `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
   per-orb 16-word slots are unchanged.
-- Studio UI: aspect (Portrait / Landscape) toggles **stop auto-rerunning**
-  the batch — they are now state-only. The previous reload-arrow chip is
-  promoted to a labelled "Roll / ガチャを引く" button, sized one step larger
-  than the aspect chips, and is the **single source of generation**. The
-  collapsible Advanced section between aspect and gacha exposes Shape
-  (Circle / Glyph) + the 1-character glyph input + Count (Few / Standard /
-  Many → 10 / 20 / 35) + Speed (Slow / Standard / Fast → slow / mid / fast)
-  + Contrast (Soft / Standard / Strong → low / mid / high). Defaulting all
-  three preset axes to `mid` is byte-exact identity with Phase A's previous
-  output.
+- Studio UI (#131): the collapsible Advanced section is gone. Instead, the
+  four axes are always visible as flat control rows directly under the aspect
+  toggles. Every control immediately re-runs the batch:
+  - Shape = Circle / Glyph + inline glyph input
+  - Count = Few / Standard / Many → 10 / 20 / 30
+  - Speed = Slow / Standard / Fast → VerySlow / Slow / Mid
+  - Softness = Low / Standard / High → sharp / identity / soft
+  The old large "Roll / ガチャを引く" chip is removed; only a small reload
+  icon remains at the bottom. The icon spins while decoding / generating /
+  animating. For IME safety, glyph input suppresses `glyph_supported()` RPCs
+  during composition and trims to the first Unicode character on commit. A symbol
+  picker is shown under the glyph row and is filtered to characters that the
+  bundled font actually supports.

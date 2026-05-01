@@ -18,7 +18,7 @@
 use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
-use crate::style::ContrastPreset;
+use crate::style::SoftnessPreset;
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -52,7 +52,10 @@ pub enum OrbShape {
     Circle,
     Aquarelle(AquarelleParams),
     /// 1 文字のグリフを orb として描く。`ch` は描画する文字、`font` は同梱フォント識別子。
-    Glyph { ch: char, font: GlyphFontId },
+    Glyph {
+        ch: char,
+        font: GlyphFontId,
+    },
 }
 
 impl PartialEq for OrbShape {
@@ -63,10 +66,9 @@ impl PartialEq for OrbShape {
         match (self, other) {
             (OrbShape::Circle, OrbShape::Circle) => true,
             (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_)) => true,
-            (
-                OrbShape::Glyph { ch: a, font: fa },
-                OrbShape::Glyph { ch: b, font: fb },
-            ) => a == b && fa == fb,
+            (OrbShape::Glyph { ch: a, font: fa }, OrbShape::Glyph { ch: b, font: fb }) => {
+                a == b && fa == fb
+            }
             _ => false,
         }
     }
@@ -90,7 +92,7 @@ pub struct RenderOptions {
     /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
     pub shape: OrbShape,
     /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
-    pub contrast: ContrastPreset,
+    pub softness: SoftnessPreset,
 }
 
 impl Default for RenderOptions {
@@ -103,7 +105,7 @@ impl Default for RenderOptions {
             saturation: 1.0,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
-            contrast: ContrastPreset::Mid,
+            softness: SoftnessPreset::Mid,
         }
     }
 }
@@ -117,12 +119,12 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
     // 不正・極端な値を握りつぶさず、最低限の防衛だけ行う。
     let width = opts.width.max(1);
     let height = opts.height.max(1);
-    // contrast offset を blur に積算してから clamp。Mid なら既存と完全同値。
-    let blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
+    // softness offset を blur に積算してから clamp。Mid なら既存と完全同値。
+    let blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
-    // contrast による中心 alpha 倍率。Circle / Glyph 経路で共通に使う。
-    let alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
+    // softness による中心 alpha 倍率。Circle / Glyph 経路で共通に使う。
+    let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
 
     // Pixmap::new は uninit を 0 埋めしてくれる（つまり全画面が透明）。
     // 透過 (alpha=0) 指定なら fill をスキップしてその透明初期値を活かす。
@@ -157,14 +159,22 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
         }
 
         // Glyph: 1 文字のアウトラインを fill。半径は Circle と同じ意味で渡す。
-        // contrast の alpha 倍率は適用、blur は使わない（グリフはアウトライン fill のため）。
+        // softness の alpha 倍率は適用、blur は使わない（グリフはアウトライン fill のため）。
         if let OrbShape::Glyph { ch, font } = opts.shape {
-            render_glyph_orb(&mut pixmap, (cx, cy), radius, [r, g, b], alpha_mul, font, ch);
+            render_glyph_orb(
+                &mut pixmap,
+                (cx, cy),
+                radius,
+                [r, g, b],
+                alpha_mul,
+                font,
+                ch,
+            );
             continue;
         }
 
         // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
-        // contrast 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
+        // softness 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
         // 動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
         render_one_orb(
             &mut pixmap,
@@ -512,7 +522,7 @@ mod tests {
         assert_eq!(img.height(), 1920);
     }
 
-    /// 平均 alpha（厳密には平均 R）を計算するヘルパ。contrast preset の比較で使う。
+    /// 平均 alpha（厳密には平均 R）を計算するヘルパ。softness preset の比較で使う。
     fn mean_red(img: &RgbaImage) -> f64 {
         let mut s = 0u64;
         for px in img.pixels() {
@@ -522,12 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn contrast_low_lower_alpha_than_high_circle() {
-        // Circle 経路で Low は High より中央輝度（≒ alpha）が低い。
-        // 入力色は赤、背景は黒（R=0）。Low ほど orb 中心の R が抑えられ、
+    fn softness_high_is_softer_than_low_for_circle() {
+        // Circle 経路で High は Low よりソフト（alpha 低め + blur 強め）になる。
+        // 入力色は赤、背景は黒（R=0）。High ほど orb 中心の R が抑えられ、
         // 平均 R も小さくなる。
         let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
-        let make = |contrast: ContrastPreset| {
+        let make = |softness: SoftnessPreset| {
             render_static(
                 &[c],
                 &RenderOptions {
@@ -536,31 +546,31 @@ mod tests {
                     blur: 0.5,
                     saturation: 1.0,
                     orb_size: 1.0,
-                    contrast,
+                    softness,
                     ..Default::default()
                 },
             )
         };
-        let low = mean_red(&make(ContrastPreset::Low));
-        let mid = mean_red(&make(ContrastPreset::Mid));
-        let high = mean_red(&make(ContrastPreset::High));
+        let low = mean_red(&make(SoftnessPreset::Low));
+        let mid = mean_red(&make(SoftnessPreset::Mid));
+        let high = mean_red(&make(SoftnessPreset::High));
         assert!(
-            low < mid,
-            "contrast=Low mean R ({low}) must be < Mid ({mid})"
+            low >= mid,
+            "softness=Low mean R ({low}) must be >= Mid ({mid}) because Low is sharper"
         );
         assert!(
-            high >= mid,
-            "contrast=High mean R ({high}) must be >= Mid ({mid}) (sharper edges keep more red near center)"
+            high < mid,
+            "softness=High mean R ({high}) must be < Mid ({mid}) because High is softer"
         );
         assert!(
-            low < high,
-            "contrast=Low ({low}) must be visibly less bright than High ({high})"
+            high < low,
+            "softness=High ({high}) must be visibly softer / dimmer than Low ({low})"
         );
     }
 
     #[test]
-    fn contrast_mid_matches_default_render() {
-        // contrast=Mid を明示しても RenderOptions::default() と同じピクセルが出る（regression なし）。
+    fn softness_mid_matches_default_render() {
+        // softness=Mid を明示しても RenderOptions::default() と同じピクセルが出る（regression なし）。
         let c = cluster([200, 50, 50], 0.5, 0.5, 1.0);
         let opts_default = RenderOptions {
             width: 64,
@@ -570,7 +580,7 @@ mod tests {
         let opts_mid = RenderOptions {
             width: 64,
             height: 64,
-            contrast: ContrastPreset::Mid,
+            softness: SoftnessPreset::Mid,
             ..Default::default()
         };
         let a = render_static(&[c], &opts_default);
@@ -578,7 +588,7 @@ mod tests {
         assert_eq!(
             a.as_raw(),
             b.as_raw(),
-            "contrast=Mid must be byte-exact identical to default"
+            "softness=Mid must be byte-exact identical to default"
         );
     }
 

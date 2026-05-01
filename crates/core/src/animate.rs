@@ -44,7 +44,7 @@
 
 use crate::cluster::Cluster;
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
-use crate::style::ContrastPreset;
+use crate::style::SoftnessPreset;
 use image::RgbaImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -127,7 +127,7 @@ pub struct AnimateOptions {
     /// orb の描画形式。
     pub shape: OrbShape,
     /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
-    pub contrast: ContrastPreset,
+    pub softness: SoftnessPreset,
 }
 
 impl Default for AnimateOptions {
@@ -144,7 +144,7 @@ impl Default for AnimateOptions {
             count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
-            contrast: ContrastPreset::Mid,
+            softness: SoftnessPreset::Mid,
         }
     }
 }
@@ -356,10 +356,10 @@ pub fn render_frame_with_params(
 
     let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
     let saturation = opts.saturation.max(0.0);
-    // contrast 軸: blur は事前に offset を加算、alpha は per-orb opacity_factor に乗じる。
+    // softness 軸: blur は事前に offset を加算、alpha は per-orb opacity_factor に乗じる。
     // Mid なら blur_offset=0, alpha_mul=1.0 で既存挙動と完全同値。
-    let base_blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
-    let contrast_alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
+    let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
+    let softness_alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
 
     // 進行軸の長さ（ピクセル）。LR/RL では width、TB/BT では height。
     // r_normalized を計算する基準になる。
@@ -422,8 +422,8 @@ pub fn render_frame_with_params(
         let cy = ny * height as f32;
         let rgb = adjust_saturation_pub(c.color, saturation);
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
-        // contrast の alpha 倍率を per-orb の opacity_factor に積算（Mid なら ×1.0 で同値）。
-        let opacity = (opacity_factor * contrast_alpha_mul).clamp(0.0, 1.0);
+        // softness の alpha 倍率を per-orb の opacity_factor に積算（Mid なら ×1.0 で同値）。
+        let opacity = (opacity_factor * softness_alpha_mul).clamp(0.0, 1.0);
 
         // shape による分岐:
         // - Glyph: 円グラデ ではなく 1 文字のフォントアウトラインを fill。blur と style は使わない
@@ -433,7 +433,15 @@ pub fn render_frame_with_params(
                 // OrbShape::Glyph はアウトライン fill 描画のため、Rim / Soft の grad stop 演出は
                 // 適用しない。RNG の `style` 引きは継続して per-orb sequence の互換性を維持する
                 // (Circle/Glyph 切替で seed 由来の他パラメータ列がズレないようにするため)。
-                crate::glyph::render_glyph_orb(&mut pixmap, (cx, cy), radius, rgb, opacity, font, ch);
+                crate::glyph::render_glyph_orb(
+                    &mut pixmap,
+                    (cx, cy),
+                    radius,
+                    rgb,
+                    opacity,
+                    font,
+                    ch,
+                );
             }
             _ => {
                 render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
@@ -560,7 +568,7 @@ fn render_frame_aquarelle(
         saturation: opts.saturation,
         background: opts.background,
         shape: opts.shape,
-        contrast: opts.contrast,
+        softness: opts.softness,
     };
     render_static(&modulated, &render_opts)
 }
@@ -621,7 +629,7 @@ mod tests {
             count: None,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
-            contrast: ContrastPreset::Mid,
+            softness: SoftnessPreset::Mid,
         }
     }
 

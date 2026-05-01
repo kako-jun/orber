@@ -1,5 +1,5 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
-// orber#55 Phase B — Glyph shape (アウトライン fill) 経路と contrast 軸を追加。
+// orber#55 Phase B — Glyph shape (アウトライン fill) 経路と softness 軸を追加。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
@@ -10,7 +10,7 @@
 // 中心 + 半径 r の正方領域で sampling して alpha を決める。Circle 経路は
 // 既存の rim/soft グラデを維持し、`if u_shape_id == 0` 分岐で texture lookup を
 // skip して regression を避ける。
-// contrast の alpha_mul は per-orb opacity に乗算（CPU 経路と同式）、
+// softness の alpha_mul は per-orb opacity に乗算（CPU 経路と同式）、
 // blur_offset は wasm 側で base_blur に積算済みなので shader はそのまま使う。
 //
 // アーキテクチャ:
@@ -76,7 +76,7 @@ uniform float u_direction;     // 0=LR, 1=RL, 2=TB, 3=BT
 uniform float u_cycle;         // 1=VerySlow, 2=Slow, 3=Mid, 4=Fast
 uniform int u_n_orbs;
 // Phase B (#55):
-uniform float u_alpha_mul;     // contrast.alpha_mul (Mid=1.0)
+uniform float u_alpha_mul;     // softness.alpha_mul (Mid=1.0)
 uniform int u_shape_id;        // 0=Circle, 1=Glyph
 uniform sampler2D u_glyph_mask;
 
@@ -148,7 +148,7 @@ void main() {
     if (radius <= 0.0) continue;
 
     float blur = clampf(u_base_blur + blur_delta, 0.0, 1.0);
-    // Phase B (#55): contrast.alpha_mul を per-orb opacity に乗算（CPU 経路と同式）。
+    // Phase B (#55): softness.alpha_mul を per-orb opacity に乗算（CPU 経路と同式）。
     // Mid なら u_alpha_mul = 1.0 で既存挙動と完全同値。
     float opacity = clampf(opacity_factor * u_alpha_mul, 0.0, 1.0);
 

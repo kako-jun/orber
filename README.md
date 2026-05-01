@@ -32,10 +32,10 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph), `--glyph-char`, `--count` (or `--count-preset`), `--contrast`, saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph), `--glyph-char`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
 
 ```bash
-orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --contrast low
+orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --softness low
 orber --input photo.jpg --output dense.png --count-preset high --speed fast
 ```
 
@@ -74,7 +74,7 @@ blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for 
 
 ### Orb count
 
-Use `--count <N>` (1..=200, default 20) to control how many orbs are visible on screen
+Use `--count <N>` (1..=1024, default 20) to control how many orbs are visible on screen
 at once. The K colors picked from the input image (by k-means) are *expanded* into N
 orbs by weight-proportional color sampling and per-orb scattering on the cross axis.
 Higher counts produce a denser, more screen-filling composition; lower counts leave
@@ -91,7 +91,7 @@ is also assigned one of two visual styles (rim or soft) deterministically from t
 seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
 
 `--count-preset low|mid|high` is a shorthand alternative to `--count <N>` (mapped
-to 10 / 20 / 35). The two flags are mutually exclusive — pass one or the other.
+to 10 / 20 / 30). The two flags are mutually exclusive — pass one or the other.
 
 > Note: the aquarelle shape ignores `--count` (palette-only rendering). It always
 > renders one orb per cluster from the k-means palette so the bleed / bloom / halo
@@ -118,23 +118,20 @@ the `--blur` parameter has no effect in this mode.
 > Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
 > text shipped alongside the TTF.
 
-### Contrast
+### Softness
 
-`--contrast low|mid|high` (default `mid`) is a single axis that bundles alpha,
-blur, and edge sharpness:
+`--softness low|mid|high` (default `mid`) is a single axis that bundles alpha,
+blur, and edge softness:
 
-- `low` — weak alpha + strong blur + soft edges. Tuned for sitting **underneath
-  text overlays**: the orbs read as ambient color rather than competing with the
-  foreground.
+- `low` — default alpha + weak blur + sharper edges. Tuned for a crisper plate
+  or wallpaper look.
 - `mid` — identical to the previous default. Existing renders are unchanged.
-- `high` — reduced blur + sharper rim. Tuned for **standalone viewing** as a
-  wallpaper or background plate. Alpha is held at the same value as `mid` to
-  preserve the `mid = identity` invariant; `high` differs from `mid` purely on
-  the blur / edge axis.
+- `high` — weaker alpha + stronger blur + softer edges. Tuned for sitting
+  **underneath text overlays** so the orbs read as ambient color.
 
 ```bash
-orber --input photo.jpg --output backdrop.png --contrast low
-orber --input photo.jpg --output wallpaper.png --contrast high
+orber --input photo.jpg --output wallpaper.png --softness low
+orber --input photo.jpg --output backdrop.png --softness high
 ```
 
 ### Variation preset

@@ -113,8 +113,15 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
         from { opacity: 0; }
         to { opacity: 1; }
       }
+      @keyframes orb-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
       .fade-in {
         animation: orb-fade-in var(--orb-motion-duration) var(--orb-motion-easing) both;
+      }
+      .orb-spin {
+        animation: orb-spin 1.1s linear infinite;
       }
       /* orber#? — タイル生成中の skeleton shimmer。runBatch 開始と同時に
          12 個のプレースホルダを置いてグリッド形状を確定させ、wasm の
@@ -143,6 +150,9 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
         }
         .fade-in {
           animation-duration: 0ms;
+        }
+        .orb-spin {
+          animation: none;
         }
         .skeleton {
           animation: none;

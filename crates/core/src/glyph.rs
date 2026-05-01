@@ -2,7 +2,7 @@
 //!
 //! [`crate::orb::OrbShape::Glyph`] を選んだ orb は、円グラデではなく
 //! 1 文字のフォントアウトラインを fill した形状になる。文字色は orb の色、
-//! 不透明度は contrast 軸 + per-orb 揺らぎで決まる。
+//! 不透明度は softness 軸 + per-orb 揺らぎで決まる。
 //!
 //! # 設計メモ
 //!
@@ -21,9 +21,7 @@
 //!   収まるよう em-square 基準でスケールする
 
 use std::sync::OnceLock;
-use tiny_skia::{
-    Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform,
-};
+use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform};
 use ttf_parser::{Face, OutlineBuilder, Rect};
 
 /// orber-core が同梱するフォント識別子。
@@ -125,9 +123,7 @@ impl OutlineBuilder for GlyphPathBuilder {
 /// public ヘルパ。`Face::glyph_index(ch)` だけで判定し、bbox / outline までは取りに
 /// 行かない（warning 用途には十分）。フォント読み込みに失敗した場合は `false`。
 pub fn has_glyph(font: GlyphFontId, ch: char) -> bool {
-    face_for(font)
-        .and_then(|f| f.glyph_index(ch))
-        .is_some()
+    face_for(font).and_then(|f| f.glyph_index(ch)).is_some()
 }
 
 /// 1 文字分のグリフを `tiny_skia::Path` に焼き、orb 中心に center 揃えで返す。
@@ -208,7 +204,13 @@ pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8
         anti_alias: true,
         ..Default::default()
     };
-    pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pix.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
     // tiny-skia は premultiplied alpha だが、white(255) を fill しているので
     // alpha と RGB が一致する。alpha チャネルだけ抽出する。
     let raw = pix.data();
@@ -222,7 +224,7 @@ pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8
 /// 単一の Glyph orb を pixmap に SourceOver で重ねる。
 ///
 /// `radius` は orb の見た目半径相当（円 orb と揃える）。`opacity` ∈ [0, 1] は
-/// 中心の不透明度（contrast / animate 軸で揺らされた最終値）。`blur` パラメータは
+/// 中心の不透明度（softness / animate 軸で揺らされた最終値）。`blur` パラメータは
 /// グリフでは使わない（グリフはアウトライン fill で表現するため）。
 pub fn render_glyph_orb(
     pixmap: &mut Pixmap,

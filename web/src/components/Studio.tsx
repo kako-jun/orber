@@ -1,5 +1,4 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import AdvancedSection from './AdvancedSection';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
@@ -16,8 +15,8 @@ import { t, lang } from '../lib/strings';
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
-// Phase B (#55): advanced 軸の preset 値。表示は strings.ts 経由、内部値は
-// wasm の WasmParams.{count,speed,contrast}_preset と 1:1 対応する文字列。
+// #131: 4 軸の preset 値。表示は strings.ts 経由、内部値は
+// wasm の WasmParams.{count,speed,softness}_preset と 1:1 対応する文字列。
 //
 // レビュー M1: 「未指定（identity）」を空文字 `''` で表現する。`'mid'` を
 // デフォルトに据えると wasm 側で `count_preset='mid' → count=20 固定` /
@@ -25,12 +24,18 @@ type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error'
 // Phase A の `random_batch_specs` ばらけ（count 10..=50, video=GUI_VIDEO_SPEEDS）
 // が壊れる。`''` を渡せば wasm 側 `parse_*_preset` が `Ok(None)` を返して
 // spec.count / spec.speed / GUI_VIDEO_SPEEDS の identity 経路に乗る。
-// UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにして、
-// 明示的にユーザが「標準」を選んだら `'mid'` を入れる（明示選択も identity）。
+// UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにする。
+// count / softness は `'mid'` でも実質 identity、speed は `''` だけが identity で
+// `'mid'` を明示選択すると `Slow` に固定される（#131 仕様）。
 type ShapeChoice = 'circle' | 'glyph';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
-type ContrastPreset = '' | 'low' | 'mid' | 'high';
+type SoftnessPreset = '' | 'low' | 'mid' | 'high';
+
+const SYMBOL_PICKER_DEFAULT = [
+  '☆', '★', '♥', '♦', '◆', '○', '●', '■', '□', '▲', '△', '✓',
+  '✕', '✿', '❀', '✦', '☀', '☁', '⚡', '←', '→', '↑', '↓',
+];
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
@@ -85,19 +90,20 @@ export default function Studio() {
   // 開始時に aspect() のスナップショットを取り、DL 経路はこちらを使うことで
   // プレビューと DL の aspect を必ず一致させる。
   const [tilesAspect, setTilesAspect] = createSignal<Aspect>('portrait');
-  // Phase B (#55): advanced 軸の signal。デフォルトは「現状（Mid / Standard）」と
-  // 完全同値。これにより既存の Circle 出力に regression が無いことを保証する
-  // （wasm 側の preset 上書きは empty / mid のとき no-op）。
+  // #131: 4 軸は常時展開で、どのボタンも押した瞬間に runBatch を起動する。
+  // 初期値は empty identity を維持し、既存 output regression を防ぐ。
   const [shape, setShape] = createSignal<ShapeChoice>('circle');
   const [glyphChar, setGlyphChar] = createSignal<string>('☆');
   const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
+  const [supportedGlyphChoices, setSupportedGlyphChoices] =
+    createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
+  const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
-  // 見えるが、内部 signal は空文字 = wasm 側で no-op = spec.count / spec.speed /
-  // GUI_VIDEO_SPEEDS / ContrastPreset::Mid を維持。Phase A の見た目を正確に再現する。
+  // 見えるが、内部 signal は empty identity を保つ。spec.count / spec.speed /
+  // GUI_VIDEO_SPEEDS / SoftnessPreset::Mid を温存し、Phase A の見た目を正確に再現する。
   const [countPreset, setCountPreset] = createSignal<CountPreset>('');
   const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('');
-  const [contrastPreset, setContrastPreset] = createSignal<ContrastPreset>('');
-  const [advancedOpen, setAdvancedOpen] = createSignal<boolean>(false);
+  const [softnessPreset, setSoftnessPreset] = createSignal<SoftnessPreset>('');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
   // ドロップエリアに表示するサムネイル用の object URL。差し替えで revoke する。
@@ -192,24 +198,34 @@ export default function Studio() {
     onCleanup(offCrash);
   });
 
-  // Phase B (#55): glyph 文字の収録状況を非同期で確認し、警告フラグに反映する。
-  // wasm 起動前は楽観的に true（警告非表示）。空文字も true（実際にガチャを
-  // 引くまでは警告しない、UI は「文字が描かれない」状態で済む）。
-  //
-  // PR #130 review Q3: wasm 起動前 (wasmStatus !== 'ready') は楽観的に true に
-  // して警告を抑制する。status が 'ready' に変わるとこの effect が再評価され
-  // workerGlyphSupported が走る。createEffect が wasmStatus と glyphChar の
-  // 両方を読むため Solid が依存追跡し、どちらかの変化で再評価される。
+  // #131: glyph 文字の収録状況を非同期で確認し、警告フラグに反映する。
+  // composition 中は IME 入力を壊さないため worker RPC を飛ばさない。
   createEffect(() => {
     const ch = glyphChar();
     const status = wasmStatus();
-    if (status !== 'ready' || ch.length === 0) {
+    if (shape() !== 'glyph' || status !== 'ready' || ch.length === 0 || isGlyphComposing()) {
       setGlyphCharSupported(true);
       return;
     }
     void workerGlyphSupported(ch).then((ok) => {
       setGlyphCharSupported(ok);
     });
+  });
+
+  // #131: シンボルピッカーに出す候補は、同梱フォントで本当に描画できるものだけに絞る。
+  // wasm 未起動時は候補をそのまま見せ、起動後に filter する。
+  createEffect(() => {
+    if (wasmStatus() !== 'ready') return;
+    void Promise.all(
+      SYMBOL_PICKER_DEFAULT.map(async (ch) => ((await workerGlyphSupported(ch)) ? ch : null)),
+    )
+      .then((symbols) => {
+        const filtered = symbols.filter((ch): ch is string => ch !== null);
+        if (filtered.length > 0) setSupportedGlyphChoices(filtered);
+      })
+      .catch((err) => {
+        console.warn('failed to validate glyph picker symbols', err);
+      });
   });
 
   onCleanup(() => {
@@ -328,8 +344,8 @@ export default function Studio() {
     // worker 側で source_* がキャッシュから自動マージされるので、ここでは
     // spec パラメータだけ渡す（毎回 RGB を送らない）。direction/speed/count/
     // orb_size/blur は generate_one_at_index ではどのみち spec で上書きされる。
-    // Phase B (#55): shape / glyph_char / count_preset / speed_preset /
-    // contrast_preset を advanced UI から流す。Mid / standard が既存挙動と同値。
+    // #131: shape / glyph_char / count_preset / speed_preset / softness_preset
+    // を常時展開 UI から流す。empty identity は既存挙動と同値。
     const params = {
       k: 5,
       width: w,
@@ -344,7 +360,7 @@ export default function Studio() {
       glyph_char: shape() === 'glyph' ? glyphChar() : '',
       count_preset: countPreset(),
       speed_preset: speedPreset(),
-      contrast_preset: contrastPreset(),
+      softness_preset: softnessPreset(),
     };
 
     const total = batchN();
@@ -637,12 +653,47 @@ export default function Studio() {
     if (tile?.blob) toggleTile(idx);
   };
 
-  // Phase B (#55): aspect トグルは状態のみ変更し、即生成しない。
-  // 唯一の生成トリガーは下のガチャボタン (#55 issue 指針)。
-  // aspect / advanced 設定を変えてからガチャを引く流れに統一する。
+  const runBatchIfReady = () => {
+    if (!decoded() || downloading()) return;
+    if (shape() === 'glyph' && glyphChar().trim().length === 0) return;
+    void runBatch();
+  };
+
   const onAspectClick = (a: Aspect) => {
-    if (aspect() === a) return;
     setAspect(a);
+    runBatchIfReady();
+  };
+
+  const onShapeClick = (next: ShapeChoice) => {
+    setShape(next);
+    runBatchIfReady();
+  };
+
+  const onCountPresetClick = (next: CountPreset) => {
+    setCountPreset(next);
+    runBatchIfReady();
+  };
+
+  const onSpeedPresetClick = (next: SpeedPreset) => {
+    setSpeedPreset(next);
+    runBatchIfReady();
+  };
+
+  const onSoftnessPresetClick = (next: SoftnessPreset) => {
+    setSoftnessPreset(next);
+    runBatchIfReady();
+  };
+
+  const applyGlyphChar = (raw: string) => {
+    const first = [...raw][0] ?? '';
+    setGlyphChar(first);
+    if (first.length > 0) runBatchIfReady();
+    return first;
+  };
+
+  const onGlyphPickerClick = (sym: string) => {
+    setGlyphChar(sym);
+    runBatchIfReady();
   };
 
   const toggleTile = (idx: number) => {
@@ -706,7 +757,7 @@ export default function Studio() {
     // worker 側に source RGB がキャッシュ済みなので、ここでは spec パラメータ
     // だけ渡す。direction/speed/count/orb_size/blur は generate_one_at_index
     // ではどのみち spec で上書きされる。
-    // Phase B (#55): hi-res 再描画でも UI の advanced 軸を踏襲する
+    // #131: hi-res 再描画でも UI の 4 軸を踏襲する
     // （DL がプレビューと別形状になったら困るため）。
     const hiParams = {
       k: 5,
@@ -722,7 +773,7 @@ export default function Studio() {
       glyph_char: shape() === 'glyph' ? glyphChar() : '',
       count_preset: countPreset(),
       speed_preset: speedPreset(),
-      contrast_preset: contrastPreset(),
+      softness_preset: softnessPreset(),
     };
 
     setDlProgress({ done: 0, total: indices.length });
@@ -801,6 +852,11 @@ export default function Studio() {
     'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed';
   // toggled (アスペクト ON 等) で重ねる class — DESIGN.md §4 Toggle.
   const GLASS_BTN_TOGGLED = 'bg-glassBgHover';
+  const GLASS_INPUT =
+    'h-9 w-20 rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
+    'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing';
+  const isRunning = () =>
+    phase() === 'decoding' || phase() === 'generating' || phase() === 'animating';
 
   return (
     <section class="space-y-4" data-lang={lang()}>
@@ -961,80 +1017,192 @@ export default function Studio() {
           </svg>
         </button>
       </div>
-
-      {/* Phase B (#55): アドバンスト折りたたみセクション。
-          PR #130 review S4: 約 265 行の JSX を AdvancedSection.tsx に分離した。
-          signal は Studio.tsx 側で所有したまま accessor + setter を props で渡す。
-          DESIGN.md §13 (AdvancedSection) — glass-bg / hairline で囲み、
-          segmented control で 2-3 段階を選ばせる。 */}
-      <AdvancedSection
-        shape={shape}
-        setShape={setShape}
-        glyphChar={glyphChar}
-        setGlyphChar={setGlyphChar}
-        glyphCharSupported={glyphCharSupported}
-        countPreset={countPreset}
-        setCountPreset={setCountPreset}
-        speedPreset={speedPreset}
-        setSpeedPreset={setSpeedPreset}
-        contrastPreset={contrastPreset}
-        setContrastPreset={setContrastPreset}
-        open={advancedOpen}
-        setOpen={setAdvancedOpen}
-        GLASS_BTN={GLASS_BTN}
-        GLASS_BTN_TOGGLED={GLASS_BTN_TOGGLED}
-      />
-
-      {/* Phase B (#55): ガチャボタンを唯一の生成トリガーに昇格。
-          aspect / advanced を変えてから「ガチャを引く」流れに統一する。
-          ボタンサイズはアスペクト・トグルより一回り大きく目立たせる
-          （px/py を 1 段増、文字 + アイコン横並び）。 */}
-      <div class="flex items-center justify-center pt-1">
-        <button
-          type="button"
-          onClick={() => void runBatch()}
-          disabled={
-            !decoded() ||
-            phase() === 'decoding' ||
-            phase() === 'generating' ||
-            phase() === 'animating' ||
-            downloading() ||
-            // Q2: shape='glyph' かつ glyphChar 空のときは wasm 入口で
-            // `glyph_char is empty` の fatal error になるためガチャを disable する。
-            // shape='circle' のときは glyphChar の中身は使われないので無視。
-            (shape() === 'glyph' && glyphChar().trim() === '')
-          }
-          aria-label={t('gachaLabel')}
-          // N5: ガチャ枚数は BATCH_TILE_COUNT を文字列に注入する（マジックナンバー禁止）。
-          title={t('gachaTitle', { n: BATCH_TILE_COUNT })}
-          class={
-            'inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded ' +
-            'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
-            'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-            'transition-colors duration-200 ease-out ' +
-            'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed text-base'
-          }
-        >
-          {/* ダイス / リロードのアイコン (DESIGN.md §7) */}
-          <svg
-            viewBox="0 0 24 24"
-            width="18"
-            height="18"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+      <div class="mx-auto grid max-w-2xl grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
+        <label class="justify-self-end text-sm text-fgMuted">{t('shapeLabel')}:</label>
+        <div class="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={shape() === 'circle'}
+            onClick={() => onShapeClick('circle')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (shape() === 'circle' ? GLASS_BTN_TOGGLED : '')}
           >
-            <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
-            <path d="M21 3v5h-5" />
-            <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
-            <path d="M3 21v-5h5" />
-          </svg>
-          <span>{t('gachaLabel')}</span>
-        </button>
+            {t('shapeOptionCircle')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={shape() === 'glyph'}
+            onClick={() => onShapeClick('glyph')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (shape() === 'glyph' ? GLASS_BTN_TOGGLED : '')}
+          >
+            {t('shapeOptionGlyph')}
+          </button>
+          <Show when={shape() === 'glyph'}>
+            <input
+              type="text"
+              aria-label={t('glyphCharLabel')}
+              value={glyphChar()}
+              placeholder={t('glyphCharPlaceholder')}
+              maxLength={16}
+              disabled={downloading()}
+              onCompositionStart={() => setIsGlyphComposing(true)}
+              onCompositionEnd={(e) => {
+                setIsGlyphComposing(false);
+                const first = applyGlyphChar(e.currentTarget.value);
+                e.currentTarget.value = first;
+              }}
+              onInput={(e) => {
+                if (isGlyphComposing()) return;
+                const first = applyGlyphChar(e.currentTarget.value);
+                if (e.currentTarget.value !== first) e.currentTarget.value = first;
+              }}
+              class={
+                GLASS_INPUT +
+                (glyphCharSupported() ? '' : ' border-fgMuted')
+              }
+            />
+          </Show>
+        </div>
+
+        <Show when={shape() === 'glyph'}>
+          <>
+            <span />
+            <div class="flex flex-wrap items-center gap-1">
+              <For each={supportedGlyphChoices()}>
+                {(sym) => (
+                  <button
+                    type="button"
+                    aria-pressed={glyphChar() === sym}
+                    onClick={() => onGlyphPickerClick(sym)}
+                    disabled={downloading()}
+                    class={
+                      GLASS_BTN +
+                      ' h-9 w-9 px-0 text-base ' +
+                      (glyphChar() === sym ? GLASS_BTN_TOGGLED : '')
+                    }
+                    title={sym}
+                  >
+                    {sym}
+                  </button>
+                )}
+              </For>
+            </div>
+          </>
+        </Show>
+
+        <label class="justify-self-end text-sm text-fgMuted">{t('countLabel')}:</label>
+        <div class="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={countPreset() === 'low'}
+            onClick={() => onCountPresetClick('low')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (countPreset() === 'low' ? GLASS_BTN_TOGGLED : '')}
+          >
+            {t('countOptionLow')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={countPreset() === '' || countPreset() === 'mid'}
+            onClick={() => onCountPresetClick('mid')}
+            disabled={downloading()}
+            class={
+              GLASS_BTN + ' text-sm ' +
+              (countPreset() === '' || countPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
+            }
+          >
+            {t('countOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={countPreset() === 'high'}
+            onClick={() => onCountPresetClick('high')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (countPreset() === 'high' ? GLASS_BTN_TOGGLED : '')}
+          >
+            {t('countOptionHigh')}
+          </button>
+        </div>
+
+        <label class="justify-self-end text-sm text-fgMuted">{t('speedLabel')}:</label>
+        <div class="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={speedPreset() === 'slow'}
+            onClick={() => onSpeedPresetClick('slow')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'slow' ? GLASS_BTN_TOGGLED : '')}
+          >
+            {t('speedOptionSlow')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={speedPreset() === '' || speedPreset() === 'mid'}
+            onClick={() => onSpeedPresetClick('mid')}
+            disabled={downloading()}
+            class={
+              GLASS_BTN + ' text-sm ' +
+              (speedPreset() === '' || speedPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
+            }
+          >
+            {t('speedOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={speedPreset() === 'fast'}
+            onClick={() => onSpeedPresetClick('fast')}
+            disabled={downloading()}
+            class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'fast' ? GLASS_BTN_TOGGLED : '')}
+          >
+            {t('speedOptionFast')}
+          </button>
+        </div>
+
+        <label class="justify-self-end text-sm text-fgMuted">{t('softnessLabel')}:</label>
+        <div class="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={softnessPreset() === 'low'}
+            onClick={() => onSoftnessPresetClick('low')}
+            disabled={downloading()}
+            class={
+              GLASS_BTN + ' text-sm ' + (softnessPreset() === 'low' ? GLASS_BTN_TOGGLED : '')
+            }
+          >
+            {t('softnessOptionLow')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={softnessPreset() === '' || softnessPreset() === 'mid'}
+            onClick={() => onSoftnessPresetClick('mid')}
+            disabled={downloading()}
+            class={
+              GLASS_BTN + ' text-sm ' +
+              (softnessPreset() === '' || softnessPreset() === 'mid'
+                ? GLASS_BTN_TOGGLED
+                : '')
+            }
+          >
+            {t('softnessOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={softnessPreset() === 'high'}
+            onClick={() => onSoftnessPresetClick('high')}
+            disabled={downloading()}
+            class={
+              GLASS_BTN + ' text-sm ' + (softnessPreset() === 'high' ? GLASS_BTN_TOGGLED : '')
+            }
+          >
+            {t('softnessOptionHigh')}
+          </button>
+        </div>
       </div>
+
+      <Show when={!glyphCharSupported() && shape() === 'glyph' && glyphChar().length > 0}>
+        <p class="text-center text-xs text-fgMuted">{t('glyphCharUnsupported')}</p>
+      </Show>
 
       <Show when={wasmStatus() === 'error'}>
         <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">
@@ -1343,6 +1511,36 @@ export default function Studio() {
             })}
           </p>
         </Show>
+
+        <div class="flex items-center justify-center pt-1">
+          <button
+            type="button"
+            onClick={runBatchIfReady}
+            disabled={!decoded() || downloading() || (shape() === 'glyph' && glyphChar().trim() === '')}
+            aria-label={t('rerollLabel')}
+            title={t('rerollTitle')}
+            class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+              classList={{ 'orb-spin': isRunning() }}
+              style={{ 'transform-origin': '50% 50%' }}
+            >
+              <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
+              <path d="M3 21v-5h5" />
+            </svg>
+          </button>
+        </div>
       </Show>
 
       {/* #57 — 長押し中だけ表示する拡大プレビュー (DESIGN.md §4 PreviewOverlay)。

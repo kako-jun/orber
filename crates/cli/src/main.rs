@@ -5,7 +5,7 @@ use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_cluster
 use orber_core::glyph::{has_glyph, GlyphFontId};
 use orber_core::orb::{OrbShape, RenderOptions};
 use orber_core::output_mode::OutputMode;
-use orber_core::style::{render_css, render_svg, ContrastPreset, StyleOptions};
+use orber_core::style::{render_css, render_svg, SoftnessPreset, StyleOptions};
 use orber_core::variations::{select_specs, VariationKind, VariationMode, VariationSpec};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -61,23 +61,23 @@ impl From<CliSpeed> for MotionSpeed {
     }
 }
 
-/// Visual contrast preset (`--contrast`). Single axis, three steps (#55).
+/// Visual softness preset (`--softness`). Single axis, three steps (#55).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum CliContrast {
-    /// Faint orbs with softer edges (good for text overlays).
+enum CliSoftness {
+    /// Low softness: less blur, sharper edges.
     Low,
     /// Same look as before (default; no regression).
     Mid,
-    /// Bold orbs with crisper edges (good for stand-alone viewing).
+    /// High softness: more blur, softer edges, slightly fainter center.
     High,
 }
 
-impl From<CliContrast> for ContrastPreset {
-    fn from(c: CliContrast) -> Self {
+impl From<CliSoftness> for SoftnessPreset {
+    fn from(c: CliSoftness) -> Self {
         match c {
-            CliContrast::Low => ContrastPreset::Low,
-            CliContrast::Mid => ContrastPreset::Mid,
-            CliContrast::High => ContrastPreset::High,
+            CliSoftness::Low => SoftnessPreset::Low,
+            CliSoftness::Mid => SoftnessPreset::Mid,
+            CliSoftness::High => SoftnessPreset::High,
         }
     }
 }
@@ -90,7 +90,7 @@ enum CliCountPreset {
     Low,
     /// Medium (20).
     Mid,
-    /// Many (35).
+    /// Many (30).
     High,
 }
 
@@ -99,7 +99,7 @@ impl CliCountPreset {
         match self {
             CliCountPreset::Low => 10,
             CliCountPreset::Mid => 20,
-            CliCountPreset::High => 35,
+            CliCountPreset::High => 30,
         }
     }
 }
@@ -261,7 +261,7 @@ struct Cli {
     speed: CliSpeed,
 
     /// Number of orbs visible on screen at once (1..=1024, default 20).
-    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=35).
+    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=30).
     /// Clusters are expanded to this count by weight-proportional color sampling
     /// and per-orb scattering on the cross axis. Higher count fills more of the
     /// frame; ~20 fills roughly 70% on the default size.
@@ -269,7 +269,7 @@ struct Cli {
     #[arg(long, default_value_t = 20, value_parser = parse_count, conflicts_with = "count_preset")]
     count: usize,
 
-    /// Coarse orb-count preset (#55): low=10 / mid=20 / high=35.
+    /// Coarse orb-count preset (#55): low=10 / mid=20 / high=30.
     /// Mutually exclusive with --count.
     #[arg(long, value_enum)]
     count_preset: Option<CliCountPreset>,
@@ -283,9 +283,10 @@ struct Cli {
     #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
     glyph_char: char,
 
-    /// Visual contrast preset (#55): low / mid / high. Mid keeps the legacy look.
-    #[arg(long, value_enum, default_value_t = CliContrast::Mid)]
-    contrast: CliContrast,
+    /// Visual softness preset (#55): low / mid / high.
+    /// Low = sharper / less blur, Mid = legacy default, High = softer / more blur.
+    #[arg(long, value_enum, default_value_t = CliSoftness::Mid)]
+    softness: CliSoftness,
 
     /// Saturation multiplier (0.0..=4.0; 1.0 = unchanged).
     #[arg(long, default_value_t = 1.0, value_parser = parse_saturation)]
@@ -336,9 +337,9 @@ impl Cli {
         }
     }
 
-    /// Resolved contrast preset for any rendering path.
-    fn resolved_contrast(&self) -> ContrastPreset {
-        self.contrast.into()
+    /// Resolved softness preset for any rendering path.
+    fn resolved_softness(&self) -> SoftnessPreset {
+        self.softness.into()
     }
 }
 
@@ -458,7 +459,7 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
         blur: cli.blur,
         saturation: cli.saturation,
         background,
-        contrast: cli.resolved_contrast(),
+        softness: cli.resolved_softness(),
     };
 
     // 5. mode で書き出しを分岐。
@@ -513,7 +514,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         count: Some(cli.resolved_count()),
         background,
         shape: cli.orb_shape(),
-        contrast: cli.resolved_contrast(),
+        softness: cli.resolved_softness(),
     };
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -567,7 +568,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         count: Some(cli.resolved_count()),
         background,
         shape: cli.orb_shape(),
-        contrast: cli.resolved_contrast(),
+        softness: cli.resolved_softness(),
     };
     let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
@@ -621,7 +622,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     }
 
     let orb_shape = cli.orb_shape();
-    let contrast = cli.resolved_contrast();
+    let softness = cli.resolved_softness();
     // クラスタ抽出は preset 全 spec で 1 回だけ（K は VARIATIONS_KMEANS_K で固定）。
     // パレットを spec ごとに変えると入力画像の色が崩れるので、ここはキャッシュではなく
     // 単一パレットを使い回す方針。
@@ -646,8 +647,14 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
         let out_path = dir.join(&filename);
         eprintln!("orber: variation {idx}/{total} ({filename})");
 
-        let result =
-            render_one_variation(&orb_clusters, spec, &out_path, background, orb_shape, contrast);
+        let result = render_one_variation(
+            &orb_clusters,
+            spec,
+            &out_path,
+            background,
+            orb_shape,
+            softness,
+        );
         if let Err(msg) = result {
             eprintln!("orber: variation {idx} ({filename}) failed: {msg}");
             return ExitCode::from(2);
@@ -668,7 +675,7 @@ fn render_one_variation(
     out_path: &std::path::Path,
     bg_rgba: [u8; 4],
     orb_shape: OrbShape,
-    contrast: ContrastPreset,
+    softness: SoftnessPreset,
 ) -> Result<(), String> {
     // saturation は preset で揺らさない（同一画像から作る複数バリエーションでは
     // 入力色をそのまま使う方針）。CLI の単発経路と揃えるため 1.0 固定。
@@ -688,7 +695,7 @@ fn render_one_variation(
                 count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
-                contrast,
+                softness,
             };
             let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
@@ -704,7 +711,7 @@ fn render_one_variation(
                 count: Some(spec.count),
                 background: bg_rgba,
                 shape: orb_shape,
-                contrast,
+                softness,
             };
             render_video(
                 clusters,
@@ -832,13 +839,7 @@ mod tests {
     fn shape_glyph_with_default_char() {
         // --shape glyph で --glyph-char 省略時は ☆ (U+2606) になる。
         let cli = Cli::try_parse_from([
-            "orber",
-            "--input",
-            "x",
-            "--output",
-            "x.png",
-            "--shape",
-            "glyph",
+            "orber", "--input", "x", "--output", "x.png", "--shape", "glyph",
         ])
         .expect("--shape glyph should parse");
         assert_eq!(cli.glyph_char, '☆');
@@ -885,7 +886,11 @@ mod tests {
             "mid",
         ])
         .unwrap();
-        assert_eq!(cli.resolved_count(), 20, "--count-preset mid must map to 20");
+        assert_eq!(
+            cli.resolved_count(),
+            20,
+            "--count-preset mid must map to 20"
+        );
 
         let cli = Cli::try_parse_from([
             "orber",
@@ -897,7 +902,7 @@ mod tests {
             "high",
         ])
         .unwrap();
-        assert_eq!(cli.resolved_count(), 35);
+        assert_eq!(cli.resolved_count(), 30);
     }
 
     #[test]
@@ -935,25 +940,25 @@ mod tests {
     }
 
     #[test]
-    fn contrast_default_is_mid() {
+    fn softness_default_is_mid() {
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
-        assert!(matches!(cli.contrast, CliContrast::Mid));
-        assert_eq!(cli.resolved_contrast(), ContrastPreset::Mid);
+        assert!(matches!(cli.softness, CliSoftness::Mid));
+        assert_eq!(cli.resolved_softness(), SoftnessPreset::Mid);
     }
 
     #[test]
-    fn contrast_low_high_parse() {
+    fn softness_low_high_parse() {
         let cli = Cli::try_parse_from([
             "orber",
             "--input",
             "x",
             "--output",
             "x.png",
-            "--contrast",
+            "--softness",
             "low",
         ])
         .unwrap();
-        assert_eq!(cli.resolved_contrast(), ContrastPreset::Low);
+        assert_eq!(cli.resolved_softness(), SoftnessPreset::Low);
 
         let cli = Cli::try_parse_from([
             "orber",
@@ -961,11 +966,11 @@ mod tests {
             "x",
             "--output",
             "x.png",
-            "--contrast",
+            "--softness",
             "high",
         ])
         .unwrap();
-        assert_eq!(cli.resolved_contrast(), ContrastPreset::High);
+        assert_eq!(cli.resolved_softness(), SoftnessPreset::High);
     }
 
     #[test]

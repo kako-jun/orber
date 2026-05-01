@@ -43,16 +43,6 @@ export const STRINGS = {
     ja: '同じ画像でもう一度ガチャ',
     en: 'Roll again with the same image',
   },
-  // Phase B (#55): ガチャを唯一の生成トリガーに昇格。aspect 即生成は廃止。
-  gachaLabel: { ja: 'ガチャを引く', en: 'Roll' },
-  // N5: 12 枚はマジックナンバーではなく BATCH_TILE_COUNT。文字列にも変数化して、
-  // 将来 BATCH_TILE_COUNT が変わったときに翻訳も自動追従する。
-  gachaTitle: {
-    ja: '現在の設定でガチャを引いて {n} 枚生成',
-    en: 'Roll a new batch of {n} with the current settings',
-  },
-  // Phase B (#55): アドバンスト折りたたみセクション。
-  advancedHeading: { ja: 'アドバンスト', en: 'Advanced' },
   shapeLabel: { ja: '形状', en: 'Shape' },
   shapeOptionCircle: { ja: '円', en: 'Circle' },
   shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
@@ -70,10 +60,10 @@ export const STRINGS = {
   speedOptionSlow: { ja: 'ゆっくり', en: 'Slow' },
   speedOptionMid: { ja: '標準', en: 'Standard' },
   speedOptionFast: { ja: '速め', en: 'Fast' },
-  contrastLabel: { ja: 'コントラスト', en: 'Contrast' },
-  contrastOptionLow: { ja: '弱め', en: 'Soft' },
-  contrastOptionMid: { ja: '標準', en: 'Standard' },
-  contrastOptionHigh: { ja: '強め', en: 'Strong' },
+  softnessLabel: { ja: 'ぼかし', en: 'Softness' },
+  softnessOptionLow: { ja: '弱め', en: 'Low' },
+  softnessOptionMid: { ja: '標準', en: 'Standard' },
+  softnessOptionHigh: { ja: '強め', en: 'High' },
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',

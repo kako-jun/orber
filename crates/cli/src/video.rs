@@ -20,7 +20,7 @@ use orber_core::animate::{
 use orber_core::cluster::Cluster;
 use orber_core::orb::OrbShape;
 use orber_core::output_mode::OutputMode;
-use orber_core::style::ContrastPreset;
+use orber_core::style::SoftnessPreset;
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
@@ -90,7 +90,7 @@ pub struct VideoOptions {
     /// orb の描画形式。
     pub shape: OrbShape,
     /// コントラスト preset (#55)。Mid なら既存挙動と完全同値。
-    pub contrast: ContrastPreset,
+    pub softness: SoftnessPreset,
 }
 
 impl Default for VideoOptions {
@@ -106,7 +106,7 @@ impl Default for VideoOptions {
             count: a.count,
             background: a.background,
             shape: a.shape,
-            contrast: a.contrast,
+            softness: a.softness,
         }
     }
 }
@@ -212,7 +212,7 @@ pub fn render_video(
         count: opts.count,
         background: opts.background,
         shape: opts.shape,
-        contrast: opts.contrast,
+        softness: opts.softness,
     };
 
     let temp_dir = tempfile::TempDir::new()?;
@@ -384,6 +384,6 @@ mod tests {
         assert_eq!(v.direction, a.direction);
         assert_eq!(v.speed, a.speed);
         assert_eq!(v.seed, a.seed);
-        assert_eq!(v.contrast, a.contrast);
+        assert_eq!(v.softness, a.softness);
     }
 }

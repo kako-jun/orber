@@ -78,7 +78,7 @@ interface BaseParams {
   glyph_char?: string;
   count_preset?: string;
   speed_preset?: string;
-  contrast_preset?: string;
+  softness_preset?: string;
 }
 
 function ensureGlyphMaskUploaded(renderer: GlRenderer, ch: string): void {
