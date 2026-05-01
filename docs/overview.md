@@ -198,6 +198,17 @@ Worker; subsequent `get_render_data` calls reference the cached kmeans
 clusters, so multi-megabyte arrays are not copied per call. The WebGL2 context
 and OffscreenCanvas are also cached per resolution and reused across calls.
 
+**Source downsampling for kmeans.** The dropped image is decoded and immediately
+resized to a longest-edge of 256 px (aspect preserved) before the RGB buffer is
+handed to the Worker. The full-resolution image is never seen by wasm or the
+shader, because the renderer only needs the kmeans cluster colors — the actual
+canvas dimensions for orbs are controlled by `width` / `height` (preview or
+download), not the source size. Downsampling fixes three problems at once:
+the JS→Worker→wasm transfer of the RGB array becomes a constant ≤196KB instead
+of scaling with the input photo (4032×3024 was 36MB and the per-tile copy cost
+dominated on Android), kmeans itself runs on a tiny pixel set, and the wasm-side
+`SOURCE_CACHE` fingerprint becomes stable across calls.
+
 **Why WebGL2.** The previous implementation rendered every pixel on the CPU
 inside wasm and ran each animation frame through `RGBA → ImageData →
 createImageBitmap → VideoFrame` before encoding. At 1080×1920 × 192 frames the
