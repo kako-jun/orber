@@ -43,6 +43,37 @@ export const STRINGS = {
     ja: '同じ画像でもう一度ガチャ',
     en: 'Roll again with the same image',
   },
+  // Phase B (#55): ガチャを唯一の生成トリガーに昇格。aspect 即生成は廃止。
+  gachaLabel: { ja: 'ガチャを引く', en: 'Roll' },
+  // N5: 12 枚はマジックナンバーではなく BATCH_TILE_COUNT。文字列にも変数化して、
+  // 将来 BATCH_TILE_COUNT が変わったときに翻訳も自動追従する。
+  gachaTitle: {
+    ja: '現在の設定でガチャを引いて {n} 枚生成',
+    en: 'Roll a new batch of {n} with the current settings',
+  },
+  // Phase B (#55): アドバンスト折りたたみセクション。
+  advancedHeading: { ja: 'アドバンスト', en: 'Advanced' },
+  shapeLabel: { ja: '形状', en: 'Shape' },
+  shapeOptionCircle: { ja: '円', en: 'Circle' },
+  shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
+  glyphCharLabel: { ja: '文字', en: 'Character' },
+  glyphCharPlaceholder: { ja: '例: ☆', en: 'e.g., ☆' },
+  glyphCharUnsupported: {
+    ja: '同梱フォントに収録されていません',
+    en: 'Not in bundled font',
+  },
+  countLabel: { ja: '数', en: 'Count' },
+  countOptionLow: { ja: '少なめ', en: 'Few' },
+  countOptionMid: { ja: '標準', en: 'Standard' },
+  countOptionHigh: { ja: '多め', en: 'Many' },
+  speedLabel: { ja: '速さ', en: 'Speed' },
+  speedOptionSlow: { ja: 'ゆっくり', en: 'Slow' },
+  speedOptionMid: { ja: '標準', en: 'Standard' },
+  speedOptionFast: { ja: '速め', en: 'Fast' },
+  contrastLabel: { ja: 'コントラスト', en: 'Contrast' },
+  contrastOptionLow: { ja: '弱め', en: 'Soft' },
+  contrastOptionMid: { ja: '標準', en: 'Standard' },
+  contrastOptionHigh: { ja: '強め', en: 'Strong' },
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',
@@ -58,7 +89,9 @@ export const STRINGS = {
     ja: '長押しで拡大',
     en: 'Long-press to enlarge',
   },
-  videoPendingBadge: { ja: '動画化中', en: 'Animating' },
+  // N2: 末尾の "…" は文字列内包に統一する（呼び出し側で `{t('...')}…` と
+  // 重ねると i18n が壊れたとき suffix だけ残る事故が起きる）。
+  videoPendingBadge: { ja: '動画化中…', en: 'Animating…' },
   animateError: {
     ja: '動画生成に失敗したタイルがあります',
     en: 'Some tiles failed to encode to video',

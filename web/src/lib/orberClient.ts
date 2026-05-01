@@ -47,6 +47,11 @@ interface BaseParams {
   orb_size: number;
   blur: number;
   shape: string;
+  // Phase B (#55): UI から流れる advanced 軸。空文字 / 省略は "未指定（既存挙動）"。
+  glyph_char?: string;
+  count_preset?: string;
+  speed_preset?: string;
+  contrast_preset?: string;
 }
 
 let worker: Worker | null = null;
@@ -229,6 +234,15 @@ export async function workerGenerateOne(
 ): Promise<Uint8Array> {
   const buf = await call<ArrayBuffer>({ kind: 'generateOne', params, n, index });
   return new Uint8Array(buf);
+}
+
+/**
+ * Phase B (#55): UI が glyph 文字の収録状況を確認するための問い合わせ。
+ * `glyph_supported(NotoSymbols2, ch)` をそのまま返す。空文字や複数 char は
+ * 先頭 char のみで判定される（UI 側で 1 char 制限済みの想定）。
+ */
+export async function workerGlyphSupported(ch: string): Promise<boolean> {
+  return await call<boolean>({ kind: 'glyphSupported', ch });
 }
 
 /** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */

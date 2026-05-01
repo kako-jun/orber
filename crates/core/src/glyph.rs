@@ -178,6 +178,47 @@ pub fn build_glyph_path(
     builder.pb.finish()
 }
 
+/// Phase B (#55): Glyph 1 文字のアウトラインを `size × size` の正方領域に
+/// 中心揃えで fill し、alpha チャネルだけを `Vec<u8>` で返す。
+///
+/// 用途: WebGL2 fragment shader が `shape == "glyph"` のときに texture
+/// sampling で orb の alpha を決めるためのプリベイク済みマスク。`R8` ないし
+/// `RGBA(alpha のみ意味)` として GPU にアップロードする想定。
+///
+/// `size` は `1..=4096` の範囲を想定（呼び出し側で validate する）。
+/// 同梱フォントに収録されていない文字を渡すと全 0 を返す（panic しない）。
+/// 生成は決定的（同じ入力なら毎回同じバイト列）。キャッシュは呼び出し側で行う。
+pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+    let s = size.max(1);
+    let mut pix = match Pixmap::new(s, s) {
+        Some(p) => p,
+        None => return vec![0u8; (s as usize) * (s as usize)],
+    };
+    let center = (s as f32 * 0.5, s as f32 * 0.5);
+    // 余白を残しつつ正方領域いっぱいに描く: 半径は size の 0.45 倍。
+    // build_glyph_path は半径 × 2 の正方領域に等比スケールするので、
+    // radius = size * 0.45 にすれば文字の bbox 最大辺が 0.9 * size に揃う。
+    let radius = (s as f32) * 0.45;
+    let path = match build_glyph_path(font, ch, center, radius) {
+        Some(p) => p,
+        None => return vec![0u8; (s as usize) * (s as usize)],
+    };
+    let paint = Paint {
+        shader: Shader::SolidColor(Color::from_rgba8(255, 255, 255, 255)),
+        anti_alias: true,
+        ..Default::default()
+    };
+    pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    // tiny-skia は premultiplied alpha だが、white(255) を fill しているので
+    // alpha と RGB が一致する。alpha チャネルだけ抽出する。
+    let raw = pix.data();
+    let mut out = Vec::with_capacity((s as usize) * (s as usize));
+    for px in raw.chunks_exact(4) {
+        out.push(px[3]);
+    }
+    out
+}
+
 /// 単一の Glyph orb を pixmap に SourceOver で重ねる。
 ///
 /// `radius` は orb の見た目半径相当（円 orb と揃える）。`opacity` ∈ [0, 1] は
@@ -307,5 +348,52 @@ mod tests {
         );
         let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
         assert_eq!(lit, 0, "opacity=0 must not paint anything");
+    }
+
+    // レビュー S3: render_glyph_alpha_mask の単体テスト 3 件
+    // (Phase B WebGL 経路で texture sampling に使われるバイト列の保証)。
+
+    /// size を変えれば長さが size² になる。基本契約。
+    #[test]
+    fn glyph_alpha_mask_size_matches_input() {
+        for size in [16u32, 32, 64, 128, 256] {
+            let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', size);
+            assert_eq!(
+                bytes.len(),
+                (size as usize) * (size as usize),
+                "size={size} must produce {} bytes",
+                (size as usize) * (size as usize)
+            );
+        }
+    }
+
+    /// 既知文字 ☆ で alpha 非ゼロ ≥ 32px (5% 以上塗られる)。
+    /// shader 側で texture(...).r > 0 のピクセルが orb の見た目を作る。
+    #[test]
+    fn glyph_alpha_mask_known_char_has_lit_pixels() {
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', 64);
+        let lit = bytes.iter().filter(|&&b| b > 0).count();
+        assert!(
+            lit >= 32,
+            "rendering ☆ at 64x64 should produce >=32 lit pixels, got {lit}"
+        );
+        // 5% 以上の閾値も併せて確認（より厳しい下限）。
+        assert!(
+            lit > 64 * 64 / 20,
+            "rendering ☆ at 64x64 should produce >=5% lit pixels, got {lit}"
+        );
+    }
+
+    /// 未収録文字（絵文字 U+1F355 ピザ等）で全ピクセル 0。
+    /// tofu 出力ではなく「何も描かない」が Phase A の方針。WebGL 経路でも
+    /// 同じ契約を保つことで、shape='glyph' + 未収録文字 = 完全透明 orb になる。
+    #[test]
+    fn glyph_alpha_mask_unknown_char_returns_empty_or_zero() {
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
+        assert_eq!(bytes.len(), 32 * 32);
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "unknown char must produce all-zero alpha mask"
+        );
     }
 }

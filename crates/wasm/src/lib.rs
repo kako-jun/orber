@@ -21,8 +21,9 @@ const MAX_DIM: u32 = 8192;
 use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
+use orber_core::glyph::{has_glyph, render_glyph_alpha_mask, GlyphFontId};
 use orber_core::orb::OrbShape;
-use orber_core::style::{render_svg as core_render_svg, StyleOptions};
+use orber_core::style::{render_svg as core_render_svg, ContrastPreset, StyleOptions};
 use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
     GUI_VIDEO_SPEEDS,
@@ -30,7 +31,10 @@ use orber_core::variations::{
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f32::consts::TAU;
+use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
@@ -41,6 +45,7 @@ const MAX_ORB_COUNT: usize = 1024;
 /// shader アップロード時に黙って切り詰められるのを防ぐ。GUI の
 /// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
 /// 将来 GUI の COUNT_MAX を増やす場合は両方同時に上げること。
+// SYNC WITH web/src/lib/orberGl.ts::MAX_ORBS
 const GL_RENDERER_MAX_ORBS: usize = 64;
 
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
@@ -70,6 +75,25 @@ pub struct WasmParams {
     pub orb_size: f32,
     pub blur: f32,
     pub shape: String,
+    /// Glyph 文字（`shape == "glyph"` のときのみ意味を持つ）。grapheme 単位
+    /// 1 文字。空文字や複数 grapheme は呼び出し側で reject すること
+    /// （wasm 側では先頭 char をそのまま採用する）。Phase B (#55) で追加。
+    /// 既存呼び出しの後方互換のため `default = ""`、`default` で `'☆'` を採用しない
+    /// （Glyph 経路に入る前提で呼び出し側が必ず指定するため）。
+    #[serde(default)]
+    pub glyph_char: String,
+    /// `count` の preset 上書き。`""` で無視（spec.count を使う）。
+    /// Phase B (#55) で追加。`"low" | "mid" | "high"` のいずれかなら
+    /// 10/20/35 を spec.count に上書きしてからレンダリングする。
+    #[serde(default)]
+    pub count_preset: String,
+    /// `speed` の preset 上書き。`""` で無視（spec.speed と GUI_VIDEO_SPEEDS を使う）。
+    /// Phase B (#55) で追加。`"very-slow" | "slow" | "mid" | "fast"`。
+    #[serde(default)]
+    pub speed_preset: String,
+    /// `contrast` の preset。`""` で `Mid` (既存挙動と同値)。Phase B (#55) で追加。
+    #[serde(default)]
+    pub contrast_preset: String,
 }
 
 // Pure parsers/validators return String errors so they can be unit-tested on
@@ -91,19 +115,85 @@ fn parse_speed(s: &str) -> Result<MotionSpeed, String> {
     match s {
         "very-slow" => Ok(MotionSpeed::VerySlow),
         "slow" => Ok(MotionSpeed::Slow),
+        "mid" => Ok(MotionSpeed::Mid),
+        "fast" => Ok(MotionSpeed::Fast),
         other => Err(format!(
-            "invalid speed: {other} (expected one of very-slow / slow)"
+            "invalid speed: {other} (expected one of very-slow / slow / mid / fast)"
         )),
     }
 }
 
-fn parse_shape(s: &str) -> Result<OrbShape, String> {
-    // OrbShape::Aquarelle はパラメータが多いので wasm 入口では `circle` のみ受ける。
+/// Phase B (#55): preset 文字列を `Option<MotionSpeed>` に変換。
+///
+/// UI 経路は `slow` / `mid` / `fast` の **3 値のみ** を受理する。空文字 / `mid`
+/// は identity（= 上書きしない、`Ok(None)`）を意味し、`spec.speed` と
+/// `GUI_VIDEO_SPEEDS` の固定割当を温存する（M1/M2: identity 不変条件）。
+/// `very-slow` は CLI 専用なのでここでは reject する（DESIGN.md §13 / CHANGELOG）。
+fn parse_speed_preset(s: &str) -> Result<Option<MotionSpeed>, String> {
+    match s {
+        // identity: spec.speed / GUI_VIDEO_SPEEDS を温存
+        "" | "mid" => Ok(None),
+        "slow" => Ok(Some(MotionSpeed::Slow)),
+        "fast" => Ok(Some(MotionSpeed::Fast)),
+        // very-slow は UI 経路では受け付けない（CLI 専用）。`parse_speed` は
+        // 4 値を受け付けるので CLI / generate_single 側で個別に使うこと。
+        other => Err(format!(
+            "invalid speed_preset: {other} (expected one of '' / slow / mid / fast)"
+        )),
+    }
+}
+
+/// Phase B (#55): count preset 文字列を絶対値に変換。`""` は `Ok(None)` で
+/// 「上書きしない（spec.count を使う）」を意味する。値は GUI 仕様に合わせて
+/// low=10 / mid=20 / high=35 で固定。
+fn parse_count_preset(s: &str) -> Result<Option<usize>, String> {
+    match s {
+        "" => Ok(None),
+        "low" => Ok(Some(10)),
+        "mid" => Ok(Some(20)),
+        "high" => Ok(Some(35)),
+        other => Err(format!(
+            "invalid count_preset: {other} (expected one of '' / low / mid / high)"
+        )),
+    }
+}
+
+/// Phase B (#55): contrast preset 文字列を `ContrastPreset` に変換。空文字 /
+/// "mid" は既存挙動と完全同値の `Mid`。
+fn parse_contrast_preset(s: &str) -> Result<ContrastPreset, String> {
+    match s {
+        "" | "mid" => Ok(ContrastPreset::Mid),
+        "low" => Ok(ContrastPreset::Low),
+        "high" => Ok(ContrastPreset::High),
+        other => Err(format!(
+            "invalid contrast_preset: {other} (expected one of '' / low / mid / high)"
+        )),
+    }
+}
+
+/// Phase B (#55): "glyph" 形状時の文字列から先頭 char を取り出す。空文字なら
+/// エラー。複数 char（grapheme cluster ではなく Unicode scalar）でも先頭のみ
+/// 採用する（UI 側で 1 文字制限済みの想定）。
+fn first_char_of(s: &str) -> Result<char, String> {
+    s.chars()
+        .next()
+        .ok_or_else(|| "glyph_char is empty (expected exactly 1 character)".to_string())
+}
+
+fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
+    // OrbShape::Aquarelle はパラメータが多いので wasm 入口では `circle` / `glyph` のみ受ける。
     // Aquarelle は将来必要になったら別 API を生やす。
     match s {
         "circle" => Ok(OrbShape::Circle),
+        "glyph" => {
+            let ch = first_char_of(glyph_char)?;
+            Ok(OrbShape::Glyph {
+                ch,
+                font: GlyphFontId::NotoSymbols2,
+            })
+        }
         other => Err(format!(
-            "invalid shape: {other} (only 'circle' is supported for now)"
+            "invalid shape: {other} (expected 'circle' or 'glyph')"
         )),
     }
 }
@@ -123,7 +213,14 @@ fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
 /// なので、(source_rgb の長さ + 4 隅 8 byte サンプル + width + height + k)
 /// を fingerprint にして再利用する。
 ///
-/// wasm は single-threaded なので静的可変状態で問題ない。
+/// レビュー S1: 旧実装は `static mut Option<CachedClusters>` で
+/// `#[allow(static_mut_refs)]` を必要としていた。Rust 2024 以降の lint 強化で
+/// 将来の事故源になるため `OnceLock<WasmSingleThreadCell<...>>` に移行する。
+/// **wasm は single-threaded** なので `RefCell` の borrow 衝突は構造的に
+/// 起きないが、`RefCell` 自体が `Sync` ではないため、wasm 専用の薄い
+/// ラッパで `Sync`/`Send` を手動 impl する（unsafe 境界は **このラッパ
+/// 1 か所だけ**に閉じ込める）。worker を複数起動しても各 worker は独立した
+/// wasm モジュールインスタンスを持つので static 共有は発生しない。
 struct CachedClusters {
     fingerprint: u64,
     clusters_full: Vec<Cluster>,
@@ -131,7 +228,33 @@ struct CachedClusters {
     clusters: Vec<Cluster>,
 }
 
-static mut SOURCE_CACHE: Option<CachedClusters> = None;
+/// wasm シングルスレッド前提の `RefCell` ラッパ。
+///
+/// `OnceLock<T>` の `T` は `Sync` を要求するが、`RefCell<T>` は `Sync` を
+/// 提供しないため、そのままでは `OnceLock<RefCell<...>>` を `static` に
+/// 置けない。wasm32 ターゲットでは static の共有が実質スレッド境界を
+/// 越えないので、ここで `Sync`/`Send` を手動 impl する。これで以後は
+/// `static mut` も `#[allow(static_mut_refs)]` も不要になる。
+struct WasmSingleThreadCell<T>(RefCell<T>);
+// SAFETY: wasm32 はシングルスレッド (Web Worker は別 wasm インスタンスを持つ)。
+// 同一 wasm インスタンス内で `RefCell` を多スレッドから同時アクセスすることは
+// 構造的に起きない。borrow 衝突は通常の RefCell ルールで実行時に検出される。
+unsafe impl<T> Sync for WasmSingleThreadCell<T> {}
+unsafe impl<T> Send for WasmSingleThreadCell<T> {}
+
+impl<T> WasmSingleThreadCell<T> {
+    fn new(v: T) -> Self {
+        Self(RefCell::new(v))
+    }
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}
+
+fn source_cache() -> &'static WasmSingleThreadCell<Option<CachedClusters>> {
+    static CELL: OnceLock<WasmSingleThreadCell<Option<CachedClusters>>> = OnceLock::new();
+    CELL.get_or_init(|| WasmSingleThreadCell::new(None))
+}
 
 fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
     // 完全一致は不要。長さ + dims + k + 4 隅サンプルで衝突は実用上ゼロ。
@@ -155,14 +278,15 @@ fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
 /// kmeans 結果（clusters_full / bg / clusters）を取得する。同じソース画像なら
 /// キャッシュヒットして O(1)、違う画像なら kmeans 実行 + キャッシュ更新。
 ///
-/// SAFETY: wasm は single-threaded なので静的可変参照は問題ない。
+/// レビュー S1: `static mut SOURCE_CACHE` を `OnceLock<WasmSingleThreadCell<...>>`
+/// 経由に切り替え。`unsafe` ブロックも `#[allow(static_mut_refs)]` も不要になる。
 type ClustersBundle = (Vec<Cluster>, [u8; 4], Vec<Cluster>);
 
-#[allow(static_mut_refs)]
 fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
     let fp = fingerprint(&p.source_rgb, p.source_width, p.source_height, p.k);
-    unsafe {
-        if let Some(c) = &SOURCE_CACHE {
+    {
+        let cache = source_cache().borrow_mut();
+        if let Some(c) = cache.as_ref() {
             if c.fingerprint == fp {
                 return Ok((c.clusters_full.clone(), c.bg, c.clusters.clone()));
             }
@@ -179,9 +303,7 @@ fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
         bg,
         clusters: clusters.clone(),
     };
-    unsafe {
-        SOURCE_CACHE = Some(cached);
-    }
+    *source_cache().borrow_mut() = Some(cached);
     Ok((clusters_full, bg, clusters))
 }
 
@@ -294,8 +416,11 @@ fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
 pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
     let direction = parse_direction(&p.direction).map_err(err_to_js)?;
+    // generate_single は呼び出し側が指定した speed をそのまま使う（preset 上書きは
+    // get_render_data 側のみ）。Mid / Fast も Phase B から受け付ける。
     let speed = parse_speed(&p.speed).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
+    let contrast = parse_contrast_preset(&p.contrast_preset).map_err(err_to_js)?;
 
     let source = build_source_image(&mut p).map_err(err_to_js)?;
     let clusters_full = extract_clusters(&source, p.k)
@@ -315,7 +440,7 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
         saturation: 1.0,
         background: bg,
         shape,
-        contrast: orber_core::style::ContrastPreset::Mid,
+        contrast,
     };
     let frame = render_frame(&clusters, &opts, 0.0);
     let png = encode_png_rgba(&frame)?;
@@ -336,7 +461,7 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
 #[wasm_bindgen]
 pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
+    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
 
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
@@ -383,11 +508,14 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// `[0..16]` ヘッダ:
 /// - `[0..4]`: 背景 RGBA (0..1 正規化)
 /// - `[4]`: base_radius_unit (px) = `min(w, h) * 0.25 * orb_size`
-/// - `[5]`: base_blur (0..1)
+/// - `[5]`: base_blur (0..1) — `(spec.blur + contrast.blur_offset()).clamp(0,1)` で
+///   contrast 軸を反映済み
 /// - `[6]`: direction_id (0=LR, 1=RL, 2=TB, 3=BT)
-/// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow)
+/// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow, 3 = Mid, 4 = Fast)
 /// - `[8]`: n_orbs (整数を f32 として)
-/// - `[9..16]`: 予約（0 詰め）
+/// - `[9]`: contrast_alpha_mul (0..1) — Phase B (#55)。Mid なら 1.0
+/// - `[10]`: shape_id (0=Circle, 1=Glyph) — Phase B (#55)
+/// - `[11..16]`: 予約（0 詰め）
 ///
 /// `[16 + 16*i ..]` per orb i:
 /// - `[+0..+3]`: color_rgb (0..1)
@@ -407,8 +535,11 @@ pub fn get_render_data(
     spec_idx: u32,
 ) -> Result<js_sys::Float32Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    // shape は今のところ Circle のみ（Aquarelle は WebGL 経路非対応）。
-    let _ = parse_shape(&p.shape).map_err(err_to_js)?;
+    // Phase B (#55): shape = "circle" | "glyph"。glyph_char は Glyph のときに必須。
+    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
+    let count_override = parse_count_preset(&p.count_preset).map_err(err_to_js)?;
+    let speed_override = parse_speed_preset(&p.speed_preset).map_err(err_to_js)?;
+    let contrast = parse_contrast_preset(&p.contrast_preset).map_err(err_to_js)?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
@@ -428,7 +559,13 @@ pub fn get_render_data(
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
     let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
-    let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
+    // Phase B (#55): UI から speed_preset が来ていれば、video 領域の
+    // GUI_VIDEO_SPEEDS 固定割当も無視してユーザ指定値で全タイル統一する。
+    // none なら従来どおり (still=spec.speed, video=GUI_VIDEO_SPEEDS)。
+    let speed = match speed_override {
+        Some(s) => s,
+        None => speed_for_spec_idx(spec_idx, still_count, &spec),
+    };
 
     let direction_id: f32 = match direction {
         MotionDirection::LeftToRight => 0.0,
@@ -438,15 +575,17 @@ pub fn get_render_data(
     };
     let cycle = speed.cycle_count() as f32;
 
-    let n_orbs = spec
-        .count
+    // Phase B (#55): count_preset があれば spec.count を上書きする。
+    // 未指定なら従来どおり spec.count（random_ranges から 10..=50 一様抽選）。
+    let effective_count = count_override.unwrap_or(spec.count);
+    let n_orbs = effective_count
         .min(MAX_ORB_COUNT)
         .max(if clusters.is_empty() { 0 } else { 1 });
 
     // review S2: WebGL fragment shader の uniform 配列上限を超えると黙って
     // 切り詰められて視覚パリティが壊れる。発見が遅れないよう wasm 側で
-    // 早期 throw する。spec.count > 64 になる経路は現 GUI には無いが、
-    // random_ranges を将来弄る際の保険。
+    // 早期 throw する。Phase B でも GL_RENDERER_MAX_ORBS=64 を超えうる
+    // count_preset (high=35) は未満。将来 high を 64 超に上げるならここを更新。
     if n_orbs > GL_RENDERER_MAX_ORBS {
         return Err(JsError::new(&format!(
             "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
@@ -454,7 +593,17 @@ pub fn get_render_data(
     }
 
     let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
-    let base_blur = spec.blur.clamp(0.0, 1.0);
+    // Phase B (#55): contrast.blur_offset() を base_blur に積算（core/animate と同式）。
+    // Mid なら +0.0 で既存挙動と完全同値。
+    let base_blur = (spec.blur + contrast.blur_offset()).clamp(0.0, 1.0);
+    let alpha_mul = contrast.alpha_mul().clamp(0.0, 1.0);
+    let shape_id: f32 = match shape {
+        OrbShape::Circle => 0.0,
+        OrbShape::Glyph { .. } => 1.0,
+        // Aquarelle は WebGL 経路非対応。parse_shape で弾かれているはずだが念のため
+        // Circle 扱いにフォールバック（パニックさせない）。
+        _ => 0.0,
+    };
 
     let buf = pack_render_data(
         &clusters,
@@ -465,6 +614,8 @@ pub fn get_render_data(
         cycle,
         spec.seed,
         n_orbs,
+        alpha_mul,
+        shape_id,
     );
 
     Ok(js_sys::Float32Array::from(buf.as_slice()))
@@ -476,6 +627,8 @@ pub fn get_render_data(
 /// core 側 `generate_orb_params` を呼び出さずに同じシーケンスを **再現** する
 /// （core の `OrbParams` は private struct で wasm から読めないため）。順序を
 /// 1 つでも変えると同じ seed でも別の orb 列になり、視覚パリティが壊れる。
+// TODO(orber#future): pack_render_data の引数が 10 個に達した。Phase C で
+// orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
 #[allow(clippy::too_many_arguments)]
 fn pack_render_data(
     clusters: &[Cluster],
@@ -486,6 +639,8 @@ fn pack_render_data(
     cycle: f32,
     seed: u64,
     n_orbs: usize,
+    alpha_mul: f32,
+    shape_id: f32,
 ) -> Vec<f32> {
     let header_words = 16usize;
     let per_orb_words = 16usize;
@@ -501,7 +656,9 @@ fn pack_render_data(
     buf[6] = direction_id;
     buf[7] = cycle;
     buf[8] = n_orbs as f32;
-    // [9..16] reserved (0)
+    buf[9] = alpha_mul;
+    buf[10] = shape_id;
+    // [11..16] reserved (0)
 
     if n_orbs == 0 || clusters.is_empty() {
         return buf;
@@ -541,6 +698,69 @@ fn pack_render_data(
     buf
 }
 
+/// Phase B (#55): Glyph 1 文字の alpha mask を JS 側に返す wasm wrapper。
+///
+/// 実体は [`orber_core::glyph::render_glyph_alpha_mask`] を参照。本関数は
+/// その上に `(font, ch, size)` キャッシュ + size validation + JS 型変換だけを
+/// 加える。size は `[16, 1024]` の範囲のみ受理（GUI は 256 固定の想定）。
+/// 戻り値は長さ `size * size` の `Uint8Array`（行優先 alpha 0..255）。
+/// 同梱フォントに無い文字は全 0 を返し panic しない。
+#[wasm_bindgen]
+pub fn get_glyph_alpha_mask(ch: &str, size: u32) -> Result<js_sys::Uint8Array, JsError> {
+    // 入力 validation。size は 16..=1024 の範囲を許可（GUI は 256 を使う想定）。
+    if !(16..=1024).contains(&size) {
+        return Err(JsError::new(&format!(
+            "size must be in [16, 1024], got {size}"
+        )));
+    }
+    let ch = first_char_of(ch).map_err(err_to_js)?;
+    let bytes = glyph_alpha_mask_bytes(GlyphFontId::NotoSymbols2, ch, size);
+    Ok(js_sys::Uint8Array::from(&bytes[..]))
+}
+
+/// `has_glyph(NotoSymbols2, ch)` の wasm 公開ラッパ。UI の警告表示で使う。
+/// 空文字や複数 char の場合は先頭 char のみ判定する（UI 側で 1 char 制限想定）。
+#[wasm_bindgen]
+pub fn glyph_supported(ch: &str) -> bool {
+    match ch.chars().next() {
+        Some(c) => has_glyph(GlyphFontId::NotoSymbols2, c),
+        None => false,
+    }
+}
+
+/// `(font, ch, size) -> Vec<u8>` の同一プロセス内キャッシュ。
+/// HashMap キーは `(font, ch as u32, size)`。
+///
+/// レビュー S2: worker の `getRenderer` は (w, h) 切替時に renderer を作り直すが
+/// この wasm 側 `glyph_mask_cache` は wasm モジュール再ロード（HMR / 再起動）まで
+/// 残る。同一 size + 同一 ch なら毎回同じ bytes が返るので決定論的に問題は
+/// 無いが、開発時 HMR で再ロードしない場合に古いキャッシュエントリが残ったまま
+/// になる点だけ注意。実運用では size=GLYPH_MASK_SIZE=256 に固定なので、
+/// glyph 文字数 ×サイズ 1 通りで メモリ上限は数十エントリ程度。
+type GlyphMaskKey = (GlyphFontId, u32, u32);
+
+/// レビュー S1: `static mut CACHE` を `OnceLock<WasmSingleThreadCell<HashMap<...>>>`
+/// に置換。`#[allow(static_mut_refs)]` を削除し、`unsafe` も無くなる。
+fn glyph_mask_cache() -> &'static WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>> {
+    static CELL: OnceLock<WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| WasmSingleThreadCell::new(HashMap::new()))
+}
+
+fn glyph_alpha_mask_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+    let key = (font, ch as u32, size);
+    {
+        let cache = glyph_mask_cache().borrow_mut();
+        if let Some(v) = cache.get(&key) {
+            return v.clone();
+        }
+    }
+    let v = render_glyph_alpha_mask(font, ch, size);
+    glyph_mask_cache().borrow_mut().insert(key, v.clone());
+    v
+}
+
+
 /// 重み比例の 1 サンプル抽選器。`crates/core::animate::pick_weighted` と同等。
 fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
     if total <= 0.0 || weights.is_empty() {
@@ -565,6 +785,7 @@ fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
 #[wasm_bindgen]
 pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let contrast = parse_contrast_preset(&p.contrast_preset).map_err(err_to_js)?;
     let source = build_source_image(&mut p).map_err(err_to_js)?;
 
     let clusters_full = extract_clusters(&source, p.k)
@@ -577,7 +798,7 @@ pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
         blur: p.blur,
         saturation: 1.0,
         background: bg,
-        contrast: orber_core::style::ContrastPreset::Mid,
+        contrast,
     };
     Ok(core_render_svg(&clusters, &opts))
 }
@@ -609,19 +830,139 @@ mod tests {
 
     #[test]
     fn parse_speed_roundtrip() {
+        // Phase B (#55) で Mid / Fast を追加済み。
         assert!(matches!(
             parse_speed("very-slow"),
             Ok(MotionSpeed::VerySlow)
         ));
         assert!(matches!(parse_speed("slow"), Ok(MotionSpeed::Slow)));
-        assert!(parse_speed("fast").is_err());
+        assert!(matches!(parse_speed("mid"), Ok(MotionSpeed::Mid)));
+        assert!(matches!(parse_speed("fast"), Ok(MotionSpeed::Fast)));
+        assert!(parse_speed("xxx").is_err());
     }
 
     #[test]
-    fn parse_shape_only_circle() {
-        assert!(matches!(parse_shape("circle"), Ok(OrbShape::Circle)));
-        assert!(parse_shape("aquarelle").is_err());
-        assert!(parse_shape("").is_err());
+    fn parse_speed_preset_handles_empty_and_values() {
+        // M1/M2: 空文字 / "mid" は identity（None）を返す。spec.speed と
+        // GUI_VIDEO_SPEEDS が温存されるための不変条件。
+        assert!(matches!(parse_speed_preset(""), Ok(None)));
+        assert!(matches!(parse_speed_preset("mid"), Ok(None)));
+        assert!(matches!(
+            parse_speed_preset("slow"),
+            Ok(Some(MotionSpeed::Slow))
+        ));
+        assert!(matches!(
+            parse_speed_preset("fast"),
+            Ok(Some(MotionSpeed::Fast))
+        ));
+        // M2: very-slow は UI 経路では受け付けない（CLI 専用、parse_speed が担当）。
+        assert!(parse_speed_preset("very-slow").is_err());
+        assert!(parse_speed_preset("xxx").is_err());
+    }
+
+    /// M1: count_preset='' のとき effective_count == spec.count を保つ。
+    /// `parse_count_preset` が `None` を返し、`get_render_data` 内で
+    /// `count_override.unwrap_or(spec.count)` がそのまま spec.count を採用する。
+    #[test]
+    fn count_preset_empty_or_unspecified_uses_spec_count() {
+        let count_override = parse_count_preset("").unwrap();
+        assert!(count_override.is_none());
+        // identity 不変条件: count_override.unwrap_or(spec_count) == spec_count
+        let spec_count: usize = 27;
+        assert_eq!(count_override.unwrap_or(spec_count), spec_count);
+    }
+
+    /// M1: speed_preset='' / 'mid' のとき speed_for_spec_idx の戻り値（
+    /// still=spec.speed / video=GUI_VIDEO_SPEEDS）を温存する。
+    #[test]
+    fn speed_preset_empty_or_unspecified_uses_spec_idx() {
+        for empty_input in ["", "mid"] {
+            let speed_override = parse_speed_preset(empty_input).unwrap();
+            assert!(
+                speed_override.is_none(),
+                "speed_preset={empty_input:?} must be identity (None)"
+            );
+        }
+        // identity 経路: get_render_data の match arm が
+        // `speed_for_spec_idx(spec_idx, still_count, &spec)` を採用する。
+        let still_count = 8;
+        let total = 12;
+        let mut spec = synth_spec(MotionDirection::TopToBottom);
+        spec.speed = MotionSpeed::Slow;
+        // still 領域は spec.speed を保つ。
+        for spec_idx in 0..still_count {
+            assert_eq!(
+                speed_for_spec_idx(spec_idx, still_count, &spec),
+                MotionSpeed::Slow
+            );
+        }
+        // video 領域は GUI_VIDEO_SPEEDS の固定割当を保つ。
+        for spec_idx in still_count..total {
+            assert_eq!(
+                speed_for_spec_idx(spec_idx, still_count, &spec),
+                GUI_VIDEO_SPEEDS[spec_idx - still_count]
+            );
+        }
+    }
+
+    /// M1: contrast_preset='' のとき ContrastPreset::Mid と一致する（identity）。
+    #[test]
+    fn contrast_preset_empty_is_mid_identity() {
+        assert_eq!(parse_contrast_preset("").unwrap(), ContrastPreset::Mid);
+        assert_eq!(parse_contrast_preset("mid").unwrap(), ContrastPreset::Mid);
+        // Mid は alpha_mul=1.0 / blur_offset=0.0 で既存挙動と完全同値であることが
+        // crates/core/src/style.rs の regression test で固定されている。
+    }
+
+    #[test]
+    fn parse_count_preset_table() {
+        assert_eq!(parse_count_preset("").unwrap(), None);
+        assert_eq!(parse_count_preset("low").unwrap(), Some(10));
+        assert_eq!(parse_count_preset("mid").unwrap(), Some(20));
+        assert_eq!(parse_count_preset("high").unwrap(), Some(35));
+        assert!(parse_count_preset("xxx").is_err());
+    }
+
+    #[test]
+    fn parse_contrast_preset_table() {
+        assert_eq!(parse_contrast_preset("").unwrap(), ContrastPreset::Mid);
+        assert_eq!(parse_contrast_preset("mid").unwrap(), ContrastPreset::Mid);
+        assert_eq!(parse_contrast_preset("low").unwrap(), ContrastPreset::Low);
+        assert_eq!(parse_contrast_preset("high").unwrap(), ContrastPreset::High);
+        assert!(parse_contrast_preset("xxx").is_err());
+    }
+
+    #[test]
+    fn parse_shape_circle_and_glyph() {
+        assert!(matches!(parse_shape("circle", ""), Ok(OrbShape::Circle)));
+        // glyph では glyph_char が必須。空はエラー。
+        assert!(parse_shape("glyph", "").is_err());
+        let g = parse_shape("glyph", "☆").unwrap();
+        assert!(matches!(g, OrbShape::Glyph { ch, .. } if ch == '☆'));
+        // Aquarelle は wasm 入口で受けない。
+        assert!(parse_shape("aquarelle", "").is_err());
+        assert!(parse_shape("", "").is_err());
+    }
+
+    #[test]
+    fn glyph_alpha_mask_paints_known_char() {
+        // ☆ は同梱 NotoSansSymbols2 にある。alpha が立っているピクセルが
+        // 一定数以上あること（少なくとも全ピクセルの 5% は塗られる想定）。
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', 64);
+        assert_eq!(bytes.len(), 64 * 64);
+        let lit = bytes.iter().filter(|&&b| b > 0).count();
+        assert!(
+            lit > 64 * 64 / 20,
+            "rendering ☆ at 64x64 should produce >=5% lit pixels, got {lit}"
+        );
+    }
+
+    #[test]
+    fn glyph_alpha_mask_unknown_char_returns_empty() {
+        // 絵文字 (Symbols 2 subset 外) は全 0 を返す。
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
+        assert_eq!(bytes.len(), 32 * 32);
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     fn base_params() -> WasmParams {
@@ -639,6 +980,11 @@ mod tests {
             orb_size: 3.0,
             blur: 0.5,
             shape: "circle".into(),
+            // Phase B (#55): 既存挙動互換のため空文字。
+            glyph_char: String::new(),
+            count_preset: String::new(),
+            speed_preset: String::new(),
+            contrast_preset: String::new(),
         }
     }
 
@@ -768,7 +1114,12 @@ mod tests {
             match s {
                 MotionSpeed::VerySlow => very_slow += 1,
                 MotionSpeed::Slow => slow += 1,
-                MotionSpeed::Mid | MotionSpeed::Fast => panic!("not yet exposed in wasm"),
+                // GUI_VIDEO_SPEEDS は現在 VerySlow / Slow しか含まないので
+                // この arm に来たら GUI_VIDEO_SPEEDS の定義変更ミス。
+                // (Phase B でも GUI_VIDEO_SPEEDS は変更していない)
+                MotionSpeed::Mid | MotionSpeed::Fast => {
+                    panic!("GUI_VIDEO_SPEEDS unexpectedly contains Mid/Fast: {s:?}")
+                }
             }
         }
         // 4 タイルで 2 + 2 のばらけが固定で保証される。

@@ -1,9 +1,17 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
+// orber#55 Phase B — Glyph shape (アウトライン fill) 経路と contrast 軸を追加。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
 // (`crates/core::animate::render_frame_with_params`) と同じ数式・同じ per-orb
 // パラメータを使うので、視覚パリティは「最終的な見た目が同じ」が保たれる。
+//
+// shape == "glyph" のときは、`u_glyph_mask` (256x256 alpha texture) を `(cx, cy)`
+// 中心 + 半径 r の正方領域で sampling して alpha を決める。Circle 経路は
+// 既存の rim/soft グラデを維持し、`if u_shape_id == 0` 分岐で texture lookup を
+// skip して regression を避ける。
+// contrast の alpha_mul は per-orb opacity に乗算（CPU 経路と同式）、
+// blur_offset は wasm 側で base_blur に積算済みなので shader はそのまま使う。
 //
 // アーキテクチャ:
 //   1. setup() で program / VAO / FBO 関連の使い回しリソースを 1 度だけ作る
@@ -32,10 +40,17 @@
 /// uniform 配列の上限。`crates/core::animate::MAX_ORB_COUNT = 1024` ほど大きく
 /// する必要はなく、GUI 経路では `random_batch_specs` の count_range
 /// (COUNT_MAX = 50) が事実上の上限。バッファ余裕を持たせて 64 とする。
+// SYNC WITH crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS
 const MAX_ORBS = 64;
 
 const HEADER_WORDS = 16;
 const PER_ORB_WORDS = 16;
+
+/// Phase B (#55): Glyph alpha mask テクスチャの解像度（縦 = 横）。
+/// wasm `get_glyph_alpha_mask` の `size` 引数と一致させる必要がある。
+/// 256 は GUI のプレビュー (360x640 / 640x360) でもタイルあたり orb 半径 ~50px
+/// 程度に収まるので、texture サイズ 256 で十分なシャープさを得る。
+export const GLYPH_MASK_SIZE = 256;
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -58,8 +73,12 @@ uniform vec4 u_bg;             // straight rgba (0..1)
 uniform float u_base_radius;   // px
 uniform float u_base_blur;     // 0..1
 uniform float u_direction;     // 0=LR, 1=RL, 2=TB, 3=BT
-uniform float u_cycle;         // 1 or 2
+uniform float u_cycle;         // 1=VerySlow, 2=Slow, 3=Mid, 4=Fast
 uniform int u_n_orbs;
+// Phase B (#55):
+uniform float u_alpha_mul;     // contrast.alpha_mul (Mid=1.0)
+uniform int u_shape_id;        // 0=Circle, 1=Glyph
+uniform sampler2D u_glyph_mask;
 
 // per-orb uniforms (length MAX_ORBS = 64). Float で詰める。
 uniform vec4 u_orb_color[${MAX_ORBS}];     // (r, g, b, weight)
@@ -70,8 +89,10 @@ float clampf(float x, float a, float b) { return min(max(x, a), b); }
 
 void main() {
   vec2 px = gl_FragCoord.xy;
-  // gl_FragCoord は左下原点。CPU 経路は左上原点 (image::RgbaImage) なので
-  // y を反転して合わせる。
+  // N4: shader-internal comments are kept English for RenderDoc / Spector.js
+  // capture readability (multibyte source comments may not survive extraction).
+  // gl_FragCoord origin is bottom-left, but CPU path uses top-left
+  // (image::RgbaImage). Flip y to match.
   px.y = u_resolution.y - px.y;
 
   // 進行軸長 (LR/RL=width, TB/BT=height)
@@ -103,8 +124,8 @@ void main() {
 
     float advance_steps = fract(u_cycle * speed_mult * u_t);
     float raw = phase * extent + advance_steps * extent;
-    // GLSL の mod() は負を出さない (mod(x, y) = x - y * floor(x/y))。Rust の
-    // rem_euclid と一致するので、Rust 側と同じ pos が出る。
+    // GLSL mod() never returns a negative value (mod(x, y) = x - y * floor(x/y)),
+    // matching the Rust rem_euclid result so the resulting pos is identical to the CPU path.
     float pos = mod(raw, extent) - r_normalized;
 
     float nx, ny;
@@ -127,39 +148,60 @@ void main() {
     if (radius <= 0.0) continue;
 
     float blur = clampf(u_base_blur + blur_delta, 0.0, 1.0);
-    float opacity = clampf(opacity_factor, 0.0, 1.0);
+    // Phase B (#55): contrast.alpha_mul を per-orb opacity に乗算（CPU 経路と同式）。
+    // Mid なら u_alpha_mul = 1.0 で既存挙動と完全同値。
+    float opacity = clampf(opacity_factor * u_alpha_mul, 0.0, 1.0);
 
     float cx = nx * u_resolution.x;
     float cy = ny * u_resolution.y;
 
-    float dist = distance(px, vec2(cx, cy));
-    float dnorm = dist / radius;        // 0..1 が orb 内、>1 は外
-
-    // alpha 計算 (rim / soft)。center_alpha = opacity, mid_alpha = opacity * 80/255。
+    // alpha 計算: shape == 0 (Circle) は rim/soft グラデ、shape == 1 (Glyph) は
+    // alpha mask テクスチャ sampling。Phase B (#55)。
     float alpha = 0.0;
-    if (dnorm < 1.0) {
-      float center_a = opacity;
-      float mid_a = opacity * (80.0 / 255.0);
-      if (style_bit < 0.5) {
-        // rim: 3-stop
-        float mid_stop = clampf(1.0 - blur * 0.8, 0.05, 0.95);
-        if (dnorm <= mid_stop) {
-          float u = (mid_stop > 0.0) ? (dnorm / mid_stop) : 1.0;
-          alpha = mix(center_a, mid_a, u);
+    if (u_shape_id == 1) {
+      // Glyph: sample the alpha texture in a 2*radius square centred on the
+      // orb. The CPU path (build_glyph_path) scales the glyph uniformly into a
+      // 2*radius square, so we build the UV as (px - center) / (2 * radius) + 0.5.
+      // The texture (uploaded with top-left origin via the row-major writer in
+      // build_glyph_alpha_mask) and the screen space (already flipped to
+      // top-left above) agree on Y axis.
+      vec2 d = px - vec2(cx, cy);
+      vec2 uv = d / (2.0 * radius) + 0.5;
+      if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+        // R8 internal format -> sample .r for the alpha value (LUMINANCE_ALPHA
+        // does not pair cleanly with WebGL2 + GLSL ES 3.00 sized internal
+        // formats; R8 + .r is the shortest reliable pairing).
+        float mask_a = texture(u_glyph_mask, uv).r;
+        alpha = mask_a * opacity;
+      }
+    } else {
+      // Circle: 既存パス (rim / soft グラデ)。
+      float dist = distance(px, vec2(cx, cy));
+      float dnorm = dist / radius;        // 0..1 が orb 内、>1 は外
+      if (dnorm < 1.0) {
+        float center_a = opacity;
+        float mid_a = opacity * (80.0 / 255.0);
+        if (style_bit < 0.5) {
+          // rim: 3-stop
+          float mid_stop = clampf(1.0 - blur * 0.8, 0.05, 0.95);
+          if (dnorm <= mid_stop) {
+            float u = (mid_stop > 0.0) ? (dnorm / mid_stop) : 1.0;
+            alpha = mix(center_a, mid_a, u);
+          } else {
+            float denom = max(1.0 - mid_stop, 1e-6);
+            float u = (dnorm - mid_stop) / denom;
+            alpha = mix(mid_a, 0.0, u);
+          }
         } else {
-          float denom = max(1.0 - mid_stop, 1e-6);
-          float u = (dnorm - mid_stop) / denom;
-          alpha = mix(mid_a, 0.0, u);
-        }
-      } else {
-        // soft: 2-stop (center .. hold_stop は center_a 一定 → hold_stop..1 で 0 へ)
-        float hold_stop = clampf(1.0 - blur, 0.05, 0.95);
-        if (dnorm <= hold_stop) {
-          alpha = center_a;
-        } else {
-          float denom = max(1.0 - hold_stop, 1e-6);
-          float u = (dnorm - hold_stop) / denom;
-          alpha = mix(center_a, 0.0, u);
+          // soft: 2-stop (center .. hold_stop は center_a 一定 → hold_stop..1 で 0 へ)
+          float hold_stop = clampf(1.0 - blur, 0.05, 0.95);
+          if (dnorm <= hold_stop) {
+            alpha = center_a;
+          } else {
+            float denom = max(1.0 - hold_stop, 1e-6);
+            float u = (dnorm - hold_stop) / denom;
+            alpha = mix(center_a, 0.0, u);
+          }
         }
       }
     }
@@ -183,6 +225,14 @@ export interface GlRenderer {
   setResolution(width: number, height: number): void;
   /** wasm の get_render_data 出力を 1 回だけ uniform に流す。 */
   setRenderData(data: Float32Array): void;
+  /**
+   * Phase B (#55): Glyph alpha mask テクスチャをアップロードする。
+   * `mask` は長さ `size * size` の `Uint8Array`（各バイトが alpha 0..255）。
+   * shape == "glyph" のときに必須。Circle のときは呼ばなくても安全だが、
+   * 既存テクスチャを上書きしても害はない。同じ glyph + size なら呼び出し側で
+   * キャッシュして再 upload を避けることを推奨。
+   */
+  setGlyphMask(mask: Uint8Array, size: number): void;
   /** u_t を書き換えて 1 フレーム描画する。 */
   renderFrame(t: number): void;
   /** リソース解放（canvas を捨てるとき）。 */
@@ -255,10 +305,42 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     direction: gl.getUniformLocation(prog, 'u_direction'),
     cycle: gl.getUniformLocation(prog, 'u_cycle'),
     nOrbs: gl.getUniformLocation(prog, 'u_n_orbs'),
+    alphaMul: gl.getUniformLocation(prog, 'u_alpha_mul'),
+    shapeId: gl.getUniformLocation(prog, 'u_shape_id'),
+    glyphMask: gl.getUniformLocation(prog, 'u_glyph_mask'),
     orbColor: gl.getUniformLocation(prog, 'u_orb_color'),
     orbPhase: gl.getUniformLocation(prog, 'u_orb_phase'),
     orbMisc: gl.getUniformLocation(prog, 'u_orb_misc'),
   };
+
+  // Phase B (#55): u_glyph_mask は texture unit 0 に固定。Circle 経路でも
+  // shader 側で `if u_shape_id == 0` で sampling を skip するため、初期は
+  // 空 (1x1 黒) のテクスチャをバインドしておけば Circle 経路で uninitialized
+  // sampler 警告が出ない。setGlyphMask が呼ばれたら中身が差し替わる。
+  const glyphTex = gl.createTexture()!;
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  // 初期 1x1 alpha=0 dummy。`gl.LUMINANCE` も使えるが WebGL2 では `R8` 内部
+  // フォーマットが推奨。R チャネルだけ使い、shader 側は texture(...).a で
+  // 取る運用に統一する（R8 は alpha チャネルが常に 1.0 に見えるので、
+  // 形状マスクとして R チャネルの値が欲しい）。よって shader 側は
+  // texture(...).r を使うのが正しい。これに合わせて shader 側も .r に統一する。
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.R8,
+    1,
+    1,
+    0,
+    gl.RED,
+    gl.UNSIGNED_BYTE,
+    new Uint8Array([0]),
+  );
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(uLoc.glyphMask, 0);
 
   // 使い回しバッファ。MAX_ORBS × 4 vec4 1 軸ぶんずつ。
   const colorBuf = new Float32Array(MAX_ORBS * 4);
@@ -292,6 +374,9 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     const directionId = data[6];
     const cycle = data[7];
     const nOrbs = data[8] | 0;
+    // Phase B (#55): header[9] = alpha_mul, header[10] = shape_id (0=Circle, 1=Glyph)。
+    const alphaMul = data[9];
+    const shapeId = data[10] | 0;
 
     if (nOrbs > MAX_ORBS) {
       throw new Error(`n_orbs ${nOrbs} exceeds MAX_ORBS=${MAX_ORBS}`);
@@ -309,6 +394,8 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     gl!.uniform1f(uLoc.direction, directionId);
     gl!.uniform1f(uLoc.cycle, cycle);
     gl!.uniform1i(uLoc.nOrbs, nOrbs);
+    gl!.uniform1f(uLoc.alphaMul, alphaMul);
+    gl!.uniform1i(uLoc.shapeId, shapeId);
 
     // per-orb を 3 本の vec4 配列に詰め直す。余り (i >= nOrbs) は 0 詰め
     // のままで shader 側で `i >= u_n_orbs` ガードしているので使われない。
@@ -338,6 +425,31 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     gl!.uniform4fv(uLoc.orbMisc, miscBuf);
   }
 
+  function setGlyphMask(mask: Uint8Array, size: number): void {
+    if (mask.length !== size * size) {
+      throw new Error(
+        `glyph mask length mismatch: got ${mask.length}, expected ${size * size}`,
+      );
+    }
+    gl!.activeTexture(gl!.TEXTURE0);
+    gl!.bindTexture(gl!.TEXTURE_2D, glyphTex);
+    // R8 / RED 1 ch でアップロード。`UNPACK_FLIP_Y_WEBGL` は default false で
+    // OK。CPU 経路 (build_glyph_alpha_mask) は左上原点で行優先に書き出している
+    // ので、shader 側の UV (top-left = (0,0)) と一致する。
+    gl!.pixelStorei(gl!.UNPACK_ALIGNMENT, 1);
+    gl!.texImage2D(
+      gl!.TEXTURE_2D,
+      0,
+      gl!.R8,
+      size,
+      size,
+      0,
+      gl!.RED,
+      gl!.UNSIGNED_BYTE,
+      mask,
+    );
+  }
+
   function renderFrame(t: number): void {
     if (curWidth === 0 || curHeight === 0) {
       throw new Error('setResolution must be called before renderFrame');
@@ -348,10 +460,11 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
   }
 
   function dispose(): void {
+    gl!.deleteTexture(glyphTex);
     gl!.deleteBuffer(vbo);
     gl!.deleteVertexArray(vao);
     gl!.deleteProgram(prog);
   }
 
-  return { setResolution, setRenderData, renderFrame, dispose };
+  return { setResolution, setRenderData, setGlyphMask, renderFrame, dispose };
 }

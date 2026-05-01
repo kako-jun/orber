@@ -1,4 +1,5 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import AdvancedSection from './AdvancedSection';
 import { decodeImageToRgb, type DecodedImage } from '../lib/decodeImage';
 import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
@@ -7,6 +8,7 @@ import {
   terminateAndRespawn,
   workerAnimateOne,
   workerGenerateOne,
+  workerGlyphSupported,
   workerInit,
   workerSetSource,
 } from '../lib/orberClient';
@@ -14,6 +16,21 @@ import { t, lang } from '../lib/strings';
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
+// Phase B (#55): advanced 軸の preset 値。表示は strings.ts 経由、内部値は
+// wasm の WasmParams.{count,speed,contrast}_preset と 1:1 対応する文字列。
+//
+// レビュー M1: 「未指定（identity）」を空文字 `''` で表現する。`'mid'` を
+// デフォルトに据えると wasm 側で `count_preset='mid' → count=20 固定` /
+// `speed_preset='mid' → MotionSpeed::Mid 固定` で全タイル同一値になり、
+// Phase A の `random_batch_specs` ばらけ（count 10..=50, video=GUI_VIDEO_SPEEDS）
+// が壊れる。`''` を渡せば wasm 側 `parse_*_preset` が `Ok(None)` を返して
+// spec.count / spec.speed / GUI_VIDEO_SPEEDS の identity 経路に乗る。
+// UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにして、
+// 明示的にユーザが「標準」を選んだら `'mid'` を入れる（明示選択も identity）。
+type ShapeChoice = 'circle' | 'glyph';
+type CountPreset = '' | 'low' | 'mid' | 'high';
+type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
+type ContrastPreset = '' | 'low' | 'mid' | 'high';
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
@@ -61,6 +78,26 @@ export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
   const [wasmErr, setWasmErr] = createSignal<string>('');
   const [aspect, setAspect] = createSignal<Aspect>('portrait');
+  // PR #130 review Q1: 「現在表示中のタイルが生成されたときの aspect」を別 signal で
+  // 持つ。aspect トグル → ガチャ未実行 → DL の順で操作されると、aspect() は新値
+  // (=表示中タイルと食い違う) なのに renderHiResForIndices が aspect() を読んで
+  // hi-res 解像度を新 aspect でレンダリングしてしまう。tilesAspect は runBatch
+  // 開始時に aspect() のスナップショットを取り、DL 経路はこちらを使うことで
+  // プレビューと DL の aspect を必ず一致させる。
+  const [tilesAspect, setTilesAspect] = createSignal<Aspect>('portrait');
+  // Phase B (#55): advanced 軸の signal。デフォルトは「現状（Mid / Standard）」と
+  // 完全同値。これにより既存の Circle 出力に regression が無いことを保証する
+  // （wasm 側の preset 上書きは empty / mid のとき no-op）。
+  const [shape, setShape] = createSignal<ShapeChoice>('circle');
+  const [glyphChar, setGlyphChar] = createSignal<string>('☆');
+  const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
+  // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
+  // 見えるが、内部 signal は空文字 = wasm 側で no-op = spec.count / spec.speed /
+  // GUI_VIDEO_SPEEDS / ContrastPreset::Mid を維持。Phase A の見た目を正確に再現する。
+  const [countPreset, setCountPreset] = createSignal<CountPreset>('');
+  const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('');
+  const [contrastPreset, setContrastPreset] = createSignal<ContrastPreset>('');
+  const [advancedOpen, setAdvancedOpen] = createSignal<boolean>(false);
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
   // ドロップエリアに表示するサムネイル用の object URL。差し替えで revoke する。
@@ -155,6 +192,26 @@ export default function Studio() {
     onCleanup(offCrash);
   });
 
+  // Phase B (#55): glyph 文字の収録状況を非同期で確認し、警告フラグに反映する。
+  // wasm 起動前は楽観的に true（警告非表示）。空文字も true（実際にガチャを
+  // 引くまでは警告しない、UI は「文字が描かれない」状態で済む）。
+  //
+  // PR #130 review Q3: wasm 起動前 (wasmStatus !== 'ready') は楽観的に true に
+  // して警告を抑制する。status が 'ready' に変わるとこの effect が再評価され
+  // workerGlyphSupported が走る。createEffect が wasmStatus と glyphChar の
+  // 両方を読むため Solid が依存追跡し、どちらかの変化で再評価される。
+  createEffect(() => {
+    const ch = glyphChar();
+    const status = wasmStatus();
+    if (status !== 'ready' || ch.length === 0) {
+      setGlyphCharSupported(true);
+      return;
+    }
+    void workerGlyphSupported(ch).then((ok) => {
+      setGlyphCharSupported(ok);
+    });
+  });
+
   onCleanup(() => {
     for (const t of tiles()) {
       URL.revokeObjectURL(t.blobUrl);
@@ -235,6 +292,10 @@ export default function Studio() {
     setWarningMsg('');
     setProgress(0);
     setPhase('generating');
+    // Q1: ここで「タイル群が生成されるときの aspect」をスナップショット。
+    // 以後 aspect() が変わっても tilesAspect() は変わらないので、DL の
+    // hi-res 再描画は表示中タイルと一致した aspect で必ず描かれる。
+    setTilesAspect(aspect());
     // #61: 新しい run の開始でビデオ参照テーブルもリセット。
     videoRefs = [];
 
@@ -267,6 +328,8 @@ export default function Studio() {
     // worker 側で source_* がキャッシュから自動マージされるので、ここでは
     // spec パラメータだけ渡す（毎回 RGB を送らない）。direction/speed/count/
     // orb_size/blur は generate_one_at_index ではどのみち spec で上書きされる。
+    // Phase B (#55): shape / glyph_char / count_preset / speed_preset /
+    // contrast_preset を advanced UI から流す。Mid / standard が既存挙動と同値。
     const params = {
       k: 5,
       width: w,
@@ -277,7 +340,11 @@ export default function Studio() {
       count: 20,
       orb_size: 3.0,
       blur: 0.5,
-      shape: 'circle',
+      shape: shape(),
+      glyph_char: shape() === 'glyph' ? glyphChar() : '',
+      count_preset: countPreset(),
+      speed_preset: speedPreset(),
+      contrast_preset: contrastPreset(),
     };
 
     const total = batchN();
@@ -570,10 +637,12 @@ export default function Studio() {
     if (tile?.blob) toggleTile(idx);
   };
 
-  const setAspectAndMaybeRerun = (a: Aspect) => {
+  // Phase B (#55): aspect トグルは状態のみ変更し、即生成しない。
+  // 唯一の生成トリガーは下のガチャボタン (#55 issue 指針)。
+  // aspect / advanced 設定を変えてからガチャを引く流れに統一する。
+  const onAspectClick = (a: Aspect) => {
     if (aspect() === a) return;
     setAspect(a);
-    if (decoded()) void runBatch();
   };
 
   const toggleTile = (idx: number) => {
@@ -622,7 +691,10 @@ export default function Studio() {
       throw new Error('cannot render hi-res: missing seed / source');
     }
 
-    const a = aspect();
+    // Q1: aspect() ではなく tilesAspect() を使う。プレビュー生成時の aspect
+    // をスナップショットしてあるので、aspect トグル後に DL してもタイル群と
+    // 食い違った解像度で hi-res 再描画されない。
+    const a = tilesAspect();
     const [hiW, hiH] =
       a === 'portrait'
         ? [DL_W_PORTRAIT, DL_H_PORTRAIT]
@@ -634,6 +706,8 @@ export default function Studio() {
     // worker 側に source RGB がキャッシュ済みなので、ここでは spec パラメータ
     // だけ渡す。direction/speed/count/orb_size/blur は generate_one_at_index
     // ではどのみち spec で上書きされる。
+    // Phase B (#55): hi-res 再描画でも UI の advanced 軸を踏襲する
+    // （DL がプレビューと別形状になったら困るため）。
     const hiParams = {
       k: 5,
       width: hiW,
@@ -644,7 +718,11 @@ export default function Studio() {
       count: 20,
       orb_size: 3.0,
       blur: 0.5,
-      shape: 'circle',
+      shape: shape(),
+      glyph_char: shape() === 'glyph' ? glyphChar() : '',
+      count_preset: countPreset(),
+      speed_preset: speedPreset(),
+      contrast_preset: contrastPreset(),
     };
 
     setDlProgress({ done: 0, total: indices.length });
@@ -841,7 +919,7 @@ export default function Studio() {
           aria-pressed={aspect() === 'portrait'}
           aria-label={t('aspectPortrait')}
           title={t('aspectPortraitTitle')}
-          onClick={() => setAspectAndMaybeRerun('portrait')}
+          onClick={() => onAspectClick('portrait')}
           disabled={downloading()}
           class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
@@ -864,7 +942,7 @@ export default function Studio() {
           aria-pressed={aspect() === 'landscape'}
           aria-label={t('aspectLandscape')}
           title={t('aspectLandscapeTitle')}
-          onClick={() => setAspectAndMaybeRerun('landscape')}
+          onClick={() => onAspectClick('landscape')}
           disabled={downloading()}
           class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
@@ -882,6 +960,36 @@ export default function Studio() {
             <rect x="3" y="8" width="18" height="8" rx="1.5" />
           </svg>
         </button>
+      </div>
+
+      {/* Phase B (#55): アドバンスト折りたたみセクション。
+          PR #130 review S4: 約 265 行の JSX を AdvancedSection.tsx に分離した。
+          signal は Studio.tsx 側で所有したまま accessor + setter を props で渡す。
+          DESIGN.md §13 (AdvancedSection) — glass-bg / hairline で囲み、
+          segmented control で 2-3 段階を選ばせる。 */}
+      <AdvancedSection
+        shape={shape}
+        setShape={setShape}
+        glyphChar={glyphChar}
+        setGlyphChar={setGlyphChar}
+        glyphCharSupported={glyphCharSupported}
+        countPreset={countPreset}
+        setCountPreset={setCountPreset}
+        speedPreset={speedPreset}
+        setSpeedPreset={setSpeedPreset}
+        contrastPreset={contrastPreset}
+        setContrastPreset={setContrastPreset}
+        open={advancedOpen}
+        setOpen={setAdvancedOpen}
+        GLASS_BTN={GLASS_BTN}
+        GLASS_BTN_TOGGLED={GLASS_BTN_TOGGLED}
+      />
+
+      {/* Phase B (#55): ガチャボタンを唯一の生成トリガーに昇格。
+          aspect / advanced を変えてから「ガチャを引く」流れに統一する。
+          ボタンサイズはアスペクト・トグルより一回り大きく目立たせる
+          （px/py を 1 段増、文字 + アイコン横並び）。 */}
+      <div class="flex items-center justify-center pt-1">
         <button
           type="button"
           onClick={() => void runBatch()}
@@ -890,17 +998,28 @@ export default function Studio() {
             phase() === 'decoding' ||
             phase() === 'generating' ||
             phase() === 'animating' ||
-            downloading()
+            downloading() ||
+            // Q2: shape='glyph' かつ glyphChar 空のときは wasm 入口で
+            // `glyph_char is empty` の fatal error になるためガチャを disable する。
+            // shape='circle' のときは glyphChar の中身は使われないので無視。
+            (shape() === 'glyph' && glyphChar().trim() === '')
           }
-          aria-label={t('rerollLabel')}
-          title={t('rerollTitle')}
-          class={GLASS_BTN}
+          aria-label={t('gachaLabel')}
+          // N5: ガチャ枚数は BATCH_TILE_COUNT を文字列に注入する（マジックナンバー禁止）。
+          title={t('gachaTitle', { n: BATCH_TILE_COUNT })}
+          class={
+            'inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded ' +
+            'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
+            'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+            'transition-colors duration-200 ease-out ' +
+            'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed text-base'
+          }
         >
-          {/* リロード (循環矢印) — アイコンのみ。テキストラベルは廃止 */}
+          {/* ダイス / リロードのアイコン (DESIGN.md §7) */}
           <svg
             viewBox="0 0 24 24"
-            width="16"
-            height="16"
+            width="18"
+            height="18"
             fill="none"
             stroke="currentColor"
             stroke-width="1.5"
@@ -913,6 +1032,7 @@ export default function Studio() {
             <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
             <path d="M3 21v-5h5" />
           </svg>
+          <span>{t('gachaLabel')}</span>
         </button>
       </div>
 
@@ -1067,7 +1187,8 @@ export default function Studio() {
                         の二重指定はスクリーンリーダーで二重読みになるので、
                         表示テキストだけ残して aria-label を外す。 */}
                     <span class="fade-in absolute bottom-1 right-1 rounded bg-glassBg backdrop-blur-glass border border-glassBorder px-2 py-0.5 text-xs tracking-wide text-fg">
-                      {t('videoPendingBadge')}…
+                      {/* N2: "…" は strings.ts 側に内包済み。Studio.tsx で重ねない。 */}
+                      {t('videoPendingBadge')}
                     </span>
                     {/* #95: フレーム単位の mp4 化進捗をリングで表示。
                         accent color なし、currentColor + text-fgMuted で淡く

@@ -373,3 +373,42 @@ silently.
 The preset is implemented as `ContrastPreset { Low, Mid, High }` in
 `crates/core/src/style.rs` and consumed by the orb rendering path; CLI parsing
 is via `clap`'s `ValueEnum`.
+
+## Phase B — Web GUI parity (#55)
+
+Phase B propagates the four CLI advanced axes to the Studio surface and
+WebGL2 fragment-shader path so a browser user can drive shape / count /
+speed / contrast without dropping to the terminal.
+
+- `WasmParams` gains four optional string fields (`glyph_char`, `count_preset`,
+  `speed_preset`, `contrast_preset`) all defaulting to `""` (= "use the spec
+  / Phase A behaviour"). The wasm crate keeps Phase A's `panic!` for
+  `MotionSpeed::Mid | Fast` removed, and `parse_speed` now accepts all four
+  variants. `parse_shape` accepts `"glyph"` in addition to `"circle"`.
+- The browser baked Glyph alpha masks via the new
+  `orber_core::glyph::render_glyph_alpha_mask(font, ch, size) -> Vec<u8>`
+  helper. The wasm wrapper exports it as
+  `get_glyph_alpha_mask(ch, size) -> Uint8Array` and caches per
+  `(font_id, ch as u32, size)`. The browser worker uploads the mask exactly
+  once per `(ch, size)` change to a `gl.R8 / gl.RED` texture and re-uses it
+  across the 96-frame `<video>` encode loop; subsequent frames only update
+  `u_t`.
+- The fragment shader gains `u_glyph_mask: sampler2D`, `u_shape_id: int`
+  (`0=Circle`, `1=Glyph`), and `u_alpha_mul: float` (the contrast preset's
+  alpha multiplier, baked into per-orb opacity). When `u_shape_id == 0` the
+  Phase A radial-gradient rim/soft path is preserved bit-for-bit; the
+  glyph-mask texture lookup is fully gated behind the `u_shape_id == 1`
+  branch, so Circle output is unchanged.
+- `get_render_data`'s 16-word header schema reserves words 9 and 10 for
+  `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
+  per-orb 16-word slots are unchanged.
+- Studio UI: aspect (Portrait / Landscape) toggles **stop auto-rerunning**
+  the batch — they are now state-only. The previous reload-arrow chip is
+  promoted to a labelled "Roll / ガチャを引く" button, sized one step larger
+  than the aspect chips, and is the **single source of generation**. The
+  collapsible Advanced section between aspect and gacha exposes Shape
+  (Circle / Glyph) + the 1-character glyph input + Count (Few / Standard /
+  Many → 10 / 20 / 35) + Speed (Slow / Standard / Fast → slow / mid / fast)
+  + Contrast (Soft / Standard / Strong → low / mid / high). Defaulting all
+  three preset axes to `mid` is byte-exact identity with Phase A's previous
+  output.

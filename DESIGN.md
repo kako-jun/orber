@@ -250,7 +250,52 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - Reduced motion is honored (see §6)
 - Hit targets: every button is at least 32×32 px
 
----
+## 13. AdvancedSection (#55 Phase B)
+
+折りたたみ式の advanced 軸 UI コンポーネント。Studio のドロップエリア + aspect トグルの直下、ガチャボタンの直上に配置する。
+
+- 外枠: `rounded` + `border border-hairline`、左右 `px-3` / 上下 `py-2`（ヘッダ行）
+- ヘッダ行（常時表示）: `<button>` 全幅、左に歯車アイコン (16px stroke 1.5) + 「アドバンスト / Advanced」、右に `▾` 開閉インジケータ。`aria-expanded` を必ず付ける
+  - 文字色は `fg-muted` → hover で `fg`（§2 の opacity ステップ準拠）
+  - 開閉アイコンは `transition-transform 200ms ease-out` で `rotate-180`
+- パネル内（展開時のみ）: `border-t border-hairline` 区切り、`px-3 py-3`、`space-y-3` で 5 行の縦積み
+  - 行 = ラベル (`w-20 shrink-0 text-fgMuted`) + 値（segmented buttons または input）
+  - segmented button = `Glass Button (§4)` + `aria-pressed`、選択時は `glass-bg-hover` で重ね（既存の Aspect Toggle と同一トークン）
+  - 行同士に色 / アイコンの装飾は付けない（文字 + segmented のみ、§1 の monochrome gothic 規律を保つ）
+
+### 構成軸
+
+| 軸 | 値（内部） | UI 表示 (ja / en) | 既定 | wasm 引数 |
+| --- | --- | --- | --- | --- |
+| 形状 | `circle` / `glyph` | 円 (Circle) / 文字 (Glyph) | `circle` | `shape` |
+| Glyph 文字 | 1 char | 1 文字入力（Glyph 選択時のみ） | `☆` | `glyph_char` |
+| 数 | `''` / `low` / `mid` / `high` | 少なめ (Few) / 標準 (Standard) / 多め (Many) | `''` (= identity) | `count_preset` (内部 `''`/`mid` は spec.count を温存、`low`/`high` は 10 / 35 で上書き) |
+| 速さ | `''` / `slow` / `mid` / `fast` | ゆっくり (Slow) / 標準 (Standard) / 速め (Fast) | `''` (= identity) | `speed_preset`（UI 経路は `slow`/`mid`/`fast` の 3 値のみ受理。`very-slow` は CLI 専用） |
+| コントラスト | `''` / `low` / `mid` / `high` | 弱め (Soft) / 標準 (Standard) / 強め (Strong) | `''` (= identity) | `contrast_preset`（`''` / `mid` は `ContrastPreset::Mid`） |
+
+「標準」segmented button は内部値 `''`（初期状態）と `'mid'`（明示選択）の両方で `aria-pressed=true` になる。どちらも wasm 入口で identity（spec.count / spec.speed / `GUI_VIDEO_SPEEDS` / `ContrastPreset::Mid`）に解決される。M1 (#130 review): 初期値を `'mid'` にすると `count_preset='mid' → 20 固定` / `speed_preset='mid' → MotionSpeed::Mid 固定` で全タイル同一値になり、Phase A の `random_batch_specs` ばらけ（10..=50）と動画 4 枚の `GUI_VIDEO_SPEEDS` 割当が壊れる。これを避けるため初期値は `''`。
+
+### Glyph 文字入力
+
+- `<input type="text" maxLength=2>` を `w-16` の中央寄せで配置。padding は `px-2 py-1`
+- IME や grapheme cluster で複数 char になっても `onInput` で先頭 char に丸める
+- 同梱フォント (Noto Sans Symbols 2) に収録されていない文字は wasm の `glyph_supported(ch)` が `false` を返す。UI は `border-fgMuted` に切り替え + `fg-muted` の小さい注記「同梱フォントに収録されていません / Not in bundled font」を右に並べる
+- ガチャボタンは未収録文字（フォントに無いがコードポイントは存在する）では disable しない — 押せば「描画されない orb」が出るのを許容する monochrome シグナリング。ただし **shape=glyph かつ glyphChar が空文字** のときは、wasm 入口の `parse_shape("glyph", "")` が `glyph_char is empty` の fatal error を返してしまうため、UI 側で disable する（PR #130 review Q2）。空文字を受理する shape=circle 経路には影響しない
+
+### 「Mid = identity」不変条件
+
+count / speed / contrast すべて `mid` を選んだ状態（= デフォルト）が、Phase A 以前の挙動と完全同値になるよう wasm 側を実装している。advanced を開かなければ既存ユーザーの体験は何も変わらない。
+
+### Contrast preset の意味
+
+- Low（弱め）: 文字オーバーレイ向け。`alpha_mul = 0.55` + `blur_offset = +0.25` で orb を奥に押し下げ、上に乗る文字の可読性を上げる
+- Mid（標準）: identity。Phase A 以前と完全同値（regression が起きないことを保証する基準）
+- High（強め）: 単独鑑賞向け。`blur_offset = -0.25` で縁をシャープにして粒子感を強める。`alpha_mul` は Mid と同値（identity の不変条件を保つため上には伸ばさない）
+
+### Aspect トグルと生成トリガー
+
+- Aspect (Portrait / Landscape) トグルは Phase B から **状態のみ変更**（即生成しない）。Phase A までは aspect クリックで自動 rerun していたが、advanced 軸が増えると「設定を弄っている途中で勝手に走る」のが目障りになるため、Phase B から **生成は下のガチャボタンに集約**する
+- 「ガチャを引く」「Roll」ボタンは glass チップだが他のチップより一回り大きく (`px-5 py-2.5`、テキスト + アイコン横並び) してファーストビューで「ここを押せば作れる」が伝わるようにする
 
 ## Agent Quick Reference
 
