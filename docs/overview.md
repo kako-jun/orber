@@ -168,26 +168,45 @@ User-facing CLI behavior is unchanged.
 
 ## Web GUI rendering pipeline
 
-The web frontend (`web/`) renders 12 tiles per drop (8 stills + 4 animated) via
-the WASM bindings. The pipeline is split between a **main thread** (UI + DOM)
-and a **dedicated Worker thread** (wasm + WebCodecs):
+The web frontend (`web/`) renders 12 tiles per drop (8 stills + 4 animated)
+**entirely on the GPU via WebGL2**. wasm is used only for kmeans color
+extraction and for packing per-orb parameters; the per-pixel composition runs
+in a fragment shader. The pipeline is split between a **main thread** (UI +
+DOM) and a **dedicated Worker thread** (wasm + WebGL2 + WebCodecs):
 
 ```
 [main thread]                          [worker thread (orberWorker.ts)]
   Studio.tsx                             wasm-bindgen loaded once
-   ├ runBatch                            ├ generate_one_at_index × 12
-   │   └ workerGenerateOne(i) ────────→  │   └→ PNG bytes (Transferable)
-   ├ animate phase                       ├ start_animation_for_batch_spec × 4
-   │   └ workerAnimateOne(i) ─────────→  │   ├ next_frame loop
-   │                                     │   ├ WebCodecs VideoEncoder
+   ├ runBatch                            ├ wasm.get_render_data(spec_idx, w, h)
+   │   └ workerGenerateOne(i) ────────→  │   └→ Float32Array (orb params)
+   │                                     ├ OffscreenCanvas + WebGL2 fragment
+   │                                     │  shader renders the t=0 frame
+   │                                     ├ canvas.convertToBlob('image/png')
+   │                                     │   └→ PNG bytes (Transferable)
+   ├ animate phase                       ├ wasm.get_render_data(spec_idx, w, h)
+   │   └ workerAnimateOne(i) ─────────→  │   for i in 0..192:
+   │                                     │     - shader.renderFrame(t = i/192)
+   │                                     │     - new VideoFrame(canvas) → encode
+   │                                     ├ WebCodecs VideoEncoder (prefer-hardware)
    │                                     │   └→ mp4 Blob (Transferable)
    └ DL high-res                         └ same APIs, with width/height = 1080×1920
        └ workerGenerateOne / workerAnimateOne (per selected index)
 ```
 
 The source RGB buffer is uploaded once via `workerSetSource` and cached in the
-Worker; subsequent `generateOne` / `animateOne` calls reference that cache so
-multi-megabyte arrays are not copied per call.
+Worker; subsequent `get_render_data` calls reference the cached kmeans
+clusters, so multi-megabyte arrays are not copied per call. The WebGL2 context
+and OffscreenCanvas are also cached per resolution and reused across calls.
+
+**Why WebGL2.** The previous implementation rendered every pixel on the CPU
+inside wasm and ran each animation frame through `RGBA → ImageData →
+createImageBitmap → VideoFrame` before encoding. At 1080×1920 × 192 frames the
+per-pixel CPU cost dominated and a single download tile took several minutes.
+The fragment shader runs in parallel on the GPU and `new VideoFrame(canvas)`
+hands the rendered surface directly to the encoder, eliminating per-frame
+transfer cost entirely. End-to-end download time for one hi-res animated tile
+drops to a few seconds (encoder flush dominates; renders themselves are
+sub-millisecond).
 
 **Preview vs. download resolution.** Tiles are rendered at **540×960** (portrait)
 or **960×540** (landscape) for the preview grid — light enough to keep mobile
@@ -205,19 +224,20 @@ roll contains all 4 directions exactly once and a 2:2 mix of slow/very-slow,
 so a batch never degenerates into "all 4 fast" or "all 4 slow". Static tiles
 keep their spec values; only the animated tiles get the override (#59 / #77).
 The wasm helpers `direction_for_spec_idx` / `speed_for_spec_idx` apply the
-same logic to both the preview PNG (`generate_one_at_index`) and the
-animation cursor (`start_animation_for_batch_spec`), so the t=0 frame and the
-mp4 are guaranteed to match.
+same logic inside `get_render_data`, so the still tile (rendered at `t = 0`)
+and the animated mp4 (rendered at `t ∈ [0, 1)`) are guaranteed to start from
+the exact same frame.
 
 **Clip duration.** Animated tiles are **8 seconds long at 24 fps** (192 frames).
 Combined with the assigned speeds above, VerySlow tiles cross the screen once
 in 8 s — slow enough to feel "drifting", appropriate for use as overlay /
 background plates beneath text.
 
-**Browser requirements.** OffscreenCanvas / VideoEncoder / VideoFrame in Worker
-context. iOS Safari 16.4+, current Android Chrome / Firefox 130+. There is no
-fallback path for older browsers — the GUI shows an error if WebCodecs is
-unavailable.
+**Browser requirements.** OffscreenCanvas / WebGL2 / VideoEncoder / VideoFrame
+in Worker context. iOS Safari 16.4+, current Android Chrome / Firefox 130+.
+There is no fallback path for older browsers — the GUI shows an error if
+WebCodecs is unavailable. WebGL2 support is a strict superset of WebCodecs in
+practice, so any browser that can run the encoder can also run the renderer.
 
 **Progressive UX.** While the Worker is busy:
 
@@ -230,11 +250,10 @@ unavailable.
 
 **Re-roll cancellation.** When the user re-rolls (or drops a new image / flips
 aspect) while the previous batch is still in flight, `runBatch` terminates the
-Worker (`worker.terminate()`) and respawns it with a fresh wasm instance. A
-logical generation guard (`runGen` / `myGen`) alone is not enough because the
-in-flight wasm calls (`generate_one_at_index`) and the WebCodecs encode loop
-keep running to completion otherwise, doubling CPU usage and delaying the new
-batch. After respawn the cached source RGB is invalidated and re-uploaded on
+Worker (`worker.terminate()`) and respawns it with a fresh wasm instance and
+WebGL2 context. A logical generation guard (`runGen` / `myGen`) alone is not
+enough because the in-flight render + encode loop keeps running to completion
+otherwise, doubling GPU/CPU usage and delaying the new batch. After respawn the cached source RGB is invalidated and re-uploaded on
 the next `workerSetSource`. The cost (a small wasm re-init) is paid only when
 re-rolling mid-batch; single, sequential runs see no overhead. Note the
 in-flight check excludes `init` / `setSource` RPCs so a re-roll triggered

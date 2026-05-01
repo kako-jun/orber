@@ -1,26 +1,24 @@
-// orber#75 — wasm 描画 + WebCodecs エンコードを Worker スレッドで実行する。
+// orber#75 / #112 — wasm + WebGL2 描画 + WebCodecs エンコードを Worker スレッドで実行する。
 //
 // メインスレッドは UI / DOM / Solid signal だけに集中させ、重い計算は全部
 // ここに逃がす。これによりスマホでも生成中にスクロール / タップが死なない。
 //
 // アーキテクチャ:
 //   main → postMessage({ kind, id, ... }) → worker
-//   worker → wasm 呼び出し → postMessage({ id, ok, data }) → main
+//   worker → wasm.get_render_data → WebGL2 (OffscreenCanvas) 描画 →
+//            convertToBlob (PNG) or VideoEncoder (mp4) → main
 //
 // データ転送:
 //   - PNG / mp4 の ArrayBuffer は Transferable で zero-copy 返却
 //   - source RGB は `setSource` で 1 度だけ送って worker 側にキャッシュする
-//     （runBatch / DL / アスペクト切替で使い回し）
 //
-// 互換性: OffscreenCanvas / VideoEncoder / VideoFrame in Worker が要る。
-// iOS Safari 16.4+ / Android Chrome / 最近の Firefox。古い端末は対象外
-// （isWebCodecsSupported() のメイン側チェックで弾く前提）。
+// 互換性: OffscreenCanvas + WebGL2 + VideoEncoder/VideoFrame in Worker が要る。
+// iOS Safari 16.4+ / Android Chrome / 最近の Firefox。古い端末は対象外。
 
 import init, * as wasm from '../wasm/orber_wasm.js';
-import { encodeAnimationToMp4 } from './encodeMp4';
+import { encodeAnimationFromCanvas } from './encodeMp4';
+import { createGlRenderer, type GlRenderer } from './orberGl';
 
-// レビュー M6: 複数メッセージが同時に到着すると ensureInit が並行に走り、
-// init() が重複実行される。Promise をキャッシュして 1 度きりにする。
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 function ensureInit(): Promise<void> {
@@ -33,11 +31,27 @@ function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// 入力画像の RGB バッファを worker 側にキャッシュ。同じ画像で複数回 wasm を
-// 呼ぶ（12 枚生成 / DL hi-res 12 枚）ので、毎回 postMessage で送るのは無駄。
-// `setSource` で 1 度送って、以降の generateOne / animateOne はキャッシュを
-// 自動で混ぜ込む。
 let cachedSource: { rgb: Uint8Array; width: number; height: number } | null = null;
+
+// OffscreenCanvas + GlRenderer は (width, height) ごとに 1 個だけ作って使い回す。
+// 192 frame の動画化中はもちろん、アスペクト切替や preview / hi-res の解像度
+// 切替でも、同じサイズなら再利用したい。WebGL の context 生成は重い。
+let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number; height: number } | null = null;
+
+function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; renderer: GlRenderer } {
+  if (cachedCanvas && cachedCanvas.width === width && cachedCanvas.height === height) {
+    return { canvas: cachedCanvas.canvas, renderer: cachedCanvas.renderer };
+  }
+  if (cachedCanvas) {
+    cachedCanvas.renderer.dispose();
+    cachedCanvas = null;
+  }
+  const canvas = new OffscreenCanvas(width, height);
+  const renderer = createGlRenderer(canvas);
+  renderer.setResolution(width, height);
+  cachedCanvas = { canvas, renderer, width, height };
+  return { canvas, renderer };
+}
 
 interface BaseParams {
   k: number;
@@ -103,44 +117,42 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
       }
       case 'generateOne': {
         const params = mergeParams(req.params);
-        const png = wasm.generate_one_at_index(params, req.n, req.index);
-        // png.buffer は wasm 線形メモリへの view → そのまま postMessage で
-        // Transferable に渡すと wasm 側のメモリが detach されて壊れる。
-        // slice() で新規 ArrayBuffer を作って Transferable で main に渡す。
-        const buf = png.slice().buffer;
+        const data = wasm.get_render_data(params, req.n, req.index);
+        const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
+        renderer.setRenderData(data);
+        renderer.renderFrame(0);
+        // PNG にエンコードして main に返す。convertToBlob は OffscreenCanvas
+        // 標準で、PNG 圧縮は worker 側で完結する。
+        const blob = await canvas.convertToBlob({ type: 'image/png' });
+        const buf = await blob.arrayBuffer();
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
       case 'animateOne': {
         const params = mergeParams(req.params);
-        const handle = wasm.start_animation_for_batch_spec(
-          params,
-          req.n,
-          req.index,
+        const data = wasm.get_render_data(params, req.n, req.index);
+        const width = req.params.width;
+        const height = req.params.height;
+        const { canvas, renderer } = getRenderer(width, height);
+        renderer.setRenderData(data);
+        // フレーム単位の進捗を main に流す。レビュー S2 の間引きは維持。
+        const PROGRESS_STRIDE = 4;
+        const blob = await encodeAnimationFromCanvas(
+          canvas,
+          (t) => renderer.renderFrame(t),
           req.totalFrames,
-        );
-        try {
-          // #95: フレーム単位の進捗を main に流す。本体応答（id + ok）と
-          // 別 kind で送るので、main 側は pending を消さずに onProgress
-          // だけ発火させる経路で受ける。
-          // レビュー S2: フレーム毎に postMessage + main 側 setTiles すると
-          // 192 frames × 4 タイル並走で setTiles が高頻度化し、特にスマホ
-          // で reconcile が重い。PROGRESS_STRIDE 毎に間引き、最終フレームは
-          // 必ず送る（リングが 100% で停止するため）。
-          const PROGRESS_STRIDE = 4;
-          const blob = await encodeAnimationToMp4(handle, (frame, total) => {
+          width,
+          height,
+          (frame, total) => {
             if (frame !== total && frame % PROGRESS_STRIDE !== 0) return;
             post({ kind: 'animateProgress', id: req.id, frame, total });
-          });
-          const buf = await blob.arrayBuffer();
-          post({ id: req.id, ok: true, data: buf }, [buf]);
-        } finally {
-          handle.free?.();
-        }
+          },
+        );
+        const buf = await blob.arrayBuffer();
+        post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
       default: {
-        // 網羅性チェック。型システムが req: never を要求する。
         const exhaustive: never = req;
         throw new Error(`unknown req kind: ${JSON.stringify(exhaustive)}`);
       }

@@ -1,23 +1,15 @@
 // 後半タイルのアニメーションを WebCodecs + mp4-muxer で h264 mp4 化する。
 //
-// orber-wasm から渡される `AnimationHandle` は RGBA フレームを 1 枚ずつ吐く
-// 反復子なので、それを順番に `VideoEncoder.encode` に流して mp4-muxer に
-// 詰め込む。フレームを保持しないことでメモリピークを 1 枚ぶん（≈ 0.9MB / 360×640、
-// hi-res DL 時は ≈ 8MB / 1080×1920）に抑える設計。
+// #112 の WebGL 経路では OffscreenCanvas (WebGL2) に 1 frame 描画して
+// `new VideoFrame(canvas)` で直接エンコーダに食わせる。RGBA バッファの GPU→CPU
+// readback が消えるので、CPU 経路 (wasm + ImageData → ImageBitmap →
+// VideoFrame) と比べて 1080×1920 × 192 frame で大幅に速い。
 //
-// 互換性: VideoEncoder / VideoFrame / ImageData(buf, w, h) が要る。
+// 互換性: VideoEncoder / VideoFrame(canvas) が要る。
 // Chrome 94+ / Safari 16.4+ / Firefox 130+。非対応ブラウザでは throw する
 // （Studio 側で catch して静止画フォールバックする）。
 
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
-
-export interface AnimationHandleLike {
-  readonly width: number;
-  readonly height: number;
-  readonly total_frames: number;
-  next_frame(): Uint8ClampedArray | null | undefined;
-  free?: () => void;
-}
 
 export const ANIM_FPS = 24;
 // #77: 8 秒ぶん。背景・配信オーバーレイ用途では「ほとんど動いていないように
@@ -34,22 +26,31 @@ export function isWebCodecsSupported(): boolean {
 }
 
 /**
- * `AnimationHandle` を消費して 1 本の mp4 Blob を返す。
+ * OffscreenCanvas (WebGL2) を消費して 1 本の mp4 Blob を返す。
  *
- * 呼び出し後、handle はすべての frame を吐き終えており、`free()` 可能。
+ * `renderFrame(t)` を呼ぶと canvas に t における 1 フレームが描画される前提。
+ * このループ側で `t = i / totalFrames` (i = 0..totalFrames) を順に流し、
+ * 各 frame について `new VideoFrame(canvas)` を作って encoder に渡す。
+ *
+ * canvas を直接 VideoFrame に渡すので RGBA の readback / ImageData 経由が消え、
+ * GPU 経路ではエンコード時間が encoder 側律速まで詰まる（#112）。
+ *
  * エンコード中の例外は再 throw する（呼び出し側で catch）。
  */
-export async function encodeAnimationToMp4(
-  handle: AnimationHandleLike,
+export async function encodeAnimationFromCanvas(
+  canvas: OffscreenCanvas,
+  renderFrame: (t: number) => void,
+  totalFrames: number,
+  width: number,
+  height: number,
   onProgress?: (frame: number, total: number) => void,
 ): Promise<Blob> {
   if (!isWebCodecsSupported()) {
     throw new Error('WebCodecs (VideoEncoder/VideoFrame) is not available');
   }
-
-  const width = handle.width;
-  const height = handle.height;
-  const totalFrames = handle.total_frames;
+  if (totalFrames <= 0) {
+    throw new Error('totalFrames must be > 0');
+  }
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
@@ -74,18 +75,8 @@ export async function encodeAnimationToMp4(
   // 解像度に応じて AVC level を選択する。
   //   - Level 3.1 (0x1F): coded area 上限 921,600px（≈ 720p まで）
   //   - Level 4.2 (0x2A): coded area 上限 2,228,224px（1080p で余裕）
-  // hi-res DL 1080×1920 は coded area が 1088×1920 = 2,088,960 になり 3.1
-  // を超えるため、preview 解像度より広い場合は 4.2 を使う。Baseline profile
-  // の互換性維持のまま level だけ上げる: avc1.42E0{XX}。
-  // bitrate 2Mbps は 24fps でも余裕がありつつファイル ~1MB に収まる目安。
-  // 仕様上 `configure` は同期で完了し、直後の `encode` 呼び出しは合法。
   const codedArea = Math.ceil(width / 16) * 16 * Math.ceil(height / 16) * 16;
   const codecString = codedArea <= 921_600 ? 'avc1.42E01F' : 'avc1.42E02A';
-  // `hardwareAcceleration: 'prefer-hardware'` で HW h264 エンコーダがあれば
-  // それを使う。Android Chrome や iOS Safari の最近の機種は MediaCodec /
-  // VideoToolbox 経由で大幅に速い。HW 不在環境では仕様上ソフトウェアに
-  // フォールバックする（`require` ではなく `prefer` なので throw しない）。
-  // 1080×1920 × 192 frame の DL hi-res で体感差が出る。
   encoder.configure({
     codec: codecString,
     width,
@@ -99,20 +90,23 @@ export async function encodeAnimationToMp4(
 
   for (let i = 0; i < totalFrames; i++) {
     if (firstError !== null) break;
-    const rgba = handle.next_frame();
-    if (!rgba) break;
-    const imageData = new ImageData(rgba, width, height);
-    // createImageBitmap でビットマップ化してから VideoFrame に詰める。
-    // 一部ブラウザは ImageData → VideoFrame 直接生成に未対応のため。
-    const bitmap = await createImageBitmap(imageData);
-    const frame = new VideoFrame(bitmap, {
-      timestamp: Math.round(i * microsecondsPerFrame),
-      duration: Math.round(microsecondsPerFrame),
-    });
-    bitmap.close();
-    // レビュー S8: VideoEncoder.encode は同期 throw する仕様（encoder の
-    // 状態異常など）。catch せずに放置すると Worker が die して Studio 側
-    // pending が孤児化する。catch して firstError 経由で flush 後に再 throw。
+    // t は [0, 1) の範囲を順に。t=1 は出さない（loop closure で t=0 と一致）。
+    const t = i / totalFrames;
+    renderFrame(t);
+    // canvas 直渡し: VideoFrame コンストラクタは canvas のピクセルをスナップ
+    // ショットして取り込む。drawArrays 直後でも GL のキューイング順序は
+    // 保たれているので、あとから読み出した時に未描画のフレームが入る心配は
+    // ない（WebGL → VideoFrame の同一スレッド内は順序保証あり）。
+    let frame: VideoFrame;
+    try {
+      frame = new VideoFrame(canvas as unknown as CanvasImageSource, {
+        timestamp: Math.round(i * microsecondsPerFrame),
+        duration: Math.round(microsecondsPerFrame),
+      });
+    } catch (e) {
+      if (firstError === null) firstError = e;
+      break;
+    }
     try {
       // 1 秒ごとにキーフレームを入れてシーク・ループ頭出しを安定させる。
       encoder.encode(frame, { keyFrame: i % ANIM_FPS === 0 });
@@ -122,10 +116,7 @@ export async function encodeAnimationToMp4(
       break;
     }
     frame.close();
-    // #95: フレーム単位の進捗を呼び出し側に通知。encode は非同期だが、
-    // ここではループ内で「キューに投入し終えたフレーム数」を進捗として
-    // 報告する（実エンコード完了を待たないため、UI 上のリングはやや
-    // 早めに 100% に達する可能性があるが、体感としては十分滑らか）。
+    // #95: フレーム単位の進捗を呼び出し側に通知。
     onProgress?.(i + 1, totalFrames);
   }
 

@@ -18,19 +18,30 @@
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{
-    render_frame, AnimateOptions, AnimationCursor, MotionDirection, MotionSpeed,
-};
+use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
-use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters};
+use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber_core::orb::OrbShape;
 use orber_core::style::{render_svg as core_render_svg, StyleOptions};
 use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
     GUI_VIDEO_SPEEDS,
 };
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
+use std::f32::consts::TAU;
 use wasm_bindgen::prelude::*;
+
+/// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
+const MAX_ORB_COUNT: usize = 1024;
+
+/// WebGL2 fragment shader 側の uniform array サイズ上限
+/// (`web/src/lib/orberGl.ts::MAX_ORBS`)。ここで超過を早期エラーにし、
+/// shader アップロード時に黙って切り詰められるのを防ぐ。GUI の
+/// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
+/// 将来 GUI の COUNT_MAX を増やす場合は両方同時に上げること。
+const GL_RENDERER_MAX_ORBS: usize = 64;
 
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
 #[wasm_bindgen(start)]
@@ -280,24 +291,53 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
     Ok(arr)
 }
 
-/// バッチ N 枚のうち `spec_idx` 番目だけを 1 枚 PNG として生成する。
+/// バッチ N 枚のうち `spec_idx` 番目の描画に必要な per-orb データをパックして返す。
 ///
-/// `generate_batch` と同じ `random_batch_specs(seed, total, still_count)` で
-/// spec 列を再構築し、`spec_idx` 番目だけ描画する。`width`/`height` を上げて
-/// 呼べば「同じバリエーションの高解像版」が得られるので、GUI のダウンロード時
-/// に表示用プレビュー（540×960）と別の解像度で焼き直す用途を想定（#73）。
+/// `generate_one_at_index` / `start_animation_for_batch_spec` の置き換え。CPU 側
+/// （core）で per-orb の決定論パラメータと clusters / 背景色を計算し、
+/// Float32Array 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）
+/// で各 t におけるフレームを per-pixel ループ + Source-Over 合成で描く。
 ///
-/// 動画タイル領域（`spec_idx >= still_count`）では
-/// `start_animation_for_batch_spec` と同じく `GUI_VIDEO_DIRECTIONS` で
-/// direction を 4 方向に上書きし、video タイルの t=0 フレームと完全一致させる。
+/// 既存 `generate_batch` と同じ `random_batch_specs(seed, total, still_count)`
+/// で spec 列を再構築するので、`spec_idx` 番目の spec / direction / speed /
+/// count / orb_size / blur / seed は他 API と完全一致する（互換性維持）。
+///
+/// per-orb の rng シーケンスも `crates/core::animate::generate_orb_params` と
+/// 同じ ChaCha8Rng + 同じドロー順で再現するので、同じ seed なら同じ
+/// (phase, phi_radius, phi_blur, phi_opacity, cross_axis, style, cluster_idx,
+/// speed_mult) が得られる。
+///
+/// # Float32Array レイアウト
+///
+/// `[0..16]` ヘッダ:
+/// - `[0..4]`: 背景 RGBA (0..1 正規化)
+/// - `[4]`: base_radius_unit (px) = `min(w, h) * 0.25 * orb_size`
+/// - `[5]`: base_blur (0..1)
+/// - `[6]`: direction_id (0=LR, 1=RL, 2=TB, 3=BT)
+/// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow)
+/// - `[8]`: n_orbs (整数を f32 として)
+/// - `[9..16]`: 予約（0 詰め）
+///
+/// `[16 + 16*i ..]` per orb i:
+/// - `[+0..+3]`: color_rgb (0..1)
+/// - `[+3]`: cluster_weight (0..1)
+/// - `[+4]`: phase (0..1)
+/// - `[+5]`: phi_radius (0..2π)
+/// - `[+6]`: phi_blur (0..2π)
+/// - `[+7]`: phi_opacity (0..2π)
+/// - `[+8]`: cross_axis (0..1)
+/// - `[+9]`: style_bit (0=rim, 1=soft)
+/// - `[+10]`: speed_mult (1..3)
+/// - `[+11..+16]`: 予約（0 詰め）
 #[wasm_bindgen]
-pub fn generate_one_at_index(
+pub fn get_render_data(
     params_js: JsValue,
     n: u32,
     spec_idx: u32,
-) -> Result<js_sys::Uint8Array, JsError> {
+) -> Result<js_sys::Float32Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
+    // shape は今のところ Circle のみ（Aquarelle は WebGL 経路非対応）。
+    let _ = parse_shape(&p.shape).map_err(err_to_js)?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
@@ -316,144 +356,133 @@ pub fn generate_one_at_index(
 
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
-
-    // direction / speed は純粋関数に集約。start_animation_for_batch_spec と
-    // 同じロジックを共有することで、プレビュー静止 PNG と動画タイルの
-    // 描画パラメータが構造的に揃う（#77 で speed も index 固定割当）。
     let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
     let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
 
-    let opts = AnimateOptions {
-        width: p.width,
-        height: p.height,
-        seed: spec.seed,
-        direction,
-        speed,
-        count: Some(spec.count),
-        orb_size: spec.orb_size,
-        blur: spec.blur,
-        saturation: 1.0,
-        background: bg,
-        shape,
+    let direction_id: f32 = match direction {
+        MotionDirection::LeftToRight => 0.0,
+        MotionDirection::RightToLeft => 1.0,
+        MotionDirection::TopToBottom => 2.0,
+        MotionDirection::BottomToTop => 3.0,
     };
-    let frame = render_frame(&clusters, &opts, 0.0);
-    let png = encode_png_rgba(&frame)?;
-    Ok(js_sys::Uint8Array::from(&png[..]))
-}
+    let cycle = speed.cycle_count() as f32;
 
-/// 動画 1 タイル分の RGBA フレームを 1 枚ずつ取り出すハンドル。
-///
-/// `start_animation_for_batch_spec` で構築する。各 `next_frame()` は
-/// `width * height * 4` バイトの RGBA8 ピクセル列 (`Uint8ClampedArray`) を
-/// 返す。完了後は `null`。`<video loop>` 用途を想定しており、
-/// `t = i / total_frames` (i = 0..total_frames) を出すので、最後のフレームの
-/// 次が t=0 とピクセル一致する（README の loop closure 不変条件を維持）。
-#[wasm_bindgen]
-pub struct AnimationHandle {
-    cursor: AnimationCursor,
-}
+    let n_orbs = spec
+        .count
+        .min(MAX_ORB_COUNT)
+        .max(if clusters.is_empty() { 0 } else { 1 });
 
-#[wasm_bindgen]
-impl AnimationHandle {
-    #[wasm_bindgen(getter)]
-    pub fn width(&self) -> u32 {
-        self.cursor.width()
-    }
-    #[wasm_bindgen(getter)]
-    pub fn height(&self) -> u32 {
-        self.cursor.height()
-    }
-    #[wasm_bindgen(getter)]
-    pub fn total_frames(&self) -> u32 {
-        self.cursor.total_frames()
-    }
-    #[wasm_bindgen(getter)]
-    pub fn next_index(&self) -> u32 {
-        self.cursor.next_index()
-    }
-
-    /// 次のフレームの RGBA バイト列を返す。完了後は `null`。
-    pub fn next_frame(&mut self) -> Option<js_sys::Uint8ClampedArray> {
-        let img = self.cursor.next_frame()?;
-        Some(js_sys::Uint8ClampedArray::from(img.as_raw().as_slice()))
-    }
-}
-
-/// 後半の動画タイルのアニメーションを起動する。
-///
-/// `random_batch_specs(params.seed, n, n - GUI_VIDEO_COUNT_DEFAULT)` を再生成
-/// して `spec_idx` 番目の spec を取り、入力画像のクラスタ抽出を 1 回だけ
-/// 走らせて `AnimationCursor` を返す。JS 側は `next_frame()` を `total_frames`
-/// 回呼んで WebCodecs `VideoEncoder` に流し込む想定。
-///
-/// # 決定論性
-///
-/// `random_batch_specs` は同じ `(seed, total, still_count)` で同じ spec 列を
-/// 返す（`crates/core::variations::random_batch_specs_is_deterministic_per_seed`
-/// テストで担保）。よって `generate_batch(params, n)` で得た spec 列の
-/// `spec_idx` 番目と、ここで再構築した spec 列の `spec_idx` 番目は完全一致する。
-/// その結果、静止画タイル（`generate_batch` で描かれた `t=0` フレーム）と
-/// 動画タイル（このアニメーション）は同じパラメータで描画され、見た目の
-/// 整合性が保たれる。
-///
-/// `total_frames` は呼び出し側で計算する（GUI 既定: `fps × seconds = 24 × 4 = 96`）。
-/// `spec_idx` が `[still_count, total)` の範囲外なら `Mp4` 枠ではないので
-/// `JsError`。
-#[wasm_bindgen]
-pub fn start_animation_for_batch_spec(
-    params_js: JsValue,
-    n: u32,
-    spec_idx: u32,
-    total_frames: u32,
-) -> Result<AnimationHandle, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape).map_err(err_to_js)?;
-
-    let total = (n as usize).clamp(1, 50);
-    let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
-    let spec_idx = spec_idx as usize;
-    if spec_idx < still_count || spec_idx >= total {
+    // review S2: WebGL fragment shader の uniform 配列上限を超えると黙って
+    // 切り詰められて視覚パリティが壊れる。発見が遅れないよう wasm 側で
+    // 早期 throw する。spec.count > 64 になる経路は現 GUI には無いが、
+    // random_ranges を将来弄る際の保険。
+    if n_orbs > GL_RENDERER_MAX_ORBS {
         return Err(JsError::new(&format!(
-            "spec_idx {spec_idx} is not within the Mp4 range [{still_count}, {total})"
+            "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
         )));
     }
-    if total_frames == 0 {
-        return Err(JsError::new("total_frames must be > 0"));
+
+    let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
+    let base_blur = spec.blur.clamp(0.0, 1.0);
+
+    let buf = pack_render_data(
+        &clusters,
+        bg,
+        base_radius_unit,
+        base_blur,
+        direction_id,
+        cycle,
+        spec.seed,
+        n_orbs,
+    );
+
+    Ok(js_sys::Float32Array::from(buf.as_slice()))
+}
+
+/// `generate_orb_params` (core) と同じ rng ドロー順で per-orb データを生成し、
+/// ヘッダ + per-orb フィールドを Float32 ベクタに詰める。
+///
+/// core 側 `generate_orb_params` を呼び出さずに同じシーケンスを **再現** する
+/// （core の `OrbParams` は private struct で wasm から読めないため）。順序を
+/// 1 つでも変えると同じ seed でも別の orb 列になり、視覚パリティが壊れる。
+fn pack_render_data(
+    clusters: &[Cluster],
+    bg: [u8; 4],
+    base_radius_unit: f32,
+    base_blur: f32,
+    direction_id: f32,
+    cycle: f32,
+    seed: u64,
+    n_orbs: usize,
+) -> Vec<f32> {
+    let header_words = 16usize;
+    let per_orb_words = 16usize;
+    let mut buf = vec![0.0f32; header_words + per_orb_words * n_orbs];
+
+    // header
+    buf[0] = bg[0] as f32 / 255.0;
+    buf[1] = bg[1] as f32 / 255.0;
+    buf[2] = bg[2] as f32 / 255.0;
+    buf[3] = bg[3] as f32 / 255.0;
+    buf[4] = base_radius_unit;
+    buf[5] = base_blur;
+    buf[6] = direction_id;
+    buf[7] = cycle;
+    buf[8] = n_orbs as f32;
+    // [9..16] reserved (0)
+
+    if n_orbs == 0 || clusters.is_empty() {
+        return buf;
     }
 
-    let source = build_source_image(&mut p).map_err(err_to_js)?;
-    let clusters_full = extract_clusters(&source, p.k)
-        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
-    let bg = derive_background_rgba(&clusters_full);
-    let clusters = drop_dominant(&clusters_full);
+    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
+    let total_w: f32 = cluster_weights.iter().sum();
 
-    let specs = random_batch_specs(p.seed as u64, total, still_count);
-    let spec = specs[spec_idx];
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    for i in 0..n_orbs {
+        // 順序は crates/core::animate::generate_orb_params と完全一致させる。
+        let phase: f32 = rng.gen_range(0.0..1.0);
+        let phi_radius: f32 = rng.gen_range(0.0..TAU);
+        let phi_blur: f32 = rng.gen_range(0.0..TAU);
+        let phi_opacity: f32 = rng.gen_range(0.0..TAU);
+        let cross_axis: f32 = rng.gen_range(0.0..1.0);
+        let style_bit: f32 = if rng.gen::<u32>() & 1 == 0 { 0.0 } else { 1.0 };
+        let cluster_idx = pick_weighted(&mut rng, &cluster_weights, total_w);
+        let speed_mult: u32 = rng.gen_range(1..=3);
 
-    // #59: 動画タイル 4 枚に LR / RL / TB / BT を 1 枚ずつ重複なく割り当てる。
-    // #77: speed も VerySlow / Slow を 2 枚ずつ固定割当（ガチャ感の保証）。
-    // direction_for_spec_idx / speed_for_spec_idx を経由することで、
-    // `generate_one_at_index` で描かれる t=0 PNG と完全に同じパラメータで
-    // 動画化される（プレビュー静止画と動画の整合性を構造的に保証）。
-    let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
-    let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
+        let c = &clusters[cluster_idx.min(clusters.len() - 1)];
 
-    let opts = AnimateOptions {
-        width: p.width,
-        height: p.height,
-        seed: spec.seed,
-        direction,
-        speed,
-        count: Some(spec.count),
-        orb_size: spec.orb_size,
-        blur: spec.blur,
-        saturation: 1.0,
-        background: bg,
-        shape,
-    };
+        let off = header_words + per_orb_words * i;
+        buf[off] = c.color[0] as f32 / 255.0;
+        buf[off + 1] = c.color[1] as f32 / 255.0;
+        buf[off + 2] = c.color[2] as f32 / 255.0;
+        buf[off + 3] = c.weight.max(0.0);
+        buf[off + 4] = phase;
+        buf[off + 5] = phi_radius;
+        buf[off + 6] = phi_blur;
+        buf[off + 7] = phi_opacity;
+        buf[off + 8] = cross_axis;
+        buf[off + 9] = style_bit;
+        buf[off + 10] = speed_mult as f32;
+        // [+11..+16] reserved
+    }
+    buf
+}
 
-    let cursor = AnimationCursor::new(clusters, opts, total_frames);
-    Ok(AnimationHandle { cursor })
+/// 重み比例の 1 サンプル抽選器。`crates/core::animate::pick_weighted` と同等。
+fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
+    if total <= 0.0 || weights.is_empty() {
+        return 0;
+    }
+    let r = rng.gen::<f32>() * total;
+    let mut acc = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w.max(0.0);
+        if r <= acc {
+            return i;
+        }
+    }
+    weights.len() - 1
 }
 
 /// 入力画像 1 枚から SVG 文字列を生成する。
