@@ -21,6 +21,49 @@ pub(crate) const STYLE_WIDTH: u32 = 1080;
 /// SVG viewBox 高さ。PNG / 動画と揃える。
 pub(crate) const STYLE_HEIGHT: u32 = 1920;
 
+/// orb の見た目コントラストを 1 軸 3 段階で制御する preset (#55)。
+///
+/// - `Low`: alpha 弱め + blur 強め + 縁ソフト → 文字オーバーレイ用、目立たない
+/// - `Mid`: 既存の振る舞いと同じ（regression なし、デフォルト）
+/// - `High`: alpha 強め + blur 弱め + 縁シャープ → 単独鑑賞用、リッチ
+///
+/// 内部効果:
+/// - alpha 倍率: Low=0.55, Mid=1.0, High=1.0
+/// - blur オフセット: Low=+0.25, Mid=0.0, High=-0.25
+///
+/// PNG (animate / render_static) と SVG / CSS の全経路で同じ意味で適用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum ContrastPreset {
+    /// alpha 弱め + blur 強め。文字オーバーレイ向け。
+    Low,
+    /// 既存の振る舞いと完全同値（デフォルト）。
+    #[default]
+    Mid,
+    /// alpha 強め + blur 弱め。単独鑑賞向け。
+    High,
+}
+
+impl ContrastPreset {
+    /// orb 中心の不透明度に掛ける倍率。Mid = 1.0（既存と同値）。
+    pub fn alpha_mul(self) -> f32 {
+        match self {
+            ContrastPreset::Low => 0.55,
+            ContrastPreset::Mid => 1.0,
+            ContrastPreset::High => 1.0,
+        }
+    }
+
+    /// blur パラメータに足すオフセット。最終 blur は呼び出し側で `[0, 1]` に clamp する。
+    /// Mid = 0.0（既存と同値）。Low は +0.25（よりソフト）、High は -0.25（よりシャープ）。
+    pub fn blur_offset(self) -> f32 {
+        match self {
+            ContrastPreset::Low => 0.25,
+            ContrastPreset::Mid => 0.0,
+            ContrastPreset::High => -0.25,
+        }
+    }
+}
+
 /// SVG / CSS 描画オプション。
 ///
 /// 解像度は SVG では viewBox 固定、CSS では % 指定なのでフィールドを持たない。
@@ -34,6 +77,8 @@ pub struct StyleOptions {
     pub saturation: f32,
     /// 背景 RGBA。alpha=0 で透過 SVG / `background-color: transparent`。
     pub background: [u8; 4],
+    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    pub contrast: ContrastPreset,
 }
 
 impl Default for StyleOptions {
@@ -43,6 +88,7 @@ impl Default for StyleOptions {
             blur: 0.5,
             saturation: 1.0,
             background: [0, 0, 0, 255],
+            contrast: ContrastPreset::Mid,
         }
     }
 }
@@ -52,9 +98,11 @@ impl Default for StyleOptions {
 /// 出力は viewBox `0 0 1080 1920` の自己完結 SVG。背景は黒い `<rect>`、
 /// 各 cluster は `<radialGradient>` と `<circle>` のペアになる。
 pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
-    let blur = opts.blur.clamp(0.0, 1.0);
+    // contrast offset を blur に積算してから clamp。Mid なら既存と完全同値。
+    let blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
+    let alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
 
     let width = STYLE_WIDTH as f32;
     let height = STYLE_HEIGHT as f32;
@@ -63,6 +111,9 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
     // mid_offset: blur=0 で外寄り（中心の不透明領域が広い）、blur=1 で中心寄り。
     // PNG 側 (1.0 - blur*0.8) と意味的に整合させ、% 表記の中間 stop を作る。
     let mid_pct = ((1.0 - blur * 0.8).clamp(0.05, 0.95) * 100.0).round() as i32;
+    // contrast 軸: alpha 全体に倍率を掛ける（0% は 1.0×alpha_mul、mid は 0.5×alpha_mul、外周 0）。
+    let stop0_a = alpha_mul;
+    let stop_mid_a = 0.5 * alpha_mul;
 
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -106,10 +157,10 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
             "    <radialGradient id=\"orb-{i}\" cx=\"50%\" cy=\"50%\" r=\"50%\">\n"
         ));
         s.push_str(&format!(
-            "      <stop offset=\"0%\" stop-color=\"rgb({r},{g},{b})\" stop-opacity=\"1\"/>\n"
+            "      <stop offset=\"0%\" stop-color=\"rgb({r},{g},{b})\" stop-opacity=\"{stop0_a:.3}\"/>\n"
         ));
         s.push_str(&format!(
-            "      <stop offset=\"{mid_pct}%\" stop-color=\"rgb({r},{g},{b})\" stop-opacity=\"0.5\"/>\n"
+            "      <stop offset=\"{mid_pct}%\" stop-color=\"rgb({r},{g},{b})\" stop-opacity=\"{stop_mid_a:.3}\"/>\n"
         ));
         s.push_str(&format!(
             "      <stop offset=\"100%\" stop-color=\"rgb({r},{g},{b})\" stop-opacity=\"0\"/>\n"
@@ -137,9 +188,11 @@ pub fn render_svg(clusters: &[Cluster], opts: &StyleOptions) -> String {
 /// `radial-gradient(...)` として合成した値を入れる。利用側は
 /// `background-image: var(--orber-bg);` で参照する。
 pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
-    let blur = opts.blur.clamp(0.0, 1.0);
+    // contrast offset を blur に積算してから clamp。Mid なら既存と完全同値。
+    let blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
+    let alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
 
     // mid_factor: PNG/SVG と同じ意味で「中間 stop が gradient 終端からどの程度内側か」。
     // blur=0 → mid=end の 95% （中心の不透明領域が広い、急峻に縁が落ちる）
@@ -189,8 +242,11 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
         // （mid_pct < end_pct を構造的に担保する）。
         let mid_pct = (end_f * mid_factor).round() as i32;
         let mid_pct = mid_pct.clamp(0, end_pct - 1);
+        // contrast 軸: alpha 全体に倍率を掛ける。Mid なら 1.0/0.5/0.0 のまま（regression なし）。
+        let stop0 = alpha_mul;
+        let stop_mid = 0.5 * alpha_mul;
         gradients.push(format!(
-            "radial-gradient(circle at {x}% {y}%, rgba({r},{g},{b},1) 0%, rgba({r},{g},{b},0.5) {mid_pct}%, rgba({r},{g},{b},0) {end_pct}%)"
+            "radial-gradient(circle at {x}% {y}%, rgba({r},{g},{b},{stop0}) 0%, rgba({r},{g},{b},{stop_mid}) {mid_pct}%, rgba({r},{g},{b},0) {end_pct}%)"
         ));
     }
 

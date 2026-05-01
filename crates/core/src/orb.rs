@@ -18,6 +18,7 @@
 use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
+use crate::style::ContrastPreset;
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -88,6 +89,8 @@ pub struct RenderOptions {
     pub background: [u8; 4],
     /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
     pub shape: OrbShape,
+    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    pub contrast: ContrastPreset,
 }
 
 impl Default for RenderOptions {
@@ -100,6 +103,7 @@ impl Default for RenderOptions {
             saturation: 1.0,
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
+            contrast: ContrastPreset::Mid,
         }
     }
 }
@@ -113,9 +117,12 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
     // 不正・極端な値を握りつぶさず、最低限の防衛だけ行う。
     let width = opts.width.max(1);
     let height = opts.height.max(1);
-    let blur = opts.blur.clamp(0.0, 1.0);
+    // contrast offset を blur に積算してから clamp。Mid なら既存と完全同値。
+    let blur = (opts.blur + opts.contrast.blur_offset()).clamp(0.0, 1.0);
     let saturation = opts.saturation.max(0.0);
     let orb_size = opts.orb_size.max(0.0);
+    // contrast による中心 alpha 倍率。Circle / Glyph 経路で共通に使う。
+    let alpha_mul = opts.contrast.alpha_mul().clamp(0.0, 1.0);
 
     // Pixmap::new は uninit を 0 埋めしてくれる（つまり全画面が透明）。
     // 透過 (alpha=0) 指定なら fill をスキップしてその透明初期値を活かす。
@@ -150,21 +157,22 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
         }
 
         // Glyph: 1 文字のアウトラインを fill。半径は Circle と同じ意味で渡す。
-        // render_static の opacity=1.0 を踏襲。
+        // contrast の alpha 倍率は適用、blur は使わない（グリフはアウトライン fill のため）。
         if let OrbShape::Glyph { ch, font } = opts.shape {
-            render_glyph_orb(&mut pixmap, (cx, cy), radius, [r, g, b], 1.0, font, ch);
+            render_glyph_orb(&mut pixmap, (cx, cy), radius, [r, g, b], alpha_mul, font, ch);
             continue;
         }
 
-        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・opacity=1.0
-        // で固定（既存挙動の互換）。動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
+        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
+        // contrast 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
+        // 動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
         render_one_orb(
             &mut pixmap,
             (cx, cy),
             radius,
             [r, g, b],
             blur,
-            1.0,
+            alpha_mul,
             OrbStyle::Rim,
         );
     }
