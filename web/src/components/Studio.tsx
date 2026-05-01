@@ -4,7 +4,6 @@ import { ANIM_TOTAL_FRAMES, isWebCodecsSupported } from '../lib/encodeMp4';
 import {
   hasInFlight,
   onWorkerCrash,
-  onWorkerDebug,
   terminateAndRespawn,
   workerAnimateOne,
   workerGenerateOne,
@@ -61,9 +60,6 @@ const DL_H_LANDSCAPE = 1080;
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
   const [wasmErr, setWasmErr] = createSignal<string>('');
-  // 実機（Android）で console を拾えないため、worker からの per-stage 計測ログを
-  // 画面 <pre> に出して kako-jun が確認できるようにする。直近 20 件保持。
-  const [debugLog, setDebugLog] = createSignal<string[]>([]);
   const [aspect, setAspect] = createSignal<Aspect>('portrait');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
@@ -157,14 +153,6 @@ export default function Studio() {
       setWasmStatus('error');
     });
     onCleanup(offCrash);
-    // perf 診断ログ: worker から流れる per-stage 計測を画面に表示
-    const offDebug = onWorkerDebug((text) => {
-      setDebugLog((prev) => {
-        const next = [...prev, text];
-        return next.length > 20 ? next.slice(-20) : next;
-      });
-    });
-    onCleanup(offDebug);
   });
 
   onCleanup(() => {
@@ -1252,16 +1240,6 @@ export default function Studio() {
             </Show>
           </div>
         )}
-      </Show>
-      {/* perf 診断ログ。実機 (Android) では console を拾えないため画面に表示。
-          落ち着いたら消す。 */}
-      <Show when={debugLog().length > 0}>
-        <pre
-          class="fixed bottom-0 left-0 right-0 z-50 max-h-[40vh] overflow-auto bg-black/80 p-2 text-[10px] leading-tight text-fgMuted whitespace-pre-wrap break-all"
-          aria-hidden="true"
-        >
-          {debugLog().join('\n')}
-        </pre>
       </Show>
     </section>
   );
