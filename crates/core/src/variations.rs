@@ -267,8 +267,12 @@ pub mod random_ranges {
     pub const COUNT_MAX: usize = 50;
     pub const ORB_SIZE_MIN: f32 = 1.5;
     pub const ORB_SIZE_MAX: f32 = 5.0;
-    pub const BLUR_MIN: f32 = 0.3;
-    pub const BLUR_MAX: f32 = 0.8;
+    // #78: 縁のコントラストを抑え、文字オーバーレイ時の可読性を上げるため
+    // ランダム生成の blur 下限を 0.3 → 0.5 に上げる（点光源寄りに偏らせ
+    // 中間 stop が中心寄りになるよう促す）。上限は 0.8 → 0.85 にわずかに
+    // 拡張して柔らかい側のバリエーションを増やす。
+    pub const BLUR_MIN: f32 = 0.5;
+    pub const BLUR_MAX: f32 = 0.85;
     pub const DURATION_MS_MIN: u64 = 6000;
     pub const DURATION_MS_MAX: u64 = 10000;
 }
@@ -467,7 +471,11 @@ mod tests {
         let specs = random_batch_specs(42, 10, 5);
         assert_eq!(specs.len(), 10);
         for s in &specs[..5] {
-            assert_eq!(s.kind, VariationKind::Png, "first 5 (still_count) must be PNG");
+            assert_eq!(
+                s.kind,
+                VariationKind::Png,
+                "first 5 (still_count) must be PNG"
+            );
             assert_eq!(s.duration_ms, 0, "PNG specs must have duration_ms=0");
         }
         for s in &specs[5..] {
