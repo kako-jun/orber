@@ -596,7 +596,8 @@ export default function Studio() {
   };
 
   // #122: ローカル時刻ベースの YYYYMMDD-HHMMSS。連続 DL で上書き確認が
-  // 出ないよう毎回ユニークなファイル名にする。machigai-salad と揃える。
+  // 出ないよう毎回ユニークなファイル名にする。zip 内のエントリ名にも
+  // 同じ ts を埋めて、複数 zip を同じフォルダに展開しても衝突しないようにする。
   const downloadTimestamp = (d = new Date()) => {
     const p = (n: number) => String(n).padStart(2, '0');
     return (
@@ -683,7 +684,7 @@ export default function Studio() {
       const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       sorted.forEach(([, { blob, ext }], n) => {
-        zip.file(`orber_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
+        zip.file(`orber-${ts}_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
       });
       const zipBlob = await zip.generateAsync({ type: 'blob' });
       triggerDownload(zipBlob, `orber-${ts}.zip`);
