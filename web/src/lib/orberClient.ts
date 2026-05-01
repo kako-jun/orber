@@ -67,6 +67,18 @@ export function onWorkerCrash(cb: CrashCallback): () => void {
   };
 }
 
+// Worker から流れる per-stage 計測ログ。Android で console を拾えないため
+// Studio.tsx で画面 <pre> に出して kako-jun が実機で見られるようにする。
+type DebugCallback = (text: string) => void;
+const debugCallbacks: DebugCallback[] = [];
+export function onWorkerDebug(cb: DebugCallback): () => void {
+  debugCallbacks.push(cb);
+  return () => {
+    const idx = debugCallbacks.indexOf(cb);
+    if (idx >= 0) debugCallbacks.splice(idx, 1);
+  };
+}
+
 // #108 (review s1): pending を全件 reject + clear する内部ヘルパ。
 // crash パスと terminateAndRespawn の両方で使い、reject 文言と
 // 副作用順序の食い違いを防ぐ。
@@ -85,7 +97,8 @@ function ensureWorker(): Worker {
     // 将来 kind が増えるなら明示分岐を追加すること。
     type Resp =
       | { id: number; ok: boolean; data?: unknown; error?: string }
-      | { kind: 'animateProgress'; id: number; frame: number; total: number };
+      | { kind: 'animateProgress'; id: number; frame: number; total: number }
+      | { kind: 'debug'; text: string };
     const msg = e.data as Resp;
     if ('kind' in msg && msg.kind === 'animateProgress') {
       const pp = pending.get(msg.id);
@@ -94,6 +107,16 @@ function ensureWorker(): Worker {
           pp.onProgress(msg.frame, msg.total);
         } catch (err) {
           console.error('orber onProgress callback failed', err);
+        }
+      }
+      return;
+    }
+    if ('kind' in msg && msg.kind === 'debug') {
+      for (const cb of debugCallbacks) {
+        try {
+          cb(msg.text);
+        } catch (err) {
+          console.error('orber debug callback failed', err);
         }
       }
       return;

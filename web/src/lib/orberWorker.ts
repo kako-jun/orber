@@ -101,6 +101,12 @@ function post(msg: unknown, transfers: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfers);
 }
 
+// 画面ログ用。Android では console を拾えないので debug 行を main thread に
+// 流して Studio.tsx の <pre> に表示させる。
+function debug(text: string) {
+  post({ kind: 'debug', text });
+}
+
 self.addEventListener('message', async (e: MessageEvent<Req>) => {
   const req = e.data;
   try {
@@ -116,30 +122,46 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'generateOne': {
+        const t0 = performance.now();
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
+        const t1 = performance.now();
         const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
+        const t2 = performance.now();
         renderer.setRenderData(data);
         renderer.renderFrame(0);
-        // PNG にエンコードして main に返す。convertToBlob は OffscreenCanvas
-        // 標準で、PNG 圧縮は worker 側で完結する。
+        const t3 = performance.now();
         const blob = await canvas.convertToBlob({ type: 'image/png' });
+        const t4 = performance.now();
         const buf = await blob.arrayBuffer();
+        const t5 = performance.now();
+        debug(
+          `still #${req.index} ${req.params.width}x${req.params.height}: ` +
+            `getData=${(t1 - t0).toFixed(1)} ctx=${(t2 - t1).toFixed(1)} ` +
+            `render=${(t3 - t2).toFixed(1)} png=${(t4 - t3).toFixed(1)} ` +
+            `buf=${(t5 - t4).toFixed(1)} total=${(t5 - t0).toFixed(1)}ms`,
+        );
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
       case 'animateOne': {
+        const t0 = performance.now();
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
         const width = req.params.width;
         const height = req.params.height;
         const { canvas, renderer } = getRenderer(width, height);
         renderer.setRenderData(data);
-        // フレーム単位の進捗を main に流す。レビュー S2 の間引きは維持。
+        const t1 = performance.now();
         const PROGRESS_STRIDE = 4;
+        let renderTotal = 0;
         const blob = await encodeAnimationFromCanvas(
           canvas,
-          (t) => renderer.renderFrame(t),
+          (t) => {
+            const r0 = performance.now();
+            renderer.renderFrame(t);
+            renderTotal += performance.now() - r0;
+          },
           req.totalFrames,
           width,
           height,
@@ -148,7 +170,15 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
             post({ kind: 'animateProgress', id: req.id, frame, total });
           },
         );
+        const t2 = performance.now();
         const buf = await blob.arrayBuffer();
+        const t3 = performance.now();
+        debug(
+          `mp4 #${req.index} ${width}x${height}: ` +
+            `setup=${(t1 - t0).toFixed(1)} encode_loop+flush=${(t2 - t1).toFixed(1)} ` +
+            `(of which render=${renderTotal.toFixed(1)}) ` +
+            `buf=${(t3 - t2).toFixed(1)} total=${(t3 - t0).toFixed(1)}ms`,
+        );
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
