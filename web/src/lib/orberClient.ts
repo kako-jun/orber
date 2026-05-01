@@ -29,6 +29,11 @@ interface PendingResolver {
   // 'animateProgress' kind の message が届くので、その経路で発火する。
   // pending は消さない（resolve は本体メッセージで行う）。
   onProgress?: (frame: number, total: number) => void;
+  // #108: 元リクエストの kind。`hasInFlight()` で init / setSource を
+  // 「ユーザー操作の進行中扱い」から除外して、再ガチャ判定の精度を上げる
+  // ために使う。init は wasm 起動だけ、setSource はキャッシュ更新だけで
+  // 旧 run の 12 個生成とは無関係。
+  kind: string;
 }
 
 interface BaseParams {
@@ -60,6 +65,14 @@ export function onWorkerCrash(cb: CrashCallback): () => void {
     const idx = crashCallbacks.indexOf(cb);
     if (idx >= 0) crashCallbacks.splice(idx, 1);
   };
+}
+
+// #108 (review s1): pending を全件 reject + clear する内部ヘルパ。
+// crash パスと terminateAndRespawn の両方で使い、reject 文言と
+// 副作用順序の食い違いを防ぐ。
+function drainPending(reason: string): void {
+  for (const [, p] of pending) p.reject(new Error(reason));
+  pending.clear();
 }
 
 function ensureWorker(): Worker {
@@ -96,8 +109,7 @@ function ensureWorker(): Worker {
     // Worker 全体が落ちると個別の id 照合では拾えないので、pending 全部に
     // reject を流して呼び出し側が例外で気づけるようにする。
     console.error('orber worker fatal error', e);
-    for (const [, p] of pending) p.reject(new Error('worker crashed'));
-    pending.clear();
+    drainPending('worker crashed');
     if (worker) {
       try {
         worker.terminate();
@@ -121,7 +133,7 @@ function ensureWorker(): Worker {
 }
 
 function call<T>(
-  req: Record<string, unknown>,
+  req: Record<string, unknown> & { kind: string },
   transfers: Transferable[] = [],
   onProgress?: (frame: number, total: number) => void,
 ): Promise<T> {
@@ -132,6 +144,7 @@ function call<T>(
       resolve: resolve as (v: unknown) => void,
       reject: reject as (e: unknown) => void,
       onProgress,
+      kind: req.kind,
     });
     w.postMessage({ ...req, id }, transfers);
   });
@@ -140,6 +153,56 @@ function call<T>(
 /** Worker を起動して wasm を初期化する。複数回呼んでも安全（worker 側で冪等）。 */
 export async function workerInit(): Promise<void> {
   await call<void>({ kind: 'init' });
+}
+
+/**
+ * runBatch の 12 個生成系 RPC（generateOne / animateOne）が in-flight
+ * かどうか。init / setSource は除外する。
+ *
+ * #108 review m1: onMount の `workerInit()` が解決する前に decode が
+ * 終わって runBatch に入るレース（軽い PNG + 低速デバイス等）で、
+ * 単純な `pending.size > 0` だと init pending を巻き添え reject して
+ * しまい wasmStatus が 'error' で固着する。kind フィルタで「実作業」
+ * の有無だけを判定する。
+ */
+export function hasInFlight(): boolean {
+  for (const [, p] of pending) {
+    if (p.kind === 'generateOne' || p.kind === 'animateOne') return true;
+  }
+  return false;
+}
+
+/**
+ * #108: Worker を物理的に terminate して新しい worker で再初期化する。
+ *
+ * `runBatch` 連打時に旧 run の wasm 同期呼び出し（generate_one_at_index）と
+ * WebCodecs encode ループを **本当に止める** 唯一の確実な手段。論理的中断
+ * （runGen ガード）では旧 12 個が完走するまで CPU が二重に走り、新 run の
+ * 開始が遅延する。
+ *
+ * - pending は全て reject し、呼び出し側の await に例外を流す
+ *   （呼び出し側は myGen ガードで吸収する）
+ * - worker.terminate() で wasm 同期処理含めて殺す
+ * - 新しい worker を立てて wasm を再初期化（数百 ms）
+ *
+ * 注意: terminate 後は worker 側の cachedSource も消えるので、呼び出し側で
+ * `lastSourceRef = null` 等のキャッシュ無効化を行うこと（onWorkerCrash の
+ * 経路と同じ）。
+ */
+export async function terminateAndRespawn(): Promise<void> {
+  if (!worker) {
+    await workerInit();
+    return;
+  }
+  drainPending('worker terminated for new run');
+  try {
+    worker.terminate();
+  } catch (err) {
+    console.error('orber worker terminate failed', err);
+  }
+  worker = null;
+  // 連打時のみ払うコスト。新 worker を立てて wasm 再初期化まで終わらせる。
+  await workerInit();
 }
 
 /**
