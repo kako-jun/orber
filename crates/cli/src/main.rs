@@ -808,6 +808,134 @@ mod tests {
     }
 
     #[test]
+    fn shape_glyph_with_default_char() {
+        // --shape glyph で --glyph-char 省略時は ☆ (U+2606) になる。
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "glyph",
+        ])
+        .expect("--shape glyph should parse");
+        assert_eq!(cli.glyph_char, '☆');
+        match cli.orb_shape() {
+            OrbShape::Glyph { ch, .. } => assert_eq!(ch, '☆'),
+            other => panic!("expected OrbShape::Glyph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glyph_char_rejects_multi_char() {
+        // --glyph-char には 1 文字しか入れられない。
+        assert!(try_parse(&["--glyph-char", "abc"]).is_err());
+        assert!(try_parse(&["--glyph-char", ""]).is_err());
+        assert!(try_parse(&["--glyph-char", "a"]).is_ok());
+        assert!(try_parse(&["--glyph-char", "♪"]).is_ok());
+    }
+
+    #[test]
+    fn count_preset_resolves_to_table() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        // デフォルトは数値 20。
+        assert_eq!(cli.resolved_count(), 20);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 10);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count-preset",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_count(), 35);
+    }
+
+    #[test]
+    fn count_and_count_preset_are_mutually_exclusive() {
+        // clap の conflicts_with で --count と --count-preset の同時指定は弾かれる。
+        let res = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--count",
+            "30",
+            "--count-preset",
+            "low",
+        ]);
+        assert!(res.is_err(), "--count + --count-preset must be rejected");
+    }
+
+    #[test]
+    fn speed_mid_and_fast_parse() {
+        let cli = Cli::try_parse_from([
+            "orber", "--input", "x", "--output", "x.png", "--speed", "mid",
+        ])
+        .unwrap();
+        assert!(matches!(cli.speed, CliSpeed::Mid));
+        assert_eq!(MotionSpeed::from(cli.speed), MotionSpeed::Mid);
+
+        let cli = Cli::try_parse_from([
+            "orber", "--input", "x", "--output", "x.png", "--speed", "fast",
+        ])
+        .unwrap();
+        assert!(matches!(cli.speed, CliSpeed::Fast));
+        assert_eq!(MotionSpeed::from(cli.speed), MotionSpeed::Fast);
+    }
+
+    #[test]
+    fn contrast_default_is_mid() {
+        let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
+        assert!(matches!(cli.contrast, CliContrast::Mid));
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::Mid);
+    }
+
+    #[test]
+    fn contrast_low_high_parse() {
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--contrast",
+            "low",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::Low);
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--contrast",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(cli.resolved_contrast(), ContrastPreset::High);
+    }
+
+    #[test]
     fn aquarelle_params_out_of_range_rejected() {
         assert!(try_parse(&["--aquarelle-bleed", "1.5"]).is_err());
         assert!(try_parse(&["--aquarelle-bloom", "-0.1"]).is_err());

@@ -511,4 +511,97 @@ mod tests {
         assert_eq!(img.width(), 1080);
         assert_eq!(img.height(), 1920);
     }
+
+    /// 平均 alpha（厳密には平均 R）を計算するヘルパ。contrast preset の比較で使う。
+    fn mean_red(img: &RgbaImage) -> f64 {
+        let mut s = 0u64;
+        for px in img.pixels() {
+            s += px[0] as u64;
+        }
+        s as f64 / (img.width() as f64 * img.height() as f64)
+    }
+
+    #[test]
+    fn contrast_low_lower_alpha_than_high_circle() {
+        // Circle 経路で Low は High より中央輝度（≒ alpha）が低い。
+        // 入力色は赤、背景は黒（R=0）。Low ほど orb 中心の R が抑えられ、
+        // 平均 R も小さくなる。
+        let c = cluster([255, 0, 0], 0.5, 0.5, 1.0);
+        let make = |contrast: ContrastPreset| {
+            render_static(
+                &[c],
+                &RenderOptions {
+                    width: 100,
+                    height: 100,
+                    blur: 0.5,
+                    saturation: 1.0,
+                    orb_size: 1.0,
+                    contrast,
+                    ..Default::default()
+                },
+            )
+        };
+        let low = mean_red(&make(ContrastPreset::Low));
+        let mid = mean_red(&make(ContrastPreset::Mid));
+        let high = mean_red(&make(ContrastPreset::High));
+        assert!(
+            low < mid,
+            "contrast=Low mean R ({low}) must be < Mid ({mid})"
+        );
+        assert!(
+            high >= mid,
+            "contrast=High mean R ({high}) must be >= Mid ({mid}) (sharper edges keep more red near center)"
+        );
+        assert!(
+            low < high,
+            "contrast=Low ({low}) must be visibly less bright than High ({high})"
+        );
+    }
+
+    #[test]
+    fn contrast_mid_matches_default_render() {
+        // contrast=Mid を明示しても RenderOptions::default() と同じピクセルが出る（regression なし）。
+        let c = cluster([200, 50, 50], 0.5, 0.5, 1.0);
+        let opts_default = RenderOptions {
+            width: 64,
+            height: 64,
+            ..Default::default()
+        };
+        let opts_mid = RenderOptions {
+            width: 64,
+            height: 64,
+            contrast: ContrastPreset::Mid,
+            ..Default::default()
+        };
+        let a = render_static(&[c], &opts_default);
+        let b = render_static(&[c], &opts_mid);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "contrast=Mid must be byte-exact identical to default"
+        );
+    }
+
+    #[test]
+    fn glyph_shape_renders_via_render_static() {
+        // OrbShape::Glyph が render_static 経由でも一定数のピクセルを描く。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 100,
+            height: 100,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[c], &opts);
+        // 背景は黒。グリフの白塗りピクセルが一定数立っているはず。
+        let lit = img.pixels().filter(|p| p[0] > 32).count();
+        assert!(
+            lit > 32,
+            "OrbShape::Glyph via render_static should paint visible pixels, lit={lit}"
+        );
+    }
 }

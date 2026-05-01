@@ -459,6 +459,71 @@ mod tests {
     }
 
     #[test]
+    fn contrast_mid_is_regression_compatible_svg() {
+        // contrast=Mid を明示的に渡しても、デフォルト（=Mid）と完全一致。
+        // これが回帰の最後の砦。
+        let clusters = six_clusters();
+        let opts_default = StyleOptions::default();
+        let opts_mid = StyleOptions {
+            contrast: ContrastPreset::Mid,
+            ..StyleOptions::default()
+        };
+        assert_eq!(
+            render_svg(&clusters, &opts_default),
+            render_svg(&clusters, &opts_mid),
+            "explicit Mid must match default StyleOptions for SVG"
+        );
+        assert_eq!(
+            render_css(&clusters, &opts_default),
+            render_css(&clusters, &opts_mid),
+            "explicit Mid must match default StyleOptions for CSS"
+        );
+    }
+
+    #[test]
+    fn contrast_low_high_differ_from_mid_svg() {
+        // Low / High は Mid と異なる文字列を生成する。
+        let clusters = six_clusters();
+        let mid = render_svg(
+            &clusters,
+            &StyleOptions {
+                contrast: ContrastPreset::Mid,
+                ..StyleOptions::default()
+            },
+        );
+        let low = render_svg(
+            &clusters,
+            &StyleOptions {
+                contrast: ContrastPreset::Low,
+                ..StyleOptions::default()
+            },
+        );
+        let high = render_svg(
+            &clusters,
+            &StyleOptions {
+                contrast: ContrastPreset::High,
+                ..StyleOptions::default()
+            },
+        );
+        assert_ne!(low, mid, "Low must produce different SVG than Mid");
+        assert_ne!(high, mid, "High must produce different SVG than Mid");
+        assert_ne!(low, high, "Low and High must differ from each other");
+    }
+
+    #[test]
+    fn contrast_alpha_mul_and_blur_offset_table() {
+        // ContrastPreset の数値テーブルが仕様通りであることを担保する回帰テスト。
+        // Mid は alpha 1.0 / blur offset 0.0（既存挙動）。
+        assert!((ContrastPreset::Mid.alpha_mul() - 1.0).abs() < 1e-6);
+        assert!((ContrastPreset::Mid.blur_offset() - 0.0).abs() < 1e-6);
+        // Low は alpha を弱め、blur を強める。
+        assert!(ContrastPreset::Low.alpha_mul() < ContrastPreset::Mid.alpha_mul());
+        assert!(ContrastPreset::Low.blur_offset() > ContrastPreset::Mid.blur_offset());
+        // High は blur を弱める（より鋭く）。
+        assert!(ContrastPreset::High.blur_offset() < ContrastPreset::Mid.blur_offset());
+    }
+
+    #[test]
     fn empty_clusters_produces_valid_svg() {
         let svg = render_svg(&[], &StyleOptions::default());
         assert!(svg.contains("<svg"));
