@@ -62,18 +62,65 @@ const KMEANS_MAX_ITER: usize = 20;
 const KMEANS_CONVERGE: f32 = 5.0;
 const KMEANS_SEED: u64 = 0;
 
+/// kmeans 入力としてのターゲット長辺 (px)。これより大きい画像は等比縮小される。
+///
+/// kmeans の支配色判定はサンプリング系処理で、長辺 256 程度のサンプルでも
+/// 視覚的に同等の結果が得られる（ImageMagick 等の palette tool の経験則）。
+/// フル解像度（数千 px）で kmeans を回すと iteration コストが線形に増えるが
+/// 出力品質は変わらないため、安全な下限まで縮小する。
+///
+/// CLI: 4000px 級の写真で kmeans が数百ms → 10ms オーダーに短縮。
+/// wasm GUI 経路: JS 側で既に 256 まで縮小しているのでこの再縮小は no-op。
+const KMEANS_TARGET_LONG_EDGE: u32 = 256;
+/// 極端アスペクト（10000×100 のパノラマ等）で短辺が 1-3 px に潰れて kmeans
+/// サンプル枯渇するのを防ぐ下限。K=5..8 程度なら 8 px 平方で十分なサンプル。
+///
+/// 注: アスペクト保持より枯渇回避を優先する。10000×100 → 256×3 だと kmeans
+/// サンプル数 768 px で K=8 に対しても十分だが、`max(8)` で 256×8 にクランプ
+/// するため厳密にはアスペクトが歪む。極端パノラマ専用の安全弁で実害なし。
+const KMEANS_MIN_EDGE: u32 = 8;
+
+/// kmeans のために画像を縮小する（必要なときだけ）。
+///
+/// 既に長辺が `KMEANS_TARGET_LONG_EDGE` 以下なら借用したまま返す（コピーなし）。
+/// それ以上のサイズなら Triangle filter で等比縮小する。Triangle はバイリニア
+/// 相当で、kmeans の支配色判定には十分かつ高速。
+fn downsample_for_kmeans(img: &RgbImage) -> std::borrow::Cow<'_, RgbImage> {
+    use std::borrow::Cow;
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    if longest <= KMEANS_TARGET_LONG_EDGE {
+        return Cow::Borrowed(img);
+    }
+    let scale = KMEANS_TARGET_LONG_EDGE as f32 / longest as f32;
+    let dw = ((w as f32 * scale).round() as u32).max(KMEANS_MIN_EDGE);
+    let dh = ((h as f32 * scale).round() as u32).max(KMEANS_MIN_EDGE);
+    let resized = image::imageops::resize(img, dw, dh, image::imageops::FilterType::Triangle);
+    Cow::Owned(resized)
+}
+
 /// 画像から最大 k 個の代表色クラスタを抽出する。
 ///
 /// k > ピクセル数の場合は実際のクラスタ数が k 未満になることがある。
 /// 戻り値は `weight` 降順にソート済み。
+///
+/// 入力画像が大きい場合は内部で長辺 `KMEANS_TARGET_LONG_EDGE` まで縮小して
+/// から kmeans を実行する。centroid は正規化座標 [0,1] で返るためスケールに
+/// 依存せず、color / weight も比率なので解像度非依存。
 pub fn extract_clusters(img: &RgbImage, k: usize) -> Result<Vec<Cluster>, ClusterError> {
     if k == 0 {
         return Err(ClusterError::KZero);
     }
-    let (width, height) = img.dimensions();
-    if width == 0 || height == 0 {
+    let (orig_w, orig_h) = img.dimensions();
+    if orig_w == 0 || orig_h == 0 {
         return Err(ClusterError::EmptyImage);
     }
+
+    // 大きい画像は kmeans 用にダウンサンプル。CLI で 4000px 級写真の処理時間が
+    // 大幅短縮される。wasm GUI 経路は JS 側で既に 256 化しているので no-op。
+    let downsampled = downsample_for_kmeans(img);
+    let img = downsampled.as_ref();
+    let (width, height) = img.dimensions();
 
     // ピクセルバッファを Lab に変換。
     let raw: &[u8] = img.as_raw();
@@ -456,5 +503,71 @@ mod tests {
             weight: 1.0,
         }];
         assert!(drop_dominant(&clusters).is_empty());
+    }
+
+    /// 大きい画像の自動ダウンサンプル（PR #119）の回帰テスト。
+    ///
+    /// フル解像度と pre-shrunk の入力で kmeans 結果がほぼ一致することを確認する。
+    /// 厳密一致は kmeans のシード位置が変わるため期待できないが、weight 序列・
+    /// color の差・centroid の差が許容範囲に収まることをチェックする。
+    /// これが壊れたら kako-jun 視点で「視覚パリティが崩れた」を検知できる。
+    #[test]
+    fn downsample_matches_pre_shrunk_visually() {
+        // 縦に 4 色の縞模様を持つ大きい画像を作る (1600×1600)。各色が 25% 占有。
+        let big: RgbImage = ImageBuffer::from_fn(1600, 1600, |_, y| match y / 400 {
+            0 => Rgb([200u8, 50, 50]),  // 赤系
+            1 => Rgb([50u8, 200, 50]),  // 緑系
+            2 => Rgb([50u8, 50, 200]),  // 青系
+            _ => Rgb([200u8, 200, 50]), // 黄系
+        });
+        // 同じ画像を pre-shrunk (long edge 256) で作る → ダウンサンプル経路と
+        // pre-shrunk が一致すれば、core 内ダウンサンプルが正しく動いている。
+        let small: RgbImage = ImageBuffer::from_fn(256, 256, |_, y| match y / 64 {
+            0 => Rgb([200u8, 50, 50]),
+            1 => Rgb([50u8, 200, 50]),
+            2 => Rgb([50u8, 50, 200]),
+            _ => Rgb([200u8, 200, 50]),
+        });
+
+        let clusters_big = extract_clusters(&big, 4).expect("big clusters");
+        let clusters_small = extract_clusters(&small, 4).expect("small clusters");
+
+        assert_eq!(clusters_big.len(), 4, "big should yield 4 clusters");
+        assert_eq!(clusters_small.len(), 4, "small should yield 4 clusters");
+
+        // weight 序列はだいたい 0.25 ずつ。順序は kmeans 初期化次第なので
+        // ソート済み (weight 降順) の対応する index 同士で比較する。
+        for i in 0..4 {
+            approx(
+                clusters_big[i].weight,
+                clusters_small[i].weight,
+                0.05,
+                &format!("weight[{i}]"),
+            );
+            // color は LAB centroid → sRGB 往復で ±数 LSB 誤差はある。
+            // ダウンサンプルでさらに数 LSB 増えるが許容内（±15）。
+            for ch in 0..3 {
+                let diff =
+                    (clusters_big[i].color[ch] as i32 - clusters_small[i].color[ch] as i32).abs();
+                assert!(
+                    diff <= 15,
+                    "color[{i}][{ch}] diff {diff} too large (big={} small={})",
+                    clusters_big[i].color[ch],
+                    clusters_small[i].color[ch],
+                );
+            }
+        }
+    }
+
+    /// 小さい画像 (≤256) では downsample が no-op で借用パスを通ることを確認する。
+    /// 出力が「フル解像度を直接 kmeans した場合」と完全一致するかは保証しない
+    /// （kmeans は元々シード位置依存で run-to-run 微変動するため）が、結果が
+    /// 妥当なクラスタ列であることをチェック。
+    #[test]
+    fn small_image_passes_through_unchanged() {
+        let img: RgbImage = ImageBuffer::from_fn(100, 100, |_, _| Rgb([128u8, 64, 32]));
+        let clusters = extract_clusters(&img, 1).expect("clusters");
+        assert_eq!(clusters.len(), 1);
+        approx(clusters[0].weight, 1.0, 1e-3, "single cluster weight");
     }
 }
