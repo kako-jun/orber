@@ -2,8 +2,8 @@
 //
 // orber-wasm から渡される `AnimationHandle` は RGBA フレームを 1 枚ずつ吐く
 // 反復子なので、それを順番に `VideoEncoder.encode` に流して mp4-muxer に
-// 詰め込む。フレームを保持しないことでメモリピークを 1 枚ぶん（≈ 2MB / 540×960）
-// に抑える設計。
+// 詰め込む。フレームを保持しないことでメモリピークを 1 枚ぶん（≈ 0.9MB / 360×640、
+// hi-res DL 時は ≈ 8MB / 1080×1920）に抑える設計。
 //
 // 互換性: VideoEncoder / VideoFrame / ImageData(buf, w, h) が要る。
 // Chrome 94+ / Safari 16.4+ / Firefox 130+。非対応ブラウザでは throw する
