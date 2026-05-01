@@ -179,11 +179,7 @@ fn direction_for_spec_idx(
 /// `direction_for_spec_idx` と同じ責務分担で、core の `generate_batch`
 /// は spec.speed をそのまま使うので、speed 固定割当は wasm 入口経由の
 /// GUI 経路でのみ適用される。
-fn speed_for_spec_idx(
-    spec_idx: usize,
-    still_count: usize,
-    spec: &VariationSpec,
-) -> MotionSpeed {
+fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec) -> MotionSpeed {
     if spec_idx >= still_count {
         let video_idx = spec_idx - still_count;
         debug_assert!(video_idx < GUI_VIDEO_COUNT_DEFAULT);

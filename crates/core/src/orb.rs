@@ -216,9 +216,14 @@ pub fn render_one_orb(
 
     let stops = match style {
         OrbStyle::Rim => {
-            // 既存挙動: 中間 stop で alpha を半分に落としてリング感を作る。
+            // 中間 stop の alpha を下げ、縁の境界を柔らかくする (#78)。
+            // 旧値 128/255 ≒ 0.50 だと「中央 → 中間」と「中間 → 透明」の差が
+            // 等しく、中間 stop の位置に視覚的なエッジが立つ。80/255 ≒ 0.31
+            // に下げると中央→中間で alpha が 0.69 落ち、中間→透明で 0.31
+            // 落ちる非対称になり、縁が滑らかにフェードして文字オーバーレイ
+            // 時の可読性が上がる。
             // blur=0 で中間 stop が外寄り（不透明領域広い）、blur=1 で中心寄り（点に近い）。
-            let mid_a = ((opacity * 128.0).round().clamp(0.0, 255.0)) as u8;
+            let mid_a = ((opacity * 80.0).round().clamp(0.0, 255.0)) as u8;
             let mid_color = Color::from_rgba8(r, g, b, mid_a);
             let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
             vec![
