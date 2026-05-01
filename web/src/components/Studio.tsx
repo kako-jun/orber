@@ -925,7 +925,9 @@ export default function Studio() {
 
       {/* #121: 進捗行は常に同じ高さを確保し、phase 完了後も消さない（消すと
           下のサムネイルグリッドがガクッと上に詰まる）。done/idle/error では
-          中身を空にして高さだけ残し、テキストはセンタリングする。 */}
+          中身を空にして高さだけ残し、テキストはセンタリングする。
+          #124: 生成完了後（タイル表示中かつ進捗 phase でない）は、空白の代わりに
+          「長押しで拡大」の操作ヒントを表示し、進捗行を導線として再利用する。 */}
       <Show
         when={
           phase() === 'decoding' ||
@@ -943,6 +945,16 @@ export default function Studio() {
             {t('generating')} {progress()} / {batchN()}
           </Show>
           <Show when={phase() === 'animating'}>{t('animating')}</Show>
+          <Show
+            when={
+              phase() !== 'decoding' &&
+              phase() !== 'generating' &&
+              phase() !== 'animating' &&
+              tiles().length > 0
+            }
+          >
+            {t('longTapToEnlargeHint')}
+          </Show>
         </p>
       </Show>
 
