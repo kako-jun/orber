@@ -31,7 +31,10 @@ use orber_core::variations::{
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f32::consts::TAU;
+use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
@@ -209,7 +212,14 @@ fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
 /// なので、(source_rgb の長さ + 4 隅 8 byte サンプル + width + height + k)
 /// を fingerprint にして再利用する。
 ///
-/// wasm は single-threaded なので静的可変状態で問題ない。
+/// レビュー S1: 旧実装は `static mut Option<CachedClusters>` で
+/// `#[allow(static_mut_refs)]` を必要としていた。Rust 2024 以降の lint 強化で
+/// 将来の事故源になるため `OnceLock<WasmSingleThreadCell<...>>` に移行する。
+/// **wasm は single-threaded** なので `RefCell` の borrow 衝突は構造的に
+/// 起きないが、`RefCell` 自体が `Sync` ではないため、wasm 専用の薄い
+/// ラッパで `Sync`/`Send` を手動 impl する（unsafe 境界は **このラッパ
+/// 1 か所だけ**に閉じ込める）。worker を複数起動しても各 worker は独立した
+/// wasm モジュールインスタンスを持つので static 共有は発生しない。
 struct CachedClusters {
     fingerprint: u64,
     clusters_full: Vec<Cluster>,
@@ -217,7 +227,33 @@ struct CachedClusters {
     clusters: Vec<Cluster>,
 }
 
-static mut SOURCE_CACHE: Option<CachedClusters> = None;
+/// wasm シングルスレッド前提の `RefCell` ラッパ。
+///
+/// `OnceLock<T>` の `T` は `Sync` を要求するが、`RefCell<T>` は `Sync` を
+/// 提供しないため、そのままでは `OnceLock<RefCell<...>>` を `static` に
+/// 置けない。wasm32 ターゲットでは static の共有が実質スレッド境界を
+/// 越えないので、ここで `Sync`/`Send` を手動 impl する。これで以後は
+/// `static mut` も `#[allow(static_mut_refs)]` も不要になる。
+struct WasmSingleThreadCell<T>(RefCell<T>);
+// SAFETY: wasm32 はシングルスレッド (Web Worker は別 wasm インスタンスを持つ)。
+// 同一 wasm インスタンス内で `RefCell` を多スレッドから同時アクセスすることは
+// 構造的に起きない。borrow 衝突は通常の RefCell ルールで実行時に検出される。
+unsafe impl<T> Sync for WasmSingleThreadCell<T> {}
+unsafe impl<T> Send for WasmSingleThreadCell<T> {}
+
+impl<T> WasmSingleThreadCell<T> {
+    fn new(v: T) -> Self {
+        Self(RefCell::new(v))
+    }
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}
+
+fn source_cache() -> &'static WasmSingleThreadCell<Option<CachedClusters>> {
+    static CELL: OnceLock<WasmSingleThreadCell<Option<CachedClusters>>> = OnceLock::new();
+    CELL.get_or_init(|| WasmSingleThreadCell::new(None))
+}
 
 fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
     // 完全一致は不要。長さ + dims + k + 4 隅サンプルで衝突は実用上ゼロ。
@@ -241,14 +277,15 @@ fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
 /// kmeans 結果（clusters_full / bg / clusters）を取得する。同じソース画像なら
 /// キャッシュヒットして O(1)、違う画像なら kmeans 実行 + キャッシュ更新。
 ///
-/// SAFETY: wasm は single-threaded なので静的可変参照は問題ない。
+/// レビュー S1: `static mut SOURCE_CACHE` を `OnceLock<WasmSingleThreadCell<...>>`
+/// 経由に切り替え。`unsafe` ブロックも `#[allow(static_mut_refs)]` も不要になる。
 type ClustersBundle = (Vec<Cluster>, [u8; 4], Vec<Cluster>);
 
-#[allow(static_mut_refs)]
 fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
     let fp = fingerprint(&p.source_rgb, p.source_width, p.source_height, p.k);
-    unsafe {
-        if let Some(c) = &SOURCE_CACHE {
+    {
+        let cache = source_cache().borrow_mut();
+        if let Some(c) = cache.as_ref() {
             if c.fingerprint == fp {
                 return Ok((c.clusters_full.clone(), c.bg, c.clusters.clone()));
             }
@@ -265,9 +302,7 @@ fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
         bg,
         clusters: clusters.clone(),
     };
-    unsafe {
-        SOURCE_CACHE = Some(cached);
-    }
+    *source_cache().borrow_mut() = Some(cached);
     Ok((clusters_full, bg, clusters))
 }
 
@@ -700,22 +735,34 @@ pub fn glyph_supported(ch: &str) -> bool {
 
 /// `(font, ch, size) -> Vec<u8>` の同一プロセス内キャッシュ。
 /// HashMap キーは `(font, ch as u32, size)`。
+///
+/// レビュー S2: worker の `getRenderer` は (w, h) 切替時に renderer を作り直すが
+/// この wasm 側 `glyph_mask_cache` は wasm モジュール再ロード（HMR / 再起動）まで
+/// 残る。同一 size + 同一 ch なら毎回同じ bytes が返るので決定論的に問題は
+/// 無いが、開発時 HMR で再ロードしない場合に古いキャッシュエントリが残ったまま
+/// になる点だけ注意。実運用では size=GLYPH_MASK_SIZE=256 に固定なので、
+/// glyph 文字数 ×サイズ 1 通りで メモリ上限は数十エントリ程度。
 type GlyphMaskKey = (GlyphFontId, u32, u32);
 
-#[allow(static_mut_refs)]
+/// レビュー S1: `static mut CACHE` を `OnceLock<WasmSingleThreadCell<HashMap<...>>>`
+/// に置換。`#[allow(static_mut_refs)]` を削除し、`unsafe` も無くなる。
+fn glyph_mask_cache() -> &'static WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>> {
+    static CELL: OnceLock<WasmSingleThreadCell<HashMap<GlyphMaskKey, Vec<u8>>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| WasmSingleThreadCell::new(HashMap::new()))
+}
+
 fn glyph_alpha_mask_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
-    use std::collections::HashMap;
-    static mut CACHE: Option<HashMap<GlyphMaskKey, Vec<u8>>> = None;
     let key = (font, ch as u32, size);
-    unsafe {
-        let cache = CACHE.get_or_insert_with(HashMap::new);
+    {
+        let cache = glyph_mask_cache().borrow_mut();
         if let Some(v) = cache.get(&key) {
             return v.clone();
         }
-        let v = render_glyph_alpha_mask(font, ch, size);
-        cache.insert(key, v.clone());
-        v
     }
+    let v = render_glyph_alpha_mask(font, ch, size);
+    glyph_mask_cache().borrow_mut().insert(key, v.clone());
+    v
 }
 
 

@@ -349,4 +349,51 @@ mod tests {
         let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
         assert_eq!(lit, 0, "opacity=0 must not paint anything");
     }
+
+    // レビュー S3: render_glyph_alpha_mask の単体テスト 3 件
+    // (Phase B WebGL 経路で texture sampling に使われるバイト列の保証)。
+
+    /// size を変えれば長さが size² になる。基本契約。
+    #[test]
+    fn glyph_alpha_mask_size_matches_input() {
+        for size in [16u32, 32, 64, 128, 256] {
+            let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', size);
+            assert_eq!(
+                bytes.len(),
+                (size as usize) * (size as usize),
+                "size={size} must produce {} bytes",
+                (size as usize) * (size as usize)
+            );
+        }
+    }
+
+    /// 既知文字 ☆ で alpha 非ゼロ ≥ 32px (5% 以上塗られる)。
+    /// shader 側で texture(...).r > 0 のピクセルが orb の見た目を作る。
+    #[test]
+    fn glyph_alpha_mask_known_char_has_lit_pixels() {
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '☆', 64);
+        let lit = bytes.iter().filter(|&&b| b > 0).count();
+        assert!(
+            lit >= 32,
+            "rendering ☆ at 64x64 should produce >=32 lit pixels, got {lit}"
+        );
+        // 5% 以上の閾値も併せて確認（より厳しい下限）。
+        assert!(
+            lit > 64 * 64 / 20,
+            "rendering ☆ at 64x64 should produce >=5% lit pixels, got {lit}"
+        );
+    }
+
+    /// 未収録文字（絵文字 U+1F355 ピザ等）で全ピクセル 0。
+    /// tofu 出力ではなく「何も描かない」が Phase A の方針。WebGL 経路でも
+    /// 同じ契約を保つことで、shape='glyph' + 未収録文字 = 完全透明 orb になる。
+    #[test]
+    fn glyph_alpha_mask_unknown_char_returns_empty_or_zero() {
+        let bytes = render_glyph_alpha_mask(GlyphFontId::NotoSymbols2, '\u{1F355}', 32);
+        assert_eq!(bytes.len(), 32 * 32);
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "unknown char must produce all-zero alpha mask"
+        );
+    }
 }
