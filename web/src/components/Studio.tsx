@@ -938,7 +938,7 @@ export default function Studio() {
                 aria-busy={!tile.blob}
                 class="group relative block w-full overflow-hidden rounded touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing disabled:cursor-default"
                 style={{
-                  'aspect-ratio': aspect() === 'portrait' ? '540 / 960' : '960 / 540',
+                  'aspect-ratio': aspect() === 'portrait' ? '9 / 16' : '16 / 9',
                 }}
               >
                 {/* tile.blob が null の間は skeleton shimmer。runBatch 冒頭で
