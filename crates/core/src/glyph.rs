@@ -178,6 +178,47 @@ pub fn build_glyph_path(
     builder.pb.finish()
 }
 
+/// Phase B (#55): Glyph 1 文字のアウトラインを `size × size` の正方領域に
+/// 中心揃えで fill し、alpha チャネルだけを `Vec<u8>` で返す。
+///
+/// 用途: WebGL2 fragment shader が `shape == "glyph"` のときに texture
+/// sampling で orb の alpha を決めるためのプリベイク済みマスク。`R8` ないし
+/// `RGBA(alpha のみ意味)` として GPU にアップロードする想定。
+///
+/// `size` は `1..=4096` の範囲を想定（呼び出し側で validate する）。
+/// 同梱フォントに収録されていない文字を渡すと全 0 を返す（panic しない）。
+/// 生成は決定的（同じ入力なら毎回同じバイト列）。キャッシュは呼び出し側で行う。
+pub fn render_glyph_alpha_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+    let s = size.max(1);
+    let mut pix = match Pixmap::new(s, s) {
+        Some(p) => p,
+        None => return vec![0u8; (s as usize) * (s as usize)],
+    };
+    let center = (s as f32 * 0.5, s as f32 * 0.5);
+    // 余白を残しつつ正方領域いっぱいに描く: 半径は size の 0.45 倍。
+    // build_glyph_path は半径 × 2 の正方領域に等比スケールするので、
+    // radius = size * 0.45 にすれば文字の bbox 最大辺が 0.9 * size に揃う。
+    let radius = (s as f32) * 0.45;
+    let path = match build_glyph_path(font, ch, center, radius) {
+        Some(p) => p,
+        None => return vec![0u8; (s as usize) * (s as usize)],
+    };
+    let paint = Paint {
+        shader: Shader::SolidColor(Color::from_rgba8(255, 255, 255, 255)),
+        anti_alias: true,
+        ..Default::default()
+    };
+    pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    // tiny-skia は premultiplied alpha だが、white(255) を fill しているので
+    // alpha と RGB が一致する。alpha チャネルだけ抽出する。
+    let raw = pix.data();
+    let mut out = Vec::with_capacity((s as usize) * (s as usize));
+    for px in raw.chunks_exact(4) {
+        out.push(px[3]);
+    }
+    out
+}
+
 /// 単一の Glyph orb を pixmap に SourceOver で重ねる。
 ///
 /// `radius` は orb の見た目半径相当（円 orb と揃える）。`opacity` ∈ [0, 1] は
