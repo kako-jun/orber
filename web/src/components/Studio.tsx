@@ -922,14 +922,27 @@ export default function Studio() {
         </div>
       </Show>
 
-      <Show when={phase() === 'decoding'}>
-        <p class="fade-in text-sm text-fgMuted">{t('decoding')}</p>
-      </Show>
-      <Show when={phase() === 'generating'}>
-        <p class="fade-in text-sm text-fgMuted">{t('generating')} {progress()} / {batchN()}</p>
-      </Show>
-      <Show when={phase() === 'animating'}>
-        <p class="fade-in text-sm text-fgMuted">{t('animating')}</p>
+      {/* #121: 進捗行は常に同じ高さを確保し、phase 完了後も消さない（消すと
+          下のサムネイルグリッドがガクッと上に詰まる）。done/idle/error では
+          中身を空にして高さだけ残し、テキストはセンタリングする。 */}
+      <Show
+        when={
+          phase() === 'decoding' ||
+          phase() === 'generating' ||
+          phase() === 'animating' ||
+          tiles().length > 0
+        }
+      >
+        <p
+          class="fade-in text-center text-sm text-fgMuted h-5 leading-5"
+          aria-live="polite"
+        >
+          <Show when={phase() === 'decoding'}>{t('decoding')}</Show>
+          <Show when={phase() === 'generating'}>
+            {t('generating')} {progress()} / {batchN()}
+          </Show>
+          <Show when={phase() === 'animating'}>{t('animating')}</Show>
+        </p>
       </Show>
 
       <Show when={errorMsg() && phase() === 'error'}>
