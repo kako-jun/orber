@@ -126,7 +126,7 @@ in 8 seconds (4 s/cross), with `2x` orbs proportionally faster.
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap. Its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen wrap buffer would interfere with
 > the halo rendering. The `[-r, 1+r]` off-screen wrap described above applies to
-> the `circle` shape only.
+> the `circle` and `glyph` shapes.
 
 ## Orb count and visual mix (v0.3.0)
 

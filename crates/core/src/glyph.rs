@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform};
 use ttf_parser::{Face, OutlineBuilder, Rect};
 
-/// Web / CLI / core が共有する canonical Glyph SDF texture size。
+/// WebGL / preview path で使う既定 Glyph SDF texture size。
 pub const DEFAULT_GLYPH_SDF_SIZE: u32 = 256;
+const MAX_GLYPH_SDF_SIZE: u32 = 1024;
 const GLYPH_SDF_RADIUS_FACTOR: f32 = 0.45;
 const GLYPH_SDF_MAX_DIST_FACTOR: f32 = 0.06;
 
@@ -324,6 +325,15 @@ fn cached_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Arc<[u8]> {
     sdf
 }
 
+#[inline]
+fn glyph_sdf_size_for_radius(radius: f32) -> u32 {
+    if radius <= 0.0 {
+        return DEFAULT_GLYPH_SDF_SIZE;
+    }
+    let desired = (radius * 2.25).ceil().max(DEFAULT_GLYPH_SDF_SIZE as f32) as u32;
+    desired.next_power_of_two().min(MAX_GLYPH_SDF_SIZE)
+}
+
 fn sample_sdf_bilinear(bytes: &[u8], size: usize, u: f32, v: f32) -> f32 {
     let x = u.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
     let y = v.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
@@ -391,11 +401,12 @@ pub fn render_glyph_orb(
     if opacity <= 0.0 {
         return;
     }
-    let sdf = cached_glyph_sdf(font, ch, DEFAULT_GLYPH_SDF_SIZE);
+    let sdf_size = glyph_sdf_size_for_radius(radius);
+    let sdf = cached_glyph_sdf(font, ch, sdf_size);
     if sdf.iter().all(|&b| b == 0) {
         return;
     }
-    let size = DEFAULT_GLYPH_SDF_SIZE as usize;
+    let size = sdf_size as usize;
     let (cx, cy) = center;
     let cos_a = rotation.cos();
     let sin_a = rotation.sin();
@@ -574,5 +585,12 @@ mod tests {
         let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', 64);
         assert!(bytes.iter().any(|&b| b < 120), "must contain outside samples");
         assert!(bytes.iter().any(|&b| b > 136), "must contain inside samples");
+    }
+
+    #[test]
+    fn glyph_sdf_size_scales_up_for_large_cpu_orbs() {
+        assert_eq!(glyph_sdf_size_for_radius(8.0), DEFAULT_GLYPH_SDF_SIZE);
+        assert_eq!(glyph_sdf_size_for_radius(160.0), 512);
+        assert_eq!(glyph_sdf_size_for_radius(400.0), 1024);
     }
 }
