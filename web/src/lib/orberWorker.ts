@@ -52,8 +52,8 @@ function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; 
   if (cachedCanvas) {
     cachedCanvas.renderer.dispose();
     cachedCanvas = null;
-    // Phase B (#55): renderer を作り直すとテクスチャも消えるので Glyph
-    // キャッシュも無効化する（次の ensureGlyphMaskUploaded で再 upload）。
+    // renderer を作り直すとテクスチャも消えるので Glyph
+    // キャッシュも無効化する（次の ensureGlyphSdfUploaded で再 upload）。
     cachedGlyph = null;
   }
   const canvas = new OffscreenCanvas(width, height);

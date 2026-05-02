@@ -29,7 +29,7 @@ CSS / SVG output is attractive because it is essentially zero-byte, infinitely l
 The CLI exposes the following flags (run `orber --help` for the authoritative list):
 
 - `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
-- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). Ignored when `--shape glyph`.
+- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). In Glyph mode this now controls the same edge falloff width used by circle orbs.
 - `--count` — orbs visible on screen at once (1..=1024, default 20)
 - `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
@@ -337,9 +337,9 @@ color. The pipeline:
 3. For each orb, the glyph outline is extracted via `Face::outline_glyph` and
    converted into a `tiny-skia::Path`. The path is filled (not stroked) with
    the orb's color at the orb's center, scaled to the orb's radius.
-4. Because Glyph is an outline-fill primitive, the **`--blur` parameter is
-   ignored in this mode**. Softness comes from the `--softness` preset's edge
-   falloff rather than a gaussian post-pass.
+4. The outline is converted to a cached SDF, so **`--blur` and `--softness`
+   both affect Glyph mode** with the same edge-falloff meaning as circle
+   orbs rather than a hard text fill.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
@@ -387,7 +387,8 @@ speed / softness without dropping to the terminal.
   loop-closed at `t = 0 ≡ 1`.
 - `get_render_data`'s 16-word header schema reserves words 9 and 10 for
   `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
-  per-orb 16-word slots are unchanged.
+  per-orb 16-word slots now also use words 11 and 12 for `base_angle` and
+  `rot_speed_signed` (the remaining tail words stay reserved).
 - Studio UI (#131): the collapsible Advanced section is gone. Instead, the
   four axes are always visible as flat control rows directly under the aspect
   toggles. Every control immediately re-runs the batch:

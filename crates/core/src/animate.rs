@@ -168,28 +168,29 @@ const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 /// なので `t=1` でループが閉じる。視覚的なバラつきの主因（#53 で 2 → 3 段階）。
 /// `base_angle` / `rot_speed_signed` は glyph 用の回転で、`cycle_count` と同じ
 /// 整数周期に乗せることで `t=0 ≡ t=1` を保つ。
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-struct OrbParams {
+pub struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
-    phase: f32,
+    pub phase: f32,
     /// 半径呼吸 sin の位相シフト。
-    phi_radius: f32,
+    pub phi_radius: f32,
     /// blur 呼吸 sin の位相シフト。radius と同期させない。
-    phi_blur: f32,
+    pub phi_blur: f32,
     /// opacity 呼吸 sin の位相シフト。3 軸を独立に。
-    phi_opacity: f32,
+    pub phi_opacity: f32,
     /// 描画スタイル（Rim / Soft）。seed 由来でほぼ 50:50 に振る。
-    style: OrbStyle,
+    pub style: OrbStyle,
     /// この orb の色 / weight を借りてくる元クラスタの index。
-    cluster_idx: usize,
+    pub cluster_idx: usize,
     /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
-    cross_axis: f32,
+    pub cross_axis: f32,
     /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
-    speed_mult: u32,
+    pub speed_mult: u32,
     /// glyph がある場合の初期回転角 [0, 2π)。
-    base_angle: f32,
+    pub base_angle: f32,
     /// glyph の signed 回転速度。±{1, 2, 3} で、絶対値は speed_mult と一致する。
-    rot_speed_signed: f32,
+    pub rot_speed_signed: f32,
 }
 
 /// 重み比例の 1 サンプルをもらう抽選器。
@@ -221,11 +222,12 @@ fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
 /// `n_orbs` は要求される orb 数。`cluster_weights` は各クラスタの占有比で、
 /// orb の色割当（cluster_idx）に重み比例で使われる。`style` と `cluster_idx` は
 /// 整数を別途引いて分布の偏りを避ける。
-fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
+#[doc(hidden)]
+pub fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let total_w: f32 = cluster_weights.iter().map(|w| w.max(0.0)).sum();
     (0..n_orbs)
-        .map(|_| {
+        .map(|i| {
             let phase = rng.gen_range(0.0..1.0);
             let phi_radius = rng.gen_range(0.0..TAU);
             let phi_blur = rng.gen_range(0.0..TAU);
@@ -246,8 +248,13 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
             // 混在する。cycle_count {1, 2} × speed_mult {1, 2, 3} で実効周回は
             // {1, 2, 3, 4, 6} の 5 段階。全部整数なのでループ性は保たれる。
             let speed_mult = rng.gen_range(1..=3);
-            let base_angle = rng.gen_range(0.0..TAU);
-            let rot_dir = if rng.gen::<u32>() & 1 == 0 { 1.0 } else { -1.0 };
+            let rot_hash = splitmix64(seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let base_angle = unit_from_hash(rot_hash) * TAU;
+            let rot_dir = if splitmix64(rot_hash ^ 0xD1B5_4A32_D192_ED03) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             OrbParams {
                 phase,
                 phi_radius,
@@ -262,6 +269,20 @@ fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec
             }
         })
         .collect()
+}
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn unit_from_hash(x: u64) -> f32 {
+    let bits = (x >> 40) as u32;
+    bits as f32 / ((1u32 << 24) as f32)
 }
 
 /// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
@@ -442,13 +463,12 @@ pub fn render_frame_with_params(
         let opacity = (opacity_factor * softness_alpha_mul).clamp(0.0, 1.0);
 
         // shape による分岐:
-        // - Glyph: 円グラデ ではなく 1 文字のフォントアウトラインを fill。blur と style は使わない
+        // - Glyph: 1 文字の SDF を回転サンプリングし、blur + Rim/Soft falloff を共有
         // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
         match opts.shape {
             OrbShape::Glyph { ch, font } => {
-                // OrbShape::Glyph はアウトライン fill 描画のため、Rim / Soft の grad stop 演出は
-                // 適用しない。RNG の `style` 引きは継続して per-orb sequence の互換性を維持する
-                // (Circle/Glyph 切替で seed 由来の他パラメータ列がズレないようにするため)。
+                // Glyph でも style / blur は Circle と同じ falloff カーブに流し込む。
+                // RNG の `style` 引きは Circle/Glyph 切替時の seed 列互換にも使われる。
                 crate::glyph::render_glyph_orb(
                     &mut pixmap,
                     (cx, cy),
@@ -995,6 +1015,39 @@ mod tests {
                     q.rot_speed_signed
                 );
             }
+        }
+    }
+
+    #[test]
+    fn glyph_rotation_does_not_perturb_legacy_rng_sequence() {
+        let seed = 42;
+        let weights = [0.7, 0.3];
+        let params = generate_orb_params(seed, 8, &weights);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let total_w: f32 = weights.iter().sum();
+
+        for p in &params {
+            let phase = rng.gen_range(0.0..1.0);
+            let phi_radius = rng.gen_range(0.0..TAU);
+            let phi_blur = rng.gen_range(0.0..TAU);
+            let phi_opacity = rng.gen_range(0.0..TAU);
+            let cross_axis = rng.gen_range(0.0..1.0);
+            let style = if rng.gen::<u32>() & 1 == 0 {
+                OrbStyle::Rim
+            } else {
+                OrbStyle::Soft
+            };
+            let cluster_idx = pick_weighted(&mut rng, &weights, total_w);
+            let speed_mult = rng.gen_range(1..=3);
+
+            assert!((p.phase - phase).abs() < 1e-6);
+            assert!((p.phi_radius - phi_radius).abs() < 1e-6);
+            assert!((p.phi_blur - phi_blur).abs() < 1e-6);
+            assert!((p.phi_opacity - phi_opacity).abs() < 1e-6);
+            assert!((p.cross_axis - cross_axis).abs() < 1e-6);
+            assert_eq!(p.style, style);
+            assert_eq!(p.cluster_idx, cluster_idx);
+            assert_eq!(p.speed_mult, speed_mult);
         }
     }
 

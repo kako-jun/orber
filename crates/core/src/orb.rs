@@ -158,8 +158,8 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             continue;
         }
 
-        // Glyph: 1 文字のアウトラインを fill。半径は Circle と同じ意味で渡す。
-        // softness の alpha 倍率は適用、blur は使わない（グリフはアウトライン fill のため）。
+        // Glyph: 1 文字の SDF を Circle と同じ半径・blur・softness の意味で描く。
+        // 静止画経路では回転だけ 0 固定にして、見た目の falloff は Circle と揃える。
         if let OrbShape::Glyph { ch, font } = opts.shape {
             render_glyph_orb(
                 &mut pixmap,

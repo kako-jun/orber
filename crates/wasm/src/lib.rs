@@ -18,7 +18,9 @@
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+use orber_core::animate::{
+    generate_orb_params, render_frame, AnimateOptions, MotionDirection, MotionSpeed,
+};
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber_core::glyph::{has_glyph, render_glyph_sdf, GlyphFontId};
@@ -28,12 +30,9 @@ use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
     GUI_VIDEO_SPEEDS,
 };
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::f32::consts::TAU;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
@@ -500,10 +499,10 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// で spec 列を再構築するので、`spec_idx` 番目の spec / direction / speed /
 /// count / orb_size / blur / seed は他 API と完全一致する（互換性維持）。
 ///
-/// per-orb の rng シーケンスも `crates/core::animate::generate_orb_params` と
-/// 同じ ChaCha8Rng + 同じドロー順で再現するので、同じ seed なら同じ
+/// per-orb の rng シーケンスは `orber_core::animate::generate_orb_params`
+/// をそのまま使うので、core 側アニメーションと同じ seed なら同じ
 /// (phase, phi_radius, phi_blur, phi_opacity, cross_axis, style, cluster_idx,
-/// speed_mult, base_angle, rot_dir) が得られる。
+/// speed_mult, base_angle, rot_speed_signed) が得られる。
 ///
 /// # Float32Array レイアウト
 ///
@@ -625,12 +624,11 @@ pub fn get_render_data(
     Ok(js_sys::Float32Array::from(buf.as_slice()))
 }
 
-/// `generate_orb_params` (core) と同じ rng ドロー順で per-orb データを生成し、
-/// ヘッダ + per-orb フィールドを Float32 ベクタに詰める。
+/// core 側と共有の `generate_orb_params` 出力を使って、ヘッダ + per-orb
+/// フィールドを Float32 ベクタに詰める。
 ///
-/// core 側 `generate_orb_params` を呼び出さずに同じシーケンスを **再現** する
-/// （core の `OrbParams` は private struct で wasm から読めないため）。順序を
-/// 1 つでも変えると同じ seed でも別の orb 列になり、視覚パリティが壊れる。
+/// WebGL path が core のアニメーションと別 RNG 列を持たないよう、乱数列は
+/// ここで再実装せず `orber_core::animate::generate_orb_params` に委譲する。
 // TODO(orber#future): pack_render_data の引数が 10 個に達した。Phase C で
 // orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
 #[allow(clippy::too_many_arguments)]
@@ -669,38 +667,29 @@ fn pack_render_data(
     }
 
     let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
-    let total_w: f32 = cluster_weights.iter().sum();
+    let params = generate_orb_params(seed, n_orbs, &cluster_weights);
 
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    for i in 0..n_orbs {
-        // 順序は crates/core::animate::generate_orb_params と完全一致させる。
-        let phase: f32 = rng.gen_range(0.0..1.0);
-        let phi_radius: f32 = rng.gen_range(0.0..TAU);
-        let phi_blur: f32 = rng.gen_range(0.0..TAU);
-        let phi_opacity: f32 = rng.gen_range(0.0..TAU);
-        let cross_axis: f32 = rng.gen_range(0.0..1.0);
-        let style_bit: f32 = if rng.gen::<u32>() & 1 == 0 { 0.0 } else { 1.0 };
-        let cluster_idx = pick_weighted(&mut rng, &cluster_weights, total_w);
-        let speed_mult: u32 = rng.gen_range(1..=3);
-        let base_angle: f32 = rng.gen_range(0.0..TAU);
-        let rot_dir: f32 = if rng.gen::<u32>() & 1 == 0 { 1.0 } else { -1.0 };
-
-        let c = &clusters[cluster_idx.min(clusters.len() - 1)];
+    for (i, p) in params.iter().enumerate() {
+        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
 
         let off = header_words + per_orb_words * i;
         buf[off] = c.color[0] as f32 / 255.0;
         buf[off + 1] = c.color[1] as f32 / 255.0;
         buf[off + 2] = c.color[2] as f32 / 255.0;
         buf[off + 3] = c.weight.max(0.0);
-        buf[off + 4] = phase;
-        buf[off + 5] = phi_radius;
-        buf[off + 6] = phi_blur;
-        buf[off + 7] = phi_opacity;
-        buf[off + 8] = cross_axis;
-        buf[off + 9] = style_bit;
-        buf[off + 10] = speed_mult as f32;
-        buf[off + 11] = base_angle;
-        buf[off + 12] = speed_mult as f32 * rot_dir;
+        buf[off + 4] = p.phase;
+        buf[off + 5] = p.phi_radius;
+        buf[off + 6] = p.phi_blur;
+        buf[off + 7] = p.phi_opacity;
+        buf[off + 8] = p.cross_axis;
+        buf[off + 9] = if p.style == orber_core::orb::OrbStyle::Rim {
+            0.0
+        } else {
+            1.0
+        };
+        buf[off + 10] = p.speed_mult as f32;
+        buf[off + 11] = p.base_angle;
+        buf[off + 12] = p.rot_speed_signed;
         // [+13..+16] reserved
     }
     buf
@@ -765,22 +754,6 @@ fn glyph_sdf_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     let v = render_glyph_sdf(font, ch, size);
     glyph_sdf_cache().borrow_mut().insert(key, v.clone());
     v
-}
-
-/// 重み比例の 1 サンプル抽選器。`crates/core::animate::pick_weighted` と同等。
-fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
-    if total <= 0.0 || weights.is_empty() {
-        return 0;
-    }
-    let r = rng.gen::<f32>() * total;
-    let mut acc = 0.0;
-    for (i, &w) in weights.iter().enumerate() {
-        acc += w.max(0.0);
-        if r <= acc {
-            return i;
-        }
-    }
-    weights.len() - 1
 }
 
 /// 入力画像 1 枚から SVG 文字列を生成する。
@@ -1146,6 +1119,72 @@ mod tests {
                 MotionSpeed::VerySlow,
                 "still tile {spec_idx} must inherit spec.speed"
             );
+        }
+    }
+
+    #[test]
+    fn pack_render_data_matches_core_generate_orb_params() {
+        let mut p = base_params();
+        p.k = 2;
+        p.source_width = 2;
+        p.source_height = 2;
+        p.source_rgb = vec![
+            255, 0, 0, 255, 0, 0, //
+            0, 0, 255, 0, 0, 255,
+        ];
+        let total = 12usize;
+        let spec_idx = 3usize;
+        let still_count = total - GUI_VIDEO_COUNT_DEFAULT;
+        let (_, bg, clusters) = get_or_build_clusters(&mut p).expect("clusters should build");
+        let specs = random_batch_specs(42, total, still_count);
+        let spec = specs[spec_idx];
+        let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
+        let direction = direction_for_spec_idx(spec_idx, still_count, &spec);
+        let direction_id = match direction {
+            MotionDirection::LeftToRight => 0.0,
+            MotionDirection::RightToLeft => 1.0,
+            MotionDirection::TopToBottom => 2.0,
+            MotionDirection::BottomToTop => 3.0,
+        };
+        let softness = parse_softness_preset("").unwrap();
+        let n_orbs = spec.count.clamp(1, MAX_ORB_COUNT);
+        let buf = pack_render_data(
+            &clusters,
+            bg,
+            (64f32.min(64.0)) * 0.25 * spec.orb_size.max(0.0),
+            (spec.blur + softness.blur_offset()).clamp(0.0, 1.0),
+            direction_id,
+            speed.cycle_count() as f32,
+            spec.seed,
+            n_orbs,
+            softness.alpha_mul().clamp(0.0, 1.0),
+            1.0,
+        );
+
+        let weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
+        let params = generate_orb_params(spec.seed, n_orbs, &weights);
+        assert_eq!(params.len(), n_orbs);
+        for (i, param) in params.iter().enumerate() {
+            let c = &clusters[param.cluster_idx];
+            let off = 16 + 16 * i;
+            assert!((buf[off] - c.color[0] as f32 / 255.0).abs() < 1e-6);
+            assert!((buf[off + 1] - c.color[1] as f32 / 255.0).abs() < 1e-6);
+            assert!((buf[off + 2] - c.color[2] as f32 / 255.0).abs() < 1e-6);
+            assert!((buf[off + 3] - c.weight.max(0.0)).abs() < 1e-6);
+            assert!((buf[off + 4] - param.phase).abs() < 1e-6);
+            assert!((buf[off + 5] - param.phi_radius).abs() < 1e-6);
+            assert!((buf[off + 6] - param.phi_blur).abs() < 1e-6);
+            assert!((buf[off + 7] - param.phi_opacity).abs() < 1e-6);
+            assert!((buf[off + 8] - param.cross_axis).abs() < 1e-6);
+            let style_bit = if param.style == orber_core::orb::OrbStyle::Rim {
+                0.0
+            } else {
+                1.0
+            };
+            assert!((buf[off + 9] - style_bit).abs() < 1e-6);
+            assert!((buf[off + 10] - param.speed_mult as f32).abs() < 1e-6);
+            assert!((buf[off + 11] - param.base_angle).abs() < 1e-6);
+            assert!((buf[off + 12] - param.rot_speed_signed).abs() < 1e-6);
         }
     }
 }

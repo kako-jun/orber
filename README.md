@@ -59,9 +59,9 @@ orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --du
 
 `--speed` is the **global** cycle count (`very-slow` / `slow` / `mid` / `fast`
 = 1 / 2 / 3 / 4 screen-crosses per clip for the slowest orbs). Each orb also gets
-a per-orb integer **speed multiplier** (`1x` / `2x`) assigned deterministically
+a per-orb integer **speed multiplier** (`1x` / `2x` / `3x`) assigned deterministically
 from the seed, so individual orbs visibly travel at different paces inside the
-same clip — effective traversal counts spread over `{cycle, 2×cycle}` per clip.
+same clip — effective traversal counts spread over `{cycle, 2×cycle, 3×cycle}` per clip.
 All factors are integers, so the loop closure at `t = 0 ≡ t = 1` stays pixel-exact.
 Combined with a long `--duration-ms`, this gives the characteristic gentle, layered
 drift. Every orb also gets three independent breathing pulses (radius ±10%,
@@ -70,7 +70,7 @@ blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen buffer would interfere with the
 > rendered halo). The off-screen wrap buffer described above applies to the
-> `circle` shape only.
+> `circle` and `glyph` shapes only.
 
 ### Orb count
 
@@ -113,9 +113,9 @@ geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
 and other characters outside this subset are silently skipped instead of
 drawing tofu. The glyph outline is converted to a cached **signed-distance
 field**, so `--blur` and `--softness` now affect glyphs with the same visual
-meaning as circle orbs: soft edge falloff, not a hard text fill. Animated
-glyphs also get a seed-derived base angle and continuous per-orb rotation, so
-the batch does not line up as a wall of identically oriented symbols.
+meaning as circle orbs: soft edge falloff, not a hard text fill. Glyphs also
+get a seed-derived base angle so stills are not a wall of identically oriented
+symbols; animated outputs continue rotating per orb from that base angle.
 
 > **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
 > Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
