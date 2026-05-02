@@ -19,7 +19,7 @@
 const MAX_DIM: u32 = 8192;
 
 use orber_core::animate::{
-    generate_orb_params, render_frame, AnimateOptions, MotionDirection, MotionSpeed,
+    pack_render_data_for_webgl, render_frame, AnimateOptions, MotionDirection, MotionSpeed,
 };
 use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
@@ -644,55 +644,18 @@ fn pack_render_data(
     alpha_mul: f32,
     shape_id: f32,
 ) -> Vec<f32> {
-    let header_words = 16usize;
-    let per_orb_words = 16usize;
-    let mut buf = vec![0.0f32; header_words + per_orb_words * n_orbs];
-
-    // header
-    buf[0] = bg[0] as f32 / 255.0;
-    buf[1] = bg[1] as f32 / 255.0;
-    buf[2] = bg[2] as f32 / 255.0;
-    buf[3] = bg[3] as f32 / 255.0;
-    buf[4] = base_radius_unit;
-    buf[5] = base_blur;
-    buf[6] = direction_id;
-    buf[7] = cycle;
-    buf[8] = n_orbs as f32;
-    buf[9] = alpha_mul;
-    buf[10] = shape_id;
-    // [11..16] reserved (0)
-
-    if n_orbs == 0 || clusters.is_empty() {
-        return buf;
-    }
-
-    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
-    let params = generate_orb_params(seed, n_orbs, &cluster_weights);
-
-    for (i, p) in params.iter().enumerate() {
-        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
-
-        let off = header_words + per_orb_words * i;
-        buf[off] = c.color[0] as f32 / 255.0;
-        buf[off + 1] = c.color[1] as f32 / 255.0;
-        buf[off + 2] = c.color[2] as f32 / 255.0;
-        buf[off + 3] = c.weight.max(0.0);
-        buf[off + 4] = p.phase;
-        buf[off + 5] = p.phi_radius;
-        buf[off + 6] = p.phi_blur;
-        buf[off + 7] = p.phi_opacity;
-        buf[off + 8] = p.cross_axis;
-        buf[off + 9] = if p.style == orber_core::orb::OrbStyle::Rim {
-            0.0
-        } else {
-            1.0
-        };
-        buf[off + 10] = p.speed_mult as f32;
-        buf[off + 11] = p.base_angle;
-        buf[off + 12] = p.rot_speed_signed;
-        // [+13..+16] reserved
-    }
-    buf
+    pack_render_data_for_webgl(
+        clusters,
+        bg,
+        base_radius_unit,
+        base_blur,
+        direction_id,
+        cycle,
+        seed,
+        n_orbs,
+        alpha_mul,
+        shape_id,
+    )
 }
 
 /// Glyph 1 文字の SDF texture を JS 側に返す wasm wrapper。
@@ -1123,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_render_data_matches_core_generate_orb_params() {
+    fn pack_render_data_matches_core_pack_helper() {
         let mut p = base_params();
         p.k = 2;
         p.source_width = 2;
@@ -1160,31 +1123,18 @@ mod tests {
             softness.alpha_mul().clamp(0.0, 1.0),
             1.0,
         );
-
-        let weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
-        let params = generate_orb_params(spec.seed, n_orbs, &weights);
-        assert_eq!(params.len(), n_orbs);
-        for (i, param) in params.iter().enumerate() {
-            let c = &clusters[param.cluster_idx];
-            let off = 16 + 16 * i;
-            assert!((buf[off] - c.color[0] as f32 / 255.0).abs() < 1e-6);
-            assert!((buf[off + 1] - c.color[1] as f32 / 255.0).abs() < 1e-6);
-            assert!((buf[off + 2] - c.color[2] as f32 / 255.0).abs() < 1e-6);
-            assert!((buf[off + 3] - c.weight.max(0.0)).abs() < 1e-6);
-            assert!((buf[off + 4] - param.phase).abs() < 1e-6);
-            assert!((buf[off + 5] - param.phi_radius).abs() < 1e-6);
-            assert!((buf[off + 6] - param.phi_blur).abs() < 1e-6);
-            assert!((buf[off + 7] - param.phi_opacity).abs() < 1e-6);
-            assert!((buf[off + 8] - param.cross_axis).abs() < 1e-6);
-            let style_bit = if param.style == orber_core::orb::OrbStyle::Rim {
-                0.0
-            } else {
-                1.0
-            };
-            assert!((buf[off + 9] - style_bit).abs() < 1e-6);
-            assert!((buf[off + 10] - param.speed_mult as f32).abs() < 1e-6);
-            assert!((buf[off + 11] - param.base_angle).abs() < 1e-6);
-            assert!((buf[off + 12] - param.rot_speed_signed).abs() < 1e-6);
-        }
+        let expected = pack_render_data_for_webgl(
+            &clusters,
+            bg,
+            (64f32.min(64.0)) * 0.25 * spec.orb_size.max(0.0),
+            (spec.blur + softness.blur_offset()).clamp(0.0, 1.0),
+            direction_id,
+            speed.cycle_count() as f32,
+            spec.seed,
+            n_orbs,
+            softness.alpha_mul().clamp(0.0, 1.0),
+            1.0,
+        );
+        assert_eq!(buf, expected);
     }
 }

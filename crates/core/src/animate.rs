@@ -168,29 +168,28 @@ const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 /// なので `t=1` でループが閉じる。視覚的なバラつきの主因（#53 で 2 → 3 段階）。
 /// `base_angle` / `rot_speed_signed` は glyph 用の回転で、`cycle_count` と同じ
 /// 整数周期に乗せることで `t=0 ≡ t=1` を保つ。
-#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub struct OrbParams {
+struct OrbParams {
     /// 進行方向の初期位置 (0..1)。これだけで「速度違いに見える」効果を作る。
-    pub phase: f32,
+    phase: f32,
     /// 半径呼吸 sin の位相シフト。
-    pub phi_radius: f32,
+    phi_radius: f32,
     /// blur 呼吸 sin の位相シフト。radius と同期させない。
-    pub phi_blur: f32,
+    phi_blur: f32,
     /// opacity 呼吸 sin の位相シフト。3 軸を独立に。
-    pub phi_opacity: f32,
+    phi_opacity: f32,
     /// 描画スタイル（Rim / Soft）。seed 由来でほぼ 50:50 に振る。
-    pub style: OrbStyle,
+    style: OrbStyle,
     /// この orb の色 / weight を借りてくる元クラスタの index。
-    pub cluster_idx: usize,
+    cluster_idx: usize,
     /// 進行方向と直交する軸の位置 (0..1)。クラスタ重心に固定せず散らせる。
-    pub cross_axis: f32,
+    cross_axis: f32,
     /// 整数倍速度 (1 / 2 / 3)。MotionSpeed の cycle_count と掛け合わせて使う。
-    pub speed_mult: u32,
+    speed_mult: u32,
     /// glyph がある場合の初期回転角 [0, 2π)。
-    pub base_angle: f32,
+    base_angle: f32,
     /// glyph の signed 回転速度。±{1, 2, 3} で、絶対値は speed_mult と一致する。
-    pub rot_speed_signed: f32,
+    rot_speed_signed: f32,
 }
 
 /// 重み比例の 1 サンプルをもらう抽選器。
@@ -222,8 +221,7 @@ fn pick_weighted(rng: &mut ChaCha8Rng, weights: &[f32], total: f32) -> usize {
 /// `n_orbs` は要求される orb 数。`cluster_weights` は各クラスタの占有比で、
 /// orb の色割当（cluster_idx）に重み比例で使われる。`style` と `cluster_idx` は
 /// 整数を別途引いて分布の偏りを避ける。
-#[doc(hidden)]
-pub fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
+fn generate_orb_params(seed: u64, n_orbs: usize, cluster_weights: &[f32]) -> Vec<OrbParams> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let total_w: f32 = cluster_weights.iter().map(|w| w.max(0.0)).sum();
     (0..n_orbs)
@@ -283,6 +281,67 @@ fn splitmix64(mut x: u64) -> u64 {
 fn unit_from_hash(x: u64) -> f32 {
     let bits = (x >> 40) as u32;
     bits as f32 / ((1u32 << 24) as f32)
+}
+
+/// WebGL / wasm 向けに per-orb render data を詰めた Float32 words を返す。
+///
+/// `orber-wasm` が shape / softness / rotation を CPU 経路と同じ決定論性で
+/// WebGL へ渡すための purpose-built helper。内部 RNG 列や `OrbParams` の
+/// レイアウトは公開しない。
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn pack_render_data_for_webgl(
+    clusters: &[Cluster],
+    bg: [u8; 4],
+    base_radius_unit: f32,
+    base_blur: f32,
+    direction_id: f32,
+    cycle: f32,
+    seed: u64,
+    n_orbs: usize,
+    alpha_mul: f32,
+    shape_id: f32,
+) -> Vec<f32> {
+    let header_words = 16usize;
+    let per_orb_words = 16usize;
+    let mut buf = vec![0.0f32; header_words + per_orb_words * n_orbs];
+
+    buf[0] = bg[0] as f32 / 255.0;
+    buf[1] = bg[1] as f32 / 255.0;
+    buf[2] = bg[2] as f32 / 255.0;
+    buf[3] = bg[3] as f32 / 255.0;
+    buf[4] = base_radius_unit;
+    buf[5] = base_blur;
+    buf[6] = direction_id;
+    buf[7] = cycle;
+    buf[8] = n_orbs as f32;
+    buf[9] = alpha_mul;
+    buf[10] = shape_id;
+
+    if n_orbs == 0 || clusters.is_empty() {
+        return buf;
+    }
+
+    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
+    let params = generate_orb_params(seed, n_orbs, &cluster_weights);
+    for (i, p) in params.iter().enumerate() {
+        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
+        let off = header_words + per_orb_words * i;
+        buf[off] = c.color[0] as f32 / 255.0;
+        buf[off + 1] = c.color[1] as f32 / 255.0;
+        buf[off + 2] = c.color[2] as f32 / 255.0;
+        buf[off + 3] = c.weight.max(0.0);
+        buf[off + 4] = p.phase;
+        buf[off + 5] = p.phi_radius;
+        buf[off + 6] = p.phi_blur;
+        buf[off + 7] = p.phi_opacity;
+        buf[off + 8] = p.cross_axis;
+        buf[off + 9] = if p.style == OrbStyle::Rim { 0.0 } else { 1.0 };
+        buf[off + 10] = p.speed_mult as f32;
+        buf[off + 11] = p.base_angle;
+        buf[off + 12] = p.rot_speed_signed;
+    }
+    buf
 }
 
 /// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
