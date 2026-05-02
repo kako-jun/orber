@@ -1,17 +1,18 @@
 //! Glyph 形状の orb 描画モジュール。
 //!
-//! [`crate::orb::OrbShape::Glyph`] を選んだ orb は、円グラデではなく
-//! 1 文字のフォントアウトラインを fill した形状になる。文字色は orb の色、
-//! 不透明度は softness 軸 + per-orb 揺らぎで決まる。
+//! [`crate::orb::OrbShape::Glyph`] を選んだ orb は、フォントアウトラインを
+//! いったん SDF に焼いてから `blur` / `softness` / rotation 付きで
+//! サンプリングした形状になる。文字色は orb の色、不透明度は softness 軸 +
+//! per-orb 揺らぎで決まる。
 //!
 //! # 設計メモ
 //!
 //! - フォントは [`include_bytes!`] でクレートに埋め込み、`'static` バイト列を
 //!   そのまま [`ttf_parser::Face::parse`] に渡す。バイト列が静的なので
 //!   `Face<'static>` は `Send + Sync`、`OnceLock` 経由でプロセス全体で 1 回だけ初期化する
-//! - グリフごとの `bounding_box` / `outline` 計算をフレーム単位でやり直さないよう、
-//!   呼び出し側 ([`render_glyph_orb`]) は 1 度のアウトライン抽出で `tiny_skia::Path`
-//!   を作り、その後の塗りに使い回す前提
+//! - グリフごとの `bounding_box` / `outline` 計算は SDF bake 時にだけ行い、
+//!   呼び出し側 ([`render_glyph_orb`]) はキャッシュ済み texture を bilinear
+//!   sampling で使い回す
 //! - グリフが見つからない場合 ([`Face::glyph_index`] が `None` を返す or `outline_glyph`
 //!   が空アウトラインを返す) は **何も描画しない**。tofu は出さない。Phase A の方針として、
 //!   絵文字など Symbols 2 に無い文字は静かに無視する
@@ -22,6 +23,7 @@
 
 use crate::style::{falloff_curve, FalloffProfile};
 use std::collections::HashMap;
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform};
 use ttf_parser::{Face, OutlineBuilder, Rect};
@@ -30,6 +32,7 @@ use ttf_parser::{Face, OutlineBuilder, Rect};
 pub const DEFAULT_GLYPH_SDF_SIZE: u32 = 256;
 const MAX_GLYPH_SDF_SIZE: u32 = 1024;
 const GLYPH_SDF_RADIUS_FACTOR: f32 = 0.45;
+const GLYPH_SDF_CONTENT_SPAN: f32 = FRAC_1_SQRT_2;
 const GLYPH_SDF_MAX_DIST_FACTOR: f32 = 0.06;
 
 /// orber-core が同梱するフォント識別子。
@@ -189,7 +192,7 @@ fn render_glyph_binary_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
         None => return vec![0u8; (s as usize) * (s as usize)],
     };
     let center = (s as f32 * 0.5, s as f32 * 0.5);
-    let radius = (s as f32) * GLYPH_SDF_RADIUS_FACTOR;
+    let radius = (s as f32) * GLYPH_SDF_RADIUS_FACTOR * GLYPH_SDF_CONTENT_SPAN;
     let path = match build_glyph_path(font, ch, center, radius) {
         Some(p) => p,
         None => return vec![0u8; (s as usize) * (s as usize)],
@@ -424,8 +427,8 @@ pub fn render_glyph_orb(
             let dy = py - cy;
             let rx = cos_a * dx - sin_a * dy;
             let ry = sin_a * dx + cos_a * dy;
-            let u = rx / (2.0 * radius) + 0.5;
-            let v = ry / (2.0 * radius) + 0.5;
+            let u = rx / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
+            let v = ry / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
             if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                 continue;
             }
@@ -592,5 +595,46 @@ mod tests {
         assert_eq!(glyph_sdf_size_for_radius(8.0), DEFAULT_GLYPH_SDF_SIZE);
         assert_eq!(glyph_sdf_size_for_radius(160.0), 512);
         assert_eq!(glyph_sdf_size_for_radius(400.0), 1024);
+    }
+
+    #[test]
+    fn rotated_glyph_does_not_clip_severely() {
+        let mut plain = Pixmap::new(256, 256).unwrap();
+        let mut rotated = Pixmap::new(256, 256).unwrap();
+        render_glyph_orb(
+            &mut plain,
+            (128.0, 128.0),
+            80.0,
+            [255, 255, 255],
+            0.5,
+            1.0,
+            FalloffProfile::Rim,
+            GlyphFontId::NotoSymbols2,
+            '☆',
+            0.0,
+        );
+        render_glyph_orb(
+            &mut rotated,
+            (128.0, 128.0),
+            80.0,
+            [255, 255, 255],
+            0.5,
+            1.0,
+            FalloffProfile::Rim,
+            GlyphFontId::NotoSymbols2,
+            '☆',
+            std::f32::consts::FRAC_PI_4,
+        );
+        let lit_plain = plain.data().chunks_exact(4).filter(|p| p[3] > 0).count() as f32;
+        let lit_rotated = rotated
+            .data()
+            .chunks_exact(4)
+            .filter(|p| p[3] > 0)
+            .count() as f32;
+        let ratio = lit_rotated / lit_plain.max(1.0);
+        assert!(
+            ratio > 0.9,
+            "rotated glyph should keep most lit pixels; ratio={ratio}"
+        );
     }
 }

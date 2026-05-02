@@ -1,5 +1,5 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
-// orber#55 Phase B — Glyph shape (アウトライン fill) 経路と softness 軸を追加。
+// orber#55 Phase B — Glyph shape (SDF sampling) 経路と softness 軸を追加。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
@@ -7,9 +7,9 @@
 // パラメータを使うので、視覚パリティは「最終的な見た目が同じ」が保たれる。
 //
 // shape == "glyph" のときは、`u_glyph_sdf` (256x256 SDF texture) を `(cx, cy)`
-// 中心 + 半径 r の正方領域で sampling し、Circle と同じ falloff に流す。Circle 経路は
-// 既存の rim/soft グラデを維持し、`if u_shape_id == 0` 分岐で texture lookup を
-// skip して regression を避ける。
+// 中心の正方領域で sampling し、回転用 padding を残した中央帯だけを使って
+// Circle と同じ falloff に流す。Circle 経路は既存の rim/soft グラデを維持し、
+// `if u_shape_id == 0` 分岐で texture lookup を skip して regression を避ける。
 // softness の alpha_mul は per-orb opacity に乗算（CPU 経路と同式）、
 // blur_offset は wasm 側で base_blur に積算済みなので shader はそのまま使う。
 //
@@ -50,6 +50,7 @@ const PER_ORB_WORDS = 16;
 /// wasm `get_glyph_sdf` の `size` 引数と一致させる必要がある。
 /// 256 は GUI のプレビュー (360x640 / 640x360) でも十分な精度を保てる。
 export const GLYPH_SDF_SIZE = 256;
+const GLYPH_SDF_CONTENT_SPAN = 0.70710678;
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -189,7 +190,7 @@ void main() {
       float c = cos(angle);
       float s = sin(angle);
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
-      vec2 uv = rotated / (2.0 * radius) + 0.5;
+      vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
         float signed_unit = sdf01 * 2.0 - 1.0;
