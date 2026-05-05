@@ -459,6 +459,8 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
         // 同じ（rot ON でも turns=0）なので、デフォルト ON のまま渡しても
         // OFF と同じ静止画が出る。CLI 同等の互換性維持として true を渡す。
         glyph_rotate: true,
+        // #7: Web GUI は静止画入力のみなので color_tracks は常に None。
+        color_tracks: None,
     };
     let frame = render_frame(&clusters, &opts, 0.0);
     let png = encode_png_rgba(&frame)?;

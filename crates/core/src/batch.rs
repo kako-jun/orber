@@ -76,6 +76,7 @@ pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, BatchError> {
                 shape: input.shape,
                 softness: crate::style::SoftnessPreset::Mid,
                 glyph_rotate: true,
+                color_tracks: None,
             };
             let frame = render_frame(&clusters, &opts, 0.0);
             let mut buf = Vec::new();

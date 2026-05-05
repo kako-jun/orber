@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod video;
+mod video_input;
 use video::{render_video, VideoCodec, VideoOptions};
+use video_input::{build_color_tracks, is_video_path, sample_video_frames};
 
 /// Conveyor-belt direction (`--direction`). All orbs flow the same way for the entire clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -349,6 +351,15 @@ fn main() -> ExitCode {
     warn_if_glyph_char_unsupported(&cli);
 
     if let Some(n) = cli.variations {
+        // #7 review M1: video + --variations は未対応経路。`render_variations` は
+        // `image::open` を直に叩くので動画を渡すと「decoder error」で落ち、
+        // ユーザーには「動画が壊れている」かのように見えてしまう。明示エラーで弾く。
+        if is_video_path(&cli.input) {
+            eprintln!(
+                "orber: --variations is not supported with video input; use --output FILE.mp4 / .webm / .png instead"
+            );
+            return ExitCode::from(2);
+        }
         return render_variations(&cli, n);
     }
 
@@ -367,6 +378,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // #7: 入力ファイルが動画なら動画入力経路へ分岐。
+    // 静止画入力は従来どおり既存パスを通る。
+    if is_video_path(&cli.input) {
+        return run_video_input(&cli, &output, mode);
+    }
 
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         return render_video_path(&cli, &output, codec);
@@ -515,6 +532,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         background,
         shape: cli.orb_shape(),
         softness: cli.resolved_softness(),
+        color_tracks: None,
     };
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -570,6 +588,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         shape: cli.orb_shape(),
         softness: cli.resolved_softness(),
         glyph_rotate: true,
+        color_tracks: None,
     };
     let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
@@ -580,6 +599,128 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     }
     eprintln!("orber: wrote {}", output.display());
     ExitCode::SUCCESS
+}
+
+/// 動画入力（#7）に使うサンプル数。
+///
+/// 色変化を「ある程度滑らかに乗せる」目的で 20 枚に固定。
+/// per-sample に ffmpeg を 1 回ずつ起動するので、増やすと前処理時間が線形に伸びる。
+const VIDEO_INPUT_N_SAMPLES: usize = 20;
+
+/// 動画入力（#7）経路。
+///
+/// - `ffprobe` / `ffmpeg` でフレーム N 枚をサンプリング
+/// - 先頭フレーム k=6 で位置・重み・テンプレート色を決め、各サンプルとの LAB マッチングで color tracks を作る
+/// - orb の位置 / 個数は時間で動かない（先頭フレームの k-means 結果で固定）
+/// - 出力時刻 t ∈ [0, 1] は出力動画の t（duration_ms で決まる）にマップされ、
+///   `interpolate_color_track` が「入力動画時刻」ごとの色を引いてくる
+///
+/// 出力長は `--duration-ms` で独立に決まる（入力動画の長さは色サンプル列の
+/// サイズだけに影響する）。
+fn run_video_input(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
+    eprintln!(
+        "orber: sampling {} frames from {}...",
+        VIDEO_INPUT_N_SAMPLES,
+        cli.input.display()
+    );
+    let samples = match sample_video_frames(&cli.input, VIDEO_INPUT_N_SAMPLES) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("orber: video input failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!("orber: extracted {} sample frame(s)", samples.len());
+
+    // k=6 で先頭フレームを基準にしてテンプレートクラスタとトラックを構築。
+    let color_tracks_data = match build_color_tracks(&samples, 6) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("orber: color track build failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 既存の静止画経路と挙動を揃えるため、derive_background + drop_dominant を適用。
+    // 同じ index フィルタを tracks にも適用しないと、cluster_idx と tracks の対応が
+    // 崩れるので、`drop_dominant` 相当を template_clusters と tracks に同時に効かせる。
+    let template_clusters = color_tracks_data.template_clusters.clone();
+    let dominant_idx = template_clusters
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
+        .map(|(i, _)| i);
+    let background = orber_core::cluster::derive_background_rgba(&template_clusters);
+
+    let (orb_clusters, orb_tracks): (Vec<_>, Vec<_>) = template_clusters
+        .iter()
+        .zip(color_tracks_data.tracks.iter())
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != dominant_idx)
+        .map(|(_, (c, t))| (*c, t.clone()))
+        .unzip();
+    warn_if_orb_pool_empty(&orb_clusters);
+    warn_if_aquarelle_count_ignored(cli);
+
+    // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
+    if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        let (direction, speed) = resolve_motion(cli);
+        let opts = VideoOptions {
+            orb_size: cli.orb_size,
+            blur: cli.blur,
+            saturation: cli.saturation,
+            direction,
+            speed,
+            seed: cli.seed,
+            count: Some(cli.resolved_count()),
+            background,
+            shape: cli.orb_shape(),
+            softness: cli.resolved_softness(),
+            color_tracks: Some(orb_tracks),
+        };
+        if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
+            eprintln!("orber: video render failed: {e}");
+            return ExitCode::from(2);
+        }
+        eprintln!("orber: wrote {}", output.display());
+        return ExitCode::SUCCESS;
+    }
+
+    match mode {
+        OutputMode::Png => {
+            // PNG は t=0 の 1 枚（=入力動画の先頭フレームの色）。
+            let (direction, speed) = resolve_motion(cli);
+            let frame_opts = orber_core::animate::AnimateOptions {
+                width: RenderOptions::default().width,
+                height: RenderOptions::default().height,
+                orb_size: cli.orb_size,
+                blur: cli.blur,
+                saturation: cli.saturation,
+                direction,
+                speed,
+                seed: cli.seed,
+                count: Some(cli.resolved_count()),
+                background,
+                shape: cli.orb_shape(),
+                softness: cli.resolved_softness(),
+                glyph_rotate: true,
+                color_tracks: Some(orb_tracks),
+            };
+            let img = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+            if let Err(e) = img.save(output) {
+                eprintln!("orber: failed to write output {}: {e}", output.display());
+                return ExitCode::from(2);
+            }
+            eprintln!("orber: wrote {}", output.display());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!(
+                "orber: video input + output mode {mode:?} is not supported (use mp4 / webm / png)"
+            );
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `--variations` 経路。`output_dir` を作って各 spec で逐次書き出す。
@@ -698,6 +839,7 @@ fn render_one_variation(
                 shape: orb_shape,
                 softness,
                 glyph_rotate: true,
+                color_tracks: None,
             };
             let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
@@ -714,6 +856,7 @@ fn render_one_variation(
                 background: bg_rgba,
                 shape: orb_shape,
                 softness,
+                color_tracks: None,
             };
             render_video(
                 clusters,

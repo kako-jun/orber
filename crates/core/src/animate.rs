@@ -43,6 +43,7 @@
 //!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
 
 use crate::cluster::Cluster;
+use crate::color_track::interpolate_color_track;
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use crate::style::{FalloffProfile, SoftnessPreset};
 use image::RgbaImage;
@@ -133,6 +134,14 @@ pub struct AnimateOptions {
     /// `false` で全 t において base_angle を保ち、glyph は静止向きで描かれる。
     /// Circle / Aquarelle 経路では使われない。既定 `true` で互換維持。
     pub glyph_rotate: bool,
+    /// 動画入力（#7）の per-cluster 色トラック。
+    ///
+    /// `Some(tracks)` のとき、各 orb の `cluster.color` は
+    /// `interpolate_color_track(tracks[cluster_idx], t)` で動的に上書きされる。
+    /// `tracks.len()` が clusters の数より少ない場合（理論上ないが防衛）や、
+    /// 個別 track が空の場合は `cluster.color` にフォールバックする。
+    /// `None` は静止画入力の従来挙動（色固定）。
+    pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
 }
 
 impl Default for AnimateOptions {
@@ -151,6 +160,7 @@ impl Default for AnimateOptions {
             shape: OrbShape::Circle,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            color_tracks: None,
         }
     }
 }
@@ -356,6 +366,31 @@ pub fn pack_render_data_for_webgl(
     buf
 }
 
+/// 動画入力（#7）: `color_tracks` が指定されているときは `tracks[cluster_idx]` を
+/// `t` で線形補間した色を返す。指定が無い・index 範囲外・track が空のときは
+/// `fallback`（cluster.color）にフォールバックする。
+///
+/// 補間そのものは [`crate::color_track::interpolate_color_track`] が担い、
+/// この関数は「track が無い場合の素通し」を担当するだけの薄いラッパー。
+#[inline]
+fn pick_color_at_t(
+    tracks: Option<&[Vec<[u8; 3]>]>,
+    cluster_idx: usize,
+    fallback: [u8; 3],
+    t: f32,
+) -> [u8; 3] {
+    let Some(tracks) = tracks else {
+        return fallback;
+    };
+    let Some(track) = tracks.get(cluster_idx) else {
+        return fallback;
+    };
+    if track.is_empty() {
+        return fallback;
+    }
+    interpolate_color_track(track, t)
+}
+
 /// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
 ///
 /// `f` と `scale` がともに整数のとき、`t = 1.0` ちょうどで `(f * t * scale)` は
@@ -489,7 +524,13 @@ pub fn render_frame_with_params(
 
     for p in params.iter() {
         // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
-        let c = &clusters[p.cluster_idx.min(clusters.len() - 1)];
+        let cluster_idx = p.cluster_idx.min(clusters.len() - 1);
+        let c = &clusters[cluster_idx];
+
+        // 動画入力（#7）: color_tracks が指定されているときは時刻 t の補間色で
+        // cluster.color を上書きする。指定が無い、track が短い、空の場合は
+        // cluster.color にフォールバック。位置・サイズ・揺らぎは変えない。
+        let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, c.color, t);
 
         // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
         // r_normalized は進行軸 [0,1] スケールにおける半径相当。
@@ -539,7 +580,7 @@ pub fn render_frame_with_params(
         // 安全にクリップする（半透明グラデのカウントだけ無駄に走るが、許容範囲）。
         let cx = nx * width as f32;
         let cy = ny * height as f32;
-        let rgb = adjust_saturation_pub(c.color, saturation);
+        let rgb = adjust_saturation_pub(color_at_t, saturation);
         let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
         // softness の alpha 倍率を per-orb の opacity_factor に積算（Mid なら ×1.0 で同値）。
         let opacity = (opacity_factor * softness_alpha_mul).clamp(0.0, 1.0);
@@ -671,7 +712,8 @@ fn render_frame_aquarelle(
     let modulated: Vec<Cluster> = clusters
         .iter()
         .zip(params.iter())
-        .map(|(c, p)| {
+        .enumerate()
+        .map(|(idx, (c, p))| {
             let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
             let progress = (p.phase + advance).rem_euclid(1.0);
             let (nx, ny) = match opts.direction {
@@ -682,8 +724,11 @@ fn render_frame_aquarelle(
             };
             let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
+            // 動画入力（#7）: cluster.color を時刻 t の色に置換。Aquarelle は
+            // cluster ループなので idx をそのまま使う（cluster_idx == idx）。
+            let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t);
             Cluster {
-                color: c.color,
+                color: color_at_t,
                 centroid: Centroid { x: nx, y: ny },
                 weight: (c.weight * weight_scale).max(0.0),
             }
@@ -761,6 +806,7 @@ mod tests {
             shape: OrbShape::Circle,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            color_tracks: None,
         }
     }
 
