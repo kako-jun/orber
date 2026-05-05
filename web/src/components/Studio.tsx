@@ -705,20 +705,27 @@ export default function Studio() {
 
   const applyGlyphChar = (raw: string) => {
     const first = [...raw][0] ?? '';
+    const changed = first !== glyphChar();
     setGlyphChar(first);
-    // #136: glyph 切替時は GLYPH_DEFAULT_ROTATE で checkbox 既定値を上書きする。
+    // #136: glyph 切替時のみ GLYPH_DEFAULT_ROTATE で checkbox 既定値を上書きする。
     // 雷 ⚡ や太陽 ☀ は OFF、それ以外は ON。これにより「⚡ を選んだら自然に
-    // 静止する」体験になる。ユーザーが直後に checkbox を切替えれば尊重される。
+    // 静止する」体験になる。ユーザーが直後に checkbox を切替えれば尊重され、
+    // 同じ glyph を再入力しても ON/OFF は維持される（review S2）。
     if (first.length > 0) {
-      setGlyphRotate(GLYPH_DEFAULT_ROTATE[first] ?? true);
+      if (changed) setGlyphRotate(GLYPH_DEFAULT_ROTATE[first] ?? true);
       runBatchIfReady();
     }
     return first;
   };
 
   const onGlyphPickerClick = (sym: string) => {
+    // #136: 同じ glyph 再クリックでは default を再適用しない（review S2）。
+    // ユーザーが手動で OFF にした後ピッカーで再選択しても OFF のまま保たれる。
+    if (sym === glyphChar()) {
+      runBatchIfReady();
+      return;
+    }
     setGlyphChar(sym);
-    // #136: ピッカー経由の切替も既定値テーブルを参照する。
     setGlyphRotate(GLYPH_DEFAULT_ROTATE[sym] ?? true);
     runBatchIfReady();
   };

@@ -95,10 +95,9 @@ pub struct WasmParams {
     pub softness_preset: String,
     /// Glyph 形状時に per-orb 回転をアニメーションさせるか（#136）。
     /// `true` で従来挙動、`false` で全 t において base_angle を保つ静止描画。
-    /// Circle 形状では使われない。`#[serde(default)]` で省略時は `false` だが、
-    /// 既存呼び出しの後方互換のため、UI 側は明示的に true を送ることを推奨。
-    /// 既存の identity 系テストはデフォルト `false` でも `true` でも shape!=glyph
-    /// なら結果不変なので、既存の wasm caller は影響を受けない。
+    /// Circle 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
+    /// で省略時は `true`（従来挙動互換）。既存の wasm caller が `glyph_rotate`
+    /// フィールドを送っていなくても `true` でデシリアライズされるため影響を受けない。
     #[serde(default = "default_glyph_rotate")]
     pub glyph_rotate: bool,
 }
