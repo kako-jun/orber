@@ -114,9 +114,10 @@ export function detectLang(): Lang {
   return navigator.language.toLowerCase().startsWith('ja') ? 'ja' : 'en';
 }
 
-// SSR-safe: Astro の SSR 段階では navigator が無いので en で初期化される。
-// hydration 後 onMount で setLang(detectLang()) を呼ぶことで ja に切り替わる。
-const [lang, setLang] = createSignal<Lang>('en');
+// SSR-safe: navigator 未定義時 (SSR) は en で初期化される。
+// クライアントではモジュール init 時に detectLang() で正しい言語に切り替わるため、
+// Subtitle の onMount を待たずに全島が初期描画から正しい言語で表示される。
+const [lang, setLang] = createSignal<Lang>(detectLang());
 export { lang, setLang };
 
 export type StringKey = keyof typeof STRINGS;
