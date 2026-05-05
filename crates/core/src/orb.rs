@@ -91,7 +91,7 @@ pub struct RenderOptions {
     pub background: [u8; 4],
     /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
     pub shape: OrbShape,
-    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    /// ぼかし (Softness) preset（#55, #131 で改名）。Mid で既存挙動と完全同値。
     pub softness: SoftnessPreset,
 }
 

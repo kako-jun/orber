@@ -126,7 +126,7 @@ pub struct AnimateOptions {
     pub background: [u8; 4],
     /// orb の描画形式。
     pub shape: OrbShape,
-    /// コントラスト preset（#55）。Mid で既存挙動と完全同値。
+    /// ぼかし (Softness) preset（#55, #131 で改名）。Mid で既存挙動と完全同値。
     pub softness: SoftnessPreset,
 }
 
