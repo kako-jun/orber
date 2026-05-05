@@ -107,6 +107,17 @@ export const STRINGS = {
     ja: 'ダウンロード準備に失敗しました',
     en: 'Failed to prepare download',
   },
+  // #56: ZIP DL に透過版 (PNG / WebP / WebM VP9 alpha) を同梱するかの checkbox。
+  // 既定 OFF（既存 byte-exact 出力を保つため）。disabled tooltip は Safari など
+  // VP9 alpha encoding 非対応ブラウザでのフォールバック用。
+  includeAlphaLabel: {
+    ja: '透過版を DL に含める',
+    en: 'Include transparent versions',
+  },
+  includeAlphaDisabledTitle: {
+    ja: 'お使いのブラウザは透過動画 (WebM VP9 alpha) のエンコードに対応していません',
+    en: "This browser cannot encode transparent video (WebM VP9 alpha)",
+  },
   variationAlt: { ja: 'バリエーション {n}', en: 'Variation {n}' },
   variationAnimatedAlt: {
     ja: 'バリエーション {n} (動画)',

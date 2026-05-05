@@ -6,10 +6,13 @@ import {
   onWorkerCrash,
   terminateAndRespawn,
   workerAnimateOne,
+  workerAnimateOneAlpha,
   workerGenerateOne,
+  workerGenerateOneAlpha,
   workerGlyphSupported,
   workerInit,
   workerSetSource,
+  workerVp9AlphaSupported,
 } from '../lib/orberClient';
 import { t, lang } from '../lib/strings';
 
@@ -111,6 +114,11 @@ export default function Studio() {
   // ユーザーが checkbox を切替えるとその session 中は尊重し、次の glyph 切替で
   // 再度 default が適用される。既定 true（既存挙動互換）。
   const [glyphRotate, setGlyphRotate] = createSignal<boolean>(true);
+  // #56: 透過版を ZIP DL に同梱するかの checkbox。既定 OFF を厳守
+  // （OFF なら既存挙動と byte-exact identity を保つ）。Safari などで VP9 alpha
+  // encode が使えないと vp9AlphaSupported が false になり、checkbox は disabled。
+  const [includeAlpha, setIncludeAlpha] = createSignal<boolean>(false);
+  const [vp9AlphaSupported, setVp9AlphaSupported] = createSignal<boolean>(true);
   const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
@@ -198,6 +206,18 @@ export default function Studio() {
       // 待つことで、初回ドロップ時の体感を「即生成開始」に保つ。
       await workerInit();
       setWasmStatus('ready');
+      // #56: VP9 alpha encode は Safari (現時点で WebCodecs 非対応分岐) では
+      // 使えないので、checkbox を disabled に倒すために事前 probe する。失敗
+      // しても致命ではない（false に倒すだけ）。worker 内でキャッシュされる。
+      try {
+        const ok = await workerVp9AlphaSupported();
+        setVp9AlphaSupported(ok);
+        if (!ok) setIncludeAlpha(false);
+      } catch (probeErr) {
+        console.warn('vp9 alpha probe failed', probeErr);
+        setVp9AlphaSupported(false);
+        setIncludeAlpha(false);
+      }
     } catch (e) {
       console.error('failed to init orber worker', e);
       setWasmErr(String(e));
@@ -818,7 +838,8 @@ export default function Studio() {
       glyph_rotate: glyphRotate(),
     };
 
-    setDlProgress({ done: 0, total: indices.length });
+    // #56: dlProgress.total は呼び出し側 (downloadIndices) で先に立てる。
+    // alpha 同梱時は indices.length * 2 にしたいので、ここで上書きしない。
     for (const i of indices) {
       if (i < stillCount || !useWebCodecs) {
         // 静止タイル、または WebCodecs 非対応環境では hi-res の t=0 PNG。
@@ -839,24 +860,138 @@ export default function Studio() {
     return out;
   };
 
+  // #56: 透過 alpha 版を hi-res で再レンダリングする。non-alpha と完全に同じ
+  // hiParams / 同じ total で worker に投げ、worker 側で bg.a だけを 0 に上書き
+  // して描画する（spec 列・解像度・形状はピクセルレベルで一致）。返り値は:
+  //   - 静止タイル (i < stillCount): PNG + WebP の 2 ファイル
+  //   - 動画タイル: WebM (VP9 alpha 'keep') 1 ファイル
+  // 各 yield ごとに dlProgress.done を進めるので、UI 側で「N/Total」表示が
+  // alpha 経路の進捗も含めて連続的に伸びる。
+  const renderAlphaForIndices = async (
+    indices: number[],
+  ): Promise<Map<number, { still?: { png: Blob; webp: Blob }; video?: Blob }>> => {
+    const out = new Map<number, { still?: { png: Blob; webp: Blob }; video?: Blob }>();
+    if (indices.length === 0) return out;
+    if (lastBaseSeed === null || lastSourceRef === null) {
+      throw new Error('cannot render alpha: missing seed / source');
+    }
+
+    const a = tilesAspect();
+    const [hiW, hiH] =
+      a === 'portrait'
+        ? [DL_W_PORTRAIT, DL_H_PORTRAIT]
+        : [DL_W_LANDSCAPE, DL_H_LANDSCAPE];
+    const total = batchN();
+    const stillCount = total - VIDEO_TILE_COUNT;
+    const useWebCodecs = isWebCodecsSupported();
+
+    const hiParams = {
+      k: 5,
+      width: hiW,
+      height: hiH,
+      seed: lastBaseSeed,
+      direction: 'lr',
+      speed: 'slow',
+      count: 20,
+      orb_size: 3.0,
+      blur: 0.5,
+      shape: shape(),
+      glyph_char: shape() === 'glyph' ? glyphChar() : '',
+      count_preset: countPreset(),
+      speed_preset: speedPreset(),
+      softness_preset: softnessPreset(),
+      glyph_rotate: glyphRotate(),
+    };
+
+    for (const i of indices) {
+      if (i < stillCount) {
+        // 静止タイル: 透過 PNG + 透過 WebP の 2 種を出力。
+        const [png, webp] = await Promise.all([
+          workerGenerateOneAlpha(hiParams, total, i, 'png'),
+          workerGenerateOneAlpha(hiParams, total, i, 'webp'),
+        ]);
+        out.set(i, { still: { png, webp } });
+      } else if (useWebCodecs && vp9AlphaSupported()) {
+        // 動画タイル: 透過 WebM (VP9 alpha 'keep')。
+        const webm = await workerAnimateOneAlpha(
+          hiParams,
+          total,
+          i,
+          ANIM_TOTAL_FRAMES,
+        );
+        out.set(i, { video: webm });
+      }
+      // VP9 alpha 非対応 + 動画タイル の組合せは silently skip。checkbox を
+      // disabled で塞ぐ実装なので通常パスでは到達しない（防御的 fallback）。
+      setDlProgress((p) => ({ ...p, done: p.done + 1 }));
+      await yieldFrame();
+    }
+    return out;
+  };
+
   const downloadIndices = async (indices: number[]) => {
     if (indices.length === 0) return;
     setDownloading(true);
     setErrorMsg('');
     try {
+      // #56: alpha 同梱時は hi-res 経路を 2 周走らせるので、進捗 total は 2x。
+      // renderHiResForIndices 冒頭で setDlProgress({done:0, total:indices.length})
+      // していたのを上書きするため、ここで先に正しい total を立てる。
+      const wantAlpha = includeAlpha() && vp9AlphaSupported();
+      setDlProgress({
+        done: 0,
+        total: wantAlpha ? indices.length * 2 : indices.length,
+      });
       const rendered = await renderHiResForIndices(indices);
       // index 順を保ってファイル名を 01, 02, ... に振る。
       const sorted = Array.from(rendered.entries()).sort((a, b) => a[0] - b[0]);
       const ts = downloadTimestamp();
-      if (sorted.length === 1) {
+      // #56: alpha OFF + 単一選択のときだけ単発 DL（裸ファイルが降る）。
+      // alpha ON のときは 1 枚選択でも zip 経路に落として `alpha/` サブフォルダを
+      // 同梱する（裸ファイル + フォルダの混在が出来ないため zip にまとめる）。
+      if (sorted.length === 1 && !wantAlpha) {
         triggerDownload(sorted[0][1].blob, `orber-${ts}.${sorted[0][1].ext}`);
         return;
       }
       const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
-      sorted.forEach(([, { blob, ext }], n) => {
-        zip.file(`orber-${ts}_${String(n + 1).padStart(2, '0')}.${ext}`, blob);
+      // sorted は [origIdx, {blob,ext}] の昇順。連番 (01, 02, ...) は配列順で振る。
+      // alpha 経路でも同じ連番を使うので、orig→seq の対応 Map を作る。
+      const seqByOrig = new Map<number, number>();
+      sorted.forEach(([orig, { blob, ext }], n) => {
+        const seq = n + 1;
+        seqByOrig.set(orig, seq);
+        zip.file(`orber-${ts}_${String(seq).padStart(2, '0')}.${ext}`, blob);
       });
+      if (wantAlpha) {
+        // dlProgress を引き継ぐ（renderHiResForIndices で done = indices.length に
+        // 達している）。renderAlphaForIndices は yield 毎に done++。
+        const alpha = await renderAlphaForIndices(indices);
+        const alphaFolder = zip.folder('alpha');
+        if (alphaFolder) {
+          for (const [orig, parts] of alpha) {
+            const seq = seqByOrig.get(orig);
+            if (seq === undefined) continue;
+            const padded = String(seq).padStart(2, '0');
+            if (parts.still) {
+              alphaFolder.file(
+                `orber-${ts}_${padded}-alpha.png`,
+                parts.still.png,
+              );
+              alphaFolder.file(
+                `orber-${ts}_${padded}-alpha.webp`,
+                parts.still.webp,
+              );
+            }
+            if (parts.video) {
+              alphaFolder.file(
+                `orber-${ts}_${padded}-alpha.webm`,
+                parts.video,
+              );
+            }
+          }
+        }
+      }
       const zipBlob = await zip.generateAsync({ type: 'blob' });
       triggerDownload(zipBlob, `orber-${ts}.zip`);
     } catch (e) {
@@ -1118,6 +1253,28 @@ export default function Studio() {
               </svg>
             </button>
           </div>
+        </div>
+
+        {/* #56: 透過版を ZIP DL に同梱する checkbox。aspect の直下 (= DL に影響する
+            設定の最上段) に置き、4 軸 segmented row 群とは視覚的に分けるため
+            col-span-2 で row 全体を使い、中央寄せで一行に収める。OFF 既定で
+            既存挙動と byte-exact identity を保つ (#56 受け入れ条件)。VP9 alpha
+            非対応 (Safari) では disabled + tooltip を出す。glass checkbox 共通
+            tokens (#136 で確立) を踏襲。 */}
+        <div class="col-span-2 flex justify-center">
+          <label
+            class={GLASS_CHECKBOX_LABEL}
+            title={!vp9AlphaSupported() ? t('includeAlphaDisabledTitle') : ''}
+          >
+            <input
+              type="checkbox"
+              class={GLASS_CHECKBOX_INPUT}
+              checked={includeAlpha()}
+              onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
+              disabled={!decoded() || downloading() || !vp9AlphaSupported()}
+            />
+            <span>{t('includeAlphaLabel')}</span>
+          </label>
         </div>
 
         <label class="justify-self-end text-sm text-fgMuted">{t('shapeLabel')}:</label>

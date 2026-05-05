@@ -407,3 +407,69 @@ speed / softness without dropping to the terminal.
   during composition and trims to the first Unicode character on commit. A symbol
   picker is shown under the glyph row and is filtered to characters that the
   bundled font actually supports.
+
+## Transparent download bundle (#56)
+
+The Web GUI offers an opt-in checkbox — "透過版を DL に含める / Include
+transparent versions" — that ships transparent renders of every selected
+tile alongside the regular background-filled outputs. The toggle sits
+directly under the aspect row (it affects the download payload, so it
+clusters with the other DL-affecting setting). It is OFF by default; flipping
+it ON changes only the download path and never affects the on-screen tiles
+(those keep their dominant-colour background fill).
+
+When the checkbox is ON, the resulting `orber-{ts}.zip` looks like:
+
+```
+orber-{ts}.zip
+├─ orber-{ts}_01.png ... _08.png       (background-filled stills, unchanged)
+├─ orber-{ts}_09.mp4 ... _12.mp4       (background-filled videos, unchanged)
+└─ alpha/
+   ├─ orber-{ts}_01-alpha.png          (transparent PNG, lossless)
+   ├─ orber-{ts}_01-alpha.webp         (transparent WebP, quality 0.9)
+   ├─ ...
+   ├─ orber-{ts}_09-alpha.webm         (transparent VP9 alpha 'keep')
+   ├─ orber-{ts}_10-alpha.webm
+   ├─ orber-{ts}_11-alpha.webm
+   └─ orber-{ts}_12-alpha.webm
+```
+
+Stills get both PNG (lossless reference) and WebP (smaller, lossy q=0.9) so
+downstream workflows can pick either. Videos use **VP9 with `alpha: 'keep'`**
+muxed into WebM via `webm-muxer`. MP4 has no alpha track in any commonly
+supported profile, so the transparent video format is necessarily different
+from the background-filled `.mp4`.
+
+Implementation notes:
+
+- The alpha render path is bit-for-bit the same render pipeline as the
+  background-filled path. The worker reuses the existing
+  `wasm.get_render_data(...)` output and only patches header word 3
+  (`bg.a` in 0..1) to `0` before calling `setRenderData`. Same `seed`,
+  same `spec`, same SDF, same shader — only the background plane changes.
+  This guarantees the alpha tile is the *same variation* as the visible
+  preview tile, just unfilled.
+- Encoders: `OffscreenCanvas.convertToBlob({type:'image/png'})` and
+  `convertToBlob({type:'image/webp', quality:0.9})` for stills;
+  `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` + `webm-muxer` for
+  videos. The encoder branch lives in `web/src/lib/encodeWebmAlpha.ts`,
+  parallel to the existing `encodeMp4.ts`.
+- Browser support: Chromium and recent Firefox encode VP9 alpha. Safari
+  does **not** at the time of writing, so the worker probes
+  `VideoEncoder.isConfigSupported({codec, alpha:'keep'})` once and exposes
+  the result as `workerVp9AlphaSupported()`. When it returns `false`, the
+  Studio surface forces the checkbox into a disabled state with a tooltip
+  rather than splitting the bundle (no partial WebP-only fallback — the
+  whole feature is gated). The probe result is cached for the worker's
+  lifetime.
+- Progress: when the toggle is ON, `dlProgress.total` is set to
+  `indices.length * 2` so the existing "Rendering high-res… N / Total"
+  text covers both the background-filled pass and the alpha pass with
+  monotonically increasing N. No extra UI string is needed.
+- OFF path identity: when the checkbox is OFF (default), `downloadIndices`
+  never instantiates the alpha helpers and never calls the new worker
+  RPCs (`generateOneAlpha` / `animateOneAlpha`). The pre-#56 download is
+  byte-exact identical.
+
+The CLI is unaffected — it already takes file paths, and adding alpha
+flags there is out of scope for #56.
