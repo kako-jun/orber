@@ -20,6 +20,7 @@
 
 use image::RgbImage;
 use orber_core::cluster::{extract_clusters, Cluster};
+use orber_core::keyframe_track::KeyframeClusterPoint;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -431,6 +432,137 @@ fn lab_f(t: f32) -> f32 {
     }
 }
 
+/// 動画入力（#33）: キーフレーム時間軸に沿った per-cluster の (color + centroid + weight + time) 列。
+///
+/// `template_clusters` は先頭サンプルから抽出した k クラスタの便宜的スナップショット。
+/// orb プールの初期構築（[`crate::main::run_video_input`] の `derive_background` /
+/// `drop_dominant` 経路など）で使う。`tracks[i]` は `template_clusters[i]` に対応する
+/// 時間軸キーポイント列で、長さは `samples.len()`。
+#[derive(Debug, Clone)]
+pub struct KeyframeTracks {
+    pub template_clusters: Vec<Cluster>,
+    pub tracks: Vec<Vec<KeyframeClusterPoint>>,
+}
+
+/// 各キーフレームから k クラスタを抽出 → 先頭フレームを「テンプレート」として
+/// LAB 距離 greedy マッチングで時間軸を追跡し、cluster ごとに
+/// `KeyframeClusterPoint` の時系列キー列を作る。
+///
+/// マッチング失敗（k クラスタ未満が抽出された / 距離マッチが見つからなかった）の
+/// 場合は **hold-last**：直前のキーの (color, centroid, weight) をそのまま引き継ぐ。
+/// 引き継ぐと次のキーが見つかった時点で通常補間に戻るので、補間が破綻しない。
+///
+/// `tracks[i].len()` は `samples.len()` と一致する。`tracks[i][s].time` は
+/// `samples[s].t` と一致する（[0, 1] の正規化時刻）。
+pub fn build_keyframe_tracks(
+    samples: &[VideoSample],
+    k: usize,
+) -> Result<KeyframeTracks, VideoInputError> {
+    if samples.is_empty() {
+        return Err(VideoInputError::NoFramesExtracted);
+    }
+    if k == 0 {
+        return Err(VideoInputError::ZeroSamples);
+    }
+
+    let template_clusters = extract_clusters(&samples[0].frame, k)
+        .map_err(|e| VideoInputError::ClusterExtractionFailed { source: e.to_string() })?;
+
+    let n_samples = samples.len();
+    let n_clusters = template_clusters.len();
+
+    // 初期化: 各 track を「先頭サンプルのテンプレート値で全 sample 埋め」しておく。
+    // 後続の sample でマッチング成功すれば上書き、失敗すれば直前のキーを hold-last
+    // するので、初期値は防衛のためのフォールバック（=テンプレート値）。
+    let mut tracks: Vec<Vec<KeyframeClusterPoint>> = template_clusters
+        .iter()
+        .map(|c| {
+            (0..n_samples)
+                .map(|s_idx| KeyframeClusterPoint {
+                    color: c.color,
+                    centroid: c.centroid,
+                    weight: c.weight,
+                    time: samples[s_idx].t,
+                })
+                .collect()
+        })
+        .collect();
+
+    for (s_idx, sample) in samples.iter().enumerate() {
+        if s_idx == 0 {
+            // 先頭サンプルはテンプレートそのもの。time だけ samples[0].t を使う。
+            for (i, c) in template_clusters.iter().enumerate() {
+                tracks[i][0] = KeyframeClusterPoint {
+                    color: c.color,
+                    centroid: c.centroid,
+                    weight: c.weight,
+                    time: sample.t,
+                };
+            }
+            continue;
+        }
+
+        let sample_clusters = match extract_clusters(&sample.frame, k) {
+            Ok(c) => c,
+            Err(_) => {
+                // クラスタ抽出に失敗: 全 cluster で前キーを hold-last。
+                for track in tracks.iter_mut().take(n_clusters) {
+                    let prev = track[s_idx - 1];
+                    track[s_idx] = KeyframeClusterPoint {
+                        color: prev.color,
+                        centroid: prev.centroid,
+                        weight: prev.weight,
+                        time: sample.t,
+                    };
+                }
+                continue;
+            }
+        };
+
+        // greedy 最近傍マッチング（template_clusters の color と sample_clusters の color を
+        // LAB ΔE76 で比較）。template index 順に最近傍を取り、双方を使用済みにする。
+        let mut sample_used = vec![false; sample_clusters.len()];
+        for (t_idx, t_c) in template_clusters.iter().enumerate() {
+            let mut best_idx: Option<usize> = None;
+            let mut best_d = f32::MAX;
+            for (s_c_idx, s_c) in sample_clusters.iter().enumerate() {
+                if sample_used[s_c_idx] {
+                    continue;
+                }
+                let d = lab_distance_rgb(t_c.color, s_c.color);
+                if d < best_d {
+                    best_d = d;
+                    best_idx = Some(s_c_idx);
+                }
+            }
+            if let Some(idx) = best_idx {
+                let m = sample_clusters[idx];
+                tracks[t_idx][s_idx] = KeyframeClusterPoint {
+                    color: m.color,
+                    centroid: m.centroid,
+                    weight: m.weight,
+                    time: sample.t,
+                };
+                sample_used[idx] = true;
+            } else {
+                // マッチが見つからなかった: 前キーを hold-last。
+                let prev = tracks[t_idx][s_idx - 1];
+                tracks[t_idx][s_idx] = KeyframeClusterPoint {
+                    color: prev.color,
+                    centroid: prev.centroid,
+                    weight: prev.weight,
+                    time: sample.t,
+                };
+            }
+        }
+    }
+
+    Ok(KeyframeTracks {
+        template_clusters,
+        tracks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +634,54 @@ mod tests {
         assert_eq!(tracks.tracks.len(), 1, "1 cluster expected");
         assert_eq!(tracks.tracks[0].len(), 1, "1 sample → track len 1");
         assert_eq!(tracks.sample_times, vec![0.0]);
+    }
+
+    #[test]
+    fn build_keyframe_tracks_zero_samples_errors() {
+        let res = build_keyframe_tracks(&[], 6);
+        assert!(matches!(res, Err(VideoInputError::NoFramesExtracted)));
+    }
+
+    #[test]
+    fn build_keyframe_tracks_one_sample_succeeds_with_single_key() {
+        // 1 サンプルだけ与えると、各 cluster の track が長さ 1 の単一キーになる。
+        let frame = image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([200u8, 100, 50]));
+        let samples = vec![VideoSample { frame, t: 0.0 }];
+        let kf = build_keyframe_tracks(&samples, 1).expect("tracks");
+        assert_eq!(kf.tracks.len(), 1, "1 cluster expected");
+        assert_eq!(kf.tracks[0].len(), 1, "1 sample → track len 1");
+        assert_eq!(kf.tracks[0][0].time, 0.0);
+    }
+
+    #[test]
+    fn build_keyframe_tracks_clusters_track_via_lab_distance() {
+        // 2 枚で色 + 位置（=画像内の dominant 色の場所）が両方違うフレームを与える。
+        // LAB greedy で track[0] が「赤 → 青」をたどることを確認する。
+        let frame_a = image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([220u8, 30, 30]));
+        let frame_b = image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([30u8, 30, 220]));
+        let samples = vec![
+            VideoSample {
+                frame: frame_a,
+                t: 0.0,
+            },
+            VideoSample {
+                frame: frame_b,
+                t: 1.0,
+            },
+        ];
+        let kf = build_keyframe_tracks(&samples, 1).expect("tracks");
+        assert_eq!(kf.tracks.len(), 1);
+        assert_eq!(kf.tracks[0].len(), 2);
+        // time フィールドが samples の t に追従。
+        assert_eq!(kf.tracks[0][0].time, 0.0);
+        assert_eq!(kf.tracks[0][1].time, 1.0);
+        // color が赤系→青系へ動く（centroid/weight も埋まっている）。
+        let k0 = kf.tracks[0][0];
+        let k1 = kf.tracks[0][1];
+        assert!(k0.color[0] > k0.color[2], "key0 should be red-dominant: {:?}", k0.color);
+        assert!(k1.color[2] > k1.color[0], "key1 should be blue-dominant: {:?}", k1.color);
+        // weight は単色画像なのでどちらも ~1.0。
+        assert!(k0.weight > 0.9 && k1.weight > 0.9);
     }
 
     #[test]

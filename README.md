@@ -55,6 +55,8 @@ one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace wit
 ```bash
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
+# Video input: keyframe interpolation (#33) — color + position + weight all lerp between keyframes
+orber --input video.mp4 --output orb.mp4 --input-mode keyframe --keyframes 8 --duration-ms 10000
 ```
 
 `--speed` is the **global** cycle count (`very-slow` / `slow` / `mid` / `fast`
