@@ -946,8 +946,9 @@ export default function Studio() {
       // index 順を保ってファイル名を 01, 02, ... に振る。
       const sorted = Array.from(rendered.entries()).sort((a, b) => a[0] - b[0]);
       const ts = downloadTimestamp();
-      // #56: 単一ファイル DL は alpha 同梱対象外（zip 化しないため）。alpha 版を
-      // 添えたいときは複数選択 or download all を使う、という UX を維持する。
+      // #56: alpha OFF + 単一選択のときだけ単発 DL（裸ファイルが降る）。
+      // alpha ON のときは 1 枚選択でも zip 経路に落として `alpha/` サブフォルダを
+      // 同梱する（裸ファイル + フォルダの混在が出来ないため zip にまとめる）。
       if (sorted.length === 1 && !wantAlpha) {
         triggerDownload(sorted[0][1].blob, `orber-${ts}.${sorted[0][1].ext}`);
         return;
