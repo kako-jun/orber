@@ -7,9 +7,10 @@
     "wasm:ensure-rust": "which rustup || (unset RUSTUP_VERSION && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && . $HOME/.cargo/env && rustup target add wasm32-unknown-unknown)",
     "wasm:install": ". $HOME/.cargo/env 2>/dev/null; which wasm-pack || cargo install wasm-pack --locked",
     "wasm:build": "cd .. && wasm-pack build crates/wasm --target web --out-dir ../../web/src/wasm --release",
-    "dev": "npm run wasm:build && astro dev",
-    "build": "npm run wasm:build && astro build",
-    "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && astro build",
+    "gen:qr": "node scripts/gen-qr.mjs",
+    "dev": "npm run wasm:build && npm run gen:qr && astro dev",
+    "build": "npm run wasm:build && npm run gen:qr && astro build",
+    "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && npm run gen:qr && astro build",
     "preview": "astro preview",
     "deploy": "wrangler pages deploy dist"
   },
@@ -19,11 +20,13 @@
     "astro": "^4.16.0",
     "jszip": "^3.10.1",
     "mp4-muxer": "^5.2.2",
+    "qrcode": "^1.5.4",
     "solid-js": "^1.9.0",
     "tailwindcss": "^3.4.0",
     "webm-muxer": "^5.1.4"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "typescript": "^5.6.0",
     "wrangler": "^3.80.0"
   }

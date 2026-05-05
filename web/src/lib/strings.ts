@@ -123,6 +123,45 @@ export const STRINGS = {
     ja: 'バリエーション {n} (動画)',
     en: 'Variation {n} (animated)',
   },
+  // #128: Footer (GH Sponsors / Amazon affiliate / QR / Copyright / Counter)
+  sponsorLabel: { ja: 'GitHub で寄付', en: 'Sponsor on GitHub' },
+  sponsorTitle: {
+    ja: 'GitHub Sponsors で kako-jun を支援する',
+    en: 'Support kako-jun on GitHub Sponsors',
+  },
+  affiliateHeading: {
+    ja: 'おすすめ機材 (Amazon)',
+    en: 'Recommended gear (Amazon)',
+  },
+  affiliateDisclosure: {
+    ja: '※ Amazon アソシエイト・プログラムに参加しています。',
+    en: 'As an Amazon Associate this site earns from qualifying purchases.',
+  },
+  qrLabel: { ja: 'スマホで開く', en: 'Open on phone' },
+  qrAlt: {
+    ja: 'orber.llll-ll.com を開く QR コード',
+    en: 'QR code to open orber.llll-ll.com',
+  },
+  privacyNote: {
+    ja: '画像はブラウザ内で処理されます。サーバーへの送信はありません。',
+    en: 'All processing happens in your browser — no images leave your device.',
+  },
+  // #128: ja は「閲覧数: {n}」、en は「{n} views」で語順を言語ごとに分ける。
+  // {n} は <nostalgic-counter> がレンダリングする数値で置換する。
+  viewsLabelPrefix: { ja: '閲覧数: ', en: '' },
+  viewsLabelSuffix: { ja: '', en: ' views' },
+  // #128 / #86: About — orber が何で、どこのソースか、何で作っているか。
+  // Footer = 最後に読まれる場所、ここで OSS と作者を改めて宣言する。
+  aboutHeading: { ja: 'orber について', en: 'About orber' },
+  aboutBody: {
+    ja: '画像から街の光を抽出して、配信や動画の背景に使えるムード素材を生成します。',
+    en: 'Extracts city lights from any image and turns them into mood loops you can drop behind a stream or video.',
+  },
+  aboutBuiltWith: {
+    ja: 'Rust + WebAssembly + Astro + Solid + Tailwind',
+    en: 'Built with Rust + WebAssembly + Astro + Solid + Tailwind',
+  },
+  repoLinkLabel: { ja: 'ソースコード (GitHub)', en: 'Source on GitHub' },
 } as const;
 
 export function detectLang(): Lang {
