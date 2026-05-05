@@ -123,7 +123,25 @@ The component is exposed in `Studio.tsx` as the constants `GLASS_CHECKBOX_LABEL`
 
 ### SegmentedControl
 
-Not used in this iteration; reserved. The aspect Portrait / Landscape pair is intentionally implemented as **two independent glass Toggles** rather than a SegmentedControl: only two states, each carries a distinct silhouette icon, and visual independence reads better against the black canvas. If a future control needs three or more mutually-exclusive states, introduce a SegmentedControl here using the same glass tokens — a group of buttons with shared border-radius on the outer edges.
+Connected pill — used by every mutually-exclusive control row in Studio (#133). Aspect / Shape are 2-segment, Count / Speed / Softness are 3-segment. All five rows share the same outer container, the same per-cell sizing rule, and the same active-state token, so a 2-pick row and a 3-pick row read as the same primitive at different cardinalities.
+
+- Outer wrapper: `inline-flex w-full max-w-md mx-auto rounded-md overflow-hidden border border-glassBorder` — `overflow-hidden` clips the children's square corners against the wrapper radius so the whole row reads as one pill
+- Cells: `flex-1 h-9 px-2 text-sm` (equal-width, fixed 36px height)
+- Outer corners: only the first cell gets `rounded-l-md`, only the last cell gets `rounded-r-md`; intermediate cells are `rounded-none`
+- Inner separator: every cell after the first gets `border-l border-glassBorder` — a single hairline, not a gap
+- Default state: `bg-glassBg text-fgMuted hover:text-fg hover:bg-glassBgHover`
+- **Active state**: `bg-fg/15 text-fg` (white at 15% over the surface). This is **stronger than the legacy Toggle's `glass-bg-hover` (10%)** so a 3-segment row reads its selection at a glance. The Toggle (`§4 Toggle`) keeps the older 10% value because its 2-state silhouette icons already communicate state via shape; the segmented control needs more chroma since cells are text-only and adjacent
+- Focus: matches the rest of the glass system (`focus-visible:ring-1 focus-visible:ring-focusRing`)
+- Disabled: `opacity-40 cursor-not-allowed`, applied per-cell so individual cells can independently dim if a future row needs that (today every row dims as a unit via the parent grid's `disabled` propagation)
+- Row alignment: every row lives inside one shared `max-w-md` grid (`grid-cols-[auto_minmax(0,1fr)]`). Aspect spans both columns (`col-span-2`) so its segmented control fills the full grid width; the four labeled rows put the segmented control in the right column. The segmented control's `w-full` plus the grid's fixed `max-w-md` means **2-pick and 3-pick rows always end at the same right edge**
+
+The implementation lives in `Studio.tsx` as the constants `SEG_GROUP` (wrapper class string) and the helper `SEG_BTN(i, total, active)` (per-cell class string). Future segmented rows should reuse those rather than open-coding the radius / separator / state logic.
+
+#### Glyph monochrome rendering
+
+When the segmented control's adjacent input is the Glyph picker (`Studio` shape row), the input, the picker buttons, and the `<datalist>` options are all tagged with `glyph-symbol-text`. That class loads `Noto Sans Symbols 2` from Google Fonts and sets `font-variant-emoji: text`, so `⚡` / `☀` / `★` / `←` are drawn as white symbols (matching the rest of the chrome) instead of the OS color-emoji rasters. The font load lives in `Base.astro`; the class is scoped — body text and other UI strings continue using the system sans stack.
+
+For Safari/iOS the picker buttons additionally append `U+FE0E` (text variation selector) after each displayed symbol — `font-variant-emoji: text` is Chromium-only, and Safari can still resolve dual-presentation codepoints like `U+26A1` to the OS color emoji font even when Symbols 2 is listed first. The variation selector is display-only; the underlying signal value (`glyphChar()`) stays as the bare codepoint so state and wasm RPCs are unaffected.
 
 ### Tile
 

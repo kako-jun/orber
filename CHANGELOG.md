@@ -7,6 +7,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [Unreleased]
 
 ### Added
+- feat(web): #133 — segmented buttons を連結ピル化、active state を白寄り強化、glyph picker を Noto Sans Symbols 2 で monochrome 化、glyph input を datalist combobox 化
 - feat(core,wasm,web): #136 — glyph rotation toggle (per-glyph defaults: ⚡/☀ default OFF). New `AnimateOptions.glyph_rotate: bool` (default `true`) and a matching `WasmParams.glyph_rotate` field thread the switch through wasm and into the WebGL fragment shader (header word 11, `u_glyph_rotate`). When `false`, glyph orbs hold their per-orb `base_angle` for all `t`, so loop closure (`t=0 ≡ t=1`) is trivially preserved. Studio adds a reusable glass checkbox component (`GLASS_CHECKBOX_LABEL` / `GLASS_CHECKBOX_INPUT`) used for the new "Animate rotation / 回転させる" toggle; this same component will be reused by the upcoming transparent-DL checkbox (#56).
 - feat(web): #135 — disable Studio controls until an image is loaded; move reroll above progress row
 - Web GUI control rows (#131). The old collapsible Advanced section is removed; the Studio surface now shows flat always-visible rows for Shape / Count / Speed / Softness directly under the aspect toggles. Every control immediately reruns the batch. Glyph mode now includes an inline IME-safe single-character input plus a symbol picker filtered through `glyph_supported()`. The old large "Roll / ガチャを引く" chip is gone; only a small reload icon remains at the bottom, and it spins while decoding / generating / animating. (#131)

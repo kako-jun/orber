@@ -894,10 +894,44 @@ export default function Studio() {
     'active:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed';
   // toggled (アスペクト ON 等) で重ねる class — DESIGN.md §4 Toggle.
   const GLASS_BTN_TOGGLED = 'bg-glassBgHover';
-  const GLASS_INPUT =
-    'h-9 w-20 rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
-    'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-    'disabled:opacity-40 disabled:cursor-not-allowed';
+  // #133: Segmented control の各セルが使う class を index と total から組み立てる。
+  // - 連結ピル化: 中間 cell は角丸を消し、左右端のみ rounded-l / rounded-r-md を付ける
+  // - 等幅: flex-1 で row 全体を占有し、2 択 row でも 3 択 row でも左右端が揃う
+  // - 区切り: 2 個目以降は left hairline (border-l border-glassBorder) で隣接 cell と分ける
+  // - active: bg-fg/15 (白 15%) + text-fg、非選択 (text-fgMuted) と差を明確化
+  //   (現状の glass-bg-toggled = 10% より白寄りで、選択中が一目で判る)
+  // SEG_GROUP は <div> wrapper 側に付けるトークン。row の最大幅は max-w-md で
+  // aspect / shape / count / speed / softness すべて揃え、左右端を一致させる。
+  const SEG_GROUP =
+    'inline-flex w-full max-w-md mx-auto rounded-md overflow-hidden border border-glassBorder';
+  const SEG_BTN = (i: number, total: number, active: boolean) => {
+    const radius =
+      total === 1
+        ? 'rounded-md'
+        : i === 0
+          ? 'rounded-l-md'
+          : i === total - 1
+            ? 'rounded-r-md'
+            : 'rounded-none';
+    const sep = i > 0 ? 'border-l border-glassBorder' : '';
+    const state = active
+      ? 'bg-fg/15 text-fg'
+      : 'bg-glassBg text-fgMuted hover:text-fg hover:bg-glassBgHover';
+    return [
+      'flex-1 h-9 px-2 text-sm flex items-center justify-center transition-colors duration-200 ease-out',
+      'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing',
+      'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-glassBg disabled:hover:text-fgMuted',
+      radius,
+      sep,
+      state,
+    ]
+      .filter(Boolean)
+      .join(' ');
+  };
+  // #133: 旧 GLASS_INPUT (h-9 w-20 ...) は glyph 入力欄の専用品だったが、
+  // segmented row 化で w-full + glyph-symbol-text を持たせて inline 展開
+  // したため不要になった。将来 width 違いの input が増えたら token として
+  // 復活させる。
   // #136: 再利用可能な glass checkbox ラベル + input スタイル。
   // 後の #56（透過DL checkbox）が同じトークンを踏襲する想定。
   // - GLASS_CHECKBOX_LABEL: <label> 全体のクリック領域・disabled 連動を担う
@@ -1026,63 +1060,74 @@ export default function Studio() {
         </Show>
       </label>
 
-      <div class="flex items-center justify-center gap-2">
-        <button
-          type="button"
-          aria-pressed={aspect() === 'portrait'}
-          aria-label={t('aspectPortrait')}
-          title={t('aspectPortraitTitle')}
-          onClick={() => onAspectClick('portrait')}
-          disabled={!decoded() || downloading()}
-          class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
-        >
-          {/* 縦長を示すシルエット (角丸縦長方形) */}
-          <svg
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <rect x="8" y="3" width="8" height="18" rx="1.5" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          aria-pressed={aspect() === 'landscape'}
-          aria-label={t('aspectLandscape')}
-          title={t('aspectLandscapeTitle')}
-          onClick={() => onAspectClick('landscape')}
-          disabled={!decoded() || downloading()}
-          class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
-        >
-          {/* 横長を示すシルエット (角丸横長方形) */}
-          <svg
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <rect x="3" y="8" width="18" height="8" rx="1.5" />
-          </svg>
-        </button>
-      </div>
-      <div class="mx-auto grid max-w-2xl grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
+      {/* #133: aspect / shape / count / speed / softness すべてを 1 つの grid に
+          載せて、各 row の左右端が完全に揃うようにする。
+          - 列定義: 左 = label (auto)、右 = segmented control (1fr)
+          - aspect は label のない 2 列 span (左右端が他 row より少し広く張り出す)
+          - 各 segmented control は SEG_GROUP の `w-full` で右列いっぱいに広がる
+          - SEG_BTN の `flex-1` で 2 択でも 3 択でも cell 幅が揃う */}
+      <div class="mx-auto grid max-w-md grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2">
+        {/* aspect: label なしで 2 列を span。other row と同じグリッド内なので
+            左右端が grid 幅 (max-w-md) で一致する。 */}
+        <div class="col-span-2">
+          <div class={SEG_GROUP}>
+            <button
+              type="button"
+              aria-pressed={aspect() === 'portrait'}
+              aria-label={t('aspectPortrait')}
+              title={t('aspectPortraitTitle')}
+              onClick={() => onAspectClick('portrait')}
+              disabled={!decoded() || downloading()}
+              class={SEG_BTN(0, 2, aspect() === 'portrait')}
+            >
+              {/* 縦長を示すシルエット (角丸縦長方形) */}
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="8" y="3" width="8" height="18" rx="1.5" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              aria-pressed={aspect() === 'landscape'}
+              aria-label={t('aspectLandscape')}
+              title={t('aspectLandscapeTitle')}
+              onClick={() => onAspectClick('landscape')}
+              disabled={!decoded() || downloading()}
+              class={SEG_BTN(1, 2, aspect() === 'landscape')}
+            >
+              {/* 横長を示すシルエット (角丸横長方形) */}
+              <svg
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="3" y="8" width="18" height="8" rx="1.5" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
         <label class="justify-self-end text-sm text-fgMuted">{t('shapeLabel')}:</label>
-        <div class="flex flex-wrap items-center gap-1">
+        <div class={SEG_GROUP}>
           <button
             type="button"
             aria-pressed={shape() === 'circle'}
             onClick={() => onShapeClick('circle')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (shape() === 'circle' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(0, 2, shape() === 'circle')}
           >
             {t('shapeOptionCircle')}
           </button>
@@ -1091,13 +1136,23 @@ export default function Studio() {
             aria-pressed={shape() === 'glyph'}
             onClick={() => onShapeClick('glyph')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (shape() === 'glyph' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(1, 2, shape() === 'glyph')}
           >
             {t('shapeOptionGlyph')}
           </button>
-          <Show when={shape() === 'glyph'}>
+        </div>
+
+        {/* #133: glyph 入力欄は datalist combobox 化。
+            候補は supportedGlyphChoices() (Noto Sans Symbols 2 同梱記号)、
+            自由入力は IME 経由で emoji なども受け付ける。
+            glyph-symbol-text class で picker / input 表示を Noto Sans Symbols 2
+            に揃え、⚡ などの白ベタ描画を実現する (Base.astro)。 */}
+        <Show when={shape() === 'glyph'}>
+          <>
+            <span />
             <input
               type="text"
+              list="glyph-suggestions"
               aria-label={t('glyphCharLabel')}
               value={glyphChar()}
               placeholder={t('glyphCharPlaceholder')}
@@ -1115,15 +1170,21 @@ export default function Studio() {
                 if (e.currentTarget.value !== first) e.currentTarget.value = first;
               }}
               class={
-                GLASS_INPUT +
+                // glass token を踏襲しつつ、segmented row 内では w-full にして
+                // 右列いっぱいに広げる。glyph-symbol-text で Noto Sans Symbols 2
+                // を当て、⚡ などをモノクロ描画する (Base.astro)。
+                // GLASS_INPUT は固定幅 (w-20) なのでここでは展開して再利用しない。
+                'glyph-symbol-text h-9 w-full rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
+                'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+                'disabled:opacity-40 disabled:cursor-not-allowed' +
                 (glyphCharSupported() ? '' : ' border-fgMuted')
               }
             />
-          </Show>
-        </div>
-
-        <Show when={shape() === 'glyph'}>
-          <>
+            <datalist id="glyph-suggestions">
+              <For each={supportedGlyphChoices()}>
+                {(sym) => <option value={sym} />}
+              </For>
+            </datalist>
             <span />
             <div class="flex flex-wrap items-center gap-1">
               <For each={supportedGlyphChoices()}>
@@ -1135,12 +1196,17 @@ export default function Studio() {
                     disabled={!decoded() || downloading()}
                     class={
                       GLASS_BTN +
-                      ' h-9 w-9 px-0 text-base ' +
+                      ' glyph-symbol-text h-9 w-9 px-0 text-base ' +
                       (glyphChar() === sym ? GLASS_BTN_TOGGLED : '')
                     }
                     title={sym}
                   >
-                    {sym}
+                    {/* #133 review Q2: U+FE0E (text variation selector) を付けて
+                        Safari/iOS で ⚡ などが OS 絵文字フォントに resolve されるのを防ぎ、
+                        Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
+                        font-variant-emoji: text で対応済み。selector は display 用で、
+                        value (sym) には付けないので状態管理は影響を受けない。 */}
+                    {sym + '︎'}
                   </button>
                 )}
               </For>
@@ -1164,13 +1230,13 @@ export default function Studio() {
         </Show>
 
         <label class="justify-self-end text-sm text-fgMuted">{t('countLabel')}:</label>
-        <div class="flex flex-wrap items-center gap-1">
+        <div class={SEG_GROUP}>
           <button
             type="button"
             aria-pressed={countPreset() === 'low'}
             onClick={() => onCountPresetClick('low')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (countPreset() === 'low' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(0, 3, countPreset() === 'low')}
           >
             {t('countOptionLow')}
           </button>
@@ -1179,10 +1245,7 @@ export default function Studio() {
             aria-pressed={countPreset() === '' || countPreset() === 'mid'}
             onClick={() => onCountPresetClick('mid')}
             disabled={!decoded() || downloading()}
-            class={
-              GLASS_BTN + ' text-sm ' +
-              (countPreset() === '' || countPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
-            }
+            class={SEG_BTN(1, 3, countPreset() === '' || countPreset() === 'mid')}
           >
             {t('countOptionMid')}
           </button>
@@ -1191,20 +1254,20 @@ export default function Studio() {
             aria-pressed={countPreset() === 'high'}
             onClick={() => onCountPresetClick('high')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (countPreset() === 'high' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(2, 3, countPreset() === 'high')}
           >
             {t('countOptionHigh')}
           </button>
         </div>
 
         <label class="justify-self-end text-sm text-fgMuted">{t('speedLabel')}:</label>
-        <div class="flex flex-wrap items-center gap-1">
+        <div class={SEG_GROUP}>
           <button
             type="button"
             aria-pressed={speedPreset() === 'slow'}
             onClick={() => onSpeedPresetClick('slow')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'slow' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(0, 3, speedPreset() === 'slow')}
           >
             {t('speedOptionSlow')}
           </button>
@@ -1213,10 +1276,7 @@ export default function Studio() {
             aria-pressed={speedPreset() === '' || speedPreset() === 'mid'}
             onClick={() => onSpeedPresetClick('mid')}
             disabled={!decoded() || downloading()}
-            class={
-              GLASS_BTN + ' text-sm ' +
-              (speedPreset() === '' || speedPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
-            }
+            class={SEG_BTN(1, 3, speedPreset() === '' || speedPreset() === 'mid')}
           >
             {t('speedOptionMid')}
           </button>
@@ -1225,22 +1285,20 @@ export default function Studio() {
             aria-pressed={speedPreset() === 'fast'}
             onClick={() => onSpeedPresetClick('fast')}
             disabled={!decoded() || downloading()}
-            class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'fast' ? GLASS_BTN_TOGGLED : '')}
+            class={SEG_BTN(2, 3, speedPreset() === 'fast')}
           >
             {t('speedOptionFast')}
           </button>
         </div>
 
         <label class="justify-self-end text-sm text-fgMuted">{t('softnessLabel')}:</label>
-        <div class="flex flex-wrap items-center gap-1">
+        <div class={SEG_GROUP}>
           <button
             type="button"
             aria-pressed={softnessPreset() === 'low'}
             onClick={() => onSoftnessPresetClick('low')}
             disabled={!decoded() || downloading()}
-            class={
-              GLASS_BTN + ' text-sm ' + (softnessPreset() === 'low' ? GLASS_BTN_TOGGLED : '')
-            }
+            class={SEG_BTN(0, 3, softnessPreset() === 'low')}
           >
             {t('softnessOptionLow')}
           </button>
@@ -1249,12 +1307,7 @@ export default function Studio() {
             aria-pressed={softnessPreset() === '' || softnessPreset() === 'mid'}
             onClick={() => onSoftnessPresetClick('mid')}
             disabled={!decoded() || downloading()}
-            class={
-              GLASS_BTN + ' text-sm ' +
-              (softnessPreset() === '' || softnessPreset() === 'mid'
-                ? GLASS_BTN_TOGGLED
-                : '')
-            }
+            class={SEG_BTN(1, 3, softnessPreset() === '' || softnessPreset() === 'mid')}
           >
             {t('softnessOptionMid')}
           </button>
@@ -1263,9 +1316,7 @@ export default function Studio() {
             aria-pressed={softnessPreset() === 'high'}
             onClick={() => onSoftnessPresetClick('high')}
             disabled={!decoded() || downloading()}
-            class={
-              GLASS_BTN + ' text-sm ' + (softnessPreset() === 'high' ? GLASS_BTN_TOGGLED : '')
-            }
+            class={SEG_BTN(2, 3, softnessPreset() === 'high')}
           >
             {t('softnessOptionHigh')}
           </button>

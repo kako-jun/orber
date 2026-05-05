@@ -83,6 +83,19 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
       href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500&display=swap"
     />
     <!--
+      orber#133 — Noto Sans Symbols 2 を読み込んで、Studio の glyph picker /
+      glyph 入力欄 / datalist combobox の文字を白ベタ (monochrome) で描画する。
+      OS の絵文字フォントだと ⚡ や ☀ がカラー絵文字でレンダリングされて
+      モノトーンの UI から浮くため、`.glyph-symbol-text` を介して
+      Symbols 2 を優先フォントに指定する (font-variant-emoji: text を併用)。
+      Studio.tsx 側で picker / input / datalist にしか付かない class なので、
+      他のテキスト要素には影響しない。
+    -->
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+Symbols+2&display=swap"
+    />
+    <!--
       orber#62 — 言語自動切替。
       hydration を待たずに <html lang> を navigator.language に合わせて書き換える
       ことで、スクリーンリーダー / 翻訳ツールが最初から正しい言語で読み上げる。
@@ -130,6 +143,15 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
       @keyframes orb-skeleton-shimmer {
         0% { background-position: 200% 0; }
         100% { background-position: -200% 0; }
+      }
+      /* orber#133 — Studio の glyph picker / glyph 入力欄 / datalist option
+         専用フォント class。OS のカラー絵文字経路を回避し、Noto Sans Symbols 2
+         (上の <link> で読み込み) でモノクロ描画する。
+         font-variant-emoji: text は Chromium で対応 (Safari は部分対応)、
+         Symbols 2 の glyph があるコードポイントは確実にそちらが優先される。 */
+      .glyph-symbol-text {
+        font-family: 'Noto Sans Symbols 2', system-ui, sans-serif;
+        font-variant-emoji: text;
       }
       .skeleton {
         background-color: rgba(255, 255, 255, 0.04);
