@@ -91,6 +91,10 @@ pub struct VideoOptions {
     pub shape: OrbShape,
     /// ぼかし (Softness) preset (#55, #131 で改名)。Mid なら既存挙動と完全同値。
     pub softness: SoftnessPreset,
+    /// 動画入力（#7）の per-cluster 色トラック。
+    /// `Some` のとき各フレームで `cluster.color` を時刻 t の補間色に置換する。
+    /// 静止画入力では `None` で従来挙動。
+    pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
 }
 
 impl Default for VideoOptions {
@@ -107,6 +111,7 @@ impl Default for VideoOptions {
             background: a.background,
             shape: a.shape,
             softness: a.softness,
+            color_tracks: None,
         }
     }
 }
@@ -214,6 +219,7 @@ pub fn render_video(
         shape: opts.shape,
         softness: opts.softness,
         glyph_rotate: true,
+        color_tracks: opts.color_tracks.clone(),
     };
 
     let temp_dir = tempfile::TempDir::new()?;
