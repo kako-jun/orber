@@ -93,6 +93,18 @@ pub struct WasmParams {
     /// `softness` の preset。`""` で `Mid` (既存挙動と同値)。Phase B (#55) で追加。
     #[serde(default)]
     pub softness_preset: String,
+    /// Glyph 形状時に per-orb 回転をアニメーションさせるか（#136）。
+    /// `true` で従来挙動、`false` で全 t において base_angle を保つ静止描画。
+    /// Circle 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
+    /// で省略時は `true`（従来挙動互換）。既存の wasm caller が `glyph_rotate`
+    /// フィールドを送っていなくても `true` でデシリアライズされるため影響を受けない。
+    #[serde(default = "default_glyph_rotate")]
+    pub glyph_rotate: bool,
+}
+
+/// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
+fn default_glyph_rotate() -> bool {
+    true
 }
 
 // Pure parsers/validators return String errors so they can be unit-tested on
@@ -442,6 +454,11 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
         background: bg,
         shape,
         softness,
+        // generate_single は generate_one_at_index と違い single-frame PNG を
+        // t=0 で 1 枚返す API。t=0 では glyph_rotate ON/OFF どちらでも角度は
+        // 同じ（rot ON でも turns=0）なので、デフォルト ON のまま渡しても
+        // OFF と同じ静止画が出る。CLI 同等の互換性維持として true を渡す。
+        glyph_rotate: true,
     };
     let frame = render_frame(&clusters, &opts, 0.0);
     let png = encode_png_rgba(&frame)?;
@@ -619,6 +636,7 @@ pub fn get_render_data(
         n_orbs,
         alpha_mul,
         shape_id,
+        p.glyph_rotate,
     );
 
     Ok(js_sys::Float32Array::from(buf.as_slice()))
@@ -629,7 +647,7 @@ pub fn get_render_data(
 ///
 /// WebGL path が core のアニメーションと別 RNG 列を持たないよう、乱数列は
 /// ここで再実装せず `orber_core::animate::generate_orb_params` に委譲する。
-// TODO(orber#future): pack_render_data の引数が 10 個に達した。Phase C で
+// TODO(orber#future): pack_render_data の引数が 11 個に達した。Phase C で
 // orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
 #[allow(clippy::too_many_arguments)]
 fn pack_render_data(
@@ -643,6 +661,7 @@ fn pack_render_data(
     n_orbs: usize,
     alpha_mul: f32,
     shape_id: f32,
+    glyph_rotate: bool,
 ) -> Vec<f32> {
     pack_render_data_for_webgl(
         clusters,
@@ -655,6 +674,7 @@ fn pack_render_data(
         n_orbs,
         alpha_mul,
         shape_id,
+        glyph_rotate,
     )
 }
 
@@ -928,6 +948,7 @@ mod tests {
             count_preset: String::new(),
             speed_preset: String::new(),
             softness_preset: String::new(),
+            glyph_rotate: true,
         }
     }
 
@@ -1122,6 +1143,7 @@ mod tests {
             n_orbs,
             softness.alpha_mul().clamp(0.0, 1.0),
             1.0,
+            true,
         );
         let expected = pack_render_data_for_webgl(
             &clusters,
@@ -1134,6 +1156,7 @@ mod tests {
             n_orbs,
             softness.alpha_mul().clamp(0.0, 1.0),
             1.0,
+            true,
         );
         assert_eq!(buf, expected);
     }

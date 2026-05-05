@@ -109,6 +109,18 @@ cursor are kept exactly as in the empty state — only the inner content swaps.
 - `aria-pressed="false"` → icon color `fg-muted`
 - No emerald accent; selection is communicated by opacity + bg shift
 
+### Checkbox (Glass)
+
+Reusable inline checkbox + label pair, introduced for the Glyph rotation toggle (#136) and intended to be reused by the transparent-DL checkbox (#56) and any future on/off control that does not warrant a full button.
+
+- Wrapper `<label>`: `inline-flex items-center gap-2 cursor-pointer text-sm text-fg`
+  - `has-[:disabled]` selectors carry `opacity: 0.4 / cursor: not-allowed` from the inner input, so the entire row dims when the input is disabled (no JS-side gating needed)
+- `<input type="checkbox">`: `h-4 w-4` (16px square), `rounded-sm`, `border-glassBorder`, `bg-glassBg`, `accent-fg` (so the native check mark inherits the surface foreground), focus ring matches the rest of the glass system (`focus-visible:ring-1 focus-visible:ring-focusRing`)
+- Spacing: 8px gap between the box and its label text. Vertically aligned with `items-center`
+- Reactivity: the parent component owns the `boolean` signal; `onChange` re-runs the batch like every other control row (#131 idiom)
+
+The component is exposed in `Studio.tsx` as the constants `GLASS_CHECKBOX_LABEL` (label classes) and `GLASS_CHECKBOX_INPUT` (input classes). Future checkboxes should reuse those tokens rather than re-deriving the look.
+
 ### SegmentedControl
 
 Not used in this iteration; reserved. The aspect Portrait / Landscape pair is intentionally implemented as **two independent glass Toggles** rather than a SegmentedControl: only two states, each carries a distinct silhouette icon, and visual independence reads better against the black canvas. If a future control needs three or more mutually-exclusive states, introduce a SegmentedControl here using the same glass tokens — a group of buttons with shared border-radius on the outer edges.

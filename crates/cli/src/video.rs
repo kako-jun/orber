@@ -213,6 +213,7 @@ pub fn render_video(
         background: opts.background,
         shape: opts.shape,
         softness: opts.softness,
+        glyph_rotate: true,
     };
 
     let temp_dir = tempfile::TempDir::new()?;
