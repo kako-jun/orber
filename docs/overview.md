@@ -166,6 +166,40 @@ conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fra
 of the requested `--count` will sit just outside the visible area, matching the
 visual language of the videos.
 
+## Video input — color track (#7)
+
+When `--input` is a video file (`.mp4` / `.webm` / `.mov` / `.mkv` / `.m4v` / `.avi`),
+orber switches to a **color-track** path. The orb **positions stay frozen** (decided
+once from the first frame's k-means cluster centroids); only the **colors evolve**
+over the output duration.
+
+How it works:
+
+1. `ffprobe` reads the video duration; `ffmpeg` is invoked once per sample to write
+   `N = 20` PNG frames evenly spaced in time (`t_i = i / (N-1) * duration`).
+   Frames are written to a `tempfile::TempDir` that is deleted on function exit.
+2. The first sample is k-means clustered (k = 6) to produce the **template clusters**
+   (= position / weight basis for the orb pool).
+3. Each subsequent sample is k-means clustered, and its clusters are **greedy-matched
+   to the template by LAB ΔE76 distance**. The matched colors form one **color track**
+   per template cluster (`tracks[cluster_idx][sample_idx]`).
+4. The CLI renders the output through the existing animate pipeline with
+   `AnimateOptions.color_tracks = Some(tracks)`. For each frame at output time
+   `t ∈ [0, 1]`, every orb's `cluster.color` is replaced by
+   `interpolate_color_track(tracks[cluster_idx], t)` (linear lerp between adjacent
+   samples, endpoints clamped).
+
+Critically, **input duration only sizes the color sample sequence** — the output
+length is set independently by `--duration-ms`. A 3-minute clip rendered as a
+30-second orb will play the input's color evolution at 6× speed; a 10-second clip
+rendered as a 5-minute orb will play at 0.5× speed. Position and motion (`--speed`
+/ `--direction` / `--count`) remain unaffected.
+
+`--output FILE.mp4` / `FILE.webm` produces a video; `FILE.png` produces a single
+frame at `t=0` (= first sampled frame's color). Other modes are rejected with a
+clear error. Static-image input continues to flow through the unchanged image
+path; no regression for existing callers.
+
 ## Use cases
 
 - Background plates for video edits
