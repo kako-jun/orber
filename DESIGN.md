@@ -349,10 +349,10 @@ sticky ではなく **Studio の自然なスクロール末尾に着地** し、
 
 - **A. GH Sponsors** ボタン — `https://github.com/sponsors/kako-jun` を新規タブで開く glass button (DESIGN.md §4 Button)
 - **B. Amazon affiliate × 3** — アソシエイト ID `ultimate-battle-22`。商品データは `web/src/data/affiliateProducts.ts` に集約され、`amazonUrl(asin)` が `?tag=ultimate-battle-22` を必ず付ける唯一の出口
-- **C. QR コード** — `/orber-qr.svg` (build 前に `qrcode` パッケージで pre-generate して `public/` 配置、bg `#040404` / fg `#FFFFFF`)。`https://orber.llll-ll.com/` を指す
+- **C. QR コード** — `/orber-qr.svg`。`web/scripts/gen-qr.mjs` が `qrcode` パッケージで build 時に再生成 (`npm run dev` / `npm run build` / `build:cf` の前段に `npm run gen:qr` を連結済み)、bg `#040404` / fg `#FFFFFF`。`https://orber.llll-ll.com/` を指す
 - **D. Copyright** — `© 2026 kako-jun` (`font-display font-light text-xs text-fgSubtle`)
-- **E. Nostalgic Counter** — `<nostalgic-counter id="orber-PLACEHOLDER" type="total" format="text" />`。embed は Footer の onMount で `https://nostalgic.llll-ll.com/components/visit.js` を `data-orber-nostalgic` フラグ付きで idempotent に注入。実 ID は kako-jun がダッシュボードで取得後に置換 (TODO コメント明記)
-- **Privacy note (#86 統合)** — 「画像はブラウザ内で処理されます。サーバーへの送信はありません。」を `text-fgMuted` で 1 行
+- **E. Nostalgic Counter** — `<nostalgic-counter id="orber-PLACEHOLDER" type="total" format="text" />`。embed は Footer の onMount で `https://nostalgic.llll-ll.com/components/visit.js` を `data-orber-nostalgic` フラグ付きで idempotent に注入。**ID が `PLACEHOLDER` の間は Counter ブロック自体を非表示にし、embed.js も注入しない** (実 ID 取得後に表示開始)。kako-jun がダッシュボードで取得した値に置換 (TODO コメント明記)
+- **About + Privacy + Source (#86 統合)** — 「orber が何を作るか / 画像は端末内処理 / GitHub repo link / ビルド技術スタック」を `text-fgMuted` 4 行で右列に集約。privacyNote 単体ではなく、About + Privacy + Source link を 1 セクションに束ねることで「最後に読まれる場所」として境界条件・OSS・作者を同時に宣言する
 
 ### レイアウト
 
@@ -363,7 +363,7 @@ sticky ではなく **Studio の自然なスクロール末尾に着地** し、
 
 ### 文字列 / i18n
 
-すべての可視文字列は `web/src/lib/strings.ts` 経由 (`sponsorLabel` / `sponsorTitle` / `affiliateHeading` / `affiliateDisclosure` / `qrLabel` / `qrAlt` / `privacyNote` / `viewsLabel`)。 `© 2026 kako-jun` は固有名詞扱いで素のテキスト。
+すべての可視文字列は `web/src/lib/strings.ts` 経由 (`sponsorLabel` / `sponsorTitle` / `affiliateHeading` / `affiliateDisclosure` / `qrLabel` / `qrAlt` / `privacyNote` / `viewsLabelPrefix` / `viewsLabelSuffix` / `aboutHeading` / `aboutBody` / `aboutBuiltWith` / `repoLinkLabel`)。`viewsLabel` は ja「閲覧数: {n}」/ en「{n} views」と語順が違うため prefix/suffix 2 キーに分けて Counter の Web Component を挟む。`© 2026 kako-jun` は固有名詞扱いで素のテキスト。
 
 ### Web Component の型付け
 

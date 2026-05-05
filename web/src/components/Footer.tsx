@@ -35,6 +35,10 @@ import {
 // TODO(kako-jun): 実 ID に置換 (例 "orber-xxxxxxxx")。
 const NOSTALGIC_COUNTER_ID = 'orber-PLACEHOLDER';
 
+// placeholder の間は Counter ブロック自体を非表示にする (review nit-1)。
+// embed.js が "Counter not found" 等のテキストを表示しないように完全 mount しない。
+const NOSTALGIC_COUNTER_ENABLED = !NOSTALGIC_COUNTER_ID.endsWith('PLACEHOLDER');
+
 // embed.js は CSP / order に敏感ではないので Footer の onMount で動的注入する
 // (Base.astro を触らずに済み、フッターが visible になるまで XHR が走らない)。
 // 同 URL の二重注入を避けるため data-orber-nostalgic フラグで idempotent に。
@@ -52,7 +56,9 @@ function ensureNostalgicEmbed(): void {
 
 export default function Footer() {
   onMount(() => {
-    ensureNostalgicEmbed();
+    if (NOSTALGIC_COUNTER_ENABLED) {
+      ensureNostalgicEmbed();
+    }
   });
 
   return (
@@ -155,23 +161,43 @@ export default function Footer() {
             </div>
           </div>
 
-          {/* #86 統合 — Privacy note */}
-          <p class="text-xs text-fgMuted leading-relaxed">
-            {t('privacyNote')}
-          </p>
+          {/* #86 統合 — About + Privacy + Source link を 1 段にまとめる。
+              orber が何 / どこのソースか / 何で作っているか + 画像はサーバーに
+              送られない、を最後に読ませる。 */}
+          <section
+            aria-label={t('aboutHeading')}
+            class="space-y-2 text-xs leading-relaxed"
+          >
+            <p class="text-fgMuted">{t('aboutBody')}</p>
+            <p class="text-fgMuted">{t('privacyNote')}</p>
+            <p class="text-fgSubtle">
+              <a
+                href="https://github.com/kako-jun/orber"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+              >
+                {t('repoLinkLabel')}
+              </a>
+              {' · '}
+              <span>{t('aboutBuiltWith')}</span>
+            </p>
+          </section>
 
-          {/* E. Nostalgic Counter */}
-          <div class="text-xs text-fgSubtle">
-            {/* Web Component — id は kako-jun が実 ID 取得後に置換する placeholder。
-                Solid の JSX intrinsic は env.d.ts で nostalgic-counter を拡張済み。 */}
-            <nostalgic-counter
-              id={NOSTALGIC_COUNTER_ID}
-              type="total"
-              format="text"
-            />
-            {' '}
-            {t('viewsLabel')}
-          </div>
+          {/* E. Nostalgic Counter — placeholder ID の間は表示しない (review nit-1) */}
+          {NOSTALGIC_COUNTER_ENABLED && (
+            <div class="text-xs text-fgSubtle">
+              {/* ja: 「閲覧数: {n}」 / en: 「{n} views」 で語順を切替 (review nit-4)。
+                  Solid の JSX intrinsic は env.d.ts で nostalgic-counter を拡張済み。 */}
+              <span>{t('viewsLabelPrefix')}</span>
+              <nostalgic-counter
+                id={NOSTALGIC_COUNTER_ID}
+                type="total"
+                format="text"
+              />
+              <span>{t('viewsLabelSuffix')}</span>
+            </div>
+          )}
 
           {/* D. Copyright */}
           <p class="font-display font-light text-xs text-fgSubtle">
