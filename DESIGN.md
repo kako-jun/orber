@@ -121,6 +121,8 @@ Reusable inline checkbox + label pair, introduced for the Glyph rotation toggle 
 
 The component is exposed in `Studio.tsx` as the constants `GLASS_CHECKBOX_LABEL` (label classes) and `GLASS_CHECKBOX_INPUT` (input classes). Future checkboxes should reuse those tokens rather than re-deriving the look.
 
+The same tokens drive the **transparent-DL checkbox** introduced for #56 ("透過版を DL に含める / Include transparent versions"). It sits directly under the aspect toggles (centred, `col-span-2`) so all download-affecting settings cluster together at the top of the grid. When the browser cannot encode VP9 alpha (`VideoEncoder.isConfigSupported({codec:'vp09.00.10.08', alpha:'keep'})` is rejected — currently Safari) the checkbox is forced disabled with a tooltip, rather than offering a partial fallback. The OFF state is byte-exact with the pre-#56 download path (the alpha worker calls are simply never made).
+
 ### SegmentedControl
 
 Connected pill — used by every mutually-exclusive control row in Studio (#133). Aspect / Shape are 2-segment, Count / Speed / Softness are 3-segment. All five rows share the same outer container, the same per-cell sizing rule, and the same active-state token, so a 2-pick row and a 3-pick row read as the same primitive at different cardinalities.

@@ -270,3 +270,59 @@ export async function workerAnimateOne(
   );
   return new Blob([buf], { type: 'video/mp4' });
 }
+
+/**
+ * #56: 1 タイルぶんの透過 PNG または透過 WebP を返す。non-alpha 版と同じ params /
+ * n / index を渡すと、worker 側で bg.a だけを 0 に上書きしてレンダリングする。
+ * `format = 'png'` は lossless、`'webp'` は quality 0.9 lossy（30-50% 圧縮）。
+ */
+export async function workerGenerateOneAlpha(
+  params: BaseParams,
+  n: number,
+  index: number,
+  format: 'png' | 'webp',
+): Promise<Blob> {
+  const buf = await call<ArrayBuffer>({
+    kind: 'generateOneAlpha',
+    params,
+    n,
+    index,
+    format,
+  });
+  const mime = format === 'webp' ? 'image/webp' : 'image/png';
+  return new Blob([buf], { type: mime });
+}
+
+/**
+ * #56: 1 タイルぶんの透過 WebM (VP9 alpha 'keep') を返す。Safari など VP9 alpha
+ * 非対応ブラウザでは worker 側 encode が throw する。呼び出し側は事前に
+ * `workerVp9AlphaSupported()` で probe して checkbox を disable すること。
+ */
+export async function workerAnimateOneAlpha(
+  params: BaseParams,
+  n: number,
+  index: number,
+  totalFrames: number,
+  onProgress?: (frame: number, total: number) => void,
+): Promise<Blob> {
+  const buf = await call<ArrayBuffer>(
+    {
+      kind: 'animateOneAlpha',
+      params,
+      n,
+      index,
+      totalFrames,
+    },
+    [],
+    onProgress,
+  );
+  return new Blob([buf], { type: 'video/webm' });
+}
+
+/**
+ * #56: 現在のブラウザで VP9 alpha encode が使えるかの probe。Safari fallback 判定用。
+ * worker は probe 結果をキャッシュするので、複数回呼んでも cost はゼロに近い。
+ */
+export async function workerVp9AlphaSupported(): Promise<boolean> {
+  return await call<boolean>({ kind: 'vp9AlphaSupported' });
+}

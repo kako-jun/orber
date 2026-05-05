@@ -17,6 +17,10 @@
 
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
+import {
+  encodeAnimationAlphaFromCanvas,
+  isVp9AlphaSupported,
+} from './encodeWebmAlpha';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
 
 let initialized = false;
@@ -122,9 +126,44 @@ type Req =
       index: number;
       totalFrames: number;
     }
+  // #56: 透過 PNG または透過 WebP を返す静止画 alpha 経路。`format` で出し分ける。
+  // wasm の get_render_data 出力をそのまま流用し、bg.a だけを 0 に上書きして
+  // canvas を描画する。Circle / Glyph どちらの shape でも straight alpha が残る。
+  | {
+      kind: 'generateOneAlpha';
+      id: number;
+      params: BaseParams;
+      n: number;
+      index: number;
+      format: 'png' | 'webp';
+    }
+  // #56: 透過 WebM (VP9 alpha 'keep') を返す動画 alpha 経路。`encodeMp4.ts` と
+  // 同じ frame loop だが、エンコーダ・muxer が VP9 + WebM になる。Safari は
+  // VP9 alpha 非対応なので、呼び出し側は `vp9AlphaSupported` で事前 probe する。
+  | {
+      kind: 'animateOneAlpha';
+      id: number;
+      params: BaseParams;
+      n: number;
+      index: number;
+      totalFrames: number;
+    }
+  // #56: VP9 alpha encode が使えるかの probe。Safari 検出用。
+  | { kind: 'vp9AlphaSupported'; id: number }
   // Phase B (#55): UI が typed-in glyph 文字が同梱フォントに収録されているか
   // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
   | { kind: 'glyphSupported'; id: number; ch: string };
+
+/// #56: wasm get_render_data の Float32Array header word 3 (= bg.a in 0..1) を 0 に
+/// 上書きして「透過背景でレンダリングしてくれ」と shader に依頼する。元 buffer は
+/// 破壊しないよう新しい Float32Array を返す（同じ params を続けて非透過レンダリング
+/// する将来の経路を壊さないため）。
+function withTransparentBackground(data: Float32Array): Float32Array {
+  const out = new Float32Array(data.length);
+  out.set(data);
+  out[3] = 0;
+  return out;
+}
 
 function post(msg: unknown, transfers: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfers);
@@ -191,6 +230,63 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         // 1 char の Unicode scalar 1 つを判定する軽量パス。wasm は init 済み
         // なので I/O コストはゼロに近い。
         const ok = wasm.glyph_supported(req.ch);
+        post({ id: req.id, ok: true, data: ok });
+        break;
+      }
+      case 'generateOneAlpha': {
+        // #56: 静止画 alpha 経路。non-alpha 経路と同じ wasm get_render_data → setRenderData
+        // を辿るが、bg.a だけ 0 に上書きする。`format` で PNG / WebP を出し分ける。
+        const params = mergeParams(req.params);
+        const data = wasm.get_render_data(params, req.n, req.index);
+        const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
+        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
+        }
+        renderer.setRenderData(withTransparentBackground(data));
+        renderer.renderFrame(0);
+        const mime = req.format === 'webp' ? 'image/webp' : 'image/png';
+        // WebP は quality 指定で alpha 込みでもサイズが大きく変わる。0.9 を選んだ
+        // のは「視覚劣化が体感上識別不能」と「PNG 比でファイルサイズ ~30-50% 削減」
+        // の落としどころ。PNG は lossless で quality 引数が無視される。
+        const blob =
+          req.format === 'webp'
+            ? await canvas.convertToBlob({ type: mime, quality: 0.9 })
+            : await canvas.convertToBlob({ type: mime });
+        const buf = await blob.arrayBuffer();
+        post({ id: req.id, ok: true, data: buf }, [buf]);
+        break;
+      }
+      case 'animateOneAlpha': {
+        // #56: 動画 alpha 経路。frame loop は encodeMp4 と同形だが、エンコーダ・muxer
+        // を VP9 alpha + WebM に差し替える。Safari は VP9 alpha 非対応なので、
+        // 呼び出し側で `vp9AlphaSupported` を probe して落とすこと。
+        const params = mergeParams(req.params);
+        const data = wasm.get_render_data(params, req.n, req.index);
+        const width = req.params.width;
+        const height = req.params.height;
+        const { canvas, renderer } = getRenderer(width, height);
+        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
+        }
+        renderer.setRenderData(withTransparentBackground(data));
+        const PROGRESS_STRIDE = 4;
+        const blob = await encodeAnimationAlphaFromCanvas(
+          canvas,
+          (t) => renderer.renderFrame(t),
+          req.totalFrames,
+          width,
+          height,
+          (frame, total) => {
+            if (frame !== total && frame % PROGRESS_STRIDE !== 0) return;
+            post({ kind: 'animateProgress', id: req.id, frame, total });
+          },
+        );
+        const buf = await blob.arrayBuffer();
+        post({ id: req.id, ok: true, data: buf }, [buf]);
+        break;
+      }
+      case 'vp9AlphaSupported': {
+        const ok = await isVp9AlphaSupported();
         post({ id: req.id, ok: true, data: ok });
         break;
       }
