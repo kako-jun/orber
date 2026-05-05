@@ -338,6 +338,37 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - 対象: aspect / shape / glyph input / symbol picker / count / speed / softness / reroll
 - 各 control は `decoded()` が null の間 `disabled:opacity-40 disabled:cursor-not-allowed`（GLASS_BTN / GLASS_INPUT に同梱済み）で視覚的に弱める。画像投入後は通常状態へ戻る
 
+## 14. Footer (#128)
+
+公開後の継続接点 (GH Sponsors / Amazon affiliate / QR / Copyright / Nostalgic
+Counter) と #86 (About / Donate のプライバシー note) を 1 コンポーネントに集約する。
+sticky ではなく **Studio の自然なスクロール末尾に着地** し、`border-t border-hairline`
++ `bg-glassBg` で本体から穏やかに分離する。
+
+### 構成 (A〜E + Privacy)
+
+- **A. GH Sponsors** ボタン — `https://github.com/sponsors/kako-jun` を新規タブで開く glass button (DESIGN.md §4 Button)
+- **B. Amazon affiliate × 3** — アソシエイト ID `ultimate-battle-22`。商品データは `web/src/data/affiliateProducts.ts` に集約され、`amazonUrl(asin)` が `?tag=ultimate-battle-22` を必ず付ける唯一の出口
+- **C. QR コード** — `/orber-qr.svg` (build 前に `qrcode` パッケージで pre-generate して `public/` 配置、bg `#040404` / fg `#FFFFFF`)。`https://orber.llll-ll.com/` を指す
+- **D. Copyright** — `© 2026 kako-jun` (`font-display font-light text-xs text-fgSubtle`)
+- **E. Nostalgic Counter** — `<nostalgic-counter id="orber-PLACEHOLDER" type="total" format="text" />`。embed は Footer の onMount で `https://nostalgic.llll-ll.com/components/visit.js` を `data-orber-nostalgic` フラグ付きで idempotent に注入。実 ID は kako-jun がダッシュボードで取得後に置換 (TODO コメント明記)
+- **Privacy note (#86 統合)** — 「画像はブラウザ内で処理されます。サーバーへの送信はありません。」を `text-fgMuted` で 1 行
+
+### レイアウト
+
+- モバイル: 縦積み (`flex-col` 相当の `grid gap-10`)
+- デスクトップ (`md:`): 2 列 — 左 = A (Sponsor) + B (Amazon)、右 = C (QR) + Privacy + E (Counter) + D (Copyright)
+- 内側コンテナ: `mx-auto max-w-3xl px-4 py-10` (本体 `main` の `max-w-3xl p-8` と幅軸を揃える)
+- 全カラーは tailwind token (`bg`/`fg`/`fgMuted`/`fgSubtle`/`hairline`/`glassBg`/`glassBgHover`/`glassBorder`/`focusRing`) のみ。`#fff` / `rgba(...)` のハードコード禁止
+
+### 文字列 / i18n
+
+すべての可視文字列は `web/src/lib/strings.ts` 経由 (`sponsorLabel` / `sponsorTitle` / `affiliateHeading` / `affiliateDisclosure` / `qrLabel` / `qrAlt` / `privacyNote` / `viewsLabel`)。 `© 2026 kako-jun` は固有名詞扱いで素のテキスト。
+
+### Web Component の型付け
+
+`<nostalgic-counter>` は Custom Element のため Solid の JSX intrinsic に存在しない。`web/src/env.d.ts` で `declare module 'solid-js'` 経由に `IntrinsicElements['nostalgic-counter']` を追加して型を通す。
+
 ## Agent Quick Reference
 
 When generating UI for orber:

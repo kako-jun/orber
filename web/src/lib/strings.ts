@@ -123,6 +123,30 @@ export const STRINGS = {
     ja: 'バリエーション {n} (動画)',
     en: 'Variation {n} (animated)',
   },
+  // #128: Footer (GH Sponsors / Amazon affiliate / QR / Copyright / Counter)
+  sponsorLabel: { ja: 'GitHub で寄付', en: 'Sponsor on GitHub' },
+  sponsorTitle: {
+    ja: 'GitHub Sponsors で kako-jun を支援する',
+    en: 'Support kako-jun on GitHub Sponsors',
+  },
+  affiliateHeading: {
+    ja: 'おすすめ機材 (Amazon)',
+    en: 'Recommended gear (Amazon)',
+  },
+  affiliateDisclosure: {
+    ja: '※ Amazon アソシエイト・プログラムに参加しています。',
+    en: 'As an Amazon Associate this site earns from qualifying purchases.',
+  },
+  qrLabel: { ja: 'スマホで開く', en: 'Open on phone' },
+  qrAlt: {
+    ja: 'orber.llll-ll.com を開く QR コード',
+    en: 'QR code to open orber.llll-ll.com',
+  },
+  privacyNote: {
+    ja: '画像はブラウザ内で処理されます。サーバーへの送信はありません。',
+    en: 'All processing happens in your browser — no images leave your device.',
+  },
+  viewsLabel: { ja: '閲覧数', en: 'views' },
 } as const;
 
 export function detectLang(): Lang {
