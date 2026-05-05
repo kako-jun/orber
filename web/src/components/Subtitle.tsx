@@ -2,15 +2,23 @@
 // index.astro 直下のサブタイトルを i18n reactive にするための薄いコンポーネント。
 // Studio と Subtitle のどちらが先に hydrate されてもよいが、lang 同期の責務は
 // こちらに集約している (Studio.tsx の onMount からは setLang を外している)。
+//
+// orber#134 — lang signal は strings.ts のモジュール init 時点で detectLang() で
+// 初期化済み (SSR は window 未定義のため en フォールバック)。ここでの
+// setLang / document.documentElement.lang 更新は safety belt として残す
+// (同じ言語なら no-op、違えば再同期。Base.astro inline script との二重保険)。
 
 import { onMount } from 'solid-js';
 import { t, setLang, detectLang } from '../lib/strings';
 
 export default function Subtitle() {
   onMount(() => {
-    setLang(detectLang());
+    // safety belt: 既に strings.ts module init で設定済みだが、SSR→hydration
+    // の境界で食い違いがあれば再同期する。同じ値なら setLang は no-op。
+    const next = detectLang();
+    setLang(next);
     if (typeof document !== 'undefined') {
-      document.documentElement.lang = detectLang();
+      document.documentElement.lang = next;
     }
   });
   // Solid の JSX コンパイラは {expr} を effect でラップするため、

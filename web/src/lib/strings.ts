@@ -110,13 +110,21 @@ export const STRINGS = {
 } as const;
 
 export function detectLang(): Lang {
-  if (typeof navigator === 'undefined') return 'en';
-  return navigator.language.toLowerCase().startsWith('ja') ? 'ja' : 'en';
+  // SSR 検出は window の有無で行う。Node 22+ は global navigator を持つため
+  // navigator では SSR を判別できない (ビルドホストの $LANG が漏れて SSR HTML
+  // が誤った言語で出力される事故が起きる)。window は SSR 環境では未定義。
+  if (typeof window === 'undefined') return 'en';
+  const nav = window.navigator;
+  if (!nav || typeof nav.language !== 'string') return 'en';
+  return nav.language.toLowerCase().startsWith('ja') ? 'ja' : 'en';
 }
 
-// SSR-safe: Astro の SSR 段階では navigator が無いので en で初期化される。
-// hydration 後 onMount で setLang(detectLang()) を呼ぶことで ja に切り替わる。
-const [lang, setLang] = createSignal<Lang>('en');
+// SSR-safe: window 未定義時 (SSR) は en で初期化される。
+// クライアントではモジュール init 時に detectLang() で正しい言語に切り替わるため、
+// Subtitle の onMount を待たずに全島が初期描画から正しい言語で表示される。
+// このモジュール init 値は Solid hydration 時に各島で再評価され、createSignal が
+// 同じ値を返すため、SSR の en と client の検出結果が一致していれば mismatch しない。
+const [lang, setLang] = createSignal<Lang>(detectLang());
 export { lang, setLang };
 
 export type StringKey = keyof typeof STRINGS;

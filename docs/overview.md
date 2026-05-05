@@ -312,7 +312,12 @@ locale renders Japanese, every other locale renders English. There is no
 language picker — users do not choose. The `<html lang>` attribute is set
 pre-hydration by an inline script in `Base.astro` so screen readers pick the
 right voice from first paint, and the Solid `lang` signal is synced
-post-hydration by `Subtitle.tsx` for reactive UI text.
+post-hydration by `Subtitle.tsx` for reactive UI text. The Solid `lang` signal
+initializes to `'en'` at SSR (no `window` — note that Node 22+ exposes a global
+`navigator`, so SSR detection keys off `window` rather than `navigator`) and to
+`detectLang()` at client module init, so all islands hydrate with the correct
+language without waiting for `onMount`. `Subtitle.tsx` `onMount` keeps a
+safety-belt re-sync.
 
 ## Glyph rendering pipeline (Phase A)
 
