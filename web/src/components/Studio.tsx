@@ -854,7 +854,8 @@ export default function Studio() {
   const GLASS_BTN_TOGGLED = 'bg-glassBgHover';
   const GLASS_INPUT =
     'h-9 w-20 rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
-    'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing';
+    'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+    'disabled:opacity-40 disabled:cursor-not-allowed';
   const isRunning = () =>
     phase() === 'decoding' || phase() === 'generating' || phase() === 'animating';
 
@@ -976,7 +977,7 @@ export default function Studio() {
           aria-label={t('aspectPortrait')}
           title={t('aspectPortraitTitle')}
           onClick={() => onAspectClick('portrait')}
-          disabled={downloading()}
+          disabled={!decoded() || downloading()}
           class={GLASS_BTN + (aspect() === 'portrait' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 縦長を示すシルエット (角丸縦長方形) */}
@@ -999,7 +1000,7 @@ export default function Studio() {
           aria-label={t('aspectLandscape')}
           title={t('aspectLandscapeTitle')}
           onClick={() => onAspectClick('landscape')}
-          disabled={downloading()}
+          disabled={!decoded() || downloading()}
           class={GLASS_BTN + (aspect() === 'landscape' ? ' ' + GLASS_BTN_TOGGLED : '')}
         >
           {/* 横長を示すシルエット (角丸横長方形) */}
@@ -1024,7 +1025,7 @@ export default function Studio() {
             type="button"
             aria-pressed={shape() === 'circle'}
             onClick={() => onShapeClick('circle')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (shape() === 'circle' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('shapeOptionCircle')}
@@ -1033,7 +1034,7 @@ export default function Studio() {
             type="button"
             aria-pressed={shape() === 'glyph'}
             onClick={() => onShapeClick('glyph')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (shape() === 'glyph' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('shapeOptionGlyph')}
@@ -1045,7 +1046,7 @@ export default function Studio() {
               value={glyphChar()}
               placeholder={t('glyphCharPlaceholder')}
               maxLength={16}
-              disabled={downloading()}
+              disabled={!decoded() || downloading()}
               onCompositionStart={() => setIsGlyphComposing(true)}
               onCompositionEnd={(e) => {
                 setIsGlyphComposing(false);
@@ -1075,7 +1076,7 @@ export default function Studio() {
                     type="button"
                     aria-pressed={glyphChar() === sym}
                     onClick={() => onGlyphPickerClick(sym)}
-                    disabled={downloading()}
+                    disabled={!decoded() || downloading()}
                     class={
                       GLASS_BTN +
                       ' h-9 w-9 px-0 text-base ' +
@@ -1097,7 +1098,7 @@ export default function Studio() {
             type="button"
             aria-pressed={countPreset() === 'low'}
             onClick={() => onCountPresetClick('low')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (countPreset() === 'low' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('countOptionLow')}
@@ -1106,7 +1107,7 @@ export default function Studio() {
             type="button"
             aria-pressed={countPreset() === '' || countPreset() === 'mid'}
             onClick={() => onCountPresetClick('mid')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={
               GLASS_BTN + ' text-sm ' +
               (countPreset() === '' || countPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
@@ -1118,7 +1119,7 @@ export default function Studio() {
             type="button"
             aria-pressed={countPreset() === 'high'}
             onClick={() => onCountPresetClick('high')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (countPreset() === 'high' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('countOptionHigh')}
@@ -1131,7 +1132,7 @@ export default function Studio() {
             type="button"
             aria-pressed={speedPreset() === 'slow'}
             onClick={() => onSpeedPresetClick('slow')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'slow' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('speedOptionSlow')}
@@ -1140,7 +1141,7 @@ export default function Studio() {
             type="button"
             aria-pressed={speedPreset() === '' || speedPreset() === 'mid'}
             onClick={() => onSpeedPresetClick('mid')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={
               GLASS_BTN + ' text-sm ' +
               (speedPreset() === '' || speedPreset() === 'mid' ? GLASS_BTN_TOGGLED : '')
@@ -1152,7 +1153,7 @@ export default function Studio() {
             type="button"
             aria-pressed={speedPreset() === 'fast'}
             onClick={() => onSpeedPresetClick('fast')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={GLASS_BTN + ' text-sm ' + (speedPreset() === 'fast' ? GLASS_BTN_TOGGLED : '')}
           >
             {t('speedOptionFast')}
@@ -1165,7 +1166,7 @@ export default function Studio() {
             type="button"
             aria-pressed={softnessPreset() === 'low'}
             onClick={() => onSoftnessPresetClick('low')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={
               GLASS_BTN + ' text-sm ' + (softnessPreset() === 'low' ? GLASS_BTN_TOGGLED : '')
             }
@@ -1176,7 +1177,7 @@ export default function Studio() {
             type="button"
             aria-pressed={softnessPreset() === '' || softnessPreset() === 'mid'}
             onClick={() => onSoftnessPresetClick('mid')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={
               GLASS_BTN + ' text-sm ' +
               (softnessPreset() === '' || softnessPreset() === 'mid'
@@ -1190,7 +1191,7 @@ export default function Studio() {
             type="button"
             aria-pressed={softnessPreset() === 'high'}
             onClick={() => onSoftnessPresetClick('high')}
-            disabled={downloading()}
+            disabled={!decoded() || downloading()}
             class={
               GLASS_BTN + ' text-sm ' + (softnessPreset() === 'high' ? GLASS_BTN_TOGGLED : '')
             }
@@ -1210,6 +1211,38 @@ export default function Studio() {
           <pre class="mt-2 text-xs whitespace-pre-wrap text-fgMuted">{wasmErr()}</pre>
         </div>
       </Show>
+
+      {/* #135: reroll は control rows の直後・進捗行の直前に置く。`!decoded()`
+          のときも他 controls と同じく disabled で視覚的に弱まる。 */}
+      <div class="flex items-center justify-center pt-1">
+        <button
+          type="button"
+          onClick={runBatchIfReady}
+          disabled={!decoded() || downloading() || (shape() === 'glyph' && glyphChar().trim() === '')}
+          aria-label={t('rerollLabel')}
+          title={t('rerollTitle')}
+          class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+            classList={{ 'orb-spin': isRunning() }}
+            style={{ 'transform-origin': '50% 50%' }}
+          >
+            <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
+            <path d="M21 3v5h-5" />
+            <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
+            <path d="M3 21v-5h5" />
+          </svg>
+        </button>
+      </div>
 
       {/* #121: 進捗行は常に同じ高さを確保し、phase 完了後も消さない（消すと
           下のサムネイルグリッドがガクッと上に詰まる）。idle/error では中身を
@@ -1511,36 +1544,6 @@ export default function Studio() {
             })}
           </p>
         </Show>
-
-        <div class="flex items-center justify-center pt-1">
-          <button
-            type="button"
-            onClick={runBatchIfReady}
-            disabled={!decoded() || downloading() || (shape() === 'glyph' && glyphChar().trim() === '')}
-            aria-label={t('rerollLabel')}
-            title={t('rerollTitle')}
-            class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="18"
-              height="18"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-              classList={{ 'orb-spin': isRunning() }}
-              style={{ 'transform-origin': '50% 50%' }}
-            >
-              <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
-              <path d="M21 3v5h-5" />
-              <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
-              <path d="M3 21v-5h5" />
-            </svg>
-          </button>
-        </div>
       </Show>
 
       {/* #57 — 長押し中だけ表示する拡大プレビュー (DESIGN.md §4 PreviewOverlay)。

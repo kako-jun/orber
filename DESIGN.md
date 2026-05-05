@@ -297,8 +297,14 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 ### 生成トリガー
 
 - aspect / shape / count / speed / softness / glyph 入力 / symbol picker のすべてが即生成
-- 旧「ガチャ」チップは撤去し、下端には **最小の 🔄 アイコンのみ** を置く
+- 旧「ガチャ」チップは撤去し、**control rows の直後・進捗行の直前** に最小の 🔄 アイコンのみを置く（#135 で位置を移動）
 - 🔄 は `decoding | generating | animating` の間だけ `orb-spin` で回転し、`prefers-reduced-motion` では停止
+
+### Source 未投入時 (#135)
+
+- 画像をまだ 1 度もドロップ/選択していない（`decoded()` が `null` の）間は、drop zone 以外の controls をすべて disabled にする
+- 対象: aspect / shape / glyph input / symbol picker / count / speed / softness / reroll
+- 各 control は `decoded()` が null の間 `disabled:opacity-40 disabled:cursor-not-allowed`（GLASS_BTN / GLASS_INPUT に同梱済み）で視覚的に弱める。画像投入後は通常状態へ戻る
 
 ## Agent Quick Reference
 
