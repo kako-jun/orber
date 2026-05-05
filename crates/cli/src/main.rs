@@ -351,6 +351,15 @@ fn main() -> ExitCode {
     warn_if_glyph_char_unsupported(&cli);
 
     if let Some(n) = cli.variations {
+        // #7 review M1: video + --variations は未対応経路。`render_variations` は
+        // `image::open` を直に叩くので動画を渡すと「decoder error」で落ち、
+        // ユーザーには「動画が壊れている」かのように見えてしまう。明示エラーで弾く。
+        if is_video_path(&cli.input) {
+            eprintln!(
+                "orber: --variations is not supported with video input; use --output FILE.mp4 / .webm / .png instead"
+            );
+            return ExitCode::from(2);
+        }
         return render_variations(&cli, n);
     }
 

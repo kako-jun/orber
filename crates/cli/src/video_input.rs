@@ -55,6 +55,8 @@ pub enum VideoInputError {
     DecodeError(image::ImageError),
     /// 1 枚もフレームを抜けなかった（動画が空、または ffmpeg がサイレント失敗）。
     NoFramesExtracted,
+    /// k-means 等のクラスタ抽出でエラー（先頭フレームが空、k=0 等）。
+    ClusterExtractionFailed { source: String },
     /// I/O エラー（一時ディレクトリ作成失敗等）。
     Io(io::Error),
 }
@@ -87,6 +89,9 @@ impl std::fmt::Display for VideoInputError {
                 f,
                 "ffmpeg produced no frames (video may be empty or fully corrupted)"
             ),
+            Self::ClusterExtractionFailed { source } => {
+                write!(f, "cluster extraction failed on first frame: {source}")
+            }
             Self::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
@@ -114,6 +119,10 @@ impl From<io::Error> for VideoInputError {
 /// `mkv` は Matroska、`avi` は AVI。ffmpeg がデコードできる主要なコンテナを
 /// CLI 引数の拡張子だけで分岐したいので、ここで明示的に列挙している。
 const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mov", "mkv", "m4v", "avi"];
+
+/// 末尾ぴったりの t は ffmpeg がフレームを返さないことがあるため、これだけ手前に
+/// 寄せる（秒）。1ms あれば実用上は最後のフレームに乗る。
+const VIDEO_FRAME_TAIL_EPSILON_S: f64 = 0.001;
 
 /// 入力ファイルの拡張子から「動画として扱うべきか」を判定する。
 ///
@@ -198,7 +207,7 @@ pub fn sample_video_frames(
     for i in 0..n {
         // N == 1 なら冒頭、それ以上なら [0, duration] を均等分割。
         // 注: 末尾ぴったりは ffmpeg で frame 取れない場合があるので、
-        // 直前位置に少しだけ寄せる（duration * 0.999）。
+        // VIDEO_FRAME_TAIL_EPSILON_S だけ手前に寄せる。
         let t_norm = if n == 1 {
             0.0
         } else {
@@ -206,7 +215,7 @@ pub fn sample_video_frames(
         };
         let mut t_seconds = t_norm as f64 * duration;
         if t_seconds >= duration {
-            t_seconds = (duration - 0.001).max(0.0);
+            t_seconds = (duration - VIDEO_FRAME_TAIL_EPSILON_S).max(0.0);
         }
 
         let out_path = temp_dir.path().join(format!("sample_{i:03}.png"));
@@ -240,7 +249,11 @@ pub fn sample_video_frames(
         }
         if !out_path.exists() {
             // ffmpeg が exit 0 だがファイルを生成しなかったケース（末尾近辺で
-            // 偶発的に起こる）。このサンプルだけスキップする。
+            // 偶発的に起こる）。このサンプルだけスキップして運用診断のため
+            // 警告を出す。N=20 中 17 枚しか取れなかった、を後追いできるように。
+            eprintln!(
+                "orber: warning: ffmpeg produced no frame at t={t_seconds:.3}s, skipping sample {i}"
+            );
             continue;
         }
         let dyn_img = image::open(&out_path).map_err(VideoInputError::DecodeError)?;
@@ -296,9 +309,8 @@ pub fn build_color_tracks(
     }
 
     let template_clusters = extract_clusters(&samples[0].frame, k)
-        .map_err(|e| VideoInputError::DurationProbeFailed { stderr: e.to_string() })?;
+        .map_err(|e| VideoInputError::ClusterExtractionFailed { source: e.to_string() })?;
 
-    let n_clusters = template_clusters.len();
     let n_samples = samples.len();
 
     // tracks[i][s] = sample s での template_clusters[i] の色。
@@ -347,7 +359,6 @@ pub fn build_color_tracks(
             }
             // 見つからなかった場合は初期化値（テンプレート色）のまま残る。
         }
-        let _ = n_clusters; // 将来の整合チェック用（warning 抑止）。
     }
 
     Ok(ColorTracks {
