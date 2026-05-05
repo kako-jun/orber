@@ -141,6 +141,8 @@ The implementation lives in `Studio.tsx` as the constants `SEG_GROUP` (wrapper c
 
 When the segmented control's adjacent input is the Glyph picker (`Studio` shape row), the input, the picker buttons, and the `<datalist>` options are all tagged with `glyph-symbol-text`. That class loads `Noto Sans Symbols 2` from Google Fonts and sets `font-variant-emoji: text`, so `⚡` / `☀` / `★` / `←` are drawn as white symbols (matching the rest of the chrome) instead of the OS color-emoji rasters. The font load lives in `Base.astro`; the class is scoped — body text and other UI strings continue using the system sans stack.
 
+For Safari/iOS the picker buttons additionally append `U+FE0E` (text variation selector) after each displayed symbol — `font-variant-emoji: text` is Chromium-only, and Safari can still resolve dual-presentation codepoints like `U+26A1` to the OS color emoji font even when Symbols 2 is listed first. The variation selector is display-only; the underlying signal value (`glyphChar()`) stays as the bare codepoint so state and wasm RPCs are unaffected.
+
 ### Tile
 
 - Flat. **No glass, no ring, no rounded corners beyond `0.125rem` (2px) for sub-pixel cleanup**

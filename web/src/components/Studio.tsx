@@ -920,7 +920,7 @@ export default function Studio() {
     return [
       'flex-1 h-9 px-2 text-sm flex items-center justify-center transition-colors duration-200 ease-out',
       'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing',
-      'disabled:opacity-40 disabled:cursor-not-allowed',
+      'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-glassBg disabled:hover:text-fgMuted',
       radius,
       sep,
       state,
@@ -1201,7 +1201,12 @@ export default function Studio() {
                     }
                     title={sym}
                   >
-                    {sym}
+                    {/* #133 review Q2: U+FE0E (text variation selector) を付けて
+                        Safari/iOS で ⚡ などが OS 絵文字フォントに resolve されるのを防ぎ、
+                        Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
+                        font-variant-emoji: text で対応済み。selector は display 用で、
+                        value (sym) には付けないので状態管理は影響を受けない。 */}
+                    {sym + '︎'}
                   </button>
                 )}
               </For>
