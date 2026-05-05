@@ -37,6 +37,19 @@ const SYMBOL_PICKER_DEFAULT = [
   '✕', '✿', '❀', '✦', '☀', '☁', '⚡', '←', '→', '↑', '↓',
 ];
 
+// #136: glyph 文字ごとに「回転を既定で ON / OFF どちらにするか」のテーブル。
+// 雷 ⚡ や太陽 ☀ のように、現実世界で回転しない記号は OFF を既定にすると
+// 違和感が減る。テーブルに無い文字は ON 既定（`?? true` で fallback）。
+//
+// glyph 切替時にこのテーブルを参照して checkbox 状態を上書きするので、
+// 「⚡ に切り替えたら回転が止まる」「☆ に切り替えたら回転が戻る」という
+// 直感的な挙動になる。ユーザーがその後 checkbox を手動で外しても、その
+// session 中は手動選択を尊重し、次の glyph 切替で再度 default が適用される。
+const GLYPH_DEFAULT_ROTATE: Record<string, boolean> = {
+  '⚡': false,
+  '☀': false,
+};
+
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
   // skeleton 表示中は null（runBatch 冒頭で 12 個先出しするため）。
@@ -94,6 +107,10 @@ export default function Studio() {
   // 初期値は empty identity を維持し、既存 output regression を防ぐ。
   const [shape, setShape] = createSignal<ShapeChoice>('circle');
   const [glyphChar, setGlyphChar] = createSignal<string>('☆');
+  // #136: Glyph 回転 ON/OFF。glyph_char 切替時に GLYPH_DEFAULT_ROTATE で上書き。
+  // ユーザーが checkbox を切替えるとその session 中は尊重し、次の glyph 切替で
+  // 再度 default が適用される。既定 true（既存挙動互換）。
+  const [glyphRotate, setGlyphRotate] = createSignal<boolean>(true);
   const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
@@ -361,6 +378,8 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
+      // #136: glyph_rotate=false で per-orb 回転を抑止。Circle 経路では未使用。
+      glyph_rotate: glyphRotate(),
     };
 
     const total = batchN();
@@ -687,12 +706,25 @@ export default function Studio() {
   const applyGlyphChar = (raw: string) => {
     const first = [...raw][0] ?? '';
     setGlyphChar(first);
-    if (first.length > 0) runBatchIfReady();
+    // #136: glyph 切替時は GLYPH_DEFAULT_ROTATE で checkbox 既定値を上書きする。
+    // 雷 ⚡ や太陽 ☀ は OFF、それ以外は ON。これにより「⚡ を選んだら自然に
+    // 静止する」体験になる。ユーザーが直後に checkbox を切替えれば尊重される。
+    if (first.length > 0) {
+      setGlyphRotate(GLYPH_DEFAULT_ROTATE[first] ?? true);
+      runBatchIfReady();
+    }
     return first;
   };
 
   const onGlyphPickerClick = (sym: string) => {
     setGlyphChar(sym);
+    // #136: ピッカー経由の切替も既定値テーブルを参照する。
+    setGlyphRotate(GLYPH_DEFAULT_ROTATE[sym] ?? true);
+    runBatchIfReady();
+  };
+
+  const onGlyphRotateChange = (next: boolean) => {
+    setGlyphRotate(next);
     runBatchIfReady();
   };
 
@@ -774,6 +806,9 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
+      // #136: hi-res 再描画でも UI の glyph_rotate を踏襲。プレビューと DL の
+      // 形状不変条件（同じ baseSeed + 同じ params で同じ spec が再現）を保つ。
+      glyph_rotate: glyphRotate(),
     };
 
     setDlProgress({ done: 0, total: indices.length });
@@ -856,6 +891,20 @@ export default function Studio() {
     'h-9 w-20 rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
     'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
     'disabled:opacity-40 disabled:cursor-not-allowed';
+  // #136: 再利用可能な glass checkbox ラベル + input スタイル。
+  // 後の #56（透過DL checkbox）が同じトークンを踏襲する想定。
+  // - GLASS_CHECKBOX_LABEL: <label> 全体のクリック領域・disabled 連動を担う
+  // - GLASS_CHECKBOX_INPUT: <input type="checkbox"> 本体の glass 風見た目
+  // ブラウザ既定の青塗りに頼らず、accent-fg + 1.5px hairline + glass-bg で
+  // ボタン群と同じ視覚言語を保つ。
+  const GLASS_CHECKBOX_LABEL =
+    'inline-flex items-center gap-2 cursor-pointer text-sm text-fg ' +
+    'has-[:disabled]:opacity-40 has-[:disabled]:cursor-not-allowed';
+  const GLASS_CHECKBOX_INPUT =
+    'h-4 w-4 rounded-sm border border-glassBorder bg-glassBg ' +
+    'accent-fg ' +
+    'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+    'disabled:cursor-not-allowed';
   const isRunning = () =>
     phase() === 'decoding' || phase() === 'generating' || phase() === 'animating';
 
@@ -1089,6 +1138,21 @@ export default function Studio() {
                 )}
               </For>
             </div>
+            {/* #136: Glyph 回転 ON/OFF の checkbox。glyph 形状時のみ表示する。
+                glyph picker の下に置くことで「文字を選ぶ → 回転を決める」の
+                論理的な流れを維持する。Sample default テーブルにより ⚡ や ☀
+                を選ぶと自動で OFF になる。 */}
+            <span />
+            <label class={GLASS_CHECKBOX_LABEL}>
+              <input
+                type="checkbox"
+                class={GLASS_CHECKBOX_INPUT}
+                checked={glyphRotate()}
+                onChange={(e) => onGlyphRotateChange(e.currentTarget.checked)}
+                disabled={!decoded() || downloading()}
+              />
+              <span>{t('glyphRotateLabel')}</span>
+            </label>
           </>
         </Show>
 

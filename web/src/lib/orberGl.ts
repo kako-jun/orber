@@ -79,6 +79,9 @@ uniform int u_n_orbs;
 uniform float u_alpha_mul;     // softness.alpha_mul (Mid=1.0)
 uniform int u_shape_id;        // 0=Circle, 1=Glyph
 uniform sampler2D u_glyph_sdf;
+// #136: glyph 回転 ON/OFF。1.0 = ON (legacy), 0.0 = OFF (静止)。
+// OFF でも base_angle は乗るので glyph 文字の初期向きは保たれる。
+uniform float u_glyph_rotate;
 
 // per-orb uniforms (length MAX_ORBS = 64). Float で詰める。
 uniform vec4 u_orb_color[${MAX_ORBS}];     // (r, g, b, weight)
@@ -186,7 +189,9 @@ void main() {
     float alpha = 0.0;
     if (u_shape_id == 1) {
       vec2 local = px - vec2(cx, cy);
-      float angle = base_angle + u_t * rot_speed_signed * TAU * u_cycle;
+      // #136: u_glyph_rotate=0 のときは t 依存項を 0 にして base_angle 固定。
+      // OFF でも base_angle は per-orb の seed 由来初期向きとして残る。
+      float angle = base_angle + u_t * rot_speed_signed * TAU * u_cycle * u_glyph_rotate;
       float c = cos(angle);
       float s = sin(angle);
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
@@ -305,6 +310,7 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     alphaMul: gl.getUniformLocation(prog, 'u_alpha_mul'),
     shapeId: gl.getUniformLocation(prog, 'u_shape_id'),
     glyphMask: gl.getUniformLocation(prog, 'u_glyph_sdf'),
+    glyphRotate: gl.getUniformLocation(prog, 'u_glyph_rotate'),
     orbColor: gl.getUniformLocation(prog, 'u_orb_color'),
     orbPhase: gl.getUniformLocation(prog, 'u_orb_phase'),
     orbMisc: gl.getUniformLocation(prog, 'u_orb_misc'),
@@ -374,8 +380,10 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     const cycle = data[7];
     const nOrbs = data[8] | 0;
     // Phase B (#55): header[9] = alpha_mul, header[10] = shape_id (0=Circle, 1=Glyph)。
+    // #136: header[11] = glyph_rotate (1.0=ON / 既定, 0.0=OFF)。
     const alphaMul = data[9];
     const shapeId = data[10] | 0;
+    const glyphRotate = data[11];
 
     if (nOrbs > MAX_ORBS) {
       throw new Error(`n_orbs ${nOrbs} exceeds MAX_ORBS=${MAX_ORBS}`);
@@ -395,6 +403,7 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     gl!.uniform1i(uLoc.nOrbs, nOrbs);
     gl!.uniform1f(uLoc.alphaMul, alphaMul);
     gl!.uniform1i(uLoc.shapeId, shapeId);
+    gl!.uniform1f(uLoc.glyphRotate, glyphRotate);
 
     // per-orb を 3 本の vec4 配列に詰め直す。余り (i >= nOrbs) は 0 詰め
     // のままで shader 側で `i >= u_n_orbs` ガードしているので使われない。

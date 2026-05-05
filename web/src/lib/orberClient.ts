@@ -52,6 +52,8 @@ interface BaseParams {
   count_preset?: string;
   speed_preset?: string;
   softness_preset?: string;
+  // #136: Glyph 回転 ON/OFF。`true` 既定で従来挙動、`false` で静止描画。
+  glyph_rotate?: boolean;
 }
 
 let worker: Worker | null = null;

@@ -128,6 +128,11 @@ pub struct AnimateOptions {
     pub shape: OrbShape,
     /// ぼかし (Softness) preset（#55, #131 で改名）。Mid で既存挙動と完全同値。
     pub softness: SoftnessPreset,
+    /// Glyph 形状時に per-orb 回転をアニメーションさせるかどうか（#136）。
+    /// `true` で従来挙動（base_angle + cycle * rot_speed_signed * t * TAU）。
+    /// `false` で全 t において base_angle を保ち、glyph は静止向きで描かれる。
+    /// Circle / Aquarelle 経路では使われない。既定 `true` で互換維持。
+    pub glyph_rotate: bool,
 }
 
 impl Default for AnimateOptions {
@@ -145,6 +150,7 @@ impl Default for AnimateOptions {
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
             softness: SoftnessPreset::Mid,
+            glyph_rotate: true,
         }
     }
 }
@@ -288,6 +294,9 @@ fn unit_from_hash(x: u64) -> f32 {
 /// `orber-wasm` が shape / softness / rotation を CPU 経路と同じ決定論性で
 /// WebGL へ渡すための purpose-built helper。内部 RNG 列や `OrbParams` の
 /// レイアウトは公開しない。
+///
+/// `glyph_rotate` (#136): `false` を渡すと shader 側で per-orb 回転を抑止し、
+/// 全 t で `base_angle` のまま描く。Circle 経路には影響しない。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data_for_webgl(
@@ -301,6 +310,7 @@ pub fn pack_render_data_for_webgl(
     n_orbs: usize,
     alpha_mul: f32,
     shape_id: f32,
+    glyph_rotate: bool,
 ) -> Vec<f32> {
     let header_words = 16usize;
     let per_orb_words = 16usize;
@@ -317,6 +327,8 @@ pub fn pack_render_data_for_webgl(
     buf[8] = n_orbs as f32;
     buf[9] = alpha_mul;
     buf[10] = shape_id;
+    // #136: header[11] = glyph_rotate (1.0 = ON / 既定, 0.0 = OFF)。既存ヘッダ予約域に追加。
+    buf[11] = if glyph_rotate { 1.0 } else { 0.0 };
 
     if n_orbs == 0 || clusters.is_empty() {
         return buf;
@@ -356,7 +368,18 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
 }
 
 #[inline]
-fn glyph_rotation_angle(cycle: u32, t: f32, base_angle: f32, rot_speed_signed: f32) -> f32 {
+fn glyph_rotation_angle(
+    cycle: u32,
+    t: f32,
+    base_angle: f32,
+    rot_speed_signed: f32,
+    glyph_rotate: bool,
+) -> f32 {
+    // #136: glyph_rotate=false なら全 t で base_angle のまま静止する。
+    // OFF でも t=0 と t=1 が一致する（loop closure は自明）。
+    if !glyph_rotate {
+        return base_angle;
+    }
     let turns = (cycle as f32 * rot_speed_signed * t).rem_euclid(1.0);
     base_angle + turns * TAU
 }
@@ -541,7 +564,13 @@ pub fn render_frame_with_params(
                     },
                     font,
                     ch,
-                    glyph_rotation_angle(cycle, t, p.base_angle, p.rot_speed_signed),
+                    glyph_rotation_angle(
+                        cycle,
+                        t,
+                        p.base_angle,
+                        p.rot_speed_signed,
+                        opts.glyph_rotate,
+                    ),
                 );
             }
             _ => {
@@ -731,6 +760,7 @@ mod tests {
             background: [0, 0, 0, 255],
             shape: OrbShape::Circle,
             softness: SoftnessPreset::Mid,
+            glyph_rotate: true,
         }
     }
 
@@ -1064,8 +1094,10 @@ mod tests {
         let p = generate_orb_params(42, 16, &[1.0]);
         for cycle in 1..=4 {
             for q in &p {
-                let a0 = glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed);
-                let a1 = glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed);
+                let a0 =
+                    glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed, true);
+                let a1 =
+                    glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed, true);
                 let delta = (a1 - a0).rem_euclid(TAU);
                 assert!(
                     delta.abs() < 1e-5 || (TAU - delta).abs() < 1e-5,
@@ -1073,6 +1105,31 @@ mod tests {
                     q.base_angle,
                     q.rot_speed_signed
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_rotation_off_keeps_base_angle() {
+        // #136: glyph_rotate=false なら全 t で角度は base_angle のまま不変。
+        // OFF パスでも t=0 と t=1 が一致する（loop closure は自明）。
+        let p = generate_orb_params(42, 16, &[1.0]);
+        for cycle in 1..=4 {
+            for q in &p {
+                for &t in &[0.0_f32, 0.13, 0.25, 0.5, 0.77, 1.0] {
+                    let a = glyph_rotation_angle(
+                        cycle,
+                        t,
+                        q.base_angle,
+                        q.rot_speed_signed,
+                        false,
+                    );
+                    assert!(
+                        (a - q.base_angle).abs() < 1e-6,
+                        "glyph_rotate=false must hold base_angle: cycle={cycle} t={t} base={} got={a}",
+                        q.base_angle,
+                    );
+                }
             }
         }
     }

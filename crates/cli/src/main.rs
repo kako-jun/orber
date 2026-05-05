@@ -569,6 +569,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         background,
         shape: cli.orb_shape(),
         softness: cli.resolved_softness(),
+        glyph_rotate: true,
     };
     let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
 
@@ -696,6 +697,7 @@ fn render_one_variation(
                 background: bg_rgba,
                 shape: orb_shape,
                 softness,
+                glyph_rotate: true,
             };
             let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())

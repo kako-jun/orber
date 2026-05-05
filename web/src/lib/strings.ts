@@ -52,6 +52,11 @@ export const STRINGS = {
     ja: '同梱フォントに収録されていません',
     en: 'Not in bundled font',
   },
+  // #136: Glyph 回転 ON/OFF。雷 ⚡ など回転すると違和感のある記号は既定 OFF にする。
+  glyphRotateLabel: {
+    ja: '回転させる',
+    en: 'Animate rotation',
+  },
   countLabel: { ja: '数', en: 'Count' },
   countOptionLow: { ja: '少なめ', en: 'Few' },
   countOptionMid: { ja: '標準', en: 'Standard' },
