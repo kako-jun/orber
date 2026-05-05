@@ -89,7 +89,7 @@ pub struct VideoOptions {
     pub background: [u8; 4],
     /// orb の描画形式。
     pub shape: OrbShape,
-    /// コントラスト preset (#55)。Mid なら既存挙動と完全同値。
+    /// ぼかし (Softness) preset (#55, #131 で改名)。Mid なら既存挙動と完全同値。
     pub softness: SoftnessPreset,
 }
 
