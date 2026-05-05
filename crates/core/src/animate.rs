@@ -42,8 +42,9 @@
 //! - 描画は [`crate::orb::render_one_orb`] / [`crate::glyph::render_glyph_orb`] を
 //!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
 
-use crate::cluster::Cluster;
+use crate::cluster::{Centroid, Cluster};
 use crate::color_track::interpolate_color_track;
+use crate::keyframe_track::{interpolate_keyframe_track, KeyframeClusterPoint};
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use crate::style::{FalloffProfile, SoftnessPreset};
 use image::RgbaImage;
@@ -142,6 +143,15 @@ pub struct AnimateOptions {
     /// 個別 track が空の場合は `cluster.color` にフォールバックする。
     /// `None` は静止画入力の従来挙動（色固定）。
     pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
+    /// 動画入力（#33）の per-cluster キーフレーム補間トラック。
+    ///
+    /// `Some(tracks)` のとき、各 orb の `cluster.color` / `cluster.centroid` /
+    /// `cluster.weight` は [`crate::keyframe_track::interpolate_keyframe_track`]
+    /// で時刻 `t` の補間値に動的に上書きされる。`color_tracks` (#7) と排他で、
+    /// 両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の上位互換）。
+    /// `None` のときは `color_tracks` に従う。
+    /// WebGL 経路 (`pack_render_data_for_webgl`) は keyframe_tracks を見ない。
+    pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
 impl Default for AnimateOptions {
@@ -161,6 +171,7 @@ impl Default for AnimateOptions {
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
+            keyframe_tracks: None,
         }
     }
 }
@@ -391,6 +402,28 @@ fn pick_color_at_t(
     interpolate_color_track(track, t)
 }
 
+/// 動画入力（#33）: `keyframe_tracks` が指定されているときは色 + 位置 + 重みを
+/// 全部時刻 `t` で補間して返す。指定が無い・index 範囲外・track が空のときは
+/// 静止画の `fallback` cluster を素通しする。
+///
+/// `keyframe_tracks` と `color_tracks` (#7) を両方持つ `AnimateOptions` でも、
+/// この関数は keyframe_tracks のみを参照する（呼び出し側で優先順位を決める）。
+#[inline]
+fn pick_cluster_at_t(
+    keyframe_tracks: Option<&[Vec<KeyframeClusterPoint>]>,
+    cluster_idx: usize,
+    fallback: &Cluster,
+    t: f32,
+) -> Option<([u8; 3], Centroid, f32)> {
+    let tracks = keyframe_tracks?;
+    let track = tracks.get(cluster_idx)?;
+    if track.is_empty() {
+        return None;
+    }
+    let _ = fallback; // 現状はフォールバック値を使わず None を返して呼び出し側で素通しさせる。
+    Some(interpolate_keyframe_track(track, t))
+}
+
 /// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
 ///
 /// `f` と `scale` がともに整数のとき、`t = 1.0` ちょうどで `(f * t * scale)` は
@@ -525,16 +558,28 @@ pub fn render_frame_with_params(
     for p in params.iter() {
         // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
         let cluster_idx = p.cluster_idx.min(clusters.len() - 1);
-        let c = &clusters[cluster_idx];
+        let static_c = &clusters[cluster_idx];
 
-        // 動画入力（#7）: color_tracks が指定されているときは時刻 t の補間色で
-        // cluster.color を上書きする。指定が無い、track が短い、空の場合は
-        // cluster.color にフォールバック。位置・サイズ・揺らぎは変えない。
-        let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, c.color, t);
+        // 動画入力（#33）: keyframe_tracks が指定されているときは色 + 位置 + 重みを
+        // 全部時刻 t の補間値に置き換える。これがない場合は静止画クラスタを使う。
+        // 動画入力（#7）: keyframe_tracks が無く、color_tracks があるときは色だけ
+        // 上書き。位置・サイズ・揺らぎは変えない。
+        let interpolated =
+            pick_cluster_at_t(opts.keyframe_tracks.as_deref(), cluster_idx, static_c, t);
+        let (color_static, centroid_used, weight_used) = match interpolated {
+            Some((col, cen, w)) => (col, cen, w),
+            None => (static_c.color, static_c.centroid, static_c.weight),
+        };
+        let _ = centroid_used; // Circle 経路は cross_axis (RNG) を使うため centroid 未参照。
+        let color_at_t = if opts.keyframe_tracks.is_some() {
+            color_static
+        } else {
+            pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, static_c.color, t)
+        };
 
         // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
         // r_normalized は進行軸 [0,1] スケールにおける半径相当。
-        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_pixels_max = base_radius_unit * weight_used.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
         let r_normalized = if progress_axis_pixels > 0.0 {
             r_pixels_max / progress_axis_pixels
         } else {
@@ -571,7 +616,7 @@ pub fn render_frame_with_params(
         let blur_delta = 0.15 * sin_loop(1, t, 1, p.phi_blur);
         let opacity_factor = 1.0 + 0.05 * sin_loop(1, t, 1, p.phi_opacity);
 
-        let radius = base_radius_unit * c.weight.max(0.0).sqrt() * radius_factor;
+        let radius = base_radius_unit * weight_used.max(0.0).sqrt() * radius_factor;
         if radius <= 0.0 {
             continue;
         }
@@ -714,23 +759,34 @@ fn render_frame_aquarelle(
         .zip(params.iter())
         .enumerate()
         .map(|(idx, (c, p))| {
+            // 動画入力（#33）: keyframe_tracks があれば色 + 重心 + 重みを時刻 t の
+            // 補間値で読み替える。#7 (color_tracks) より優先される。
+            let interpolated =
+                pick_cluster_at_t(opts.keyframe_tracks.as_deref(), idx, c, t);
+            let (color_t33, centroid_t33, weight_t33) = match interpolated {
+                Some((col, cen, w)) => (col, cen, w),
+                None => (c.color, c.centroid, c.weight),
+            };
             let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
             let progress = (p.phase + advance).rem_euclid(1.0);
             let (nx, ny) = match opts.direction {
-                MotionDirection::LeftToRight => (progress, c.centroid.y),
-                MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
-                MotionDirection::TopToBottom => (c.centroid.x, progress),
-                MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
+                MotionDirection::LeftToRight => (progress, centroid_t33.y),
+                MotionDirection::RightToLeft => (1.0 - progress, centroid_t33.y),
+                MotionDirection::TopToBottom => (centroid_t33.x, progress),
+                MotionDirection::BottomToTop => (centroid_t33.x, 1.0 - progress),
             };
             let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
-            // 動画入力（#7）: cluster.color を時刻 t の色に置換。Aquarelle は
-            // cluster ループなので idx をそのまま使う（cluster_idx == idx）。
-            let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t);
+            // #33 が無いときだけ #7 の color_tracks を見る（#33 が指定済みなら色は補間値）。
+            let color_at_t = if opts.keyframe_tracks.is_some() {
+                color_t33
+            } else {
+                pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t)
+            };
             Cluster {
                 color: color_at_t,
                 centroid: Centroid { x: nx, y: ny },
-                weight: (c.weight * weight_scale).max(0.0),
+                weight: (weight_t33 * weight_scale).max(0.0),
             }
         })
         .collect();
@@ -807,6 +863,7 @@ mod tests {
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
+            keyframe_tracks: None,
         }
     }
 
