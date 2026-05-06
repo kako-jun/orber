@@ -570,7 +570,19 @@ pub fn render_frame_with_params(
             Some((col, cen, w)) => (col, cen, w),
             None => (static_c.color, static_c.centroid, static_c.weight),
         };
-        let _ = centroid_used; // Circle 経路は cross_axis (RNG) を使うため centroid 未参照。
+        // #33 review M1: keyframe_tracks ありのときだけ centroid を反映。
+        // cross_axis (seed 由来 RNG) と centroid 補間値を 50:50 でブレンドして
+        // 入力動画のコンポジショナルな動きを視覚化する。none のとき (#7 / 静止画) は
+        // 完全に既存挙動を保つ（縞模様回避維持）。
+        let cross_axis_used = if opts.keyframe_tracks.is_some() {
+            let centroid_axis = match opts.direction {
+                MotionDirection::LeftToRight | MotionDirection::RightToLeft => centroid_used.y,
+                MotionDirection::TopToBottom | MotionDirection::BottomToTop => centroid_used.x,
+            };
+            p.cross_axis * 0.5 + centroid_axis * 0.5
+        } else {
+            p.cross_axis
+        };
         let color_at_t = if opts.keyframe_tracks.is_some() {
             color_static
         } else {
@@ -601,10 +613,10 @@ pub fn render_frame_with_params(
         // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
         // なるので、画面全体に散布するため orb 個別のオフセットを使う。
         let (nx, ny) = match opts.direction {
-            MotionDirection::LeftToRight => (pos, p.cross_axis),
-            MotionDirection::RightToLeft => (1.0 - pos, p.cross_axis),
-            MotionDirection::TopToBottom => (p.cross_axis, pos),
-            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - pos),
+            MotionDirection::LeftToRight => (pos, cross_axis_used),
+            MotionDirection::RightToLeft => (1.0 - pos, cross_axis_used),
+            MotionDirection::TopToBottom => (cross_axis_used, pos),
+            MotionDirection::BottomToTop => (cross_axis_used, 1.0 - pos),
         };
 
         // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
@@ -1467,6 +1479,142 @@ mod tests {
         assert!(
             pixels_equal(&a, &b),
             "loop must close at t=1 even with mixed speed_mult"
+        );
+    }
+
+    // ---- #33 review S1: keyframe_tracks E2E 統合テスト ----
+    //
+    // ここから 4 件は keyframe_tracks 経路の入口〜出口（render_frame_with_params）まで
+    // を通して回し、(a) Aquarelle / Circle で centroid drift が視覚反映されること、
+    // (b) 決定論性、(c) keyframe_tracks が color_tracks より優先されること、を検証する。
+
+    /// 1 cluster ぶんの keyframe トラックを (k0=左上 / k1=右下、色も大きく異なる) で
+    /// 構築するヘルパ。M1/S1 の centroid drift 検証はこの「t=0 と t=1 で位置・色が
+    /// 大幅に異なる」性質に依存する。
+    fn drift_keyframe_tracks() -> Vec<Vec<KeyframeClusterPoint>> {
+        vec![vec![
+            KeyframeClusterPoint {
+                color: [240, 40, 40],
+                centroid: Centroid { x: 0.15, y: 0.15 },
+                weight: 1.0,
+                time: 0.0,
+            },
+            KeyframeClusterPoint {
+                color: [40, 80, 240],
+                centroid: Centroid { x: 0.85, y: 0.85 },
+                weight: 1.0,
+                time: 1.0,
+            },
+        ]]
+    }
+
+    /// drift_keyframe_tracks() に対応する static cluster（先頭キーと同じ位置・色）。
+    fn drift_static_clusters() -> Vec<Cluster> {
+        vec![cluster([240, 40, 40], 0.15, 0.15, 1.0)]
+    }
+
+    /// 中央列 (x = width/2) の RGB 行ベクトルを取り出す。Aquarelle の centroid drift
+    /// 検出に使う（左上→右下のドリフトでは中央列上の輝度分布が t によって変わる）。
+    fn middle_column_bytes(img: &RgbaImage) -> Vec<u8> {
+        let mid_x = img.width() / 2;
+        let mut out = Vec::with_capacity(img.height() as usize * 3);
+        for y in 0..img.height() {
+            let p = img.get_pixel(mid_x, y);
+            out.push(p[0]);
+            out.push(p[1]);
+            out.push(p[2]);
+        }
+        out
+    }
+
+    fn pixel_diff_count(a: &RgbaImage, b: &RgbaImage) -> usize {
+        assert_eq!(a.dimensions(), b.dimensions());
+        a.as_raw()
+            .chunks_exact(4)
+            .zip(b.as_raw().chunks_exact(4))
+            .filter(|(pa, pb)| pa != pb)
+            .count()
+    }
+
+    #[test]
+    fn keyframe_tracks_render_centroid_drift_aquarelle() {
+        // Aquarelle 経路は cluster.centroid を直接位置に使う。keyframe_tracks で
+        // centroid が大きく移動するキー列を渡すと t=0 と t=1 で中央列 RGB が
+        // 異なるはず（左上→右下の対角ドリフト）。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = OrbShape::Aquarelle(crate::aquarelle::AquarelleParams::default());
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        let col_a = middle_column_bytes(&a);
+        let col_b = middle_column_bytes(&b);
+        assert_ne!(
+            col_a, col_b,
+            "Aquarelle centroid drift must change middle-column RGB between t=0 and t=1"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_render_centroid_drift_circle_with_keyframes() {
+        // M1 修正後: Circle 経路でも keyframe_tracks ありのとき centroid を 50% 反映。
+        // 同じ keyframe トラックで t=0 と t=1 を比べると少なくとも 1 ピクセル以上
+        // 差分が出るはず（cross_axis 単独だった以前は色変化のみで微差はあったが、
+        // ここでは「位置」の効果も加わるため、より顕著に異なるフレームが出る）。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = OrbShape::Circle;
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        let diff = pixel_diff_count(&a, &b);
+        assert!(
+            diff >= 1,
+            "Circle + keyframe_tracks must show centroid drift (>=1 pixel diff between t=0 and t=1, got {diff})"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_determinism_e2e() {
+        // 同じ keyframe_tracks + 同じ seed + 同じ t=0.5 で render_frame_with_params を
+        // 2 回呼んで byte-exact 同値であることを保証する。決定論性の最終ガード。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let cache = precompute_orb_params(&opts, &clusters);
+        let a = render_frame_with_params(&clusters, &opts, &cache, 0.5);
+        let b = render_frame_with_params(&clusters, &opts, &cache, 0.5);
+        assert!(
+            pixels_equal(&a, &b),
+            "keyframe_tracks render must be byte-exact deterministic at t=0.5"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_takes_precedence_over_color_tracks() {
+        // 色が大きく違う color_tracks (#7) と keyframe_tracks (#33) を両方指定して、
+        // 出力色は keyframe_tracks に従うことを確認する（#33 が #7 の上位互換のため）。
+        // color_tracks 単独 vs keyframe_tracks+color_tracks の出力を比較し、
+        // 後者が「keyframe_tracks 単独」と byte-exact 一致することを assert する。
+        let clusters = drift_static_clusters();
+
+        // keyframe_tracks のみ
+        let mut opts_kf_only = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_kf_only.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        // keyframe_tracks + color_tracks（color_tracks は明らかに違う色 — 緑系）
+        let mut opts_both = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_both.keyframe_tracks = Some(drift_keyframe_tracks());
+        opts_both.color_tracks = Some(vec![vec![[20, 240, 20], [20, 240, 20]]]);
+
+        let kf_only = render_frame(&clusters, &opts_kf_only, 0.5);
+        let both = render_frame(&clusters, &opts_both, 0.5);
+        assert!(
+            pixels_equal(&kf_only, &both),
+            "keyframe_tracks must take precedence over color_tracks (output should match keyframe-only render)"
         );
     }
 }

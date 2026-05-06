@@ -381,6 +381,16 @@ fn main() -> ExitCode {
 
     warn_if_glyph_char_unsupported(&cli);
 
+    // #33 review S3: --input-mode keyframe は動画入力専用。静止画 + variations の
+    // 組合せでは silent skip にせず、--variations 分岐より先に明示エラーで弾く。
+    if cli.input_mode == CliInputMode::Keyframe && !is_video_path(&cli.input) {
+        eprintln!(
+            "orber: --input-mode keyframe requires video input (got still image: {})",
+            cli.input.display()
+        );
+        return ExitCode::from(2);
+    }
+
     if let Some(n) = cli.variations {
         // #7 review M1: video + --variations は未対応経路。`render_variations` は
         // `image::open` を直に叩くので動画を渡すと「decoder error」で落ち、
@@ -414,16 +424,6 @@ fn main() -> ExitCode {
     // 静止画入力は従来どおり既存パスを通る。
     if is_video_path(&cli.input) {
         return run_video_input(&cli, &output, mode);
-    }
-
-    // #33: --input-mode keyframe は動画入力にしか意味がない。静止画と組合せたら
-    // 明示エラーで弾く（無言で keyframe 設定を無視すると UI 上の矛盾になるため）。
-    if cli.input_mode == CliInputMode::Keyframe {
-        eprintln!(
-            "orber: --input-mode keyframe requires video input (got still image: {})",
-            cli.input.display()
-        );
-        return ExitCode::from(2);
     }
 
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
@@ -794,6 +794,14 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
 /// 出力長は `--duration-ms` で独立に決まる（入力動画の長さは N 枚抽出の時刻計算に
 /// だけ影響する）。
 fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
+    // #33 review N3: --keyframes 1 は補間に最低 2 枚必要なので無言で 2 にクランプ
+    // すると挙動と CLI 値が乖離する。ユーザーに気付けるよう warning を出してから clamp。
+    if cli.keyframes < MIN_KEYFRAMES {
+        eprintln!(
+            "orber: warning: --keyframes {} is too few, clamping to {} (need at least 2 to interpolate)",
+            cli.keyframes, MIN_KEYFRAMES
+        );
+    }
     let n_keys = cli.keyframes.max(MIN_KEYFRAMES) as usize;
     eprintln!(
         "orber: sampling {} keyframe(s) from {}...",

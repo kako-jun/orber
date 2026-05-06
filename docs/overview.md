@@ -222,6 +222,16 @@ How it differs from the color-track path (#7):
    between the two adjacent keyframes by the keyframe's stored normalized time
    (endpoints clamped, NaN-safe, divide-by-zero defended).
 
+How `centroid` drift becomes visible depends on the orb shape:
+
+- **Aquarelle** shape uses `cluster.centroid` directly for orb placement, so the
+  input video's compositional motion is fully reflected in the output.
+- **Circle** shape blends `cluster.centroid` drift with the per-orb seeded
+  `cross_axis` at 50:50 to keep the input video's compositional motion visible
+  without losing the per-orb scatter that prevents stripe artifacts. With
+  `--input-mode color-track` (#7) or still-image input, Circle uses `cross_axis`
+  alone (existing behavior preserved).
+
 Output length is still set entirely by `--duration-ms`. A 3-minute clip
 rendered as a 10-second orb compresses the input's mood; a 10-second clip
 rendered as a 1-minute orb stretches it. Determinism: same input + same
