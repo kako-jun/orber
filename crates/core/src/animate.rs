@@ -591,7 +591,8 @@ pub fn render_frame_with_params(
 
         // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
         // r_normalized は進行軸 [0,1] スケールにおける半径相当。
-        let r_pixels_max = base_radius_unit * weight_used.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_pixels_max =
+            base_radius_unit * weight_used.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
         let r_normalized = if progress_axis_pixels > 0.0 {
             r_pixels_max / progress_axis_pixels
         } else {
@@ -773,8 +774,7 @@ fn render_frame_aquarelle(
         .map(|(idx, (c, p))| {
             // 動画入力（#33）: keyframe_tracks があれば色 + 重心 + 重みを時刻 t の
             // 補間値で読み替える。#7 (color_tracks) より優先される。
-            let interpolated =
-                pick_cluster_at_t(opts.keyframe_tracks.as_deref(), idx, c, t);
+            let interpolated = pick_cluster_at_t(opts.keyframe_tracks.as_deref(), idx, c, t);
             let (color_t33, centroid_t33, weight_t33) = match interpolated {
                 Some((col, cen, w)) => (col, cen, w),
                 None => (c.color, c.centroid, c.weight),
@@ -1200,8 +1200,14 @@ mod tests {
         let p = generate_orb_params(7, 64, &[1.0]);
         let cw = p.iter().filter(|q| q.rot_speed_signed > 0.0).count();
         let ccw = p.iter().filter(|q| q.rot_speed_signed < 0.0).count();
-        assert!((20..=44).contains(&cw), "clockwise count out of band: cw={cw} ccw={ccw}");
-        assert!((20..=44).contains(&ccw), "counter-clockwise count out of band: cw={cw} ccw={ccw}");
+        assert!(
+            (20..=44).contains(&cw),
+            "clockwise count out of band: cw={cw} ccw={ccw}"
+        );
+        assert!(
+            (20..=44).contains(&ccw),
+            "counter-clockwise count out of band: cw={cw} ccw={ccw}"
+        );
     }
 
     #[test]
@@ -1209,10 +1215,8 @@ mod tests {
         let p = generate_orb_params(42, 16, &[1.0]);
         for cycle in 1..=4 {
             for q in &p {
-                let a0 =
-                    glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed, true);
-                let a1 =
-                    glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed, true);
+                let a0 = glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed, true);
+                let a1 = glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed, true);
                 let delta = (a1 - a0).rem_euclid(TAU);
                 assert!(
                     delta.abs() < 1e-5 || (TAU - delta).abs() < 1e-5,
@@ -1232,13 +1236,7 @@ mod tests {
         for cycle in 1..=4 {
             for q in &p {
                 for &t in &[0.0_f32, 0.13, 0.25, 0.5, 0.77, 1.0] {
-                    let a = glyph_rotation_angle(
-                        cycle,
-                        t,
-                        q.base_angle,
-                        q.rot_speed_signed,
-                        false,
-                    );
+                    let a = glyph_rotation_angle(cycle, t, q.base_angle, q.rot_speed_signed, false);
                     assert!(
                         (a - q.base_angle).abs() < 1e-6,
                         "glyph_rotate=false must hold base_angle: cycle={cycle} t={t} base={} got={a}",

@@ -166,9 +166,11 @@ fn probe_duration_seconds(video_path: &Path) -> Result<f64, VideoInputError> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let trimmed = stdout.trim();
-    let dur: f64 = trimmed.parse().map_err(|_| VideoInputError::DurationProbeFailed {
-        stderr: format!("could not parse duration: {trimmed:?}"),
-    })?;
+    let dur: f64 = trimmed
+        .parse()
+        .map_err(|_| VideoInputError::DurationProbeFailed {
+            stderr: format!("could not parse duration: {trimmed:?}"),
+        })?;
     if !dur.is_finite() || dur <= 0.0 {
         return Err(VideoInputError::ZeroDuration);
     }
@@ -226,14 +228,7 @@ pub fn sample_video_frames(
             .arg(format!("{t_seconds:.6}"))
             .arg("-i")
             .arg(video_path)
-            .args([
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=512:-1",
-                "-pix_fmt",
-                "rgb24",
-            ])
+            .args(["-frames:v", "1", "-vf", "scale=512:-1", "-pix_fmt", "rgb24"])
             .arg(&out_path)
             .output();
         let out = match result {
@@ -309,8 +304,11 @@ pub fn build_color_tracks(
         return Err(VideoInputError::ZeroSamples);
     }
 
-    let template_clusters = extract_clusters(&samples[0].frame, k)
-        .map_err(|e| VideoInputError::ClusterExtractionFailed { source: e.to_string() })?;
+    let template_clusters = extract_clusters(&samples[0].frame, k).map_err(|e| {
+        VideoInputError::ClusterExtractionFailed {
+            source: e.to_string(),
+        }
+    })?;
 
     let n_samples = samples.len();
 
@@ -465,8 +463,11 @@ pub fn build_keyframe_tracks(
         return Err(VideoInputError::ZeroSamples);
     }
 
-    let template_clusters = extract_clusters(&samples[0].frame, k)
-        .map_err(|e| VideoInputError::ClusterExtractionFailed { source: e.to_string() })?;
+    let template_clusters = extract_clusters(&samples[0].frame, k).map_err(|e| {
+        VideoInputError::ClusterExtractionFailed {
+            source: e.to_string(),
+        }
+    })?;
 
     let n_samples = samples.len();
     let n_clusters = template_clusters.len();
@@ -678,8 +679,16 @@ mod tests {
         // color が赤系→青系へ動く（centroid/weight も埋まっている）。
         let k0 = kf.tracks[0][0];
         let k1 = kf.tracks[0][1];
-        assert!(k0.color[0] > k0.color[2], "key0 should be red-dominant: {:?}", k0.color);
-        assert!(k1.color[2] > k1.color[0], "key1 should be blue-dominant: {:?}", k1.color);
+        assert!(
+            k0.color[0] > k0.color[2],
+            "key0 should be red-dominant: {:?}",
+            k0.color
+        );
+        assert!(
+            k1.color[2] > k1.color[0],
+            "key1 should be blue-dominant: {:?}",
+            k1.color
+        );
         // weight は単色画像なのでどちらも ~1.0。
         assert!(k0.weight > 0.9 && k1.weight > 0.9);
     }
@@ -688,8 +697,7 @@ mod tests {
     fn build_color_tracks_two_samples_color_changes() {
         // 2 枚のサンプルで、色が違うものを与えたとき、track[0][0] と track[0][1] が
         // 異なる色になる（greedy マッチングが両方を埋める）。
-        let frame_a =
-            image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([220u8, 30, 30]));
+        let frame_a = image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([220u8, 30, 30]));
         let frame_b = image::ImageBuffer::from_fn(64, 64, |_, _| image::Rgb([30u8, 30, 220]));
         let samples = vec![
             VideoSample {
@@ -708,6 +716,9 @@ mod tests {
         let t0 = tracks.tracks[0][0];
         let t1 = tracks.tracks[0][1];
         assert!(t0[0] > t0[2], "first sample should be red-dominant: {t0:?}");
-        assert!(t1[2] > t1[0], "second sample should be blue-dominant: {t1:?}");
+        assert!(
+            t1[2] > t1[0],
+            "second sample should be blue-dominant: {t1:?}"
+        );
     }
 }

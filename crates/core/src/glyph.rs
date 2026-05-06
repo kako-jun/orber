@@ -228,12 +228,11 @@ fn edt_1d(f: &[f32]) -> Vec<f32> {
     z[1] = f32::INFINITY;
     for q in 1..n {
         let qf = q as f32;
-        let mut s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2)))
-            / (2.0 * (qf - v[k] as f32));
+        let mut s =
+            ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2))) / (2.0 * (qf - v[k] as f32));
         while k > 0 && s <= z[k] {
             k -= 1;
-            s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2)))
-                / (2.0 * (qf - v[k] as f32));
+            s = ((f[q] + qf * qf) - (f[v[k]] + (v[k] as f32).powi(2))) / (2.0 * (qf - v[k] as f32));
         }
         k += 1;
         v[k] = q;
@@ -317,7 +316,11 @@ fn glyph_sdf_cache() -> &'static Mutex<HashMap<GlyphSdfKey, Arc<[u8]>>> {
 
 fn cached_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Arc<[u8]> {
     let key = (font, ch as u32, size);
-    if let Some(v) = glyph_sdf_cache().lock().expect("glyph sdf cache poisoned").get(&key) {
+    if let Some(v) = glyph_sdf_cache()
+        .lock()
+        .expect("glyph sdf cache poisoned")
+        .get(&key)
+    {
         return Arc::clone(v);
     }
     let sdf: Arc<[u8]> = Arc::from(render_glyph_sdf(font, ch, size));
@@ -372,9 +375,15 @@ fn blend_source_over(pixmap: &mut Pixmap, x: u32, y: u32, rgb: [u8; 3], alpha: f
     let dst_r = dst[0] as f32 / 255.0;
     let dst_g = dst[1] as f32 / 255.0;
     let dst_b = dst[2] as f32 / 255.0;
-    dst[0] = ((src_r + dst_r * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
-    dst[1] = ((src_g + dst_g * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
-    dst[2] = ((src_b + dst_b * one_minus_a) * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[0] = ((src_r + dst_r * one_minus_a) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    dst[1] = ((src_g + dst_g * one_minus_a) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    dst[2] = ((src_b + dst_b * one_minus_a) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
     dst[3] = ((alpha + dst_a * one_minus_a) * 255.0)
         .round()
         .clamp(0.0, 255.0) as u8;
@@ -586,8 +595,14 @@ mod tests {
     #[test]
     fn glyph_sdf_has_both_inside_and_outside_regions() {
         let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', 64);
-        assert!(bytes.iter().any(|&b| b < 120), "must contain outside samples");
-        assert!(bytes.iter().any(|&b| b > 136), "must contain inside samples");
+        assert!(
+            bytes.iter().any(|&b| b < 120),
+            "must contain outside samples"
+        );
+        assert!(
+            bytes.iter().any(|&b| b > 136),
+            "must contain inside samples"
+        );
     }
 
     #[test]
@@ -626,11 +641,7 @@ mod tests {
             std::f32::consts::FRAC_PI_4,
         );
         let lit_plain = plain.data().chunks_exact(4).filter(|p| p[3] > 0).count() as f32;
-        let lit_rotated = rotated
-            .data()
-            .chunks_exact(4)
-            .filter(|p| p[3] > 0)
-            .count() as f32;
+        let lit_rotated = rotated.data().chunks_exact(4).filter(|p| p[3] > 0).count() as f32;
         let ratio = lit_rotated / lit_plain.max(1.0);
         assert!(
             ratio > 0.9,
