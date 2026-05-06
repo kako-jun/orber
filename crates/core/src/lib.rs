@@ -6,6 +6,7 @@ pub mod batch;
 pub mod cluster;
 pub mod color_track;
 pub mod glyph;
+pub mod keyframe_track;
 pub mod orb;
 pub mod output_mode;
 pub mod style;

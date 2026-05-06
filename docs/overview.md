@@ -200,6 +200,47 @@ frame at `t=0` (= first sampled frame's color). Other modes are rejected with a
 clear error. Static-image input continues to flow through the unchanged image
 path; no regression for existing callers.
 
+## Video input — keyframe interpolation (#33)
+
+`--input-mode keyframe` switches the video pipeline to a **keyframe** path that
+interpolates **color + position + weight** between sampled keyframes, rather than
+just colors with positions frozen. Pass `--keyframes N` to control how many
+keyframes are sampled (default 8, clamped to a minimum of 2 since one keyframe
+cannot be interpolated).
+
+How it differs from the color-track path (#7):
+
+1. The video is sampled at `N` evenly-spaced keyframe times rather than 20 fixed
+   color samples. Each keyframe is independently k-means clustered (k = 6).
+2. Clusters are tracked across keyframes by LAB ΔE76 greedy matching against the
+   first keyframe's cluster colors. If a match is missing for some keyframe, the
+   previous keyframe's `(color, centroid, weight)` is held in place (**hold-last
+   fallback**) so interpolation does not break; the next successful match
+   resumes normal lerp.
+3. At output time `t ∈ [0, 1]`, each orb's `(color, centroid, weight)` is taken
+   from `interpolate_keyframe_track(tracks[cluster_idx], t)` — a pure linear lerp
+   between the two adjacent keyframes by the keyframe's stored normalized time
+   (endpoints clamped, NaN-safe, divide-by-zero defended).
+
+How `centroid` drift becomes visible depends on the orb shape:
+
+- **Aquarelle** shape uses `cluster.centroid` directly for orb placement, so the
+  input video's compositional motion is fully reflected in the output.
+- **Circle** shape blends `cluster.centroid` drift with the per-orb seeded
+  `cross_axis` at 50:50 to keep the input video's compositional motion visible
+  without losing the per-orb scatter that prevents stripe artifacts. With
+  `--input-mode color-track` (#7) or still-image input, Circle uses `cross_axis`
+  alone (existing behavior preserved).
+
+Output length is still set entirely by `--duration-ms`. A 3-minute clip
+rendered as a 10-second orb compresses the input's mood; a 10-second clip
+rendered as a 1-minute orb stretches it. Determinism: same input + same
+`--duration-ms` + same `--seed` produces the same output bytes.
+
+`--input-mode keyframe` requires video input — passing it with a still image
+yields an explicit error rather than silently degrading. The default
+`--input-mode color-track` keeps existing #7 behavior.
+
 ## Use cases
 
 - Background plates for video edits

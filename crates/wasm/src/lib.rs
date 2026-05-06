@@ -461,6 +461,8 @@ pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError
         glyph_rotate: true,
         // #7: Web GUI は静止画入力のみなので color_tracks は常に None。
         color_tracks: None,
+        // #33: Web GUI は静止画入力のみなので keyframe_tracks も常に None。
+        keyframe_tracks: None,
     };
     let frame = render_frame(&clusters, &opts, 0.0);
     let png = encode_png_rgba(&frame)?;

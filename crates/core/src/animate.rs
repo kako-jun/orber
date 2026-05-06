@@ -42,8 +42,9 @@
 //! - 描画は [`crate::orb::render_one_orb`] / [`crate::glyph::render_glyph_orb`] を
 //!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
 
-use crate::cluster::Cluster;
+use crate::cluster::{Centroid, Cluster};
 use crate::color_track::interpolate_color_track;
+use crate::keyframe_track::{interpolate_keyframe_track, KeyframeClusterPoint};
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use crate::style::{FalloffProfile, SoftnessPreset};
 use image::RgbaImage;
@@ -142,6 +143,15 @@ pub struct AnimateOptions {
     /// 個別 track が空の場合は `cluster.color` にフォールバックする。
     /// `None` は静止画入力の従来挙動（色固定）。
     pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
+    /// 動画入力（#33）の per-cluster キーフレーム補間トラック。
+    ///
+    /// `Some(tracks)` のとき、各 orb の `cluster.color` / `cluster.centroid` /
+    /// `cluster.weight` は [`crate::keyframe_track::interpolate_keyframe_track`]
+    /// で時刻 `t` の補間値に動的に上書きされる。`color_tracks` (#7) と排他で、
+    /// 両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の上位互換）。
+    /// `None` のときは `color_tracks` に従う。
+    /// WebGL 経路 (`pack_render_data_for_webgl`) は keyframe_tracks を見ない。
+    pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
 impl Default for AnimateOptions {
@@ -161,6 +171,7 @@ impl Default for AnimateOptions {
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
+            keyframe_tracks: None,
         }
     }
 }
@@ -391,6 +402,28 @@ fn pick_color_at_t(
     interpolate_color_track(track, t)
 }
 
+/// 動画入力（#33）: `keyframe_tracks` が指定されているときは色 + 位置 + 重みを
+/// 全部時刻 `t` で補間して返す。指定が無い・index 範囲外・track が空のときは
+/// 静止画の `fallback` cluster を素通しする。
+///
+/// `keyframe_tracks` と `color_tracks` (#7) を両方持つ `AnimateOptions` でも、
+/// この関数は keyframe_tracks のみを参照する（呼び出し側で優先順位を決める）。
+#[inline]
+fn pick_cluster_at_t(
+    keyframe_tracks: Option<&[Vec<KeyframeClusterPoint>]>,
+    cluster_idx: usize,
+    fallback: &Cluster,
+    t: f32,
+) -> Option<([u8; 3], Centroid, f32)> {
+    let tracks = keyframe_tracks?;
+    let track = tracks.get(cluster_idx)?;
+    if track.is_empty() {
+        return None;
+    }
+    let _ = fallback; // 現状はフォールバック値を使わず None を返して呼び出し側で素通しさせる。
+    Some(interpolate_keyframe_track(track, t))
+}
+
 /// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
 ///
 /// `f` と `scale` がともに整数のとき、`t = 1.0` ちょうどで `(f * t * scale)` は
@@ -525,16 +558,41 @@ pub fn render_frame_with_params(
     for p in params.iter() {
         // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
         let cluster_idx = p.cluster_idx.min(clusters.len() - 1);
-        let c = &clusters[cluster_idx];
+        let static_c = &clusters[cluster_idx];
 
-        // 動画入力（#7）: color_tracks が指定されているときは時刻 t の補間色で
-        // cluster.color を上書きする。指定が無い、track が短い、空の場合は
-        // cluster.color にフォールバック。位置・サイズ・揺らぎは変えない。
-        let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, c.color, t);
+        // 動画入力（#33）: keyframe_tracks が指定されているときは色 + 位置 + 重みを
+        // 全部時刻 t の補間値に置き換える。これがない場合は静止画クラスタを使う。
+        // 動画入力（#7）: keyframe_tracks が無く、color_tracks があるときは色だけ
+        // 上書き。位置・サイズ・揺らぎは変えない。
+        let interpolated =
+            pick_cluster_at_t(opts.keyframe_tracks.as_deref(), cluster_idx, static_c, t);
+        let (color_static, centroid_used, weight_used) = match interpolated {
+            Some((col, cen, w)) => (col, cen, w),
+            None => (static_c.color, static_c.centroid, static_c.weight),
+        };
+        // #33 review M1: keyframe_tracks ありのときだけ centroid を反映。
+        // cross_axis (seed 由来 RNG) と centroid 補間値を 50:50 でブレンドして
+        // 入力動画のコンポジショナルな動きを視覚化する。none のとき (#7 / 静止画) は
+        // 完全に既存挙動を保つ（縞模様回避維持）。
+        let cross_axis_used = if opts.keyframe_tracks.is_some() {
+            let centroid_axis = match opts.direction {
+                MotionDirection::LeftToRight | MotionDirection::RightToLeft => centroid_used.y,
+                MotionDirection::TopToBottom | MotionDirection::BottomToTop => centroid_used.x,
+            };
+            p.cross_axis * 0.5 + centroid_axis * 0.5
+        } else {
+            p.cross_axis
+        };
+        let color_at_t = if opts.keyframe_tracks.is_some() {
+            color_static
+        } else {
+            pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, static_c.color, t)
+        };
 
         // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
         // r_normalized は進行軸 [0,1] スケールにおける半径相当。
-        let r_pixels_max = base_radius_unit * c.weight.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_pixels_max =
+            base_radius_unit * weight_used.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
         let r_normalized = if progress_axis_pixels > 0.0 {
             r_pixels_max / progress_axis_pixels
         } else {
@@ -556,10 +614,10 @@ pub fn render_frame_with_params(
         // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
         // なるので、画面全体に散布するため orb 個別のオフセットを使う。
         let (nx, ny) = match opts.direction {
-            MotionDirection::LeftToRight => (pos, p.cross_axis),
-            MotionDirection::RightToLeft => (1.0 - pos, p.cross_axis),
-            MotionDirection::TopToBottom => (p.cross_axis, pos),
-            MotionDirection::BottomToTop => (p.cross_axis, 1.0 - pos),
+            MotionDirection::LeftToRight => (pos, cross_axis_used),
+            MotionDirection::RightToLeft => (1.0 - pos, cross_axis_used),
+            MotionDirection::TopToBottom => (cross_axis_used, pos),
+            MotionDirection::BottomToTop => (cross_axis_used, 1.0 - pos),
         };
 
         // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
@@ -571,7 +629,7 @@ pub fn render_frame_with_params(
         let blur_delta = 0.15 * sin_loop(1, t, 1, p.phi_blur);
         let opacity_factor = 1.0 + 0.05 * sin_loop(1, t, 1, p.phi_opacity);
 
-        let radius = base_radius_unit * c.weight.max(0.0).sqrt() * radius_factor;
+        let radius = base_radius_unit * weight_used.max(0.0).sqrt() * radius_factor;
         if radius <= 0.0 {
             continue;
         }
@@ -714,23 +772,33 @@ fn render_frame_aquarelle(
         .zip(params.iter())
         .enumerate()
         .map(|(idx, (c, p))| {
+            // 動画入力（#33）: keyframe_tracks があれば色 + 重心 + 重みを時刻 t の
+            // 補間値で読み替える。#7 (color_tracks) より優先される。
+            let interpolated = pick_cluster_at_t(opts.keyframe_tracks.as_deref(), idx, c, t);
+            let (color_t33, centroid_t33, weight_t33) = match interpolated {
+                Some((col, cen, w)) => (col, cen, w),
+                None => (c.color, c.centroid, c.weight),
+            };
             let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
             let progress = (p.phase + advance).rem_euclid(1.0);
             let (nx, ny) = match opts.direction {
-                MotionDirection::LeftToRight => (progress, c.centroid.y),
-                MotionDirection::RightToLeft => (1.0 - progress, c.centroid.y),
-                MotionDirection::TopToBottom => (c.centroid.x, progress),
-                MotionDirection::BottomToTop => (c.centroid.x, 1.0 - progress),
+                MotionDirection::LeftToRight => (progress, centroid_t33.y),
+                MotionDirection::RightToLeft => (1.0 - progress, centroid_t33.y),
+                MotionDirection::TopToBottom => (centroid_t33.x, progress),
+                MotionDirection::BottomToTop => (centroid_t33.x, 1.0 - progress),
             };
             let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
             let weight_scale = radius_factor * radius_factor;
-            // 動画入力（#7）: cluster.color を時刻 t の色に置換。Aquarelle は
-            // cluster ループなので idx をそのまま使う（cluster_idx == idx）。
-            let color_at_t = pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t);
+            // #33 が無いときだけ #7 の color_tracks を見る（#33 が指定済みなら色は補間値）。
+            let color_at_t = if opts.keyframe_tracks.is_some() {
+                color_t33
+            } else {
+                pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t)
+            };
             Cluster {
                 color: color_at_t,
                 centroid: Centroid { x: nx, y: ny },
-                weight: (c.weight * weight_scale).max(0.0),
+                weight: (weight_t33 * weight_scale).max(0.0),
             }
         })
         .collect();
@@ -807,6 +875,7 @@ mod tests {
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
+            keyframe_tracks: None,
         }
     }
 
@@ -1131,8 +1200,14 @@ mod tests {
         let p = generate_orb_params(7, 64, &[1.0]);
         let cw = p.iter().filter(|q| q.rot_speed_signed > 0.0).count();
         let ccw = p.iter().filter(|q| q.rot_speed_signed < 0.0).count();
-        assert!((20..=44).contains(&cw), "clockwise count out of band: cw={cw} ccw={ccw}");
-        assert!((20..=44).contains(&ccw), "counter-clockwise count out of band: cw={cw} ccw={ccw}");
+        assert!(
+            (20..=44).contains(&cw),
+            "clockwise count out of band: cw={cw} ccw={ccw}"
+        );
+        assert!(
+            (20..=44).contains(&ccw),
+            "counter-clockwise count out of band: cw={cw} ccw={ccw}"
+        );
     }
 
     #[test]
@@ -1140,10 +1215,8 @@ mod tests {
         let p = generate_orb_params(42, 16, &[1.0]);
         for cycle in 1..=4 {
             for q in &p {
-                let a0 =
-                    glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed, true);
-                let a1 =
-                    glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed, true);
+                let a0 = glyph_rotation_angle(cycle, 0.0, q.base_angle, q.rot_speed_signed, true);
+                let a1 = glyph_rotation_angle(cycle, 1.0, q.base_angle, q.rot_speed_signed, true);
                 let delta = (a1 - a0).rem_euclid(TAU);
                 assert!(
                     delta.abs() < 1e-5 || (TAU - delta).abs() < 1e-5,
@@ -1163,13 +1236,7 @@ mod tests {
         for cycle in 1..=4 {
             for q in &p {
                 for &t in &[0.0_f32, 0.13, 0.25, 0.5, 0.77, 1.0] {
-                    let a = glyph_rotation_angle(
-                        cycle,
-                        t,
-                        q.base_angle,
-                        q.rot_speed_signed,
-                        false,
-                    );
+                    let a = glyph_rotation_angle(cycle, t, q.base_angle, q.rot_speed_signed, false);
                     assert!(
                         (a - q.base_angle).abs() < 1e-6,
                         "glyph_rotate=false must hold base_angle: cycle={cycle} t={t} base={} got={a}",
@@ -1410,6 +1477,142 @@ mod tests {
         assert!(
             pixels_equal(&a, &b),
             "loop must close at t=1 even with mixed speed_mult"
+        );
+    }
+
+    // ---- #33 review S1: keyframe_tracks E2E 統合テスト ----
+    //
+    // ここから 4 件は keyframe_tracks 経路の入口〜出口（render_frame_with_params）まで
+    // を通して回し、(a) Aquarelle / Circle で centroid drift が視覚反映されること、
+    // (b) 決定論性、(c) keyframe_tracks が color_tracks より優先されること、を検証する。
+
+    /// 1 cluster ぶんの keyframe トラックを (k0=左上 / k1=右下、色も大きく異なる) で
+    /// 構築するヘルパ。M1/S1 の centroid drift 検証はこの「t=0 と t=1 で位置・色が
+    /// 大幅に異なる」性質に依存する。
+    fn drift_keyframe_tracks() -> Vec<Vec<KeyframeClusterPoint>> {
+        vec![vec![
+            KeyframeClusterPoint {
+                color: [240, 40, 40],
+                centroid: Centroid { x: 0.15, y: 0.15 },
+                weight: 1.0,
+                time: 0.0,
+            },
+            KeyframeClusterPoint {
+                color: [40, 80, 240],
+                centroid: Centroid { x: 0.85, y: 0.85 },
+                weight: 1.0,
+                time: 1.0,
+            },
+        ]]
+    }
+
+    /// drift_keyframe_tracks() に対応する static cluster（先頭キーと同じ位置・色）。
+    fn drift_static_clusters() -> Vec<Cluster> {
+        vec![cluster([240, 40, 40], 0.15, 0.15, 1.0)]
+    }
+
+    /// 中央列 (x = width/2) の RGB 行ベクトルを取り出す。Aquarelle の centroid drift
+    /// 検出に使う（左上→右下のドリフトでは中央列上の輝度分布が t によって変わる）。
+    fn middle_column_bytes(img: &RgbaImage) -> Vec<u8> {
+        let mid_x = img.width() / 2;
+        let mut out = Vec::with_capacity(img.height() as usize * 3);
+        for y in 0..img.height() {
+            let p = img.get_pixel(mid_x, y);
+            out.push(p[0]);
+            out.push(p[1]);
+            out.push(p[2]);
+        }
+        out
+    }
+
+    fn pixel_diff_count(a: &RgbaImage, b: &RgbaImage) -> usize {
+        assert_eq!(a.dimensions(), b.dimensions());
+        a.as_raw()
+            .chunks_exact(4)
+            .zip(b.as_raw().chunks_exact(4))
+            .filter(|(pa, pb)| pa != pb)
+            .count()
+    }
+
+    #[test]
+    fn keyframe_tracks_render_centroid_drift_aquarelle() {
+        // Aquarelle 経路は cluster.centroid を直接位置に使う。keyframe_tracks で
+        // centroid が大きく移動するキー列を渡すと t=0 と t=1 で中央列 RGB が
+        // 異なるはず（左上→右下の対角ドリフト）。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = OrbShape::Aquarelle(crate::aquarelle::AquarelleParams::default());
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        let col_a = middle_column_bytes(&a);
+        let col_b = middle_column_bytes(&b);
+        assert_ne!(
+            col_a, col_b,
+            "Aquarelle centroid drift must change middle-column RGB between t=0 and t=1"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_render_centroid_drift_circle_with_keyframes() {
+        // M1 修正後: Circle 経路でも keyframe_tracks ありのとき centroid を 50% 反映。
+        // 同じ keyframe トラックで t=0 と t=1 を比べると少なくとも 1 ピクセル以上
+        // 差分が出るはず（cross_axis 単独だった以前は色変化のみで微差はあったが、
+        // ここでは「位置」の効果も加わるため、より顕著に異なるフレームが出る）。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = OrbShape::Circle;
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        let diff = pixel_diff_count(&a, &b);
+        assert!(
+            diff >= 1,
+            "Circle + keyframe_tracks must show centroid drift (>=1 pixel diff between t=0 and t=1, got {diff})"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_determinism_e2e() {
+        // 同じ keyframe_tracks + 同じ seed + 同じ t=0.5 で render_frame_with_params を
+        // 2 回呼んで byte-exact 同値であることを保証する。決定論性の最終ガード。
+        let clusters = drift_static_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        let cache = precompute_orb_params(&opts, &clusters);
+        let a = render_frame_with_params(&clusters, &opts, &cache, 0.5);
+        let b = render_frame_with_params(&clusters, &opts, &cache, 0.5);
+        assert!(
+            pixels_equal(&a, &b),
+            "keyframe_tracks render must be byte-exact deterministic at t=0.5"
+        );
+    }
+
+    #[test]
+    fn keyframe_tracks_takes_precedence_over_color_tracks() {
+        // 色が大きく違う color_tracks (#7) と keyframe_tracks (#33) を両方指定して、
+        // 出力色は keyframe_tracks に従うことを確認する（#33 が #7 の上位互換のため）。
+        // color_tracks 単独 vs keyframe_tracks+color_tracks の出力を比較し、
+        // 後者が「keyframe_tracks 単独」と byte-exact 一致することを assert する。
+        let clusters = drift_static_clusters();
+
+        // keyframe_tracks のみ
+        let mut opts_kf_only = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_kf_only.keyframe_tracks = Some(drift_keyframe_tracks());
+
+        // keyframe_tracks + color_tracks（color_tracks は明らかに違う色 — 緑系）
+        let mut opts_both = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_both.keyframe_tracks = Some(drift_keyframe_tracks());
+        opts_both.color_tracks = Some(vec![vec![[20, 240, 20], [20, 240, 20]]]);
+
+        let kf_only = render_frame(&clusters, &opts_kf_only, 0.5);
+        let both = render_frame(&clusters, &opts_both, 0.5);
+        assert!(
+            pixels_equal(&kf_only, &both),
+            "keyframe_tracks must take precedence over color_tracks (output should match keyframe-only render)"
         );
     }
 }
