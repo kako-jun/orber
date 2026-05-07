@@ -482,10 +482,21 @@ speed / softness without dropping to the terminal.
   - Softness = Low / Standard / High → sharp / identity / soft
   The old large "Roll / ガチャを引く" chip is removed; only a small reload
   icon remains at the bottom. The icon spins while decoding / generating /
-  animating. For IME safety, glyph input suppresses `glyph_supported()` RPCs
-  during composition and trims to the first Unicode character on commit. A symbol
+  animating. For IME safety, glyph input suppresses worker RPCs during
+  composition and trims to the first Unicode character on commit. A symbol
   picker is shown under the glyph row and is filtered to characters that the
-  bundled font actually supports.
+  bundled wasm font can draw deterministically; the input field above the
+  picker accepts **any Unicode codepoint** including emoji, kanji, and
+  arbitrary symbols. Characters outside the bundled set are rasterized in the
+  worker via `OffscreenCanvas` using the OS font stack (Apple Color Emoji /
+  Segoe UI Emoji / Noto Color Emoji / Noto Sans Symbols 2 / system-ui), then
+  converted to a Signed Distance Field by a JS-side Felzenszwalb–Huttenlocher
+  Euclidean Distance Transform (`web/src/lib/jsGlyphSdf.ts`) so the resulting
+  buffer is interchangeable with the wasm SDF path. Color emoji become
+  silhouettes via alpha extraction, which lines up with orber's monochrome
+  pipeline. The exact glyph shape depends on the OS font renderer, so the
+  same 🐱 may differ between Mac and Windows; this is accepted as the trade
+  for accepting any character the user types.
 
 ## Transparent download bundle (#56)
 

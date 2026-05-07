@@ -327,9 +327,21 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 
 - 入力欄は shape row の右端に同居し、下段に落とさない
 - `maxLength=16` で IME の中間状態を吸収し、確定時に先頭 1 Unicode scalar に丸める
-- `compositionstart` / `compositionend` 中は `glyph_supported()` RPC を飛ばさない
-- 同梱フォントに無い文字は小さな muted warning を 1 行出す
-- シンボルピッカーは実際に `glyph_supported()` が `true` な文字だけ残す
+- `compositionstart` / `compositionend` 中は worker RPC を飛ばさない
+- 入力欄は **任意の Unicode 1 文字** を受け付ける (絵文字 / 漢字 / 記号)。実装は
+  二段構成: wasm 同梱フォントで描画できる字 (☆ など) は wasm 経路で SDF 化、
+  それ以外 (🐱 / 漢字 / 任意 Unicode) は worker 内 OffscreenCanvas で OS フォント
+  スタックでラスタライズ → JS 側 EDT で SDF 化 (`web/src/lib/jsGlyphSdf.ts`)。
+  両経路とも出力フォーマット (R8 256×256 SDF) は共通。
+- color emoji (🐱 等) は alpha チャンネル抽出により **シルエット化** され、
+  orber の monochrome 出力に自然に乗る。形は OS のフォントレンダリングに依存
+  するため、Mac の 🐱 と Windows の 🐱 は別の輪郭になる ── これは「ユーザーが
+  入れた字を尊重して描画する」を優先するための仕様で、UI には実装詳細
+  (フォント名 / SDF / OS 差) を一切露出させない
+- placeholder は `☆, A, 漢, 🐱, ♪` のように文字種を例示する。"emoji" 1 単語
+  だけだと「emoji 限定で特別」と誤読されるため
+- シンボルピッカーは見た目を端末非依存に保つため wasm 同梱フォントで描画
+  できる字に限定する (任意文字は入力欄経由で受け付ける)
 - glyph の描画 backend は alpha mask ではなく **SDF + 共通 falloff**。picker UI は
   変えず、見た目だけ circle と同じ「ぼけた光」に寄せる
 - glyph は seed 由来の `base_angle` で始まり、静止画でも向きがばらける
