@@ -9,18 +9,18 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
+// 全 describe で共通の前後処理: 各テストでモジュールキャッシュをリセットし、
+// navigator / window の stub を import タイミングで効かせる。strings.ts は
+// import 時に queueMicrotask を仕込むため、stub 確定後に動的 import する。
+beforeEach(() => {
+  vi.resetModules();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe('detectLang()', () => {
-  // 各テストでモジュールキャッシュをリセットし、navigator.language の変更を
-  // import タイミングで効かせる。strings.ts は import 時に queueMicrotask を
-  // 仕込むため、stub を確定させた状態で動的 import する。
-  beforeEach(() => {
-    vi.resetModules();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   test('navigator.language が "ja" 始まりなら "ja"', async () => {
     vi.stubGlobal('navigator', { language: 'ja-JP' });
     const { detectLang } = await import('./strings');
@@ -39,22 +39,29 @@ describe('detectLang()', () => {
     expect(detectLang()).toBe('en');
   });
 
-  test('navigator.language が未定義なら "en"', async () => {
+  test('navigator が空オブジェクトなら "en"', async () => {
     vi.stubGlobal('navigator', {});
+    const { detectLang } = await import('./strings');
+    expect(detectLang()).toBe('en');
+  });
+
+  test('navigator.language が undefined なら "en" (typeof string チェック)', async () => {
+    vi.stubGlobal('navigator', { language: undefined });
+    const { detectLang } = await import('./strings');
+    expect(detectLang()).toBe('en');
+  });
+
+  test('window 未定義 (SSR 想定) なら "en" (#161 SSR フォールバック)', async () => {
+    // jsdom 環境では window が常に定義されるため、明示的に削除して SSR を再現する。
+    // strings.ts は `typeof window === 'undefined'` のみで判定しているので、
+    // globalThis.window を消せば SSR 経路に入る。
+    vi.stubGlobal('window', undefined);
     const { detectLang } = await import('./strings');
     expect(detectLang()).toBe('en');
   });
 });
 
 describe('lang signal + t()', () => {
-  beforeEach(() => {
-    vi.resetModules();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   test('en ブラウザで microtask flush 後も lang() === "en"', async () => {
     vi.stubGlobal('navigator', { language: 'en-US' });
     const { lang, t } = await import('./strings');
@@ -99,5 +106,20 @@ describe('lang signal + t()', () => {
     expect(t('pickedThumbAlt', { name: '写真.jpg' })).toBe(
       '選択した画像: 写真.jpg',
     );
+  });
+
+  test('viewsLabelPrefix / Suffix の語順が言語ごとに切り替わる (Footer counter)', async () => {
+    // ja は「閲覧数: {n}」(prefix のみ)、en は「{n} views」(suffix のみ) の
+    // 非対称構成。Footer の <nostalgic-counter> をこの 2 キーで挟む設計
+    // (#128 / #146) のため、語順切替を直接押さえる。
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    const { setLang, t } = await import('./strings');
+    await Promise.resolve();
+    setLang('ja');
+    expect(t('viewsLabelPrefix')).toBe('閲覧数: ');
+    expect(t('viewsLabelSuffix')).toBe('');
+    setLang('en');
+    expect(t('viewsLabelPrefix')).toBe('');
+    expect(t('viewsLabelSuffix')).toBe(' views');
   });
 });
