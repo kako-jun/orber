@@ -112,7 +112,11 @@ export default function Studio() {
   // #131: 4 軸は常時展開で、どのボタンも押した瞬間に runBatch を起動する。
   // 初期値は empty identity を維持し、既存 output regression を防ぐ。
   const [shape, setShape] = createSignal<ShapeChoice>('circle');
-  const [glyphChar, setGlyphChar] = createSignal<string>('☆');
+  // 初期値は空文字。User: 「最初から ☆ が入力されてるせいでプレイスホルダ
+  // を見られない」。空にすればプレイスホルダ (例: emoji) が見え、ユーザーが
+  // 自由入力欄であることに気付ける。glyph shape を選んでも何も入れなければ
+  // line 700 の guard で runBatch が走らないので落ちない。
+  const [glyphChar, setGlyphChar] = createSignal<string>('');
   // #136: Glyph 回転 ON/OFF。glyph_char 切替時に GLYPH_DEFAULT_ROTATE で上書き。
   // ユーザーが checkbox を切替えるとその session 中は尊重し、次の glyph 切替で
   // 再度 default が適用される。既定 true（既存挙動互換）。
@@ -1340,10 +1344,12 @@ export default function Studio() {
                         Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
                         font-variant-emoji: text で対応済み。selector は display 用で、
                         value (sym) には付けないので状態管理は影響を受けない。
-                        ボタン高さ h-9 に対してフォント独自メトリクスでズレるため、
-                        leading-none + inline-block span でグリフ中心を上下センターに
-                        揃える (review)。 */}
-                    <span class="inline-block leading-none">{sym + '︎'}</span>
+                        Noto Sans Symbols 2 はフォント独自の baseline でボタン中央
+                        からズレるので、span を flex で h-full 化して再度
+                        items-center / justify-center を当てて強制センタリングする。 */}
+                    <span class="flex h-full w-full items-center justify-center leading-none">
+                      {sym + '︎'}
+                    </span>
                   </button>
                 )}
               </For>
@@ -1707,66 +1713,70 @@ export default function Studio() {
                 </Show>
                 {/* 4-corner L marker — DESIGN.md §4 SelectionMarker
                     skeleton 中は disabled なので hover も発火しない。
-                    白い orb 画像でも見えるよう drop-shadow で黒い影を付け、
-                    selected 時はぼんやり呼吸アニメ (orb-selected-pulse) を当てる。 */}
+                    User: マークが小さすぎ / 影が薄すぎ / アニメ見えない、を反映:
+                      - サイズ 14 → 24 (約 1.7x 拡大)
+                      - stroke 1.5 → 2.5 (太く)
+                      - drop-shadow を 6px + 2px の二重影で濃く (黒 100%)
+                      - orb-selected-pulse の opacity 振幅を 100%↔65% → 100%↔30% に強化 */}
                 <span
                   class={
                     'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
                     (tile.selected ? 'opacity-100 orb-selected-pulse' : 'opacity-0 group-hover:opacity-30')
                   }
                   style={{
-                    filter: 'drop-shadow(0 0 2px rgba(0,0,0,0.85))',
+                    filter:
+                      'drop-shadow(0 0 6px rgba(0,0,0,1)) drop-shadow(0 0 2px rgba(0,0,0,1))',
                   }}
                   aria-hidden="true"
                 >
                   {/* top-left */}
                   <svg
-                    class="absolute top-1 left-1"
-                    width="14"
-                    height="14"
+                    class="absolute top-1.5 left-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M2 5 V2 H5" />
                   </svg>
                   {/* top-right */}
                   <svg
-                    class="absolute top-1 right-1"
-                    width="14"
-                    height="14"
+                    class="absolute top-1.5 right-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M9 2 H12 V5" />
                   </svg>
                   {/* bottom-left */}
                   <svg
-                    class="absolute bottom-1 left-1"
-                    width="14"
-                    height="14"
+                    class="absolute bottom-1.5 left-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M2 9 V12 H5" />
                   </svg>
                   {/* bottom-right */}
                   <svg
-                    class="absolute bottom-1 right-1"
-                    width="14"
-                    height="14"
+                    class="absolute bottom-1.5 right-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M9 12 H12 V9" />
