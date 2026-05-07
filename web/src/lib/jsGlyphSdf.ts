@@ -142,7 +142,8 @@ export function generateImageSdf(
   for (let i = 0; i < s * s; i++) {
     if (data[i * 4 + 3] < 255) alphaPixelCount++;
   }
-  const hasMeaningfulAlpha = alphaPixelCount * 100 > s * s;
+  // ドキュメント上は「1% 以上」表記なので >= で揃える (boundary を inclusive)。
+  const hasMeaningfulAlpha = alphaPixelCount * 100 >= s * s;
 
   const inside = new Uint8Array(s * s);
   let insideCount = 0;

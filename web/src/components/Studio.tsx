@@ -330,6 +330,18 @@ export default function Studio() {
   // 1 frame ぶん描画を挟む（setTimeout(0) より意図が明確）。
   const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 
+  // #169: runBatch から伝播してくる worker エラーを i18n 文言にマップする。
+  // image-shape-no-contrast は generateImageSdf でシルエット抽出に失敗した
+  // ことを示す内部 sentinel。`Error` インスタンスなら .message を見て、それ
+  // 以外は String(e) で文字列化する (N2)。
+  const formatRunBatchError = (e: unknown): string => {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('image-shape-no-contrast')) {
+      return t('imageShapeNoContrast');
+    }
+    return msg;
+  };
+
   const runBatch = async () => {
     const src = decoded();
     if (!src) return;
@@ -749,27 +761,20 @@ export default function Studio() {
     }
   };
 
-  // #169: runBatch から伝播してくる worker エラーを i18n 文言にマップする。
-  // image-shape-no-contrast は generateImageSdf でシルエット抽出に失敗した
-  // ことを示す内部コード。それ以外は生のまま表示する (デバッグ用)。
-  const formatRunBatchError = (e: unknown): string => {
-    const s = String(e);
-    if (s.includes('image-shape-no-contrast')) {
-      return t('imageShapeNoContrast');
-    }
-    return s;
-  };
-
   // #170: invert トグル切替時に worker 側 SDF を再生成する。File ref が
-  // 残っていれば自動で再 upload。
-  const onImageShapeInvertChange = (next: boolean) => {
+  // 残っていれば再 upload を試み、失敗時は signal をロールバックして UI
+  // と worker 状態の整合を保つ (S2)。スタイルは onImageShapePick の async
+  // /try-catch に揃える (N1)。
+  const onImageShapeInvertChange = async (next: boolean) => {
     setImageShapeInvert(next);
-    if (lastImageFileRef && shape() === 'image') {
-      void workerSetImageShape(lastImageFileRef, next).then(() => {
-        runBatchIfReady();
-      }).catch((err) => {
-        console.warn('failed to re-upload image shape on invert toggle', err);
-      });
+    if (!lastImageFileRef || shape() !== 'image') return;
+    try {
+      await workerSetImageShape(lastImageFileRef, next);
+      runBatchIfReady();
+    } catch (err) {
+      console.warn('failed to re-upload image shape on invert toggle', err);
+      setImageShapeInvert(!next);
+      setErrorMsg(formatRunBatchError(err));
     }
   };
 
@@ -1503,7 +1508,7 @@ export default function Studio() {
                 type="checkbox"
                 class={GLASS_CHECKBOX_INPUT}
                 checked={imageShapeInvert()}
-                onChange={(e) => onImageShapeInvertChange(e.currentTarget.checked)}
+                onChange={(e) => void onImageShapeInvertChange(e.currentTarget.checked)}
                 disabled={!decoded() || downloading() || !imageShapeReady()}
               />
               <span>{t('imageShapeInvert')}</span>
