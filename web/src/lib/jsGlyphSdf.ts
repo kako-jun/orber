@@ -10,8 +10,8 @@
 //
 // Rust 経路 (`crates/core/src/glyph.rs`) と数値が一致するように:
 // - GLYPH_SDF_MAX_DIST_FACTOR = 0.06 (norm = size * 0.06)
-// - inside (alpha >= 128) は signed_px = +sqrt(dist_to_outside) - 0.5
-// - outside は signed_px = -(sqrt(dist_to_inside) - 0.5)... の形 (Rust 側コードを参照)
+// - inside (alpha >= 128) は signed_px = sqrt(dist_to_outside) - 0.5
+// - outside (alpha < 128) は signed_px = 0.5 - sqrt(dist_to_inside)
 // - 最終バイト = ((signed_unit * 0.5 + 0.5) * 255).round().clamp(0, 255)
 //
 // この定数は Rust 側 `GLYPH_SDF_MAX_DIST_FACTOR` と同期させること。値を変える
@@ -137,7 +137,10 @@ function edt1d(f: Float32Array, n: number, v: Int32Array, z: Float32Array): void
   z[1] = INF;
   for (let q = 1; q < n; q++) {
     let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * (q - v[k]));
-    while (s <= z[k]) {
+    // Rust / 原論文と同じく `k > 0` ガードを入れて k=0 のときの underflow を防ぐ。
+    // 現状は `z[0] = -INF` が sentinel なので無くても落ちないが、INF を有限値に
+    // 差し替えた瞬間に `v[-1]` を読む潜在バグになるため明示的に守る。
+    while (k > 0 && s <= z[k]) {
       k--;
       s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * (q - v[k]));
     }

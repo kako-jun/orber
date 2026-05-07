@@ -54,13 +54,23 @@ describe('generateJsGlyphSdf()', () => {
     expect(out.every((v) => v === 0)).toBe(true);
   });
 
-  test('中央 1 ピクセルだけ alpha=255 の synthetic 入力で SDF が edge=128 / 中心 > 128 / 端 < 128 になる', () => {
-    // 8×8 の中央 1 ピクセルだけが inside のテスト入力。EDT が動くことを確認する。
+  test('synthetic 1 ピクセル inside で EDT 距離が Rust 公式と一致する', () => {
+    // 8×8 で (3,3) だけ alpha=255 の入力。
+    //   inside[3,3] = 1、それ以外 outside。
+    //   distOutside[3,3] = 1 (最寄り outside は (2,3)/(3,2)/(3,4)/(4,3) のどれか)
+    //   distInside[3,2] = 1、distInside[2,2] = 2、distInside[0,0] = 18、…
+    //
+    // Rust 公式 (`crates/core/src/glyph.rs:295`) と完全一致する byte が出るかを
+    // 直接検査する。size=8 のとき norm は `(size * 0.06).max(1.0)` で 1.0 に
+    // 固定 (Rust 側と同じ floor)。よって signed_unit = signed_px がそのまま入り、
+    // 各セルで以下の値が期待される:
+    //   (3,3) inside: signed_px = sqrt(1) - 0.5 = +0.5  → byte = 191
+    //   (3,2) outside dist²=1: signed_px = 0.5 - 1 = -0.5 → byte =  64
+    //   (2,2) outside dist²=2: signed_px = 0.5 - √2 ≈ -0.914 → byte = 11
+    //   (0,0) outside dist²=18: signed_px ≈ -3.74 → clamp(-1) → byte = 0
     const SIZE = 8;
     const data = new Uint8ClampedArray(SIZE * SIZE * 4);
-    // (3,3) (中央付近) の alpha だけ 255
-    const idx = (3 * SIZE + 3) * 4;
-    data[idx + 3] = 255;
+    data[(3 * SIZE + 3) * 4 + 3] = 255;
     class StubCanvas {
       width: number;
       height: number;
@@ -83,18 +93,17 @@ describe('generateJsGlyphSdf()', () => {
     vi.stubGlobal('OffscreenCanvas', StubCanvas);
     const out = generateJsGlyphSdf('A', SIZE);
     expect(out.length).toBe(SIZE * SIZE);
-    // inside ピクセル (3,3): signed_px = sqrt(0) - 0.5 = -0.5 → byte < 128
-    // (Rust と同符号: inside なのに -0.5 で 128 を下回る点に注意)
-    // ただし inside 自身は dist_to_outside=0 なので signed_px = -0.5、
-    //   byte = ((-0.5/(8*0.06))*0.5+0.5)*255 ≈ 0.5 - 0.52 → clamp → 0 寄り
-    // 隣接ピクセル (3,2) は outside で dist_to_inside=1 → signed_px = 0.5 - 1 = -0.5
-    // → 同様に 128 未満
-    // 遠いピクセル (0,0) は outside で大きな負の値 → byte は 0 寄り
-    // すなわち全体的に 128 未満になり、中心 1 px だけの synthetic ケースでは
-    // 「inside と outside の境界」自体が明確でない。fully-zero ではないことだけ
-    // チェックする。
-    const allZero = out.every((v) => v === 0);
-    expect(allZero).toBe(false);
+    // 内側 1 セル
+    expect(out[3 * SIZE + 3]).toBe(191);
+    // 上下左右の隣接 outside (4-way) は対称: dist²=1 → byte=64
+    expect(out[3 * SIZE + 2]).toBe(64);
+    expect(out[3 * SIZE + 4]).toBe(64);
+    expect(out[2 * SIZE + 3]).toBe(64);
+    expect(out[4 * SIZE + 3]).toBe(64);
+    // 対角 (2,2): dist²=2 → byte=11
+    expect(out[2 * SIZE + 2]).toBe(11);
+    // 端 (0,0): clamp -1 → byte=0
+    expect(out[0]).toBe(0);
   });
 
   test('GLYPH_SDF_MAX_DIST_FACTOR は Rust 側 (crates/core/src/glyph.rs) の 0.06 と同値', () => {
