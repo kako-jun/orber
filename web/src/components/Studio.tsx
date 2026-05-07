@@ -1344,10 +1344,12 @@ export default function Studio() {
                         Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
                         font-variant-emoji: text で対応済み。selector は display 用で、
                         value (sym) には付けないので状態管理は影響を受けない。
-                        ボタン高さ h-9 に対してフォント独自メトリクスでズレるため、
-                        leading-none + inline-block span でグリフ中心を上下センターに
-                        揃える (review)。 */}
-                    <span class="inline-block leading-none">{sym + '︎'}</span>
+                        Noto Sans Symbols 2 はフォント独自の baseline でボタン中央
+                        からズレるので、span を flex で h-full 化して再度
+                        items-center / justify-center を当てて強制センタリングする。 */}
+                    <span class="flex h-full w-full items-center justify-center leading-none">
+                      {sym + '︎'}
+                    </span>
                   </button>
                 )}
               </For>
