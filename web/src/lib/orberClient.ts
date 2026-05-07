@@ -249,11 +249,13 @@ export async function workerGlyphSupported(ch: string): Promise<boolean> {
 
 /**
  * #160: shape='image' で使う画像を worker に渡してキャッシュさせる。
- * `bitmap` は Transferable で zero-copy 転送される (転送後は呼び出し側で
- * 使えなくなる)。古い bitmap は worker 側で `close()` される。
+ * `file` は structured-clone で worker に複製される (Transferable は使わ
+ * ない)。これでメインスレッド側に File への参照が残り、worker クラッシュ
+ * 後の再 upload が可能になる。worker 側で `createImageBitmap(file)` を
+ * 呼んで ImageBitmap 化し、古い bitmap は close() される。
  */
-export async function workerSetImageShape(bitmap: ImageBitmap): Promise<void> {
-  await call<void>({ kind: 'setImageShape', bitmap }, [bitmap]);
+export async function workerSetImageShape(file: File): Promise<void> {
+  await call<void>({ kind: 'setImageShape', file });
 }
 
 /** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */

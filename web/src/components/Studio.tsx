@@ -130,12 +130,14 @@ export default function Studio() {
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
-  // #160: shape='image' のときに使う画像のローカル参照。worker には
-  // workerSetImageShape で transfer して送るため、ここでは表示用の name と
-  // プレビュー URL だけ保持する (bitmap 自体は transfer 後 unusable)。
+  // #160: shape='image' のときに使う画像のローカル参照。File を worker に
+  // structured-clone で送るため、main 側で File 参照を保持しておくと
+  // worker クラッシュ / terminateAndRespawn 後に再 upload できる。
   const [imageShapeName, setImageShapeName] = createSignal<string>('');
   const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
   const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
+  // setImageShape を再送するための File ref。runBatch / crash 経路で参照。
+  let lastImageFileRef: File | null = null;
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
   // 見えるが、内部 signal は empty identity を保つ。spec.count / spec.speed /
   // GUI_VIDEO_SPEEDS / SoftnessPreset::Mid を温存し、Phase A の見た目を正確に再現する。
@@ -242,10 +244,23 @@ export default function Studio() {
     // 感を抑える（リロードを促すサインになる）。
     const offCrash = onWorkerCrash(() => {
       lastSourceRef = null;
+      // #160: shape='image' の bitmap は worker 側で消えている。ロックして
+      // 次の runBatch で再 upload を必須にする。File ref が残っていれば
+      // 自動再 upload を裏で試みる (silent: triggerRun=false)。
+      if (lastImageFileRef) {
+        setImageShapeReady(false);
+        void onImageShapePick(lastImageFileRef, false).catch(() => {});
+      }
       setErrorMsg(t('wasmLoadFailed'));
       setWasmStatus('error');
     });
     onCleanup(offCrash);
+    // #160: shape='image' のサムネイル URL をコンポーネント unmount 時に
+    // revoke する (新ファイル選択時の revoke と対称)。
+    onCleanup(() => {
+      const u = imageShapeUrl();
+      if (u) URL.revokeObjectURL(u);
+    });
   });
 
   // #131 / #159: シンボルピッカーに並べる候補は、wasm 同梱フォントで描画できる
@@ -339,6 +354,16 @@ export default function Studio() {
       // worker を作り直したので worker 側の cachedSource も消えている。
       // 次の workerSetSource を再送させる（onWorkerCrash 経路と同じ後始末）。
       lastSourceRef = null;
+      // #160: shape='image' の bitmap も worker 側で消えているので、File ref
+      // が残っていればここで再送する (Studio onWorkerCrash 経路と同じ思想)。
+      if (lastImageFileRef && shape() === 'image') {
+        try {
+          await workerSetImageShape(lastImageFileRef);
+        } catch (err) {
+          console.warn('failed to re-upload image shape after respawn', err);
+          setImageShapeReady(false);
+        }
+      }
     }
 
     seedSkeletons();
@@ -700,23 +725,24 @@ export default function Studio() {
     void runBatch();
   };
 
-  // #160: shape='image' 用の画像読込。File を ImageBitmap 化して worker に
-  // transfer し、UI 側はプレビュー URL とファイル名だけ保持する。
-  const onImageShapePick = async (file: File) => {
+  // #160: shape='image' 用の画像読込。File を worker に送って worker 側で
+  // createImageBitmap させる。main 側は File 参照を保持して crash 後の
+  // 再 upload に備える。第 2 引数 `triggerRun` を false にすると runBatch を
+  // 走らせず、worker recovery 後の silent 再 upload に使える。
+  const onImageShapePick = async (file: File, triggerRun = true) => {
     try {
-      const bitmap = await createImageBitmap(file);
-      // worker に transfer (これで main 側 bitmap は detached)。
-      await workerSetImageShape(bitmap);
-      // 旧 URL を revoke してから新 URL に差し替え。
+      lastImageFileRef = file;
+      await workerSetImageShape(file);
       const oldUrl = imageShapeUrl();
       if (oldUrl) URL.revokeObjectURL(oldUrl);
       setImageShapeUrl(URL.createObjectURL(file));
       setImageShapeName(file.name);
       setImageShapeReady(true);
-      runBatchIfReady();
+      if (triggerRun) runBatchIfReady();
     } catch (err) {
       console.warn('failed to load image shape', err);
       setErrorMsg(t('imageShapeLoadFailed'));
+      setImageShapeReady(false);
     }
   };
 
@@ -1559,7 +1585,11 @@ export default function Studio() {
             (shape() === 'image' && !imageShapeReady())
           }
           aria-label={t('rerollLabel')}
-          title={t('rerollTitle')}
+          title={
+            shape() === 'image' && !imageShapeReady()
+              ? t('imageShapePickHint')
+              : t('rerollTitle')
+          }
           class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
         >
           <svg

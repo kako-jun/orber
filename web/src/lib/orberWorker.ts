@@ -209,9 +209,12 @@ type Req =
   // Phase B (#55): UI が typed-in glyph 文字が同梱フォントに収録されているか
   // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
   | { kind: 'glyphSupported'; id: number; ch: string }
-  // #160: shape='image' で使う画像 (ImageBitmap) を worker にキャッシュする。
-  // bitmap は Transferable で zero-copy 転送される (Studio.tsx 側で transfer)。
-  | { kind: 'setImageShape'; id: number; bitmap: ImageBitmap };
+  // #160: shape='image' で使う画像 (File) を worker にキャッシュする。
+  // worker 側で createImageBitmap(file) を呼んで ImageBitmap 化する。
+  // Transferable を使わず structured-clone で渡す ── main 側が File 参照
+  // を保持し続けることで、worker クラッシュ / terminateAndRespawn 後の
+  // 再 upload が可能になる。
+  | { kind: 'setImageShape'; id: number; file: File };
 
 /// #56: wasm get_render_data の Float32Array header word 3 (= bg.a in 0..1) を 0 に
 /// 上書きして「透過背景でレンダリングしてくれ」と shader に依頼する。元 buffer は
@@ -243,11 +246,14 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'setImageShape': {
-        // 古い bitmap は close して GPU メモリを解放する。新 bitmap を保持。
-        if (cachedImageBitmap && cachedImageBitmap !== req.bitmap) {
+        // File を worker 内で ImageBitmap 化する。古い bitmap は close して
+        // GPU メモリを解放してから差し替え。decode 失敗時は呼び出し側に
+        // error を返す (Studio 側で UI 通知)。
+        const newBitmap = await createImageBitmap(req.file);
+        if (cachedImageBitmap && cachedImageBitmap !== newBitmap) {
           cachedImageBitmap.close();
         }
-        cachedImageBitmap = req.bitmap;
+        cachedImageBitmap = newBitmap;
         // 既存の image SDF キャッシュを invalidate (新 bitmap で再生成させる)。
         if (cachedGlyph && cachedGlyph.kind === 'image') {
           cachedGlyph = null;
