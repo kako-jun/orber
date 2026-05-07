@@ -105,7 +105,7 @@ export default function Footer() {
   return (
     <footer
       class="mt-16 border-t border-hairline"
-      aria-label="orber footer"
+      aria-label={t('footerAriaLabel')}
     >
       <div class="mx-auto max-w-3xl px-4 py-10 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
@@ -208,10 +208,12 @@ export default function Footer() {
           {t('privacyNote')}
         </p>
 
-        {/* Counter + version (1 行、tabular-nums) */}
+        {/* Counter + version (1 行、tabular-nums)。
+            #146 review S1: Counter 非表示時に version 単独になるため justify-center で
+            親の text-center に揃えておく。 */}
         <div
           ref={counterRootRef}
-          class="text-xs text-fgSubtle flex items-center gap-3"
+          class="text-xs text-fgSubtle flex items-center justify-center gap-3"
           style={{ 'font-variant-numeric': 'tabular-nums' }}
         >
           {NOSTALGIC_COUNTER_ENABLED && (

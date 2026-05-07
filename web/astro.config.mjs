@@ -17,7 +17,9 @@ export default defineConfig({
   site: 'https://orber.llll-ll.com',
   vite: {
     define: {
-      // dev サーバーでも置換されるので、開発中は dev サーバー起動日が表示される。
+      // dev サーバー起動時の日付で literal 置換される。HMR では再評価されないため、
+      // 日付をリフレッシュしたい場合は dev サーバーを再起動すること。本番 build では
+      // `npm run build` ごとに評価されるので、デプロイ時の日付が必ず反映される。
       __BUILD_DATE__: JSON.stringify(BUILD_DATE),
     },
     server: {

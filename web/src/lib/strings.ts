@@ -150,6 +150,8 @@ export const STRINGS = {
   // {n} は <nostalgic-counter> がレンダリングする数値で置換する。
   viewsLabelPrefix: { ja: '閲覧数: ', en: '' },
   viewsLabelSuffix: { ja: '', en: ' views' },
+  // #146 review S2: Footer 全体の aria-label を i18n 化。
+  footerAriaLabel: { ja: 'orber フッター', en: 'orber footer' },
   // #146: About 見出し / aboutBody / aboutBuiltWith / repoLinkLabel は Footer から外した。
   // privacyNote だけ「画像はブラウザ内で処理される」境界条件として残す。
   // #148: PWA install prompt (machigai-salad と同パターンの toast)。
