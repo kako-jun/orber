@@ -1,25 +1,27 @@
-// orber#128 — Footer (Solid island)
-// 公開後の継続接点 (GH Sponsors / Amazon affiliate / QR / Copyright /
-// Nostalgic Counter) を 1 コンポーネントに集約する。#86 (About / Donate) の
-// プライバシー note もここに置き、フッター = 「最後に読まれる場所」 として
-// orber の境界条件 (画像はブラウザ内処理) を改めて宣言する。
+// orber#146 — Footer (Solid island, redesigned)
 //
-// レイアウト方針 (DESIGN.md §3 + 本ファイル冒頭で扱う):
-//   - モバイル: 縦積み (flex-col)
-//   - デスクトップ (md:): 2 列 — 左 = Sponsor + Amazon、右 = QR + Copyright + Counter
-//   - sticky ではなく自然なフロー (Studio の最後に着地)
-//   - glass-bg + hairline で本体から分離 (border-t border-hairline)
+// 旧 #128 実装は左右 2 列・glass コンテナ・自己説明文 (about / built with /
+// repo link / "Open on phone") を詰め込んでおり、orber 本体の引き算 UI から
+// 浮いていた。#146 で以下に再設計する。
 //
-// ハードコード禁止: カラーは tailwind.config.mjs の token (bg / fg / fgMuted /
-// fgSubtle / hairline / glassBg / glassBgHover / glassBorder / focusRing) のみ。
-// 生 #fff / rgba() を class に書き込まない。
+//   - 中央揃えに統一
+//   - glass コンテナを廃し、border-t のみで穏やかに区切る
+//   - 自己説明文 (aboutBody / aboutBuiltWith / repoLinkLabel / qrLabel) を削除
+//   - Copyright から年号を外す (`© kako-jun`)
+//   - QR は build 時生成の SVG ではなく、別途指定する PNG (`/orber-qr.png`) を使う
+//   - Footer の入口にオーブモチーフ (●) をサイズ違いで縦 5 個並べ、
+//     「これは orber」の視覚サインを置く (DESIGN.md §14)
+//   - Nostalgic Counter と build version (`v2026-05-07` 等) を 1 行に並べる
+//     (machigai-salad の VisitorCounter と同じパターン)
 //
-// Web Components:
-//   <nostalgic-counter id="..." type="total" format="text" />
-// は Custom Element なので JSX intrinsic に存在しない。Solid 1.x は
-// 任意のタグを許容するが TypeScript が落ちるため `as any` キャストで通す。
-// 別案として `web-components.d.ts` を切る方法もあるが、orber でこれが唯一の
-// Web Component なら 1 行のキャストの方が変更面が小さい。
+// Amazon affiliate (B section) は #146 のスコープ外。商品データ管理・
+// アソシエイト ID 管理・orb/glow に寄せた商品カード再設計は別 issue。
+// レイアウトのみ中央揃えに合わせる。
+//
+// ハードコード禁止: カラーは tailwind token (bg / fg / fgMuted / fgSubtle /
+// hairline / glassBg / glassBgHover / glassBorder / focusRing) のみ。
+//
+// Web Components: <nostalgic-counter> は env.d.ts で IntrinsicElements に追加済み。
 
 import { onMount } from 'solid-js';
 import { t } from '../lib/strings';
@@ -30,18 +32,13 @@ import {
 
 // #128: Nostalgic Counter の実 ID は kako-jun が
 // https://nostalgic.llll-ll.com/ のダッシュボードで取得後に置換する。
-// ear-sky の ID 形式 ("ear-sky-eaae1797") を踏襲し、orber では
-// "orber-XXXXXXXX" の placeholder にしておく。
 // TODO(kako-jun): 実 ID に置換 (例 "orber-xxxxxxxx")。
 const NOSTALGIC_COUNTER_ID = 'orber-PLACEHOLDER';
 
-// placeholder の間は Counter ブロック自体を非表示にする (review nit-1)。
-// embed.js が "Counter not found" 等のテキストを表示しないように完全 mount しない。
+// placeholder の間は Counter 部分を非表示にする。embed.js が "Counter not found"
+// 等のテキストを表示しないように完全 mount しない。
 const NOSTALGIC_COUNTER_ENABLED = !NOSTALGIC_COUNTER_ID.endsWith('PLACEHOLDER');
 
-// embed.js は CSP / order に敏感ではないので Footer の onMount で動的注入する
-// (Base.astro を触らずに済み、フッターが visible になるまで XHR が走らない)。
-// 同 URL の二重注入を避けるため data-orber-nostalgic フラグで idempotent に。
 const NOSTALGIC_EMBED_SRC = 'https://nostalgic.llll-ll.com/components/visit.js';
 
 function ensureNostalgicEmbed(): void {
@@ -54,141 +51,173 @@ function ensureNostalgicEmbed(): void {
   document.head.appendChild(s);
 }
 
+// machigai-salad/components/VisitorCounter.tsx と同じパターン: counter mount 後に
+// テキスト (`12345`) を `toLocaleString()` でカンマ区切り (`12,345`) に整形する。
+// 5 秒以内に値が入らなければ諦める (max 50 回 × 100ms)。
+const MAX_POLL_ATTEMPTS = 50;
+
+function formatCounterAfterMount(root: HTMLElement): void {
+  let attempts = 0;
+  const timer = window.setInterval(() => {
+    attempts += 1;
+    if (attempts >= MAX_POLL_ATTEMPTS) {
+      window.clearInterval(timer);
+      return;
+    }
+    const counter = root.querySelector('nostalgic-counter');
+    const txt = counter?.textContent ?? '';
+    if (txt && txt !== '0') {
+      const num = txt.replace(/,/g, '');
+      if (/^\d+$/.test(num) && counter) {
+        counter.textContent = parseInt(num, 10).toLocaleString();
+      }
+      window.clearInterval(timer);
+    }
+  }, 100);
+}
+
+// Footer 入口のオーブモチーフ。●をサイズ違いで縦 5 個。
+// 中央 (3 つ目) を最大にし、上下に向かって縮ませることで奥行きを出す。
+// fg トークンを使い、opacity だけで濃淡を作る (色トークン外しない)。
+const ORB_DOTS: { size: number; opacity: number }[] = [
+  { size: 6, opacity: 0.35 },
+  { size: 12, opacity: 0.55 },
+  { size: 22, opacity: 0.85 },
+  { size: 12, opacity: 0.55 },
+  { size: 6, opacity: 0.35 },
+];
+
 export default function Footer() {
+  let counterRootRef: HTMLDivElement | undefined;
+
   onMount(() => {
     if (NOSTALGIC_COUNTER_ENABLED) {
       ensureNostalgicEmbed();
+      if (counterRootRef) {
+        formatCounterAfterMount(counterRootRef);
+      }
     }
   });
 
+  // #146: vite.define で build 時に literal 置換される。
+  const buildDate = __BUILD_DATE__;
+
   return (
     <footer
-      class="mt-16 border-t border-hairline bg-glassBg backdrop-blur-glass"
-      aria-label="orber footer"
+      class="mt-16 border-t border-hairline"
+      aria-label={t('footerAriaLabel')}
     >
-      <div class="mx-auto max-w-3xl px-4 py-10 grid gap-10 md:grid-cols-2">
-        {/* 左列: Sponsor + Amazon */}
-        <div class="space-y-6">
-          {/* A. GH Sponsors */}
-          <div>
-            <a
-              href="https://github.com/sponsors/kako-jun"
-              target="_blank"
-              rel="noopener noreferrer"
-              title={t('sponsorTitle')}
-              class="inline-flex items-center gap-2 rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover px-3 py-2 text-sm text-fg transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-            >
-              {/* GitHub heart icon — DESIGN.md §7 (inline SVG, stroke 1.5, currentColor) */}
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-              </svg>
-              <span>{t('sponsorLabel')}</span>
-            </a>
-          </div>
-
-          {/* B. Amazon affiliate × 3 */}
-          <section aria-label={t('affiliateHeading')}>
-            <h2 class="text-xs text-fgMuted mb-3 tracking-wide">
-              {t('affiliateHeading')}
-            </h2>
-            <ul class="grid grid-cols-3 gap-2">
-              {AFFILIATE_PRODUCTS.map((p) => (
-                <li>
-                  <a
-                    href={amazonUrl(p.asin)}
-                    target="_blank"
-                    rel="noopener noreferrer sponsored nofollow"
-                    title={p.title}
-                    class="block rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover p-2 transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-                  >
-                    <div class="aspect-square w-full mb-2 bg-glassBg rounded-sm overflow-hidden flex items-center justify-center">
-                      <img
-                        src={p.imageUrl}
-                        alt={p.title}
-                        loading="lazy"
-                        decoding="async"
-                        width="120"
-                        height="120"
-                        class="max-h-full max-w-full object-contain"
-                        onError={(e) => {
-                          // placeholder URL は 404 になるため、エラー時は
-                          // 画像要素を非表示にして枠だけ残す (UX 上の
-                          // broken icon を消す)。実 ASIN 投入後は普通に
-                          // 表示される。
-                          (e.currentTarget as HTMLImageElement).style.visibility = 'hidden';
-                        }}
-                      />
-                    </div>
-                    <div class="text-xs text-fg leading-tight truncate">
-                      {p.title}
-                    </div>
-                    <div class="text-xs text-fgSubtle leading-tight truncate mt-0.5">
-                      {p.caption}
-                    </div>
-                  </a>
-                </li>
-              ))}
-            </ul>
-            <p class="text-xs text-fgSubtle mt-2">
-              {t('affiliateDisclosure')}
-            </p>
-          </section>
+      <div class="mx-auto max-w-3xl px-4 py-10 flex flex-col items-center text-center gap-8">
+        {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
+        <div
+          class="flex flex-col items-center gap-2 py-2"
+          aria-hidden="true"
+        >
+          {ORB_DOTS.map((dot) => (
+            <span
+              class="block rounded-full bg-fg"
+              style={{
+                width: `${dot.size}px`,
+                height: `${dot.size}px`,
+                opacity: dot.opacity,
+              }}
+            />
+          ))}
         </div>
 
-        {/* 右列: QR + Privacy + Copyright + Counter */}
-        <div class="space-y-6 md:text-right">
-          {/* C. QR */}
-          <div class="md:flex md:justify-end">
-            <div class="inline-flex flex-col items-center gap-1">
-              <img
-                src="/orber-qr.svg"
-                alt={t('qrAlt')}
-                width="120"
-                height="120"
-                class="block rounded-sm border border-hairline bg-bg"
-              />
-              <span class="text-xs text-fgSubtle">{t('qrLabel')}</span>
-            </div>
-          </div>
-
-          {/* #86 統合 — About + Privacy + Source link を 1 段にまとめる。
-              orber が何 / どこのソースか / 何で作っているか + 画像はサーバーに
-              送られない、を最後に読ませる。 */}
-          <section
-            aria-label={t('aboutHeading')}
-            class="space-y-2 text-xs leading-relaxed"
+        {/* A. GH Sponsors */}
+        <a
+          href="https://github.com/sponsors/kako-jun"
+          target="_blank"
+          rel="noopener noreferrer"
+          title={t('sponsorTitle')}
+          class="inline-flex items-center gap-2 rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover px-3 py-2 text-sm text-fg transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
           >
-            <p class="text-fgMuted">{t('aboutBody')}</p>
-            <p class="text-fgMuted">{t('privacyNote')}</p>
-            <p class="text-fgSubtle">
-              <a
-                href="https://github.com/kako-jun/orber"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-              >
-                {t('repoLinkLabel')}
-              </a>
-              {' · '}
-              <span>{t('aboutBuiltWith')}</span>
-            </p>
-          </section>
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+          </svg>
+          <span>{t('sponsorLabel')}</span>
+        </a>
 
-          {/* E. Nostalgic Counter — placeholder ID の間は表示しない (review nit-1) */}
+        {/* B. Amazon affiliate × 3 — #146 スコープ外 (商品データ・カード再設計は別 issue)。
+            レイアウトのみ中央揃えに合わせ、disclosure を簡潔に下に置く。 */}
+        <section aria-label={t('affiliateHeading')} class="w-full">
+          <h2 class="text-xs text-fgMuted mb-3 tracking-wide">
+            {t('affiliateHeading')}
+          </h2>
+          <ul class="grid grid-cols-3 gap-2 max-w-sm mx-auto">
+            {AFFILIATE_PRODUCTS.map((p) => (
+              <li>
+                <a
+                  href={amazonUrl(p.asin)}
+                  target="_blank"
+                  rel="noopener noreferrer sponsored nofollow"
+                  title={p.title}
+                  class="block rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover p-2 transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+                >
+                  <div class="aspect-square w-full mb-2 bg-glassBg rounded-sm overflow-hidden flex items-center justify-center">
+                    <img
+                      src={p.imageUrl}
+                      alt={p.title}
+                      loading="lazy"
+                      decoding="async"
+                      width="120"
+                      height="120"
+                      class="max-h-full max-w-full object-contain"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).style.visibility = 'hidden';
+                      }}
+                    />
+                  </div>
+                  <div class="text-xs text-fg leading-tight truncate">
+                    {p.title}
+                  </div>
+                  <div class="text-xs text-fgSubtle leading-tight truncate mt-0.5">
+                    {p.caption}
+                  </div>
+                </a>
+              </li>
+            ))}
+          </ul>
+          <p class="text-xs text-fgSubtle mt-2">
+            {t('affiliateDisclosure')}
+          </p>
+        </section>
+
+        {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。 */}
+        <img
+          src="/orber-qr.png"
+          alt={t('qrAlt')}
+          width="120"
+          height="120"
+          class="block rounded-sm border border-hairline bg-bg"
+        />
+
+        {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}
+        <p class="text-xs text-fgMuted leading-relaxed max-w-md">
+          {t('privacyNote')}
+        </p>
+
+        {/* Counter + version (1 行、tabular-nums)。
+            #146 review S1: Counter 非表示時に version 単独になるため justify-center で
+            親の text-center に揃えておく。 */}
+        <div
+          ref={counterRootRef}
+          class="text-xs text-fgSubtle flex items-center justify-center gap-3"
+          style={{ 'font-variant-numeric': 'tabular-nums' }}
+        >
           {NOSTALGIC_COUNTER_ENABLED && (
-            <div class="text-xs text-fgSubtle">
-              {/* ja: 「閲覧数: {n}」 / en: 「{n} views」 で語順を切替 (review nit-4)。
-                  Solid の JSX intrinsic は env.d.ts で nostalgic-counter を拡張済み。 */}
+            <span>
               <span>{t('viewsLabelPrefix')}</span>
               <nostalgic-counter
                 id={NOSTALGIC_COUNTER_ID}
@@ -196,14 +225,15 @@ export default function Footer() {
                 format="text"
               />
               <span>{t('viewsLabelSuffix')}</span>
-            </div>
+            </span>
           )}
-
-          {/* D. Copyright */}
-          <p class="font-display font-light text-xs text-fgSubtle">
-            © 2026 kako-jun
-          </p>
+          <span>v{buildDate}</span>
         </div>
+
+        {/* D. Copyright — 年号なし */}
+        <p class="font-display font-light text-xs text-fgSubtle">
+          © kako-jun
+        </p>
       </div>
     </footer>
   );
