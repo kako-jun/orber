@@ -70,10 +70,13 @@ export default function PwaInstallPrompt() {
   return (
     <>
       {visible() && deferred() && (
+        // #148 review M1: 当初 role="dialog" + aria-live="polite" にしていたが、
+        // 本コンポーネントは非モーダル toast / banner なので role="status" の方が
+        // 正しい (status は live region を内包するため aria-live は不要、
+        // dialog はフォーカス管理を期待されるので誤通知になる)。
         <div
           class="fixed bottom-4 left-4 right-4 mx-auto z-50 max-w-md flex items-center gap-3 rounded-md border border-glassBorder bg-glassBg backdrop-blur-glass px-4 py-3 shadow-lg fade-in"
-          role="dialog"
-          aria-live="polite"
+          role="status"
         >
           <span class="flex-1 text-sm text-fg">{t('installPromptBody')}</span>
           <button
