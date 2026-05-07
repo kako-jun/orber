@@ -126,19 +126,23 @@ export const STRINGS = {
     ja: 'バリエーション {n} (動画)',
     en: 'Variation {n} (animated)',
   },
-  // #128: Footer (GH Sponsors / Amazon affiliate / QR / Copyright / Counter)
-  sponsorLabel: { ja: 'GitHub で寄付', en: 'Sponsor on GitHub' },
-  sponsorTitle: {
-    ja: 'GitHub Sponsors で kako-jun を支援する',
-    en: 'Support kako-jun on GitHub Sponsors',
-  },
+  // #128 / #156: Footer (Amazon affiliate / QR / Copyright / Counter)。
+  // sponsorLabel / sponsorTitle は #156 で大きい GH Sponsors button を削除して
+  // 以来未使用 (テキストリンクは sponsorTextLabel 側) なので削除済み。
+  //
+  // affiliate 文言:
+  //   - User 「本やゲームは機材じゃない」「Amazon と 2 回言う必要はない」
+  //     「サイト維持のため、購入を検討くださいみたいな表現に」「文章が長くて改行されてしまう」
+  //   - heading: 「機材」だと書籍 / ゲームに合わないので「kako-jun のおすすめ」に
+  //   - disclosure: 1 行に収まる短さに圧縮。Amazon Associate の開示は維持
+  //     (en は FTC 推奨テンプレ、ja は短文 + Associate キーワードを残す)
   affiliateHeading: {
-    ja: 'おすすめ機材 (Amazon)',
-    en: 'Recommended gear (Amazon)',
+    ja: 'kako-jun のおすすめ',
+    en: "kako-jun's picks",
   },
   affiliateDisclosure: {
-    ja: '※ Amazon アソシエイト・プログラムに参加しています。',
-    en: 'As an Amazon Associate this site earns from qualifying purchases.',
+    ja: '購入が orber 維持の支援になります (Amazon アソシエイト)',
+    en: 'As an Amazon Associate I earn from qualifying purchases.',
   },
   // #146: QR の補助コピー (qrLabel / "Open on phone") は廃止。alt のみ残す。
   qrAlt: {

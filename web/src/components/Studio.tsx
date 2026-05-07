@@ -938,7 +938,12 @@ export default function Studio() {
       // #56: alpha 同梱時は hi-res 経路を 2 周走らせるので、進捗 total は 2x。
       // renderHiResForIndices 冒頭で setDlProgress({done:0, total:indices.length})
       // していたのを上書きするため、ここで先に正しい total を立てる。
-      const wantAlpha = includeAlpha() && vp9AlphaSupported();
+      // User: 「透過版を含めるチェックを入れたのに含まれていなかった」を反映。
+      // 旧 `wantAlpha = includeAlpha() && vp9AlphaSupported()` は VP9 alpha
+      // 非対応ブラウザ (Safari 等) で alpha 経路が一切走らない状態だった。
+      // PNG / WebP 透過は VP9 と無関係なのでチェックされたら必ず走らせ、
+      // WebM 透過は renderAlphaForIndices 内 (line 915) で個別に VP9 ガードする。
+      const wantAlpha = includeAlpha();
       setDlProgress({
         done: 0,
         total: wantAlpha ? indices.length * 2 : indices.length,
