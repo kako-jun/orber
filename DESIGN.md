@@ -353,22 +353,35 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - shape segmented pill は `Circle / Glyph / Image` の 3 択
 - `Image` を選ぶとシェイプ row の下に画像入力 row が出現する: ファイル選択
   ボタン + 9×9 サムネイル + ファイル名表示
-- 入力画像 (PNG / JPG / WebP / GIF / SVG) は メインスレッドで `createImageBitmap`
-  → `workerSetImageShape` で worker に Transferable で送信 → worker 内で
+- 入力画像 (PNG / JPG / WebP / GIF / SVG) は **`File` を worker に
+  structured-clone で送信** → worker 内で `createImageBitmap` →
   `OffscreenCanvas` に「contain」リサンプル → alpha or 輝度しきい値で二値化 →
-  Glyph と同じ EDT で SDF 化 (`web/src/lib/jsGlyphSdf.ts:generateImageSdf`)
-- しきい値ヒューリスティック:
-  - 透過 PNG など `alpha < 255` のピクセルが 1 つでもあれば「透過画像」扱い
-    → `alpha >= 128` を inside
-  - 完全不透明な画像は輝度 `Y = 0.299R + 0.587G + 0.114B` で二値化、
-    平均輝度を境界に **少数派ピクセル群を inside** とする (背景 vs 被写体の
-    自動判定。被写体が背景より小領域である前提)
+  Glyph と同じ EDT で SDF 化 (`web/src/lib/jsGlyphSdf.ts:generateImageSdf`)。
+  Transferable を使わない理由は worker クラッシュ / `terminateAndRespawn`
+  後にメインスレッドに残った `File` 参照から再 upload するため (#168 M1)
+- しきい値ヒューリスティック (#171 で改訂):
+  - **透過画像判定**: `alpha < 255` のピクセル数が画像全体の **1% 以上** の
+    ときだけ「透過画像」扱いとする。1 px 単位の混入 (JPEG → PNG 変換ロスや
+    ICC プロファイルの端ピクセル等) で alpha 経路に倒れる事故を防ぐ
+  - **透過画像経路**: `alpha >= 128` を inside
+  - **不透明画像経路**: 輝度 `Y = 0.299R + 0.587G + 0.114B` で二値化、
+    平均輝度を境界に **少数派ピクセル群を inside** とする (auto-polarity)
+- **コントラスト不足検出 (#169)**: シルエット抽出が成功しない (= inside 0 個、
+  または全画素 inside) 場合は worker が `image-shape-no-contrast` エラーを
+  投げ、UI に「この画像にはコントラストがありません」を表示する
+- **シルエット反転トグル (#170)**: 画像入力 row に `imageShapeInvert`
+  checkbox を置く。auto-polarity が外れる画像 (証明写真風など被写体が画面
+  半分以上を占める) の救済。トグル ON で inside / outside を強制反転、
+  worker 側 SDF が再生成される
 - 画像はアスペクト比を保ったまま 256×256 に「contain」リサンプルされ、
   上下/左右の余白は SDF 上の outside になる。これにより縦長/横長の画像も
   シルエットが歪まない
 - カラー画像の色情報は捨てる (orber は monochrome ピペライン)
 - shape='image' の wasm 経路は内部的に shape='glyph' として扱い、worker は
-  upload する SDF テクスチャだけを差し替える (wasm / `crates/wasm` は無改修)
+  upload する SDF テクスチャだけを差し替える (wasm / `crates/wasm` は無改修)。
+  wasm に渡すダミー `glyph_char` は `'☆'` (Noto Sans Symbols 2 同梱で必ず
+  glyph_supported になる字) を使い、将来 wasm 側で glyph_char バリデーション
+  が厳格化されても silent fail しないよう備える (#172 N2)
 
 ### 生成トリガー
 

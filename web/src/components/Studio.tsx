@@ -136,6 +136,9 @@ export default function Studio() {
   const [imageShapeName, setImageShapeName] = createSignal<string>('');
   const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
   const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
+  // #170: シルエット反転トグル。auto-polarity (= 少数派 = 被写体) が外れる
+  // 画像 (証明写真など被写体が画面の半分以上) の救済。
+  const [imageShapeInvert, setImageShapeInvert] = createSignal<boolean>(false);
   // setImageShape を再送するための File ref。runBatch / crash 経路で参照。
   let lastImageFileRef: File | null = null;
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
@@ -346,7 +349,7 @@ export default function Studio() {
       } catch (e) {
         if (myGen !== runGen) return;
         clearTiles();
-        setErrorMsg(String(e));
+        setErrorMsg(formatRunBatchError(e));
         setPhase('error');
         return;
       }
@@ -388,7 +391,7 @@ export default function Studio() {
       } catch (e) {
         if (myGen !== runGen) return;
         clearTiles();
-        setErrorMsg(String(e));
+        setErrorMsg(formatRunBatchError(e));
         setPhase('error');
         return;
       }
@@ -468,7 +471,7 @@ export default function Studio() {
       // setTimeout 等が動いていても抑止できるよう保守的に維持する。
       runGen += 1;
       clearTiles();
-      setErrorMsg(String(e));
+      setErrorMsg(formatRunBatchError(e));
       setPhase('error');
       return;
     }
@@ -597,7 +600,7 @@ export default function Studio() {
       await runBatch();
     } catch (e) {
       console.error('decode failed', e);
-      setErrorMsg(String(e));
+      setErrorMsg(formatRunBatchError(e));
       setPhase('error');
       // 失敗した画像を「成功扱い」のサムネとしてドロップエリアに残さない。
       const failedThumbUrl = pickedThumbUrl();
@@ -732,7 +735,7 @@ export default function Studio() {
   const onImageShapePick = async (file: File, triggerRun = true) => {
     try {
       lastImageFileRef = file;
-      await workerSetImageShape(file);
+      await workerSetImageShape(file, imageShapeInvert());
       const oldUrl = imageShapeUrl();
       if (oldUrl) URL.revokeObjectURL(oldUrl);
       setImageShapeUrl(URL.createObjectURL(file));
@@ -743,6 +746,30 @@ export default function Studio() {
       console.warn('failed to load image shape', err);
       setErrorMsg(t('imageShapeLoadFailed'));
       setImageShapeReady(false);
+    }
+  };
+
+  // #169: runBatch から伝播してくる worker エラーを i18n 文言にマップする。
+  // image-shape-no-contrast は generateImageSdf でシルエット抽出に失敗した
+  // ことを示す内部コード。それ以外は生のまま表示する (デバッグ用)。
+  const formatRunBatchError = (e: unknown): string => {
+    const s = String(e);
+    if (s.includes('image-shape-no-contrast')) {
+      return t('imageShapeNoContrast');
+    }
+    return s;
+  };
+
+  // #170: invert トグル切替時に worker 側 SDF を再生成する。File ref が
+  // 残っていれば自動で再 upload。
+  const onImageShapeInvertChange = (next: boolean) => {
+    setImageShapeInvert(next);
+    if (lastImageFileRef && shape() === 'image') {
+      void workerSetImageShape(lastImageFileRef, next).then(() => {
+        runBatchIfReady();
+      }).catch((err) => {
+        console.warn('failed to re-upload image shape on invert toggle', err);
+      });
     }
   };
 
@@ -1468,6 +1495,19 @@ export default function Studio() {
                 </span>
               </Show>
             </div>
+            {/* #170: シルエット反転トグル。auto-polarity が外れる画像
+                (被写体が画面の半分以上を占める証明写真風など) の救済。 */}
+            <span />
+            <label class={GLASS_CHECKBOX_LABEL}>
+              <input
+                type="checkbox"
+                class={GLASS_CHECKBOX_INPUT}
+                checked={imageShapeInvert()}
+                onChange={(e) => onImageShapeInvertChange(e.currentTarget.checked)}
+                disabled={!decoded() || downloading() || !imageShapeReady()}
+              />
+              <span>{t('imageShapeInvert')}</span>
+            </label>
           </>
         </Show>
 
