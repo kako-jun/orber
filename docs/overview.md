@@ -496,7 +496,15 @@ speed / softness without dropping to the terminal.
   silhouettes via alpha extraction, which lines up with orber's monochrome
   pipeline. The exact glyph shape depends on the OS font renderer, so the
   same 🐱 may differ between Mac and Windows; this is accepted as the trade
-  for accepting any character the user types.
+  for accepting any character the user types. The shape segmented control
+  has a third option, **Image**, which lets users upload an arbitrary picture
+  (PNG / JPG / WebP / GIF / SVG); the bitmap is silhouetted in-worker (alpha
+  threshold for transparent images, otherwise a luminance threshold whose
+  inside/outside polarity is auto-detected by minority count) and pushed
+  through the same EDT → SDF pipeline as glyph rasterization, so the wasm
+  rendering path is reused unchanged (`web/src/lib/jsGlyphSdf.ts:generateImageSdf`).
+  Color information is discarded — orber's monochrome pipeline keeps only
+  the shape.
 
 ## Transparent download bundle (#56)
 

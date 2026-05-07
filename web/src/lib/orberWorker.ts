@@ -22,7 +22,7 @@ import {
   isVp9AlphaSupported,
 } from './encodeWebmAlpha';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
-import { generateJsGlyphSdf } from './jsGlyphSdf';
+import { generateImageSdf, generateJsGlyphSdf } from './jsGlyphSdf';
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -48,7 +48,15 @@ let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number
 // (GLYPH_SDF_SIZE) でしか呼ばないので size をキーから外しても良いが、将来
 // 切替の余地を残すために含める。getRenderer で renderer を作り直したときも
 // invalidate する必要がある（テクスチャも一緒に dispose されるため）。
-let cachedGlyph: { ch: string; size: number } | null = null;
+//
+// #160: shape='image' のときは ch ではなく ImageBitmap を SDF 元にするので、
+// kind を分けてキャッシュする。bitmap は Studio から `setImageShape` で 1 度
+// 送られて worker にキャッシュされる (cachedImageBitmap)。
+let cachedGlyph:
+  | { kind: 'char'; ch: string; size: number }
+  | { kind: 'image'; bitmap: ImageBitmap; size: number }
+  | null = null;
+let cachedImageBitmap: ImageBitmap | null = null;
 
 function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; renderer: GlRenderer } {
   if (cachedCanvas && cachedCanvas.width === width && cachedCanvas.height === height) {
@@ -57,8 +65,8 @@ function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; 
   if (cachedCanvas) {
     cachedCanvas.renderer.dispose();
     cachedCanvas = null;
-    // renderer を作り直すとテクスチャも消えるので Glyph
-    // キャッシュも無効化する（次の ensureGlyphSdfUploaded で再 upload）。
+    // renderer を作り直すとテクスチャも消えるので Glyph / Image
+    // キャッシュも無効化する（次の ensure*SdfUploaded で再 upload）。
     cachedGlyph = null;
   }
   const canvas = new OffscreenCanvas(width, height);
@@ -90,7 +98,13 @@ interface BaseParams {
 
 function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
   const size = GLYPH_SDF_SIZE;
-  if (cachedGlyph && cachedGlyph.ch === ch && cachedGlyph.size === size) return;
+  if (
+    cachedGlyph &&
+    cachedGlyph.kind === 'char' &&
+    cachedGlyph.ch === ch &&
+    cachedGlyph.size === size
+  )
+    return;
   // #159: wasm 側で同梱フォントから SDF を作れる字 (☆ 等) は wasm 経路を使う
   // (高速 / 環境非依存)。それ以外 (絵文字 / 漢字 / 任意 Unicode) は worker 内
   // OffscreenCanvas で OS フォントスタックでラスタライズして SDF 化する。
@@ -105,15 +119,45 @@ function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
     sdf = generateJsGlyphSdf(ch, size);
   }
   renderer.setGlyphSdf(sdf, size);
-  cachedGlyph = { ch, size };
+  cachedGlyph = { kind: 'char', ch, size };
+}
+
+// #160: shape='image' 用。Studio 側で `setImageShape(bitmap)` 経由で送られて
+// `cachedImageBitmap` に入っている画像をシルエット化 → SDF 化 → upload。
+// 同じ bitmap reference なら再生成しない。
+function ensureImageSdfUploaded(renderer: GlRenderer): void {
+  const size = GLYPH_SDF_SIZE;
+  if (!cachedImageBitmap) {
+    throw new Error('image shape requires setImageShape before generate');
+  }
+  if (
+    cachedGlyph &&
+    cachedGlyph.kind === 'image' &&
+    cachedGlyph.bitmap === cachedImageBitmap &&
+    cachedGlyph.size === size
+  )
+    return;
+  const sdf = generateImageSdf(cachedImageBitmap, size);
+  renderer.setGlyphSdf(sdf, size);
+  cachedGlyph = { kind: 'image', bitmap: cachedImageBitmap, size };
 }
 
 function mergeParams(p: BaseParams) {
   if (!cachedSource) {
     throw new Error('source not set — call setSource before generate/animate');
   }
+  // #160: UI shape='image' は wasm からは shape='glyph' (= SDF テクスチャを
+  // サンプルする) として見せる。glyph_char は wasm 内部の SDF キャッシュ
+  // キーになるが、こちらでテクスチャを上書き upload するので値は問われない。
+  // 念のため非空ダミー ('A') を入れて wasm の glyph_char バリデーションが
+  // 弾かないようにする。
+  const wasmShape = p.shape === 'image' ? 'glyph' : p.shape;
+  const wasmGlyphChar =
+    p.shape === 'image' ? 'A' : p.glyph_char;
   return {
     ...p,
+    shape: wasmShape,
+    glyph_char: wasmGlyphChar,
     source_rgb: cachedSource.rgb,
     source_width: cachedSource.width,
     source_height: cachedSource.height,
@@ -164,7 +208,10 @@ type Req =
   | { kind: 'vp9AlphaSupported'; id: number }
   // Phase B (#55): UI が typed-in glyph 文字が同梱フォントに収録されているか
   // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
-  | { kind: 'glyphSupported'; id: number; ch: string };
+  | { kind: 'glyphSupported'; id: number; ch: string }
+  // #160: shape='image' で使う画像 (ImageBitmap) を worker にキャッシュする。
+  // bitmap は Transferable で zero-copy 転送される (Studio.tsx 側で transfer)。
+  | { kind: 'setImageShape'; id: number; bitmap: ImageBitmap };
 
 /// #56: wasm get_render_data の Float32Array header word 3 (= bg.a in 0..1) を 0 に
 /// 上書きして「透過背景でレンダリングしてくれ」と shader に依頼する。元 buffer は
@@ -195,6 +242,19 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         post({ id: req.id, ok: true });
         break;
       }
+      case 'setImageShape': {
+        // 古い bitmap は close して GPU メモリを解放する。新 bitmap を保持。
+        if (cachedImageBitmap && cachedImageBitmap !== req.bitmap) {
+          cachedImageBitmap.close();
+        }
+        cachedImageBitmap = req.bitmap;
+        // 既存の image SDF キャッシュを invalidate (新 bitmap で再生成させる)。
+        if (cachedGlyph && cachedGlyph.kind === 'image') {
+          cachedGlyph = null;
+        }
+        post({ id: req.id, ok: true });
+        break;
+      }
       case 'generateOne': {
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
@@ -202,7 +262,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         // Glyph 形状なら SDF を 1 度アップロードする。
         // setRenderData の前に呼ぶことで shape_id=1 の uniform が立つ前から
         // テクスチャは正しい状態になる（順序依存はないが、明示的に先に行う）。
-        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+        if (req.params.shape === 'image') {
+          ensureImageSdfUploaded(renderer);
+        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
           ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(data);
@@ -218,7 +280,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const width = req.params.width;
         const height = req.params.height;
         const { canvas, renderer } = getRenderer(width, height);
-        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+        if (req.params.shape === 'image') {
+          ensureImageSdfUploaded(renderer);
+        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
           ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(data);
@@ -251,7 +315,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
         const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
-        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+        if (req.params.shape === 'image') {
+          ensureImageSdfUploaded(renderer);
+        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
           ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(withTransparentBackground(data));
@@ -277,7 +343,9 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const width = req.params.width;
         const height = req.params.height;
         const { canvas, renderer } = getRenderer(width, height);
-        if (req.params.shape === 'glyph' && req.params.glyph_char) {
+        if (req.params.shape === 'image') {
+          ensureImageSdfUploaded(renderer);
+        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
           ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
         }
         renderer.setRenderData(withTransparentBackground(data));

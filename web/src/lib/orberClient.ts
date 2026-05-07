@@ -247,6 +247,15 @@ export async function workerGlyphSupported(ch: string): Promise<boolean> {
   return await call<boolean>({ kind: 'glyphSupported', ch });
 }
 
+/**
+ * #160: shape='image' で使う画像を worker に渡してキャッシュさせる。
+ * `bitmap` は Transferable で zero-copy 転送される (転送後は呼び出し側で
+ * 使えなくなる)。古い bitmap は worker 側で `close()` される。
+ */
+export async function workerSetImageShape(bitmap: ImageBitmap): Promise<void> {
+  await call<void>({ kind: 'setImageShape', bitmap }, [bitmap]);
+}
+
 /** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */
 export async function workerAnimateOne(
   params: BaseParams,

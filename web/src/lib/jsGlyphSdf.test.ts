@@ -8,7 +8,11 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
-import { GLYPH_SDF_MAX_DIST_FACTOR, generateJsGlyphSdf } from './jsGlyphSdf';
+import {
+  GLYPH_SDF_MAX_DIST_FACTOR,
+  generateImageSdf,
+  generateJsGlyphSdf,
+} from './jsGlyphSdf';
 
 describe('generateJsGlyphSdf()', () => {
   afterEach(() => {
@@ -109,5 +113,112 @@ describe('generateJsGlyphSdf()', () => {
   test('GLYPH_SDF_MAX_DIST_FACTOR は Rust 側 (crates/core/src/glyph.rs) の 0.06 と同値', () => {
     // 値変更時の同期忘れを防ぐ guard。Rust 側を変えたら同じ値にする。
     expect(GLYPH_SDF_MAX_DIST_FACTOR).toBe(0.06);
+  });
+});
+
+describe('generateImageSdf()', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // 画像 → SDF パイプの出力フォーマット検証。jsdom で実画像はデコードできないが、
+  // ImageBitmap-like / OffscreenCanvas-like の stub を渡すことで内部 EDT 経路を
+  // 通せる。
+
+  test('OffscreenCanvas 未定義環境では全 0 を返す', () => {
+    vi.stubGlobal('OffscreenCanvas', undefined);
+    const fakeBitmap = { width: 16, height: 16 } as unknown as ImageBitmap;
+    const out = generateImageSdf(fakeBitmap, 16);
+    expect(out.length).toBe(16 * 16);
+    expect(out.every((v) => v === 0)).toBe(true);
+  });
+
+  test('完全透過な画像 (alpha 全 0) なら全 0 を返す', () => {
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    class StubCanvas {
+      width: number;
+      height: number;
+      constructor(w: number, h: number) {
+        this.width = w;
+        this.height = h;
+      }
+      getContext() {
+        return {
+          clearRect: () => {},
+          drawImage: () => {},
+          getImageData: () => ({ data, width: SIZE, height: SIZE }),
+        };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', StubCanvas);
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const out = generateImageSdf(fakeBitmap, SIZE);
+    expect(out.length).toBe(SIZE * SIZE);
+    expect(out.every((v) => v === 0)).toBe(true);
+  });
+
+  test('透過画像 (alpha=255 中央 1px) で文字版と同じ SDF を生成する', () => {
+    // generateJsGlyphSdf と同じ EDT 経路を共有しているので、入力 alpha 配置が
+    // 同じなら出力 SDF も完全に同じになることを確認する (regression guard)。
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    data[(3 * SIZE + 3) * 4 + 3] = 255;
+    class StubCanvas {
+      width: number;
+      height: number;
+      constructor(w: number, h: number) {
+        this.width = w;
+        this.height = h;
+      }
+      getContext() {
+        return {
+          clearRect: () => {},
+          drawImage: () => {},
+          getImageData: () => ({ data, width: SIZE, height: SIZE }),
+        };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', StubCanvas);
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const out = generateImageSdf(fakeBitmap, SIZE);
+    expect(out[3 * SIZE + 3]).toBe(191);
+    expect(out[3 * SIZE + 2]).toBe(64);
+    expect(out[2 * SIZE + 2]).toBe(11);
+    expect(out[0]).toBe(0);
+  });
+
+  test('不透明画像でも輝度しきい値で二値化される', () => {
+    // 全ピクセル alpha=255、中央 1 px だけ白 (輝度高)、他は黒 (輝度 0)。
+    // hasAlpha=false 経路に入り、avgY ≈ 255/64 ≈ 4。中央 1 px は輝度 255 で
+    // avgY 以上 → 「明るいセル数=1, 暗いセル数=63」 → 少数派の bright を
+    // inside とする → 中央が inside、その他が outside。alpha 経路と同じ
+    // SDF が出る。
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255; // alpha=255 全部
+    data[(3 * SIZE + 3) * 4 + 0] = 255;
+    data[(3 * SIZE + 3) * 4 + 1] = 255;
+    data[(3 * SIZE + 3) * 4 + 2] = 255;
+    class StubCanvas {
+      width: number;
+      height: number;
+      constructor(w: number, h: number) {
+        this.width = w;
+        this.height = h;
+      }
+      getContext() {
+        return {
+          clearRect: () => {},
+          drawImage: () => {},
+          getImageData: () => ({ data, width: SIZE, height: SIZE }),
+        };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', StubCanvas);
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const out = generateImageSdf(fakeBitmap, SIZE);
+    expect(out[3 * SIZE + 3]).toBe(191);
+    expect(out[3 * SIZE + 2]).toBe(64);
   });
 });

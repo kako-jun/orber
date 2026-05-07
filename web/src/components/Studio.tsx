@@ -11,6 +11,7 @@ import {
   workerGenerateOneAlpha,
   workerGlyphSupported,
   workerInit,
+  workerSetImageShape,
   workerSetSource,
   workerVp9AlphaSupported,
 } from '../lib/orberClient';
@@ -30,7 +31,7 @@ type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error'
 // UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにする。
 // count / softness は `'mid'` でも実質 identity、speed は `''` だけが identity で
 // `'mid'` を明示選択すると `Slow` に固定される（#131 仕様）。
-type ShapeChoice = 'circle' | 'glyph';
+type ShapeChoice = 'circle' | 'glyph' | 'image';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
@@ -129,6 +130,12 @@ export default function Studio() {
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
+  // #160: shape='image' のときに使う画像のローカル参照。worker には
+  // workerSetImageShape で transfer して送るため、ここでは表示用の name と
+  // プレビュー URL だけ保持する (bitmap 自体は transfer 後 unusable)。
+  const [imageShapeName, setImageShapeName] = createSignal<string>('');
+  const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
+  const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
   // 見えるが、内部 signal は empty identity を保つ。spec.count / spec.speed /
   // GUI_VIDEO_SPEEDS / SoftnessPreset::Mid を温存し、Phase A の見た目を正確に再現する。
@@ -689,7 +696,28 @@ export default function Studio() {
   const runBatchIfReady = () => {
     if (!decoded() || downloading()) return;
     if (shape() === 'glyph' && glyphChar().trim().length === 0) return;
+    if (shape() === 'image' && !imageShapeReady()) return;
     void runBatch();
+  };
+
+  // #160: shape='image' 用の画像読込。File を ImageBitmap 化して worker に
+  // transfer し、UI 側はプレビュー URL とファイル名だけ保持する。
+  const onImageShapePick = async (file: File) => {
+    try {
+      const bitmap = await createImageBitmap(file);
+      // worker に transfer (これで main 側 bitmap は detached)。
+      await workerSetImageShape(bitmap);
+      // 旧 URL を revoke してから新 URL に差し替え。
+      const oldUrl = imageShapeUrl();
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
+      setImageShapeUrl(URL.createObjectURL(file));
+      setImageShapeName(file.name);
+      setImageShapeReady(true);
+      runBatchIfReady();
+    } catch (err) {
+      console.warn('failed to load image shape', err);
+      setErrorMsg(t('imageShapeLoadFailed'));
+    }
   };
 
   const onAspectClick = (a: Aspect) => {
@@ -1255,7 +1283,7 @@ export default function Studio() {
             aria-pressed={shape() === 'circle'}
             onClick={() => onShapeClick('circle')}
             disabled={!decoded() || downloading()}
-            class={SEG_BTN(0, 2, shape() === 'circle')}
+            class={SEG_BTN(0, 3, shape() === 'circle')}
           >
             {t('shapeOptionCircle')}
           </button>
@@ -1264,9 +1292,18 @@ export default function Studio() {
             aria-pressed={shape() === 'glyph'}
             onClick={() => onShapeClick('glyph')}
             disabled={!decoded() || downloading()}
-            class={SEG_BTN(1, 2, shape() === 'glyph')}
+            class={SEG_BTN(1, 3, shape() === 'glyph')}
           >
             {t('shapeOptionGlyph')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={shape() === 'image'}
+            onClick={() => onShapeClick('image')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(2, 3, shape() === 'image')}
+          >
+            {t('shapeOptionImage')}
           </button>
         </div>
 
@@ -1360,6 +1397,51 @@ export default function Studio() {
               />
               <span>{t('glyphRotateLabel')}</span>
             </label>
+          </>
+        </Show>
+
+        {/* #160: Image shape 用の画像入力 row。shape='image' のときだけ
+            表示する。ファイル選択 input + プレビューサムネイル + 名前。
+            画像はメインスレッドで ImageBitmap 化 → worker に transfer する。 */}
+        <Show when={shape() === 'image'}>
+          <>
+            <label class="justify-self-end text-sm text-fgMuted">
+              {t('imageShapeLabel')}:
+            </label>
+            <div class="flex items-center gap-2 min-w-0">
+              <label
+                class={
+                  'inline-flex items-center justify-center cursor-pointer h-9 px-3 text-sm rounded-md border border-glassBorder bg-glassBg text-fgMuted hover:text-fg hover:bg-glassBgHover transition-colors duration-200 ' +
+                  'focus-within:outline-none focus-within:ring-1 focus-within:ring-focusRing ' +
+                  (!decoded() || downloading() ? 'opacity-40 cursor-not-allowed pointer-events-none' : '')
+                }
+              >
+                <span>{t('imageShapePick')}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  class="hidden"
+                  disabled={!decoded() || downloading()}
+                  onChange={(e) => {
+                    const file = e.currentTarget.files?.[0];
+                    if (file) void onImageShapePick(file);
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+              <Show when={imageShapeUrl()}>
+                <img
+                  src={imageShapeUrl()}
+                  alt={imageShapeName() || t('imageShapeLabel')}
+                  class="h-9 w-9 rounded border border-glassBorder object-contain bg-bg"
+                />
+              </Show>
+              <Show when={imageShapeName()}>
+                <span class="truncate text-xs text-fgMuted min-w-0">
+                  {imageShapeName()}
+                </span>
+              </Show>
+            </div>
           </>
         </Show>
 
@@ -1470,7 +1552,12 @@ export default function Studio() {
         <button
           type="button"
           onClick={runBatchIfReady}
-          disabled={!decoded() || downloading() || (shape() === 'glyph' && glyphChar().trim() === '')}
+          disabled={
+            !decoded() ||
+            downloading() ||
+            (shape() === 'glyph' && glyphChar().trim() === '') ||
+            (shape() === 'image' && !imageShapeReady())
+          }
           aria-label={t('rerollLabel')}
           title={t('rerollTitle')}
           class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
