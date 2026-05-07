@@ -1255,28 +1255,6 @@ export default function Studio() {
           </div>
         </div>
 
-        {/* #56: 透過版を ZIP DL に同梱する checkbox。aspect の直下 (= DL に影響する
-            設定の最上段) に置き、4 軸 segmented row 群とは視覚的に分けるため
-            col-span-2 で row 全体を使い、中央寄せで一行に収める。OFF 既定で
-            既存挙動と byte-exact identity を保つ (#56 受け入れ条件)。VP9 alpha
-            非対応 (Safari) では disabled + tooltip を出す。glass checkbox 共通
-            tokens (#136 で確立) を踏襲。 */}
-        <div class="col-span-2 flex justify-center">
-          <label
-            class={GLASS_CHECKBOX_LABEL}
-            title={!vp9AlphaSupported() ? t('includeAlphaDisabledTitle') : ''}
-          >
-            <input
-              type="checkbox"
-              class={GLASS_CHECKBOX_INPUT}
-              checked={includeAlpha()}
-              onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
-              disabled={!decoded() || downloading() || !vp9AlphaSupported()}
-            />
-            <span>{t('includeAlphaLabel')}</span>
-          </label>
-        </div>
-
         <label class="justify-self-end text-sm text-fgMuted">{t('shapeLabel')}:</label>
         <div class={SEG_GROUP}>
           <button
@@ -1786,7 +1764,28 @@ export default function Studio() {
           </For>
         </div>
 
-        <div class="flex flex-wrap items-center justify-center gap-2 pt-2">
+        {/* #56 / 配置調整: 透過版同梱 checkbox は DL ボタン行の直上に置き、
+            DL に影響する設定であることを近接で示す。OFF 既定で既存挙動と
+            byte-exact identity を保つ (#56 受け入れ条件)。VP9 alpha 非対応
+            (Safari) では disabled + tooltip を出す。glass checkbox 共通
+            tokens (#136 で確立) を踏襲。 */}
+        <div class="flex justify-center pt-2">
+          <label
+            class={GLASS_CHECKBOX_LABEL}
+            title={!vp9AlphaSupported() ? t('includeAlphaDisabledTitle') : ''}
+          >
+            <input
+              type="checkbox"
+              class={GLASS_CHECKBOX_INPUT}
+              checked={includeAlpha()}
+              onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
+              disabled={!decoded() || downloading() || !vp9AlphaSupported()}
+            />
+            <span>{t('includeAlphaLabel')}</span>
+          </label>
+        </div>
+
+        <div class="flex flex-wrap items-center justify-center gap-2">
           <button
             type="button"
             onClick={downloadSelected}

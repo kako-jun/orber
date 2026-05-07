@@ -25,10 +25,10 @@ import { onMount } from 'solid-js';
 import { t } from '../lib/strings';
 import AffiliateGrid from './AffiliateGrid';
 
-// #128: Nostalgic Counter の実 ID は kako-jun が
-// https://nostalgic.llll-ll.com/ のダッシュボードで取得後に置換する。
-// TODO(kako-jun): 実 ID に置換 (例 "orber-xxxxxxxx")。
-const NOSTALGIC_COUNTER_ID = 'orber-PLACEHOLDER';
+// #128 / #148: Nostalgic Counter ID。
+// `https://api.nostalgic.llll-ll.com/visit?action=create` POST で発行済み。
+// URL: https://orber.llll-ll.com、token は kako-jun 統一値 (`ekumetoteroesu`)。
+const NOSTALGIC_COUNTER_ID = 'orber-11532f39';
 
 // placeholder の間は Counter 部分を非表示にする。embed.js が "Counter not found"
 // 等のテキストを表示しないように完全 mount しない。
@@ -75,11 +75,11 @@ function formatCounterAfterMount(root: HTMLElement): void {
 // 中央 (3 つ目) を最大にし、上下に向かって縮ませることで奥行きを出す。
 // fg トークンを使い、opacity だけで濃淡を作る (色トークン外しない)。
 const ORB_DOTS: { size: number; opacity: number }[] = [
-  { size: 6, opacity: 0.35 },
-  { size: 12, opacity: 0.55 },
-  { size: 22, opacity: 0.85 },
-  { size: 12, opacity: 0.55 },
-  { size: 6, opacity: 0.35 },
+  { size: 3, opacity: 0.35 },
+  { size: 6, opacity: 0.55 },
+  { size: 10, opacity: 0.85 },
+  { size: 6, opacity: 0.55 },
+  { size: 3, opacity: 0.35 },
 ];
 
 export default function Footer() {
@@ -149,13 +149,15 @@ export default function Footer() {
             他 PWA にコピペで横展開できる pattern にしている。 */}
         <AffiliateGrid />
 
-        {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。 */}
+        {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。
+            元 PNG は黒モジュール / 白背景なので、orber の dark テーマで見えるよう
+            `invert` でモジュールを白にする (他アプリと同じスタイル: テーマカラーに揃える)。 */}
         <img
           src="/orber-qr.png"
           alt={t('qrAlt')}
           width="120"
           height="120"
-          class="block rounded-sm border border-hairline bg-bg"
+          class="block rounded-sm border border-hairline bg-bg invert"
         />
 
         {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}
