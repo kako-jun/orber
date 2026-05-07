@@ -135,13 +135,14 @@ export default function Footer() {
         {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。
             PNG は事前に `magick -negate` 済みで、白モジュール + 透明背景。
             bg-bg (#040404) 上で白モジュールが見える形 (orber テーマカラーに合わせ済み)。
-            CSS の invert 指定は使わない (二重反転で全面白塗りになるため)。 */}
+            border / bg-bg は削除済み: 透明背景ごと bg をそのまま透かすため不要。
+            User: 「うっすらと白い四角い枠」がモジュール領域以外に見えるのを解消。 */}
         <img
           src="/orber-qr.png"
           alt={t('qrAlt')}
           width="120"
           height="120"
-          class="block rounded-sm border border-hairline bg-bg"
+          class="block"
         />
 
         {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}
