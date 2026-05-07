@@ -191,10 +191,31 @@ export default function Footer() {
           <span>v{buildDate}</span>
         </div>
 
-        {/* D. Copyright — 年号なし */}
-        <p class="font-display font-light text-xs text-fgSubtle">
-          © kako-jun
-        </p>
+        {/* D. Copyright + 関連リンク (machigai-salad パターン)。
+            [llll-ll.com] · [GitHub Sponsors テキスト] · © kako-jun を 1 行で。
+            上の大きな Sponsor button は CTA として残しつつ、ここでも小さい
+            テキストリンクを再掲して machigai-salad の終端 UI と揃える。 */}
+        <div class="flex flex-wrap items-center justify-center gap-3 text-xs text-fgSubtle">
+          <a
+            href="https://llll-ll.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+          >
+            {t('authorSiteLabel')}
+          </a>
+          <span aria-hidden="true">·</span>
+          <a
+            href="https://github.com/sponsors/kako-jun"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+          >
+            {t('sponsorTextLabel')}
+          </a>
+          <span aria-hidden="true">·</span>
+          <span class="font-display font-light">© kako-jun</span>
+        </div>
       </div>
     </footer>
   );

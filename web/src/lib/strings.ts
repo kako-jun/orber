@@ -155,6 +155,10 @@ export const STRINGS = {
   viewsLabelSuffix: { ja: '', en: ' views' },
   // #146 review S2: Footer 全体の aria-label を i18n 化。
   footerAriaLabel: { ja: 'orber フッター', en: 'orber footer' },
+  // Footer 末尾の小さい link 行 (machigai-salad パターン)。
+  // [authorSite] · [GitHub Sponsors テキスト] · © kako-jun を 1 行で。
+  authorSiteLabel: { ja: 'kako-jun の他作品', en: 'More by kako-jun' },
+  sponsorTextLabel: { ja: 'GitHub Sponsors', en: 'GitHub Sponsors' },
   // #146: About 見出し / aboutBody / aboutBuiltWith / repoLinkLabel は Footer から外した。
   // privacyNote だけ「画像はブラウザ内で処理される」境界条件として残す。
   // #148: PWA install prompt (machigai-salad と同パターンの toast)。
