@@ -4,12 +4,25 @@
 
 ## ビルド・テスト
 
+Rust 側 (CLI / core / wasm):
 ```bash
 cargo build
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
+
+Web GUI 側 (Astro + Solid):
+```bash
+cd web
+npm run build       # wasm rebuild + astro build + sw.js stamp
+npm test            # vitest (strings.ts の lang signal 経路など)
+npm run test:watch  # 開発時の watch モード
+```
+
+`web/` の vitest は #163 で導入。現状は `web/src/lib/strings.test.ts` のみ
+(detectLang() / lang signal / t() 補間の回帰テスト 8 件)。新機能追加時は
+同階層に `*.test.ts` を増やしていく方針 (jsdom 環境、`vitest.config.ts` 参照)。
 
 ## ドキュメント
 
