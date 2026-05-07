@@ -22,6 +22,7 @@ import {
   isVp9AlphaSupported,
 } from './encodeWebmAlpha';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
+import { generateJsGlyphSdf } from './jsGlyphSdf';
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -90,8 +91,19 @@ interface BaseParams {
 function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
   const size = GLYPH_SDF_SIZE;
   if (cachedGlyph && cachedGlyph.ch === ch && cachedGlyph.size === size) return;
-  // wasm 側で生成 → Uint8Array で受ける。同じ ch なら wasm 側もキャッシュヒット。
-  const sdf = wasm.get_glyph_sdf(ch, size);
+  // #159: wasm 側で同梱フォントから SDF を作れる字 (☆ 等) は wasm 経路を使う
+  // (高速 / 環境非依存)。それ以外 (絵文字 / 漢字 / 任意 Unicode) は worker 内
+  // OffscreenCanvas で OS フォントスタックでラスタライズして SDF 化する。
+  // 後者は端末ごとに見た目が変わり得る (Mac の 🐱 と Windows の 🐱 は別形状)
+  // が、これは「ユーザーが入れた字を尊重して描画する」を優先するための
+  // 仕様。両経路とも出力フォーマット (R8 size×size) は一致しているので
+  // renderer 側の取り扱いは共通で良い。
+  let sdf: Uint8Array;
+  if (wasm.glyph_supported(ch)) {
+    sdf = wasm.get_glyph_sdf(ch, size);
+  } else {
+    sdf = generateJsGlyphSdf(ch, size);
+  }
   renderer.setGlyphSdf(sdf, size);
   cachedGlyph = { ch, size };
 }

@@ -126,7 +126,6 @@ export default function Studio() {
   // encode が使えないと vp9AlphaSupported が false になり、checkbox は disabled。
   const [includeAlpha, setIncludeAlpha] = createSignal<boolean>(false);
   const [vp9AlphaSupported, setVp9AlphaSupported] = createSignal<boolean>(true);
-  const [glyphCharSupported, setGlyphCharSupported] = createSignal<boolean>(true);
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
@@ -242,21 +241,9 @@ export default function Studio() {
     onCleanup(offCrash);
   });
 
-  // #131: glyph 文字の収録状況を非同期で確認し、警告フラグに反映する。
-  // composition 中は IME 入力を壊さないため worker RPC を飛ばさない。
-  createEffect(() => {
-    const ch = glyphChar();
-    const status = wasmStatus();
-    if (shape() !== 'glyph' || status !== 'ready' || ch.length === 0 || isGlyphComposing()) {
-      setGlyphCharSupported(true);
-      return;
-    }
-    void workerGlyphSupported(ch).then((ok) => {
-      setGlyphCharSupported(ok);
-    });
-  });
-
-  // #131: シンボルピッカーに出す候補は、同梱フォントで本当に描画できるものだけに絞る。
+  // #131 / #159: シンボルピッカーに並べる候補は、wasm 同梱フォントで描画できる
+  // ものだけに絞り込む (端末非依存で見た目が安定するため)。任意の Unicode は
+  // 入力欄の自由入力で受け付ける (#159 の OS フォントスタックラスタライズ経路)。
   // wasm 未起動時は候補をそのまま見せ、起動後に filter する。
   createEffect(() => {
     if (wasmStatus() !== 'ready') return;
@@ -1316,9 +1303,8 @@ export default function Studio() {
                 // を当て、⚡ などをモノクロ描画する (Base.astro)。
                 // GLASS_INPUT は固定幅 (w-20) なのでここでは展開して再利用しない。
                 'glyph-symbol-text h-9 w-full rounded border border-glassBorder bg-glassBg px-2 text-center text-sm text-fg ' +
-                'backdrop-blur-glass placeholder:text-fgSubtle focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-                'disabled:opacity-40 disabled:cursor-not-allowed' +
-                (glyphCharSupported() ? '' : ' border-fgMuted')
+                'backdrop-blur-glass placeholder:text-fgSubtle placeholder:tracking-wide focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+                'disabled:opacity-40 disabled:cursor-not-allowed'
               }
             />
             <datalist id="glyph-suggestions">
@@ -1470,16 +1456,6 @@ export default function Studio() {
           </button>
         </div>
       </div>
-
-      <Show when={!glyphCharSupported() && shape() === 'glyph' && glyphChar().length > 0}>
-        {/* 警告は text-fg + glass 枠で目立たせる (User: 🐱 を入力しても何も表示
-            されない、と気付かれない問題)。typed char をそのまま見せて何が
-            unsupported かを明示。 */}
-        <p class="mx-auto inline-flex items-center gap-2 rounded-md border border-glassBorder bg-glassBg px-3 py-2 text-center text-sm text-fg">
-          <span class="glyph-symbol-text leading-none">{glyphChar()}</span>
-          <span>{t('glyphCharUnsupported')}</span>
-        </p>
-      </Show>
 
       <Show when={wasmStatus() === 'error'}>
         <div class="fade-in rounded border border-hairline bg-glassBg p-3 text-sm text-fg">

@@ -47,14 +47,11 @@ export const STRINGS = {
   shapeOptionCircle: { ja: '円', en: 'Circle' },
   shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
   glyphCharLabel: { ja: '文字', en: 'Character' },
-  // 自由入力欄であることを示すため "emoji" 1 単語。下のボタン群と同じ記号を
-  // 例示しても重複情報になるだけなので、ユーザーが「ボタンに無い文字も
-  // 入れられる」と気付けるよう emoji 表記にする (収録外なら警告表示)。
-  glyphCharPlaceholder: { ja: 'emoji', en: 'emoji' },
-  glyphCharUnsupported: {
-    ja: '同梱フォントに収録されていません',
-    en: 'Not in bundled font',
-  },
+  // #159 後は任意の Unicode 1 文字を受け付ける (絵文字 / 漢字 / 記号)。
+  // placeholder は文字種の多様性を例示してユーザーに「何でも入る」ことを
+  // 伝える。実装詳細 (Noto / 同梱フォント / SDF / OS フォントスタック) は
+  // ユーザーには関係しないため、placeholder にも警告にも露出させない。
+  glyphCharPlaceholder: { ja: '☆, A, 漢, 🐱, ♪', en: '☆, A, 漢, 🐱, ♪' },
   // #136: Glyph 回転 ON/OFF。雷 ⚡ など回転すると違和感のある記号は既定 OFF にする。
   glyphRotateLabel: {
     ja: '回転させる',
