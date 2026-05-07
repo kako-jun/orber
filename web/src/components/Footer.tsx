@@ -123,29 +123,9 @@ export default function Footer() {
           ))}
         </div>
 
-        {/* A. GH Sponsors */}
-        <a
-          href="https://github.com/sponsors/kako-jun"
-          target="_blank"
-          rel="noopener noreferrer"
-          title={t('sponsorTitle')}
-          class="inline-flex items-center gap-2 rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover px-3 py-2 text-sm text-fg transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-        >
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-          </svg>
-          <span>{t('sponsorLabel')}</span>
-        </a>
+        {/* A. GH Sponsors の大きな glass button は削除 (User: GH Sponsors が
+            Footer 末尾の link 行と二重になるため)。寄付導線は最終行の
+            text link [GitHub Sponsors] に集約する (machigai-salad と同パターン)。 */}
 
         {/* B. Amazon affiliate × 3 — #152 で AffiliateGrid に切り出し。
             データ層 (web/src/data/affiliateProducts.ts) と UI 層を分離し、
@@ -155,13 +135,14 @@ export default function Footer() {
         {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。
             PNG は事前に `magick -negate` 済みで、白モジュール + 透明背景。
             bg-bg (#040404) 上で白モジュールが見える形 (orber テーマカラーに合わせ済み)。
-            CSS の invert 指定は使わない (二重反転で全面白塗りになるため)。 */}
+            border / bg-bg は削除済み: 透明背景ごと bg をそのまま透かすため不要。
+            User: 「うっすらと白い四角い枠」がモジュール領域以外に見えるのを解消。 */}
         <img
           src="/orber-qr.png"
           alt={t('qrAlt')}
           width="120"
           height="120"
-          class="block rounded-sm border border-hairline bg-bg"
+          class="block"
         />
 
         {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}

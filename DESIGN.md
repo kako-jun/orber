@@ -35,11 +35,21 @@ Deliberately no red / amber / yellow. Error and warning surfaces share the glass
 
 ### Font Families
 
+UI 全体で Space Grotesk に統一する (Latin)。CJK 文字 (日本語) は Space Grotesk
+に収録されていないので、OS の日本語フォントへ自動フォールバックさせる。
+
 ```
-display: "Space Grotesk", system-ui, sans-serif   # logo only
-body:    system-ui, -apple-system, "Segoe UI", "Hiragino Sans",
-         "Yu Gothic", Meiryo, sans-serif           # everything else
+sans (default for body / labels / buttons / status):
+  "Space Grotesk", system-ui, -apple-system, "Segoe UI",
+  "Hiragino Sans", "Yu Gothic", Meiryo, sans-serif
+
+display (h1 ロゴ・大型表示専用):
+  "Space Grotesk", system-ui, sans-serif
 ```
+
+`tailwind.config.mjs` で `fontFamily.sans` を上記に上書きしているので、
+特に何も class を付けない要素 (`text-sm` 等) も自動で Space Grotesk を
+拾う。`font-display` はロゴ等の意味的に「大型表示」な場面でのみ使う。
 
 Space Grotesk is loaded from Google Fonts CDN with `preconnect` to `fonts.googleapis.com` and `fonts.gstatic.com`. Weights pulled: 300, 400, 500.
 
@@ -48,10 +58,10 @@ Space Grotesk is loaded from Google Fonts CDN with `preconnect` to `fonts.google
 | Element       | Size            | Weight | Tracking  | Notes                                       |
 | ------------- | --------------- | ------ | --------- | ------------------------------------------- |
 | Logo (h1)     | 3rem (48px)     | 300    | `0.4em`   | `font-display`, lowercase, color `fg`. Compensate the trailing tracking with `pl-[0.4em]` so the visual center aligns with the page axis. |
-| Subtitle      | 0.875rem (14px) | 400    | normal    | `font-display`, color `fg-muted`, 1 line     |
-| Status        | 0.875rem (14px) | 400    | normal    | system sans, color `fg-muted`               |
-| Button label  | 0.875rem (14px) | 400    | normal    | system sans, color `fg` / `fg-muted`        |
-| Placeholder   | 0.875rem (14px) | 400    | normal    | color `fg-subtle`                           |
+| Subtitle      | 0.875rem (14px) | 400    | normal    | `font-display` 明示、color `fg-muted`、1 line |
+| Status        | 0.875rem (14px) | 400    | normal    | sans (Space Grotesk)、color `fg-muted`      |
+| Button label  | 0.875rem (14px) | 400    | normal    | sans (Space Grotesk)、color `fg` / `fg-muted` |
+| Placeholder   | 0.875rem (14px) | 400    | normal    | sans (Space Grotesk)、color `fg-subtle`     |
 
 No bold anywhere. Headers are deliberately light.
 

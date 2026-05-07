@@ -1461,7 +1461,13 @@ export default function Studio() {
       </div>
 
       <Show when={!glyphCharSupported() && shape() === 'glyph' && glyphChar().length > 0}>
-        <p class="text-center text-xs text-fgMuted">{t('glyphCharUnsupported')}</p>
+        {/* 警告は text-fg + glass 枠で目立たせる (User: 🐱 を入力しても何も表示
+            されない、と気付かれない問題)。typed char をそのまま見せて何が
+            unsupported かを明示。 */}
+        <p class="mx-auto inline-flex items-center gap-2 rounded-md border border-glassBorder bg-glassBg px-3 py-2 text-center text-sm text-fg">
+          <span class="glyph-symbol-text leading-none">{glyphChar()}</span>
+          <span>{t('glyphCharUnsupported')}</span>
+        </p>
       </Show>
 
       <Show when={wasmStatus() === 'error'}>

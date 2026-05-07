@@ -20,6 +20,19 @@ export default {
       },
       fontFamily: {
         display: ['"Space Grotesk"', 'system-ui', 'sans-serif'],
+        // Latin は Space Grotesk に統一 (DESIGN.md §3 改訂、ロゴ専用ではなく
+        // UI 全体に拡張)。CJK 文字は Space Grotesk に収録されていないので
+        // OS の日本語フォントへ自動フォールバックさせる。
+        sans: [
+          '"Space Grotesk"',
+          'system-ui',
+          '-apple-system',
+          '"Segoe UI"',
+          '"Hiragino Sans"',
+          '"Yu Gothic"',
+          'Meiryo',
+          'sans-serif',
+        ],
       },
       letterSpacing: {
         // ロゴ用 — DESIGN.md §3 (0.4em)
