@@ -72,14 +72,110 @@ export function generateJsGlyphSdf(ch: string, size: number): Uint8Array {
     }
   }
   if (!anyInside) return new Uint8Array(s * s);
+  return computeSdfFromMask(inside, s);
+}
 
-  // 2D Euclidean Distance Transform (Felzenszwalb-Huttenlocher 1996, O(n))。
-  // 行 → 列の順で 1D EDT を 2 回走らせると 2D 距離^2 が得られる。
-  const distInside = edt2d(inside, s, s); // 各セルから「inside」までの最短 dist^2 (inside セルは 0)
+/**
+ * #160: 任意の `ImageBitmap` (PNG / JPG / WebP / SVG decode 結果) を
+ * `size`×`size` の SDF Uint8Array にラスタライズする。
+ *
+ * しきい値:
+ * - 透過画像 (`hasAlpha = true`): alpha >= 128 を inside とする
+ * - 不透明画像 (`hasAlpha = false`): 輝度 (Y = 0.299R + 0.587G + 0.114B) で
+ *   二値化。被写体が背景より暗いか明るいかは事前に決めず、画像全体の輝度
+ *   平均を境界に inside / outside を分け、**inside ピクセルが少数派** に
+ *   なる側を採用する (典型的な被写体は背景より小領域である前提)
+ *
+ * 出力フォーマットは `generateJsGlyphSdf` と同一 (R8 size×size)、
+ * `renderer.setGlyphSdf` にそのまま渡せる。
+ */
+export function generateImageSdf(bitmap: ImageBitmap, size: number): Uint8Array {
+  const s = Math.max(1, size | 0);
+  if (typeof OffscreenCanvas === 'undefined') {
+    return new Uint8Array(s * s);
+  }
+  const canvas = new OffscreenCanvas(s, s);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return new Uint8Array(s * s);
+
+  // 元画像のアスペクトを保ったまま s×s に「contain」リサンプル (上下/左右に
+  // 余白を入れる)。シルエットが歪まないようにするため。
+  ctx.clearRect(0, 0, s, s);
+  const bw = bitmap.width || 1;
+  const bh = bitmap.height || 1;
+  const scale = Math.min(s / bw, s / bh);
+  const dw = Math.max(1, Math.round(bw * scale));
+  const dh = Math.max(1, Math.round(bh * scale));
+  const dx = Math.round((s - dw) / 2);
+  const dy = Math.round((s - dh) / 2);
+  ctx.drawImage(bitmap, 0, 0, bw, bh, dx, dy, dw, dh);
+
+  const img = ctx.getImageData(0, 0, s, s);
+  const data = img.data;
+
+  // 透過があるかをチェック (alpha < 255 のピクセルが 1 つでもあれば「透過画像」)。
+  let hasAlpha = false;
+  for (let i = 0; i < s * s; i++) {
+    if (data[i * 4 + 3] < 255) {
+      hasAlpha = true;
+      break;
+    }
+  }
+
+  const inside = new Uint8Array(s * s);
+  let anyInside = false;
+  if (hasAlpha) {
+    // alpha しきい値 (透過画像経路)
+    for (let i = 0; i < s * s; i++) {
+      if (data[i * 4 + 3] >= 128) {
+        inside[i] = 1;
+        anyInside = true;
+      }
+    }
+  } else {
+    // 輝度しきい値 (不透明画像経路)。平均輝度を境界にし、少数派のピクセル群を
+    // inside (= 被写体) とする。背景が暗い / 明るいの両方に対応するためのヒューリスティック。
+    let sumY = 0;
+    for (let i = 0; i < s * s; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      sumY += 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+    const avgY = sumY / (s * s);
+    let darkCount = 0;
+    for (let i = 0; i < s * s; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const y = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (y < avgY) darkCount++;
+    }
+    const insideIsDark = darkCount < s * s / 2;
+    for (let i = 0; i < s * s; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const y = 0.299 * r + 0.587 * g + 0.114 * b;
+      const isInside = insideIsDark ? y < avgY : y >= avgY;
+      if (isInside) {
+        inside[i] = 1;
+        anyInside = true;
+      }
+    }
+  }
+  if (!anyInside) return new Uint8Array(s * s);
+
+  return computeSdfFromMask(inside, s);
+}
+
+// inside mask (0/1) → Rust 互換の SDF Uint8Array を計算する共通経路。
+// generateJsGlyphSdf / generateImageSdf の両方から使う。
+function computeSdfFromMask(inside: Uint8Array, s: number): Uint8Array {
+  const distInside = edt2d(inside, s, s);
   const outside = new Uint8Array(s * s);
   for (let i = 0; i < s * s; i++) outside[i] = inside[i] ? 0 : 1;
-  const distOutside = edt2d(outside, s, s); // outside までの最短 dist^2 (outside セルは 0)
-
+  const distOutside = edt2d(outside, s, s);
   const norm = Math.max(1, s * GLYPH_SDF_MAX_DIST_FACTOR);
   const out = new Uint8Array(s * s);
   for (let i = 0; i < s * s; i++) {

@@ -11,6 +11,7 @@ import {
   workerGenerateOneAlpha,
   workerGlyphSupported,
   workerInit,
+  workerSetImageShape,
   workerSetSource,
   workerVp9AlphaSupported,
 } from '../lib/orberClient';
@@ -30,7 +31,7 @@ type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error'
 // UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにする。
 // count / softness は `'mid'` でも実質 identity、speed は `''` だけが identity で
 // `'mid'` を明示選択すると `Slow` に固定される（#131 仕様）。
-type ShapeChoice = 'circle' | 'glyph';
+type ShapeChoice = 'circle' | 'glyph' | 'image';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
@@ -129,6 +130,14 @@ export default function Studio() {
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
+  // #160: shape='image' のときに使う画像のローカル参照。File を worker に
+  // structured-clone で送るため、main 側で File 参照を保持しておくと
+  // worker クラッシュ / terminateAndRespawn 後に再 upload できる。
+  const [imageShapeName, setImageShapeName] = createSignal<string>('');
+  const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
+  const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
+  // setImageShape を再送するための File ref。runBatch / crash 経路で参照。
+  let lastImageFileRef: File | null = null;
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
   // 見えるが、内部 signal は empty identity を保つ。spec.count / spec.speed /
   // GUI_VIDEO_SPEEDS / SoftnessPreset::Mid を温存し、Phase A の見た目を正確に再現する。
@@ -235,10 +244,23 @@ export default function Studio() {
     // 感を抑える（リロードを促すサインになる）。
     const offCrash = onWorkerCrash(() => {
       lastSourceRef = null;
+      // #160: shape='image' の bitmap は worker 側で消えている。ロックして
+      // 次の runBatch で再 upload を必須にする。File ref が残っていれば
+      // 自動再 upload を裏で試みる (silent: triggerRun=false)。
+      if (lastImageFileRef) {
+        setImageShapeReady(false);
+        void onImageShapePick(lastImageFileRef, false).catch(() => {});
+      }
       setErrorMsg(t('wasmLoadFailed'));
       setWasmStatus('error');
     });
     onCleanup(offCrash);
+    // #160: shape='image' のサムネイル URL をコンポーネント unmount 時に
+    // revoke する (新ファイル選択時の revoke と対称)。
+    onCleanup(() => {
+      const u = imageShapeUrl();
+      if (u) URL.revokeObjectURL(u);
+    });
   });
 
   // #131 / #159: シンボルピッカーに並べる候補は、wasm 同梱フォントで描画できる
@@ -332,6 +354,16 @@ export default function Studio() {
       // worker を作り直したので worker 側の cachedSource も消えている。
       // 次の workerSetSource を再送させる（onWorkerCrash 経路と同じ後始末）。
       lastSourceRef = null;
+      // #160: shape='image' の bitmap も worker 側で消えているので、File ref
+      // が残っていればここで再送する (Studio onWorkerCrash 経路と同じ思想)。
+      if (lastImageFileRef && shape() === 'image') {
+        try {
+          await workerSetImageShape(lastImageFileRef);
+        } catch (err) {
+          console.warn('failed to re-upload image shape after respawn', err);
+          setImageShapeReady(false);
+        }
+      }
     }
 
     seedSkeletons();
@@ -689,7 +721,29 @@ export default function Studio() {
   const runBatchIfReady = () => {
     if (!decoded() || downloading()) return;
     if (shape() === 'glyph' && glyphChar().trim().length === 0) return;
+    if (shape() === 'image' && !imageShapeReady()) return;
     void runBatch();
+  };
+
+  // #160: shape='image' 用の画像読込。File を worker に送って worker 側で
+  // createImageBitmap させる。main 側は File 参照を保持して crash 後の
+  // 再 upload に備える。第 2 引数 `triggerRun` を false にすると runBatch を
+  // 走らせず、worker recovery 後の silent 再 upload に使える。
+  const onImageShapePick = async (file: File, triggerRun = true) => {
+    try {
+      lastImageFileRef = file;
+      await workerSetImageShape(file);
+      const oldUrl = imageShapeUrl();
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
+      setImageShapeUrl(URL.createObjectURL(file));
+      setImageShapeName(file.name);
+      setImageShapeReady(true);
+      if (triggerRun) runBatchIfReady();
+    } catch (err) {
+      console.warn('failed to load image shape', err);
+      setErrorMsg(t('imageShapeLoadFailed'));
+      setImageShapeReady(false);
+    }
   };
 
   const onAspectClick = (a: Aspect) => {
@@ -1255,7 +1309,7 @@ export default function Studio() {
             aria-pressed={shape() === 'circle'}
             onClick={() => onShapeClick('circle')}
             disabled={!decoded() || downloading()}
-            class={SEG_BTN(0, 2, shape() === 'circle')}
+            class={SEG_BTN(0, 3, shape() === 'circle')}
           >
             {t('shapeOptionCircle')}
           </button>
@@ -1264,9 +1318,18 @@ export default function Studio() {
             aria-pressed={shape() === 'glyph'}
             onClick={() => onShapeClick('glyph')}
             disabled={!decoded() || downloading()}
-            class={SEG_BTN(1, 2, shape() === 'glyph')}
+            class={SEG_BTN(1, 3, shape() === 'glyph')}
           >
             {t('shapeOptionGlyph')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={shape() === 'image'}
+            onClick={() => onShapeClick('image')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(2, 3, shape() === 'image')}
+          >
+            {t('shapeOptionImage')}
           </button>
         </div>
 
@@ -1360,6 +1423,51 @@ export default function Studio() {
               />
               <span>{t('glyphRotateLabel')}</span>
             </label>
+          </>
+        </Show>
+
+        {/* #160: Image shape 用の画像入力 row。shape='image' のときだけ
+            表示する。ファイル選択 input + プレビューサムネイル + 名前。
+            画像はメインスレッドで ImageBitmap 化 → worker に transfer する。 */}
+        <Show when={shape() === 'image'}>
+          <>
+            <label class="justify-self-end text-sm text-fgMuted">
+              {t('imageShapeLabel')}:
+            </label>
+            <div class="flex items-center gap-2 min-w-0">
+              <label
+                class={
+                  'inline-flex items-center justify-center cursor-pointer h-9 px-3 text-sm rounded-md border border-glassBorder bg-glassBg text-fgMuted hover:text-fg hover:bg-glassBgHover transition-colors duration-200 ' +
+                  'focus-within:outline-none focus-within:ring-1 focus-within:ring-focusRing ' +
+                  (!decoded() || downloading() ? 'opacity-40 cursor-not-allowed pointer-events-none' : '')
+                }
+              >
+                <span>{t('imageShapePick')}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  class="hidden"
+                  disabled={!decoded() || downloading()}
+                  onChange={(e) => {
+                    const file = e.currentTarget.files?.[0];
+                    if (file) void onImageShapePick(file);
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+              <Show when={imageShapeUrl()}>
+                <img
+                  src={imageShapeUrl()}
+                  alt={imageShapeName() || t('imageShapeLabel')}
+                  class="h-9 w-9 rounded border border-glassBorder object-contain bg-bg"
+                />
+              </Show>
+              <Show when={imageShapeName()}>
+                <span class="truncate text-xs text-fgMuted min-w-0">
+                  {imageShapeName()}
+                </span>
+              </Show>
+            </div>
           </>
         </Show>
 
@@ -1470,9 +1578,18 @@ export default function Studio() {
         <button
           type="button"
           onClick={runBatchIfReady}
-          disabled={!decoded() || downloading() || (shape() === 'glyph' && glyphChar().trim() === '')}
+          disabled={
+            !decoded() ||
+            downloading() ||
+            (shape() === 'glyph' && glyphChar().trim() === '') ||
+            (shape() === 'image' && !imageShapeReady())
+          }
           aria-label={t('rerollLabel')}
-          title={t('rerollTitle')}
+          title={
+            shape() === 'image' && !imageShapeReady()
+              ? t('imageShapePickHint')
+              : t('rerollTitle')
+          }
           class={GLASS_BTN + ' h-10 w-10 px-0 active:scale-95'}
         >
           <svg

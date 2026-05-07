@@ -247,6 +247,17 @@ export async function workerGlyphSupported(ch: string): Promise<boolean> {
   return await call<boolean>({ kind: 'glyphSupported', ch });
 }
 
+/**
+ * #160: shape='image' で使う画像を worker に渡してキャッシュさせる。
+ * `file` は structured-clone で worker に複製される (Transferable は使わ
+ * ない)。これでメインスレッド側に File への参照が残り、worker クラッシュ
+ * 後の再 upload が可能になる。worker 側で `createImageBitmap(file)` を
+ * 呼んで ImageBitmap 化し、古い bitmap は close() される。
+ */
+export async function workerSetImageShape(file: File): Promise<void> {
+  await call<void>({ kind: 'setImageShape', file });
+}
+
 /** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */
 export async function workerAnimateOne(
   params: BaseParams,

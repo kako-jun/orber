@@ -46,6 +46,18 @@ export const STRINGS = {
   shapeLabel: { ja: '形状', en: 'Shape' },
   shapeOptionCircle: { ja: '円', en: 'Circle' },
   shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
+  shapeOptionImage: { ja: '画像', en: 'Image' },
+  // #160: Image shape (任意の画像をシルエット化して orb として使う) の UI。
+  imageShapeLabel: { ja: '画像', en: 'Image' },
+  imageShapePick: { ja: '画像を選択', en: 'Choose image' },
+  imageShapeLoadFailed: {
+    ja: '画像を読み込めませんでした',
+    en: 'Failed to load image',
+  },
+  imageShapePickHint: {
+    ja: '画像を選択してください',
+    en: 'Pick an image first',
+  },
   glyphCharLabel: { ja: '文字', en: 'Character' },
   // #159 後は任意の Unicode 1 文字を受け付ける (絵文字 / 漢字 / 記号)。
   // placeholder は文字種の多様性を例示してユーザーに「何でも入る」ことを

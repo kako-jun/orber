@@ -348,6 +348,28 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - 動画中の glyph はそこからさらに orb ごとに異なる向き・回転方向・
   回転速度で連続回転する
 
+### Image 入力 (#160)
+
+- shape segmented pill は `Circle / Glyph / Image` の 3 択
+- `Image` を選ぶとシェイプ row の下に画像入力 row が出現する: ファイル選択
+  ボタン + 9×9 サムネイル + ファイル名表示
+- 入力画像 (PNG / JPG / WebP / GIF / SVG) は メインスレッドで `createImageBitmap`
+  → `workerSetImageShape` で worker に Transferable で送信 → worker 内で
+  `OffscreenCanvas` に「contain」リサンプル → alpha or 輝度しきい値で二値化 →
+  Glyph と同じ EDT で SDF 化 (`web/src/lib/jsGlyphSdf.ts:generateImageSdf`)
+- しきい値ヒューリスティック:
+  - 透過 PNG など `alpha < 255` のピクセルが 1 つでもあれば「透過画像」扱い
+    → `alpha >= 128` を inside
+  - 完全不透明な画像は輝度 `Y = 0.299R + 0.587G + 0.114B` で二値化、
+    平均輝度を境界に **少数派ピクセル群を inside** とする (背景 vs 被写体の
+    自動判定。被写体が背景より小領域である前提)
+- 画像はアスペクト比を保ったまま 256×256 に「contain」リサンプルされ、
+  上下/左右の余白は SDF 上の outside になる。これにより縦長/横長の画像も
+  シルエットが歪まない
+- カラー画像の色情報は捨てる (orber は monochrome ピペライン)
+- shape='image' の wasm 経路は内部的に shape='glyph' として扱い、worker は
+  upload する SDF テクスチャだけを差し替える (wasm / `crates/wasm` は無改修)
+
 ### 生成トリガー
 
 - aspect / shape / count / speed / softness / glyph 入力 / symbol picker のすべてが即生成
