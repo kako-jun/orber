@@ -253,9 +253,16 @@ export async function workerGlyphSupported(ch: string): Promise<boolean> {
  * ない)。これでメインスレッド側に File への参照が残り、worker クラッシュ
  * 後の再 upload が可能になる。worker 側で `createImageBitmap(file)` を
  * 呼んで ImageBitmap 化し、古い bitmap は close() される。
+ *
+ * #170: `invert` で inside/outside を強制反転する (auto-polarity が外れる
+ * 画像の救済)。worker 側で SDF キャッシュに含まれるため、トグル切替時は
+ * 必ず再 upload する必要がある。
  */
-export async function workerSetImageShape(file: File): Promise<void> {
-  await call<void>({ kind: 'setImageShape', file });
+export async function workerSetImageShape(
+  file: File,
+  invert: boolean = false,
+): Promise<void> {
+  await call<void>({ kind: 'setImageShape', file, invert });
 }
 
 /** 1 タイル分の mp4 を返す（WebCodecs + mp4-muxer で h264 化）。 */

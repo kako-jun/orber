@@ -49,14 +49,18 @@ let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number
 // 切替の余地を残すために含める。getRenderer で renderer を作り直したときも
 // invalidate する必要がある（テクスチャも一緒に dispose されるため）。
 //
-// #160: shape='image' のときは ch ではなく ImageBitmap を SDF 元にするので、
-// kind を分けてキャッシュする。bitmap は Studio から `setImageShape` で 1 度
-// 送られて worker にキャッシュされる (cachedImageBitmap)。
+// #160 / #172: shape='image' のときは ch ではなく ImageBitmap (cachedImageBitmap)
+// と invert flag (cachedImageInvert) を SDF の元にする。`cachedGlyph` の image
+// 分岐は SDF アップロード状態の identity (= どの (bitmap, invert, size) で
+// upload 済か) を表すフラグなので、bitmap reference を再保持する必要は無い:
+// setImageShape で cachedImageBitmap が差し替わるたびに cachedGlyph を null
+// にすれば、次の ensureImageSdfUploaded で必ず再 upload される (#172 N1)。
 let cachedGlyph:
   | { kind: 'char'; ch: string; size: number }
-  | { kind: 'image'; bitmap: ImageBitmap; size: number }
+  | { kind: 'image'; size: number; invert: boolean }
   | null = null;
 let cachedImageBitmap: ImageBitmap | null = null;
+let cachedImageInvert = false;
 
 function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; renderer: GlRenderer } {
   if (cachedCanvas && cachedCanvas.width === width && cachedCanvas.height === height) {
@@ -122,9 +126,13 @@ function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
   cachedGlyph = { kind: 'char', ch, size };
 }
 
-// #160: shape='image' 用。Studio 側で `setImageShape(bitmap)` 経由で送られて
+// #160: shape='image' 用。Studio 側で `setImageShape` 経由で送られて
 // `cachedImageBitmap` に入っている画像をシルエット化 → SDF 化 → upload。
-// 同じ bitmap reference なら再生成しない。
+// 同じ (bitmap, invert) なら再生成しない (setImageShape が cachedGlyph を
+// null にするので reference が変われば必ず再 upload される)。
+//
+// #169: シルエット抽出に失敗 (コントラスト不足) したら専用 Error を投げる。
+// 呼び出し側 (Studio) で `imageShapeNoContrast` 文言の UI に使う。
 function ensureImageSdfUploaded(renderer: GlRenderer): void {
   const size = GLYPH_SDF_SIZE;
   if (!cachedImageBitmap) {
@@ -133,27 +141,38 @@ function ensureImageSdfUploaded(renderer: GlRenderer): void {
   if (
     cachedGlyph &&
     cachedGlyph.kind === 'image' &&
-    cachedGlyph.bitmap === cachedImageBitmap &&
-    cachedGlyph.size === size
+    cachedGlyph.size === size &&
+    cachedGlyph.invert === cachedImageInvert
   )
     return;
-  const sdf = generateImageSdf(cachedImageBitmap, size);
-  renderer.setGlyphSdf(sdf, size);
-  cachedGlyph = { kind: 'image', bitmap: cachedImageBitmap, size };
+  const result = generateImageSdf(cachedImageBitmap, size, cachedImageInvert);
+  if (!result.ok) {
+    throw new Error('image-shape-no-contrast');
+  }
+  renderer.setGlyphSdf(result.sdf, size);
+  cachedGlyph = { kind: 'image', size, invert: cachedImageInvert };
 }
+
+// #160 / #172 N2: shape='image' のとき wasm 側に渡すダミー glyph_char。
+// wasm は SDF テクスチャをそのまま使うので glyph_char の値は読まないが、
+// 内部バリデーションが「非空」を要求しているケースを想定して安全な記号を
+// 当てる。将来 wasm 側で glyph_char バリデーションが厳格化された場合
+// (例: 同梱フォントに収録されている字のみ受け付ける) でも、`☆` (Noto Sans
+// Symbols 2 同梱・glyph_supported(☆)=true) を選ぶことで silent fail しにくい。
+// 真の解決は crates/wasm 側で shape='image' を直接受け付ける API を生やす
+// ことだが、現状はテクスチャ上書きの仕組みで充分なため UI レイヤで吸収する。
+const IMAGE_SHAPE_DUMMY_GLYPH = '☆';
 
 function mergeParams(p: BaseParams) {
   if (!cachedSource) {
     throw new Error('source not set — call setSource before generate/animate');
   }
-  // #160: UI shape='image' は wasm からは shape='glyph' (= SDF テクスチャを
-  // サンプルする) として見せる。glyph_char は wasm 内部の SDF キャッシュ
-  // キーになるが、こちらでテクスチャを上書き upload するので値は問われない。
-  // 念のため非空ダミー ('A') を入れて wasm の glyph_char バリデーションが
-  // 弾かないようにする。
+  // UI shape='image' は wasm からは shape='glyph' (= SDF テクスチャを
+  // サンプルする) として見せる。`IMAGE_SHAPE_DUMMY_GLYPH` を渡す理由は
+  // 上の定数コメントを参照。
   const wasmShape = p.shape === 'image' ? 'glyph' : p.shape;
   const wasmGlyphChar =
-    p.shape === 'image' ? 'A' : p.glyph_char;
+    p.shape === 'image' ? IMAGE_SHAPE_DUMMY_GLYPH : p.glyph_char;
   return {
     ...p,
     shape: wasmShape,
@@ -214,7 +233,7 @@ type Req =
   // Transferable を使わず structured-clone で渡す ── main 側が File 参照
   // を保持し続けることで、worker クラッシュ / terminateAndRespawn 後の
   // 再 upload が可能になる。
-  | { kind: 'setImageShape'; id: number; file: File };
+  | { kind: 'setImageShape'; id: number; file: File; invert: boolean };
 
 /// #56: wasm get_render_data の Float32Array header word 3 (= bg.a in 0..1) を 0 に
 /// 上書きして「透過背景でレンダリングしてくれ」と shader に依頼する。元 buffer は
@@ -254,7 +273,10 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
           cachedImageBitmap.close();
         }
         cachedImageBitmap = newBitmap;
-        // 既存の image SDF キャッシュを invalidate (新 bitmap で再生成させる)。
+        cachedImageInvert = req.invert;
+        // 既存の image SDF キャッシュを invalidate (新 bitmap / invert で
+        // 再生成させる)。これによって ensureImageSdfUploaded 側は単純な
+        // (size, invert) 比較だけで済む (#172 N1)。
         if (cachedGlyph && cachedGlyph.kind === 'image') {
           cachedGlyph = null;
         }

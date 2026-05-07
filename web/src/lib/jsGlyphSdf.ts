@@ -76,27 +76,49 @@ export function generateJsGlyphSdf(ch: string, size: number): Uint8Array {
 }
 
 /**
+ * #160 結果型。`sdf` は SDF Uint8Array、`ok` は false ならシルエット抽出に
+ * 失敗したことを示す (#169: 単色塗りなどで inside / outside の分離が
+ * 取れない画像)。呼び出し側は `ok=false` のとき UI に「コントラスト不足」を
+ * 通知する。
+ */
+export interface ImageSdfResult {
+  sdf: Uint8Array;
+  ok: boolean;
+}
+
+/**
  * #160: 任意の `ImageBitmap` (PNG / JPG / WebP / SVG decode 結果) を
  * `size`×`size` の SDF Uint8Array にラスタライズする。
  *
  * しきい値:
- * - 透過画像 (`hasAlpha = true`): alpha >= 128 を inside とする
- * - 不透明画像 (`hasAlpha = false`): 輝度 (Y = 0.299R + 0.587G + 0.114B) で
- *   二値化。被写体が背景より暗いか明るいかは事前に決めず、画像全体の輝度
- *   平均を境界に inside / outside を分け、**inside ピクセルが少数派** に
- *   なる側を採用する (典型的な被写体は背景より小領域である前提)
+ * - 透過画像 (alpha < 255 のピクセルが画像全体の **1% 以上**): alpha >= 128
+ *   を inside とする (#171: 単発 stray 透過 1px で経路が暴れる問題を回避)
+ * - 不透明画像 (上記以外): 輝度 (Y = 0.299R + 0.587G + 0.114B) で二値化。
+ *   平均輝度を境界に **inside ピクセルが少数派** になる側を採用する (典型的
+ *   な被写体は背景より小領域である前提のヒューリスティック)
+ *
+ * #170: `invert` が true なら inside / outside を強制的に逆転させる
+ * (被写体が画面の半分以上を占める画像で自動判定が反転するときの救済)。
+ *
+ * #169: シルエットが抽出できない (= inside ピクセルが 0、または全画素が
+ * inside でコントラストが無い) 場合は `ok: false` を返し、呼び出し側で UI
+ * 通知を行う。`sdf` は念のため全 0 を入れる。
  *
  * 出力フォーマットは `generateJsGlyphSdf` と同一 (R8 size×size)、
  * `renderer.setGlyphSdf` にそのまま渡せる。
  */
-export function generateImageSdf(bitmap: ImageBitmap, size: number): Uint8Array {
+export function generateImageSdf(
+  bitmap: ImageBitmap,
+  size: number,
+  invert: boolean = false,
+): ImageSdfResult {
   const s = Math.max(1, size | 0);
   if (typeof OffscreenCanvas === 'undefined') {
-    return new Uint8Array(s * s);
+    return { sdf: new Uint8Array(s * s), ok: false };
   }
   const canvas = new OffscreenCanvas(s, s);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return new Uint8Array(s * s);
+  if (!ctx) return { sdf: new Uint8Array(s * s), ok: false };
 
   // 元画像のアスペクトを保ったまま s×s に「contain」リサンプル (上下/左右に
   // 余白を入れる)。シルエットが歪まないようにするため。
@@ -113,60 +135,66 @@ export function generateImageSdf(bitmap: ImageBitmap, size: number): Uint8Array 
   const img = ctx.getImageData(0, 0, s, s);
   const data = img.data;
 
-  // 透過があるかをチェック (alpha < 255 のピクセルが 1 つでもあれば「透過画像」)。
-  let hasAlpha = false;
+  // #171: 透過判定は「alpha < 255 のピクセルが画像全体の 1% 以上」で初めて
+  // 透過画像とみなす。1 px 単位の混入 (JPEG → PNG 変換のロス由来など) で
+  // alpha 経路に倒れて輝度ベースの被写体抽出が走らなくなる事故を防ぐ。
+  let alphaPixelCount = 0;
   for (let i = 0; i < s * s; i++) {
-    if (data[i * 4 + 3] < 255) {
-      hasAlpha = true;
-      break;
-    }
+    if (data[i * 4 + 3] < 255) alphaPixelCount++;
   }
+  // ドキュメント上は「1% 以上」表記なので >= で揃える (boundary を inclusive)。
+  const hasMeaningfulAlpha = alphaPixelCount * 100 >= s * s;
 
   const inside = new Uint8Array(s * s);
-  let anyInside = false;
-  if (hasAlpha) {
-    // alpha しきい値 (透過画像経路)
+  let insideCount = 0;
+  if (hasMeaningfulAlpha) {
+    // alpha しきい値経路
     for (let i = 0; i < s * s; i++) {
       if (data[i * 4 + 3] >= 128) {
         inside[i] = 1;
-        anyInside = true;
+        insideCount++;
       }
     }
   } else {
-    // 輝度しきい値 (不透明画像経路)。平均輝度を境界にし、少数派のピクセル群を
-    // inside (= 被写体) とする。背景が暗い / 明るいの両方に対応するためのヒューリスティック。
+    // 輝度しきい値経路 (auto-polarity: 少数派 = 被写体)
     let sumY = 0;
+    const yBuf = new Float32Array(s * s);
     for (let i = 0; i < s * s; i++) {
       const r = data[i * 4];
       const g = data[i * 4 + 1];
       const b = data[i * 4 + 2];
-      sumY += 0.299 * r + 0.587 * g + 0.114 * b;
+      const y = 0.299 * r + 0.587 * g + 0.114 * b;
+      yBuf[i] = y;
+      sumY += y;
     }
     const avgY = sumY / (s * s);
     let darkCount = 0;
     for (let i = 0; i < s * s; i++) {
-      const r = data[i * 4];
-      const g = data[i * 4 + 1];
-      const b = data[i * 4 + 2];
-      const y = 0.299 * r + 0.587 * g + 0.114 * b;
-      if (y < avgY) darkCount++;
+      if (yBuf[i] < avgY) darkCount++;
     }
     const insideIsDark = darkCount < s * s / 2;
     for (let i = 0; i < s * s; i++) {
-      const r = data[i * 4];
-      const g = data[i * 4 + 1];
-      const b = data[i * 4 + 2];
-      const y = 0.299 * r + 0.587 * g + 0.114 * b;
-      const isInside = insideIsDark ? y < avgY : y >= avgY;
+      const isInside = insideIsDark ? yBuf[i] < avgY : yBuf[i] >= avgY;
       if (isInside) {
         inside[i] = 1;
-        anyInside = true;
+        insideCount++;
       }
     }
   }
-  if (!anyInside) return new Uint8Array(s * s);
 
-  return computeSdfFromMask(inside, s);
+  // #170: invert が true なら inside/outside を flip。auto-polarity で
+  // 反転誤判定された画像の救済。
+  if (invert) {
+    for (let i = 0; i < s * s; i++) inside[i] = inside[i] ? 0 : 1;
+    insideCount = s * s - insideCount;
+  }
+
+  // #169: 全 inside でも全 outside でもコントラスト 0 として扱う。
+  if (insideCount === 0 || insideCount === s * s) {
+    return { sdf: new Uint8Array(s * s), ok: false };
+  }
+
+  return { sdf: computeSdfFromMask(inside, s), ok: true };
 }
 
 // inside mask (0/1) → Rust 互換の SDF Uint8Array を計算する共通経路。

@@ -125,18 +125,9 @@ describe('generateImageSdf()', () => {
   // ImageBitmap-like / OffscreenCanvas-like の stub を渡すことで内部 EDT 経路を
   // 通せる。
 
-  test('OffscreenCanvas 未定義環境では全 0 を返す', () => {
-    vi.stubGlobal('OffscreenCanvas', undefined);
-    const fakeBitmap = { width: 16, height: 16 } as unknown as ImageBitmap;
-    const out = generateImageSdf(fakeBitmap, 16);
-    expect(out.length).toBe(16 * 16);
-    expect(out.every((v) => v === 0)).toBe(true);
-  });
-
-  test('完全透過な画像 (alpha 全 0) なら全 0 を返す', () => {
-    const SIZE = 8;
-    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
-    class StubCanvas {
+  // 共通 stub
+  const makeStubCanvas = (data: Uint8ClampedArray, size: number) => {
+    return class StubCanvas {
       width: number;
       height: number;
       constructor(w: number, h: number) {
@@ -147,78 +138,123 @@ describe('generateImageSdf()', () => {
         return {
           clearRect: () => {},
           drawImage: () => {},
-          getImageData: () => ({ data, width: SIZE, height: SIZE }),
+          getImageData: () => ({ data, width: size, height: size }),
         };
       }
-    }
-    vi.stubGlobal('OffscreenCanvas', StubCanvas);
-    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
-    const out = generateImageSdf(fakeBitmap, SIZE);
-    expect(out.length).toBe(SIZE * SIZE);
-    expect(out.every((v) => v === 0)).toBe(true);
+    };
+  };
+
+  test('OffscreenCanvas 未定義環境では ok=false で全 0 を返す', () => {
+    vi.stubGlobal('OffscreenCanvas', undefined);
+    const fakeBitmap = { width: 16, height: 16 } as unknown as ImageBitmap;
+    const r = generateImageSdf(fakeBitmap, 16);
+    expect(r.ok).toBe(false);
+    expect(r.sdf.length).toBe(16 * 16);
+    expect(r.sdf.every((v) => v === 0)).toBe(true);
   });
 
-  test('透過画像 (alpha=255 中央 1px) で文字版と同じ SDF を生成する', () => {
-    // generateJsGlyphSdf と同じ EDT 経路を共有しているので、入力 alpha 配置が
-    // 同じなら出力 SDF も完全に同じになることを確認する (regression guard)。
+  test('完全透過な画像 (alpha 全 0) は ok=false', () => {
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(false);
+    expect(r.sdf.every((v) => v === 0)).toBe(true);
+  });
+
+  test('透過画像 (alpha=255 中央 1px、他 alpha=0) は alpha 経路で文字版と同じ SDF を生成', () => {
+    // alpha<255 のピクセルが 63/64 = 98% > 1% → alpha 経路 (#171)。
+    // generateJsGlyphSdf と同じ EDT で同じ byte が出る (regression guard)。
     const SIZE = 8;
     const data = new Uint8ClampedArray(SIZE * SIZE * 4);
     data[(3 * SIZE + 3) * 4 + 3] = 255;
-    class StubCanvas {
-      width: number;
-      height: number;
-      constructor(w: number, h: number) {
-        this.width = w;
-        this.height = h;
-      }
-      getContext() {
-        return {
-          clearRect: () => {},
-          drawImage: () => {},
-          getImageData: () => ({ data, width: SIZE, height: SIZE }),
-        };
-      }
-    }
-    vi.stubGlobal('OffscreenCanvas', StubCanvas);
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
     const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
-    const out = generateImageSdf(fakeBitmap, SIZE);
-    expect(out[3 * SIZE + 3]).toBe(191);
-    expect(out[3 * SIZE + 2]).toBe(64);
-    expect(out[2 * SIZE + 2]).toBe(11);
-    expect(out[0]).toBe(0);
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(true);
+    expect(r.sdf[3 * SIZE + 3]).toBe(191);
+    expect(r.sdf[3 * SIZE + 2]).toBe(64);
+    expect(r.sdf[2 * SIZE + 2]).toBe(11);
+    expect(r.sdf[0]).toBe(0);
   });
 
   test('不透明画像でも輝度しきい値で二値化される', () => {
-    // 全ピクセル alpha=255、中央 1 px だけ白 (輝度高)、他は黒 (輝度 0)。
-    // hasAlpha=false 経路に入り、avgY ≈ 255/64 ≈ 4。中央 1 px は輝度 255 で
-    // avgY 以上 → 「明るいセル数=1, 暗いセル数=63」 → 少数派の bright を
-    // inside とする → 中央が inside、その他が outside。alpha 経路と同じ
-    // SDF が出る。
+    // 全ピクセル alpha=255、中央 1 px だけ白 (輝度高)、他は黒。
+    // alphaPixelCount=0 → 不透明経路 → 少数派 (中央 1px) が inside。
     const SIZE = 8;
     const data = new Uint8ClampedArray(SIZE * SIZE * 4);
-    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255; // alpha=255 全部
+    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255;
     data[(3 * SIZE + 3) * 4 + 0] = 255;
     data[(3 * SIZE + 3) * 4 + 1] = 255;
     data[(3 * SIZE + 3) * 4 + 2] = 255;
-    class StubCanvas {
-      width: number;
-      height: number;
-      constructor(w: number, h: number) {
-        this.width = w;
-        this.height = h;
-      }
-      getContext() {
-        return {
-          clearRect: () => {},
-          drawImage: () => {},
-          getImageData: () => ({ data, width: SIZE, height: SIZE }),
-        };
-      }
-    }
-    vi.stubGlobal('OffscreenCanvas', StubCanvas);
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
     const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
-    const out = generateImageSdf(fakeBitmap, SIZE);
-    expect(out[3 * SIZE + 3]).toBe(191);
-    expect(out[3 * SIZE + 2]).toBe(64);
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(true);
+    expect(r.sdf[3 * SIZE + 3]).toBe(191);
+    expect(r.sdf[3 * SIZE + 2]).toBe(64);
+  });
+
+  test('#169 単色塗り画像 (全画素同輝度) は ok=false でコントラスト不足を通知', () => {
+    // 全画素 RGB=(128,128,128), alpha=255 → 平均輝度=128、全画素が avgY と
+    // 同値で「未満」が 0 → insideIsDark=true、`y < avgY` は false 全部 →
+    // insideCount=0 → ok=false。
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) {
+      data[i * 4] = 128;
+      data[i * 4 + 1] = 128;
+      data[i * 4 + 2] = 128;
+      data[i * 4 + 3] = 255;
+    }
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(false);
+    expect(r.sdf.every((v) => v === 0)).toBe(true);
+  });
+
+  test('#170 invert=true で inside/outside が反転する', () => {
+    // 不透明・中央 1px 白 (= 自動判定で inside=中央)。invert=true で
+    // 中央以外が inside になり、SDF byte 値が大きく変わる。
+    const SIZE = 8;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255;
+    data[(3 * SIZE + 3) * 4 + 0] = 255;
+    data[(3 * SIZE + 3) * 4 + 1] = 255;
+    data[(3 * SIZE + 3) * 4 + 2] = 255;
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const direct = generateImageSdf(fakeBitmap, SIZE, false);
+    const inverted = generateImageSdf(fakeBitmap, SIZE, true);
+    // 中央: direct は inside (signed_px=+0.5 → byte=191)、
+    //       invert は outside (signed_px=-0.5 → byte=64)。
+    expect(direct.sdf[3 * SIZE + 3]).toBe(191);
+    expect(inverted.sdf[3 * SIZE + 3]).toBe(64);
+  });
+
+  test('#171 alpha<255 が 1px だけの「実質不透明」画像は alpha 経路に入らない', () => {
+    // 8×8 の隅 1 px だけ alpha=128、他 alpha=255、輝度差は中央 1 px に持たせる。
+    // alphaPixelCount = 1、s*s = 64、1*100 = 100、64 と比べて 100 > 64 → true。
+    // つまり SIZE=8 の場合 1 px でも > 1% を超えてしまう。テストは輝度経路を
+    // ちゃんとピックアップする SIZE=32 で行う (1 px / 1024 = 0.097% < 1%)。
+    const SIZE = 32;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255;
+    data[3] = 128; // (0,0) alpha=128 (1 px だけ alpha < 255)
+    // 中央 (16,16) を白く
+    const c = (16 * SIZE + 16) * 4;
+    data[c] = 255;
+    data[c + 1] = 255;
+    data[c + 2] = 255;
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
+    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(true);
+    // 輝度経路に入ったなら中央 (16,16) が inside で byte が高く、
+    // (0,0) は outside で 0 寄り。alpha 経路だと逆 (alpha=128 なら inside)。
+    expect(r.sdf[16 * SIZE + 16]).toBeGreaterThan(127);
+    expect(r.sdf[0]).toBeLessThan(127);
   });
 });
