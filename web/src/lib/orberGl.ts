@@ -66,6 +66,11 @@ out vec4 outColor;
 
 const float TAU = 6.28318530718;
 const float BREATH_RADIUS_MAX_FACTOR = 1.10;
+// #147: glyph SDF の content span を GLSL 側にも宣言する。
+// この値は TS 定数 GLYPH_SDF_CONTENT_SPAN と Rust 側
+// crates/core/src/glyph.rs の GLYPH_SDF_CONTENT_SPAN (= 1/√2) に同期させること。
+// 未宣言だと shader compile が "GLYPH_SDF_CONTENT_SPAN: undeclared identifier" で落ちる。
+const float GLYPH_SDF_CONTENT_SPAN = ${GLYPH_SDF_CONTENT_SPAN};
 
 uniform vec2 u_resolution;
 uniform float u_t;             // [0, 1)
