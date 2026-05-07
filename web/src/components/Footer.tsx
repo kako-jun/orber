@@ -1,8 +1,9 @@
-// orber#146 — Footer (Solid island, redesigned)
+// orber#146 / #152 — Footer (Solid island, redesigned)
 //
 // 旧 #128 実装は左右 2 列・glass コンテナ・自己説明文 (about / built with /
 // repo link / "Open on phone") を詰め込んでおり、orber 本体の引き算 UI から
-// 浮いていた。#146 で以下に再設計する。
+// 浮いていた。#146 で以下に再設計し、#152 で Amazon affiliate を実商品 +
+// orb/glow カード (AffiliateGrid) に切り出した。
 //
 //   - 中央揃えに統一
 //   - glass コンテナを廃し、border-t のみで穏やかに区切る
@@ -13,10 +14,7 @@
 //     「これは orber」の視覚サインを置く (DESIGN.md §14)
 //   - Nostalgic Counter と build version (`v2026-05-07` 等) を 1 行に並べる
 //     (machigai-salad の VisitorCounter と同じパターン)
-//
-// Amazon affiliate (B section) は #146 のスコープ外。商品データ管理・
-// アソシエイト ID 管理・orb/glow に寄せた商品カード再設計は別 issue。
-// レイアウトのみ中央揃えに合わせる。
+//   - Amazon affiliate は `<AffiliateGrid />` (Sponsor の直下、#152 で切り出し)
 //
 // ハードコード禁止: カラーは tailwind token (bg / fg / fgMuted / fgSubtle /
 // hairline / glassBg / glassBgHover / glassBorder / focusRing) のみ。
@@ -25,10 +23,7 @@
 
 import { onMount } from 'solid-js';
 import { t } from '../lib/strings';
-import {
-  AFFILIATE_PRODUCTS,
-  amazonUrl,
-} from '../data/affiliateProducts';
+import AffiliateGrid from './AffiliateGrid';
 
 // #128: Nostalgic Counter の実 ID は kako-jun が
 // https://nostalgic.llll-ll.com/ のダッシュボードで取得後に置換する。
@@ -149,50 +144,10 @@ export default function Footer() {
           <span>{t('sponsorLabel')}</span>
         </a>
 
-        {/* B. Amazon affiliate × 3 — #146 スコープ外 (商品データ・カード再設計は別 issue)。
-            レイアウトのみ中央揃えに合わせ、disclosure を簡潔に下に置く。 */}
-        <section aria-label={t('affiliateHeading')} class="w-full">
-          <h2 class="text-xs text-fgMuted mb-3 tracking-wide">
-            {t('affiliateHeading')}
-          </h2>
-          <ul class="grid grid-cols-3 gap-2 max-w-sm mx-auto">
-            {AFFILIATE_PRODUCTS.map((p) => (
-              <li>
-                <a
-                  href={amazonUrl(p.asin)}
-                  target="_blank"
-                  rel="noopener noreferrer sponsored nofollow"
-                  title={p.title}
-                  class="block rounded-md border border-glassBorder bg-glassBg hover:bg-glassBgHover p-2 transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-                >
-                  <div class="aspect-square w-full mb-2 bg-glassBg rounded-sm overflow-hidden flex items-center justify-center">
-                    <img
-                      src={p.imageUrl}
-                      alt={p.title}
-                      loading="lazy"
-                      decoding="async"
-                      width="120"
-                      height="120"
-                      class="max-h-full max-w-full object-contain"
-                      onError={(e) => {
-                        (e.currentTarget as HTMLImageElement).style.visibility = 'hidden';
-                      }}
-                    />
-                  </div>
-                  <div class="text-xs text-fg leading-tight truncate">
-                    {p.title}
-                  </div>
-                  <div class="text-xs text-fgSubtle leading-tight truncate mt-0.5">
-                    {p.caption}
-                  </div>
-                </a>
-              </li>
-            ))}
-          </ul>
-          <p class="text-xs text-fgSubtle mt-2">
-            {t('affiliateDisclosure')}
-          </p>
-        </section>
+        {/* B. Amazon affiliate × 3 — #152 で AffiliateGrid に切り出し。
+            データ層 (web/src/data/affiliateProducts.ts) と UI 層を分離し、
+            他 PWA にコピペで横展開できる pattern にしている。 */}
+        <AffiliateGrid />
 
         {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。 */}
         <img

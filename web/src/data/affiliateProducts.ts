@@ -1,46 +1,49 @@
-// orber#128: Amazon affiliate products.
-// アソシエイト ID は kako-jun の `ultimate-battle-22`。`amazonUrl(asin)` が
-// `tag=ultimate-battle-22` を必ず付ける唯一の出口。Footer から呼び出す。
+// orber#152: Amazon affiliate products.
 //
-// `asin` / `imageUrl` は kako-jun が実 ASIN に置き換えるまでの placeholder。
-// テーマは「写真・配信・ライティング」(orber は配信背景・動画背景の生成ツールなので
-// 周辺機材＋関連書籍を 3 枠並べる)。
-// TODO(kako-jun): 各 ASIN を実商品に差し替える (PLACEHOLDER_* と _SL250_PLACEHOLDER を)。
+// 3 商品グリッドは Footer の Sponsor ボタンの下に置き、他 PWA でも同じ
+// pattern を横展開する。商品はリポごとに違うので、本ファイル (データ層) を
+// リポごとに用意し、`AffiliateGrid` (UI 層) を横コピーで再利用する想定。
+//
+// アソシエイト ID は kako-jun の `ultimate-battle-22`。osaka-kenpo と同じく
+// **amzn.to 短縮リンク** を使う方針 (Associates ダッシュボードで生成)。
+// tag を URL に露出せず、Amazon 側の redirect で計測される。
+// `amazonUrl(asin)` ヘルパは amzn.to 化に伴い廃止。
+//
+// 画像 URL は Amazon CDN の `m.media-amazon.com/images/I/{IMAGEID}.jpg` を
+// そのまま使う。`_SL250_` 等のリサイズ指定は付けず、`<img width height>` で
+// 表示サイズだけ縛り、CDN は元解像度を返す (Retina 対応)。
 
 export interface AffiliateProduct {
-  /** Amazon ASIN。'PLACEHOLDER_*' は仮値。 */
-  asin: string;
-  /** 表示名。短く。ja/en どちらでもよいが orber は片寄せ運用。 */
+  /** 商品ページへの amzn.to 短縮 URL (Associates ダッシュボードで生成)。 */
+  url: string;
+  /** Amazon 商品の正式タイトル (短縮可)。 */
   title: string;
-  /** 商品サムネ。Amazon CDN の `_SL250_` 系 dynamic image を推奨。 */
+  /** Amazon CDN の商品メイン画像 URL。 */
   imageUrl: string;
-  /** 一言コメント。strings.ts には入れない短文 (ja/en の片方でよい)。 */
+  /** kako-jun が商品ごとに書く一言コメント。orber 視点での選定理由など。 */
   caption: string;
 }
 
 export const AFFILIATE_PRODUCTS: AffiliateProduct[] = [
   {
-    asin: 'PLACEHOLDER_WEBCAM', // TODO(kako-jun): 実 ASIN に置換
-    title: 'Logicool StreamCam',
-    imageUrl: 'https://m.media-amazon.com/images/I/_SL250_PLACEHOLDER.jpg',
-    caption: '配信用 Webカメラ',
+    url: 'https://amzn.to/4nbQcSF',
+    title: 'ドラゴンクエストIII そして伝説へ…',
+    imageUrl: 'https://m.media-amazon.com/images/I/61mJHMLthgL.jpg',
+    // TODO(kako-jun): 一言コメントを入れる
+    caption: '',
   },
   {
-    asin: 'PLACEHOLDER_RINGLIGHT', // TODO(kako-jun): 実 ASIN に置換
-    title: 'リングライト 18inch',
-    imageUrl: 'https://m.media-amazon.com/images/I/_SL250_PLACEHOLDER.jpg',
-    caption: '撮影・配信向き',
+    url: 'https://amzn.to/4tpzi4L',
+    title: 'HG オオワシアカツキガンダム 1/144',
+    imageUrl: 'https://m.media-amazon.com/images/I/51tZBx3ATSL.jpg',
+    // TODO(kako-jun): 一言コメントを入れる
+    caption: '',
   },
   {
-    asin: 'PLACEHOLDER_PHOTOBOOK', // TODO(kako-jun): 実 ASIN に置換
-    title: '光と影の写真集',
-    imageUrl: 'https://m.media-amazon.com/images/I/_SL250_PLACEHOLDER.jpg',
-    caption: 'ボケ・光・抽象 系',
+    url: 'https://amzn.to/4nfDjHr',
+    title: '行って眺めて撮る 巨大工場探訪ガイド',
+    imageUrl: 'https://m.media-amazon.com/images/I/51i4p4hJLYL.jpg',
+    // TODO(kako-jun): 一言コメントを入れる
+    caption: '',
   },
 ];
-
-export const AFFILIATE_TAG = 'ultimate-battle-22';
-
-/** Amazon 商品ページ URL。`tag=ultimate-battle-22` を必ず付ける。 */
-export const amazonUrl = (asin: string): string =>
-  `https://www.amazon.co.jp/dp/${asin}/?tag=${AFFILIATE_TAG}`;
