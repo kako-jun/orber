@@ -25,7 +25,10 @@ export default function AffiliateGrid() {
       <h2 class="text-xs text-fgMuted mb-4 tracking-wide text-center">
         {t('affiliateHeading')}
       </h2>
-      <ul class="grid grid-cols-3 gap-4 max-w-sm mx-auto">
+      {/* レビュー: max-w-sm (24rem) では caption が折り返されたため max-w-xl
+          (36rem) に拡大。3 列 × ~180px/cell でフリガナの長い caption も 1-2 行で
+          収まる。Footer のコンテナ (max-w-3xl) より小さい範囲で中央寄せを保つ。 */}
+      <ul class="grid grid-cols-3 gap-4 max-w-xl mx-auto">
         {AFFILIATE_PRODUCTS.map((p) => (
           <li>
             <a

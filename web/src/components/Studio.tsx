@@ -35,9 +35,12 @@ type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
 
+// 9 列 × 2 段の picker 配置を取るため候補リストの順序と数を整える。
+// 旧 `♦` (ダイヤ・スートマーク) はユーザー指示で除外、`◆` (黒ダイヤ) も
+// 同様の意味重複を避けて落とす。最終 18 文字を想定。
 const SYMBOL_PICKER_DEFAULT = [
-  '☆', '★', '♥', '♦', '◆', '○', '●', '■', '□', '▲', '△', '✓',
-  '✕', '✿', '❀', '✦', '☀', '☁', '⚡', '←', '→', '↑', '↓',
+  '☆', '★', '♥', '○', '●', '■', '□', '▲', '△',
+  '✓', '✕', '✿', '❀', '✦', '☀', '☁', '⚡', '→',
 ];
 
 // #136: glyph 文字ごとに「回転を既定で ON / OFF どちらにするか」のテーブル。
@@ -725,28 +728,22 @@ export default function Studio() {
 
   const applyGlyphChar = (raw: string) => {
     const first = [...raw][0] ?? '';
-    const changed = first !== glyphChar();
     setGlyphChar(first);
-    // #136: glyph 切替時のみ GLYPH_DEFAULT_ROTATE で checkbox 既定値を上書きする。
-    // 雷 ⚡ や太陽 ☀ は OFF、それ以外は ON。これにより「⚡ を選んだら自然に
-    // 静止する」体験になる。ユーザーが直後に checkbox を切替えれば尊重され、
-    // 同じ glyph を再入力しても ON/OFF は維持される（review S2）。
+    // glyphRotate は glyph 切替時に再設定しない (ユーザー指示: 「グリフを変える
+    // たびに回転させるが復活している。独自管理であるべき」)。GLYPH_DEFAULT_ROTATE
+    // による自動上書きは廃止し、checkbox は完全にユーザー操作のみで動く。
     if (first.length > 0) {
-      if (changed) setGlyphRotate(GLYPH_DEFAULT_ROTATE[first] ?? true);
       runBatchIfReady();
     }
     return first;
   };
 
   const onGlyphPickerClick = (sym: string) => {
-    // #136: 同じ glyph 再クリックでは default を再適用しない（review S2）。
-    // ユーザーが手動で OFF にした後ピッカーで再選択しても OFF のまま保たれる。
     if (sym === glyphChar()) {
       runBatchIfReady();
       return;
     }
     setGlyphChar(sym);
-    setGlyphRotate(GLYPH_DEFAULT_ROTATE[sym] ?? true);
     runBatchIfReady();
   };
 
@@ -1321,7 +1318,9 @@ export default function Studio() {
               </For>
             </datalist>
             <span />
-            <div class="flex flex-wrap items-center gap-1">
+            {/* 9 列 × 2 段の固定グリッド。各ボタンは w-full でセル幅を埋め、
+                右端が他の segmented control 行とぴったり揃う。 */}
+            <div class="grid grid-cols-9 gap-1">
               <For each={supportedGlyphChoices()}>
                 {(sym) => (
                   <button
@@ -1331,7 +1330,7 @@ export default function Studio() {
                     disabled={!decoded() || downloading()}
                     class={
                       GLASS_BTN +
-                      ' glyph-symbol-text h-9 w-9 px-0 text-base ' +
+                      ' glyph-symbol-text h-9 w-full px-0 text-base leading-none ' +
                       (glyphChar() === sym ? GLASS_BTN_TOGGLED : '')
                     }
                     title={sym}
@@ -1340,8 +1339,11 @@ export default function Studio() {
                         Safari/iOS で ⚡ などが OS 絵文字フォントに resolve されるのを防ぎ、
                         Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
                         font-variant-emoji: text で対応済み。selector は display 用で、
-                        value (sym) には付けないので状態管理は影響を受けない。 */}
-                    {sym + '︎'}
+                        value (sym) には付けないので状態管理は影響を受けない。
+                        ボタン高さ h-9 に対してフォント独自メトリクスでズレるため、
+                        leading-none + inline-block span でグリフ中心を上下センターに
+                        揃える (review)。 */}
+                    <span class="inline-block leading-none">{sym + '︎'}</span>
                   </button>
                 )}
               </For>
@@ -1698,12 +1700,17 @@ export default function Studio() {
                   </Show>
                 </Show>
                 {/* 4-corner L marker — DESIGN.md §4 SelectionMarker
-                    skeleton 中は disabled なので hover も発火しない。 */}
+                    skeleton 中は disabled なので hover も発火しない。
+                    白い orb 画像でも見えるよう drop-shadow で黒い影を付け、
+                    selected 時はぼんやり呼吸アニメ (orb-selected-pulse) を当てる。 */}
                 <span
                   class={
                     'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
-                    (tile.selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-30')
+                    (tile.selected ? 'opacity-100 orb-selected-pulse' : 'opacity-0 group-hover:opacity-30')
                   }
+                  style={{
+                    filter: 'drop-shadow(0 0 2px rgba(0,0,0,0.85))',
+                  }}
                   aria-hidden="true"
                 >
                   {/* top-left */}
@@ -1764,11 +1771,11 @@ export default function Studio() {
           </For>
         </div>
 
-        {/* #56 / 配置調整: 透過版同梱 checkbox は DL ボタン行の直上に置き、
-            DL に影響する設定であることを近接で示す。OFF 既定で既存挙動と
-            byte-exact identity を保つ (#56 受け入れ条件)。VP9 alpha 非対応
-            (Safari) では disabled + tooltip を出す。glass checkbox 共通
-            tokens (#136 で確立) を踏襲。 */}
+        {/* #56 / 配置調整: 透過版同梱 checkbox は DL ボタン行の直上に置く。
+            VP9 alpha 非対応ブラウザ (Safari 等) でも checkbox はクリック可能に
+            し、tooltip で「WebM 透過は出ない (PNG/WebP のみ)」と説明する。
+            disabled の条件は !decoded() / downloading() のみ (ユーザー指示で
+            灰色不可活状態を解除)。 */}
         <div class="flex justify-center pt-2">
           <label
             class={GLASS_CHECKBOX_LABEL}
@@ -1779,7 +1786,7 @@ export default function Studio() {
               class={GLASS_CHECKBOX_INPUT}
               checked={includeAlpha()}
               onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
-              disabled={!decoded() || downloading() || !vp9AlphaSupported()}
+              disabled={!decoded() || downloading()}
             />
             <span>{t('includeAlphaLabel')}</span>
           </label>
