@@ -162,6 +162,13 @@ export const STRINGS = {
     en: 'Built with Rust + WebAssembly + Astro + Solid + Tailwind',
   },
   repoLinkLabel: { ja: 'ソースコード (GitHub)', en: 'Source on GitHub' },
+  // #148: PWA install prompt (machigai-salad と同パターンの toast)。
+  installPromptBody: {
+    ja: 'orber をホーム画面に追加できます',
+    en: 'Install orber on your device',
+  },
+  installBtn: { ja: 'インストール', en: 'Install' },
+  installDismiss: { ja: '閉じる', en: 'Dismiss' },
 } as const;
 
 export function detectLang(): Lang {

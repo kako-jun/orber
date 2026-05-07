@@ -103,6 +103,8 @@ web/                        # Web フロントエンド (#37, #38)
 - **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
 - **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
 
+- **PWA は手書き Service Worker (#148)** — `web/public/sw.js` を直接書き、`@vite-pwa/astro` 等の追加依存は入れない。machigai-salad と同じく `CACHE_NAME = 'orber-__BUILD_DATE__'`、precache は `['/', '/manifest.webmanifest']` のみ、fetch は network-first + キャッシュ fallback。`blob:` / `data:` は intercept しない（生成結果の DL を握り潰さないため）。`npm run build` の `stamp:sw` 段で `dist/sw.js` の `__BUILD_DATE__` を JST 日付に Node 1 行スクリプトで literal 置換する。詳細は DESIGN.md §15
+
 ## 関連プロジェクト
 
 - [aquarelle](https://github.com/kako-jun/aquarelle)（将来作る予定）— にじみエンジンを独立 crate 化したもの。orber と blueprinter から共有依存される
