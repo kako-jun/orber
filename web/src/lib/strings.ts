@@ -184,12 +184,27 @@ export function detectLang(): Lang {
   return nav.language.toLowerCase().startsWith('ja') ? 'ja' : 'en';
 }
 
-// SSR-safe: window 未定義時 (SSR) は en で初期化される。
-// クライアントではモジュール init 時に detectLang() で正しい言語に切り替わるため、
-// Subtitle の onMount を待たずに全島が初期描画から正しい言語で表示される。
-// このモジュール init 値は Solid hydration 時に各島で再評価され、createSignal が
-// 同じ値を返すため、SSR の en と client の検出結果が一致していれば mismatch しない。
-const [lang, setLang] = createSignal<Lang>(detectLang());
+// orber#161 — Solid hydration mismatch 対策。
+// 以前はモジュール init 時に detectLang() を呼んで signal を初期化していたが、
+// それだと SSR 評価値 ('en') と client 評価値 ('ja') が食い違い、Solid の
+// hydration が「DOM 既存 → 再レンダリングしない」最適化に引っかかって
+// SSR の EN テキストが残留する島が発生していた (一部だけ JP、他は EN という
+// 混在状態)。
+//
+// 対策: signal は SSR と同じ 'en' で初期化し、hydration 完了後の microtask で
+// setLang(detectLang()) を呼んで reactive 再評価をトリガする。これにより
+// 全 t() 呼び出しが (各島で) 同時に再評価され、言語が確実に揃う。
+//
+// 各 Solid island が同一モジュールチャンクを共有するか別かは Vite の chunk
+// 分割に依る。共有なら 1 度の setLang で全島更新、別なら各島の microtask が
+// それぞれ自島の signal を更新するため、どちらの構成でも結果は同じ。
+const [lang, setLang] = createSignal<Lang>('en');
+if (typeof window !== 'undefined') {
+  queueMicrotask(() => {
+    const detected = detectLang();
+    if (detected !== 'en') setLang(detected);
+  });
+}
 export { lang, setLang };
 
 export type StringKey = keyof typeof STRINGS;

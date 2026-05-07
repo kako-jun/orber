@@ -388,11 +388,15 @@ language picker — users do not choose. The `<html lang>` attribute is set
 pre-hydration by an inline script in `Base.astro` so screen readers pick the
 right voice from first paint, and the Solid `lang` signal is synced
 post-hydration by `Subtitle.tsx` for reactive UI text. The Solid `lang` signal
-initializes to `'en'` at SSR (no `window` — note that Node 22+ exposes a global
-`navigator`, so SSR detection keys off `window` rather than `navigator`) and to
-`detectLang()` at client module init, so all islands hydrate with the correct
-language without waiting for `onMount`. `Subtitle.tsx` `onMount` keeps a
-safety-belt re-sync.
+initializes to `'en'` on both SSR and client (no `window` — note that Node 22+
+exposes a global `navigator`, so SSR detection keys off `window` rather than
+`navigator`) so the SSR HTML and the post-hydration DOM agree, then a
+`queueMicrotask` in `strings.ts` flips the signal to `detectLang()` after
+hydration, triggering a reactive re-render of every `t()` call across all
+islands at once. This avoids the hydration-mismatch bug (#161) where Solid's
+"DOM already exists, skip re-render" optimization left some islands stuck on
+the SSR English while others switched to Japanese. `Subtitle.tsx` `onMount`
+keeps a safety-belt re-sync.
 
 ## Glyph rendering pipeline (Phase A)
 
