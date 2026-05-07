@@ -338,36 +338,44 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - 対象: aspect / shape / glyph input / symbol picker / count / speed / softness / reroll
 - 各 control は `decoded()` が null の間 `disabled:opacity-40 disabled:cursor-not-allowed`（GLASS_BTN / GLASS_INPUT に同梱済み）で視覚的に弱める。画像投入後は通常状態へ戻る
 
-## 14. Footer (#128)
+## 14. Footer (#128 / #146)
 
 公開後の継続接点 (GH Sponsors / Amazon affiliate / QR / Copyright / Nostalgic
-Counter) と #86 (About / Donate のプライバシー note) を 1 コンポーネントに集約する。
+Counter / version) と #86 のプライバシー note を 1 コンポーネントに集約する。
 sticky ではなく **Studio の自然なスクロール末尾に着地** し、`border-t border-hairline`
-+ `bg-glassBg` で本体から穏やかに分離する。
+だけで本体から穏やかに分離する (#146 で glass コンテナは廃止)。
 
-### 構成 (A〜E + Privacy)
+### 構成 (中央揃え基調 / #146 再設計)
 
-- **A. GH Sponsors** ボタン — `https://github.com/sponsors/kako-jun` を新規タブで開く glass button (DESIGN.md §4 Button)
-- **B. Amazon affiliate × 3** — アソシエイト ID `ultimate-battle-22`。商品データは `web/src/data/affiliateProducts.ts` に集約され、`amazonUrl(asin)` が `?tag=ultimate-battle-22` を必ず付ける唯一の出口
-- **C. QR コード** — `/orber-qr.svg`。`web/scripts/gen-qr.mjs` が `qrcode` パッケージで build 時に再生成 (`npm run dev` / `npm run build` / `build:cf` の前段に `npm run gen:qr` を連結済み)、bg `#040404` / fg `#FFFFFF`。`https://orber.llll-ll.com/` を指す
-- **D. Copyright** — `© 2026 kako-jun` (`font-display font-light text-xs text-fgSubtle`)
-- **E. Nostalgic Counter** — `<nostalgic-counter id="orber-PLACEHOLDER" type="total" format="text" />`。embed は Footer の onMount で `https://nostalgic.llll-ll.com/components/visit.js` を `data-orber-nostalgic` フラグ付きで idempotent に注入。**ID が `PLACEHOLDER` の間は Counter ブロック自体を非表示にし、embed.js も注入しない** (実 ID 取得後に表示開始)。kako-jun がダッシュボードで取得した値に置換 (TODO コメント明記)
-- **About + Privacy + Source (#86 統合)** — 「orber が何を作るか / 画像は端末内処理 / GitHub repo link / ビルド技術スタック」を `text-fgMuted` 4 行で右列に集約。privacyNote 単体ではなく、About + Privacy + Source link を 1 セクションに束ねることで「最後に読まれる場所」として境界条件・OSS・作者を同時に宣言する
+縦の出現順:
+
+1. **Orb motif** — `●` をサイズ違い (6 / 12 / 22 / 12 / 6 px) で縦に 5 個並べ、`bg-fg` + opacity (0.35 / 0.55 / 0.85 / 0.55 / 0.35) で奥行きを作る。「これは orber」の視覚サイン。`aria-hidden="true"`
+2. **A. GH Sponsors** ボタン — `https://github.com/sponsors/kako-jun` を新規タブで開く glass button (DESIGN.md §4 Button)
+3. **B. Amazon affiliate × 3** — アソシエイト ID `ultimate-battle-22`。商品データは `web/src/data/affiliateProducts.ts` に集約され、`amazonUrl(asin)` が `?tag=ultimate-battle-22` を必ず付ける唯一の出口。**#146 では商品データ管理・カード再設計はスコープ外**で別 issue 扱い、レイアウトのみ中央揃えに合わせる
+4. **C. QR コード** — `/orber-qr.png`。**別途指定する PNG を `web/public/orber-qr.png` に置く方式に変更** (#146)。build 時生成 (`gen-qr.mjs` / `qrcode` パッケージ) は廃止
+5. **Privacy note** — 「画像はブラウザ内で処理されます」を 1 文だけ残す。orber の境界条件として最後に読ませる
+6. **E. Nostalgic Counter + version** — 1 行に並べる: `閲覧数: {N}  v{date}` (ja) / `{N} views  v{date}` (en)。`tabular-nums` で揃える。Counter は `<nostalgic-counter id="orber-PLACEHOLDER" type="total" format="text" />`、embed は Footer の onMount で `https://nostalgic.llll-ll.com/components/visit.js` を `data-orber-nostalgic` フラグ付きで idempotent に注入。**ID が `PLACEHOLDER` の間は Counter 部分のみ非表示にし、embed.js も注入しない** (version 部分は常に表示)。実 ID 取得後に counter が現れる。`__BUILD_DATE__` は Vite の define で JST 日付に literal 置換 (`astro.config.mjs`)
+7. **D. Copyright** — `© kako-jun` (年号なし、`font-display font-light text-xs text-fgSubtle`)
 
 ### レイアウト
 
-- モバイル: 縦積み (`flex-col` 相当の `grid gap-10`)
-- デスクトップ (`md:`): 2 列 — 左 = A (Sponsor) + B (Amazon)、右 = C (QR) + Privacy + E (Counter) + D (Copyright)
+- 全要素を中央揃え (`flex flex-col items-center text-center gap-8`)
 - 内側コンテナ: `mx-auto max-w-3xl px-4 py-10` (本体 `main` の `max-w-3xl p-8` と幅軸を揃える)
 - 全カラーは tailwind token (`bg`/`fg`/`fgMuted`/`fgSubtle`/`hairline`/`glassBg`/`glassBgHover`/`glassBorder`/`focusRing`) のみ。`#fff` / `rgba(...)` のハードコード禁止
 
 ### 文字列 / i18n
 
-すべての可視文字列は `web/src/lib/strings.ts` 経由 (`sponsorLabel` / `sponsorTitle` / `affiliateHeading` / `affiliateDisclosure` / `qrLabel` / `qrAlt` / `privacyNote` / `viewsLabelPrefix` / `viewsLabelSuffix` / `aboutHeading` / `aboutBody` / `aboutBuiltWith` / `repoLinkLabel`)。`viewsLabel` は ja「閲覧数: {n}」/ en「{n} views」と語順が違うため prefix/suffix 2 キーに分けて Counter の Web Component を挟む。`© 2026 kako-jun` は固有名詞扱いで素のテキスト。
+すべての可視文字列は `web/src/lib/strings.ts` 経由 (`sponsorLabel` / `sponsorTitle` / `affiliateHeading` / `affiliateDisclosure` / `qrAlt` / `privacyNote` / `viewsLabelPrefix` / `viewsLabelSuffix`)。`viewsLabel` は ja「閲覧数: {n}」/ en「{n} views」と語順が違うため prefix/suffix 2 キーに分けて Counter の Web Component を挟む。`© kako-jun` と `v{date}` は固有名詞・機械生成扱いで素のテキスト。
+
+**#146 で削除したキー**: `qrLabel` / `aboutHeading` / `aboutBody` / `aboutBuiltWith` / `repoLinkLabel`。Footer から「Open on phone」「about / built with / repo link」の自己説明文を引き算した結果。
+
+### カウンター数値の整形
+
+machigai-salad の `VisitorCounter` と同じパターン: counter の `textContent` が値で埋まるまで 100ms × 50 回までポーリングし、`12345` → `12,345` を `toLocaleString()` で整形する。
 
 ### Web Component の型付け
 
-`<nostalgic-counter>` は Custom Element のため Solid の JSX intrinsic に存在しない。`web/src/env.d.ts` で `declare module 'solid-js'` 経由に `IntrinsicElements['nostalgic-counter']` を追加して型を通す。
+`<nostalgic-counter>` は Custom Element のため Solid の JSX intrinsic に存在しない。`web/src/env.d.ts` で `declare module 'solid-js'` 経由に `IntrinsicElements['nostalgic-counter']` を追加して型を通す。同じ `env.d.ts` で `declare const __BUILD_DATE__: string;` も宣言する。
 
 ## 15. PWA (#148)
 

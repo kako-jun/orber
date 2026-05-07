@@ -1,6 +1,10 @@
 /// <reference path="../.astro/types.d.ts" />
 /// <reference types="astro/client" />
 
+// orber#146 — Vite の define で source 内の `__BUILD_DATE__` を
+// `"YYYY-MM-DD"` 文字列リテラルに build 時置換する (astro.config.mjs)。
+declare const __BUILD_DATE__: string;
+
 // orber#128 — Web Component intrinsic for Nostalgic Counter (Footer.tsx).
 // solid-js の JSX intrinsic を拡張し、`<nostalgic-counter id="..." type="..."
 // format="..." />` を SolidJS 経路で型エラーなく書けるようにする。
