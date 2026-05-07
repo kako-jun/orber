@@ -725,28 +725,22 @@ export default function Studio() {
 
   const applyGlyphChar = (raw: string) => {
     const first = [...raw][0] ?? '';
-    const changed = first !== glyphChar();
     setGlyphChar(first);
-    // #136: glyph 切替時のみ GLYPH_DEFAULT_ROTATE で checkbox 既定値を上書きする。
-    // 雷 ⚡ や太陽 ☀ は OFF、それ以外は ON。これにより「⚡ を選んだら自然に
-    // 静止する」体験になる。ユーザーが直後に checkbox を切替えれば尊重され、
-    // 同じ glyph を再入力しても ON/OFF は維持される（review S2）。
+    // glyphRotate は glyph 切替時に再設定しない (ユーザー指示: 「グリフを変える
+    // たびに回転させるが復活している。独自管理であるべき」)。GLYPH_DEFAULT_ROTATE
+    // による自動上書きは廃止し、checkbox は完全にユーザー操作のみで動く。
     if (first.length > 0) {
-      if (changed) setGlyphRotate(GLYPH_DEFAULT_ROTATE[first] ?? true);
       runBatchIfReady();
     }
     return first;
   };
 
   const onGlyphPickerClick = (sym: string) => {
-    // #136: 同じ glyph 再クリックでは default を再適用しない（review S2）。
-    // ユーザーが手動で OFF にした後ピッカーで再選択しても OFF のまま保たれる。
     if (sym === glyphChar()) {
       runBatchIfReady();
       return;
     }
     setGlyphChar(sym);
-    setGlyphRotate(GLYPH_DEFAULT_ROTATE[sym] ?? true);
     runBatchIfReady();
   };
 
@@ -1331,7 +1325,7 @@ export default function Studio() {
                     disabled={!decoded() || downloading()}
                     class={
                       GLASS_BTN +
-                      ' glyph-symbol-text h-9 w-9 px-0 text-base ' +
+                      ' glyph-symbol-text h-9 w-9 px-0 text-base leading-none ' +
                       (glyphChar() === sym ? GLASS_BTN_TOGGLED : '')
                     }
                     title={sym}
@@ -1340,8 +1334,11 @@ export default function Studio() {
                         Safari/iOS で ⚡ などが OS 絵文字フォントに resolve されるのを防ぎ、
                         Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
                         font-variant-emoji: text で対応済み。selector は display 用で、
-                        value (sym) には付けないので状態管理は影響を受けない。 */}
-                    {sym + '︎'}
+                        value (sym) には付けないので状態管理は影響を受けない。
+                        ボタン高さ h-9 に対してフォント独自メトリクスでズレるため、
+                        leading-none + inline-block span でグリフ中心を上下センターに
+                        揃える (review)。 */}
+                    <span class="inline-block leading-none">{sym + '︎'}</span>
                   </button>
                 )}
               </For>

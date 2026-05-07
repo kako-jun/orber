@@ -102,7 +102,10 @@ export default function Footer() {
       class="mt-16 border-t border-hairline"
       aria-label={t('footerAriaLabel')}
     >
-      <div class="mx-auto max-w-3xl px-4 py-10 flex flex-col items-center text-center gap-8">
+      {/* レビュー: 下のスペースは main の p-8 (32px) のみに頼り、footer 自体の
+          bottom padding は削る (pb-0)。これで © kako-jun の下のスペースが
+          ヘッダ「orber」の上のスペースと揃う。 */}
+      <div class="mx-auto max-w-3xl px-4 pt-10 pb-0 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
         <div
           class="flex flex-col items-center gap-2 py-2"
@@ -150,14 +153,15 @@ export default function Footer() {
         <AffiliateGrid />
 
         {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。
-            元 PNG は黒モジュール / 白背景なので、orber の dark テーマで見えるよう
-            `invert` でモジュールを白にする (他アプリと同じスタイル: テーマカラーに揃える)。 */}
+            PNG は事前に `magick -negate` 済みで、白モジュール + 透明背景。
+            bg-bg (#040404) 上で白モジュールが見える形 (orber テーマカラーに合わせ済み)。
+            CSS の invert 指定は使わない (二重反転で全面白塗りになるため)。 */}
         <img
           src="/orber-qr.png"
           alt={t('qrAlt')}
           width="120"
           height="120"
-          class="block rounded-sm border border-hairline bg-bg invert"
+          class="block rounded-sm border border-hairline bg-bg"
         />
 
         {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}
