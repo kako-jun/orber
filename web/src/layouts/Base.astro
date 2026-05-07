@@ -111,6 +111,23 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
       }
     </script>
     <!--
+      orber#148 — Service Worker registration.
+      `web/public/sw.js` を `/sw.js` (scope `/`) で登録する。
+      Solid 島は使わずインラインで完結させ、`load` イベント後に登録することで
+      本体ロードに影響しない順序にする。失敗時は console.warn のみ。
+    -->
+    <script is:inline>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker
+            .register('/sw.js', { scope: '/' })
+            .catch(function (err) {
+              console.warn('[orber] Service Worker registration failed:', err);
+            });
+        });
+      }
+    </script>
+    <!--
       orber#60 — Motion tokens & .fade-in class (DESIGN.md §6).
       duration / easing は CSS 変数で 1 箇所集約。新しく要素が DOM に
       マウントされる瞬間 (タイル追加 / サムネイル表示 / 進捗テキスト等)

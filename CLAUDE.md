@@ -102,6 +102,7 @@ web/                        # Web フロントエンド (#37, #38)
 - **Web GUI の wasm は Worker で動かす（#75）** — メインスレッドは UI / DOM / Solid signal だけにして、wasm 描画 + WebCodecs エンコード + mp4-muxer は全部 `orberWorker.ts` 内で完結させる。スマホで生成中もタップ・スクロールが反応するためのコア施策。フォールバックパスは作らない（最新ブラウザ前提、死コード化を防ぐ）
 - **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
 - **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
+- **PWA は手書き Service Worker (#148)** — `web/public/sw.js` を直接書き、`@vite-pwa/astro` 等の追加依存は入れない。machigai-salad と同じく `CACHE_NAME = 'orber-__BUILD_DATE__'`、precache は `['/', '/manifest.webmanifest']` のみ。`/_astro/*` (Astro/Vite content-hash 付き immutable asset) は **CacheFirst**、それ以外は **network-first** + キャッシュ fallback。navigation がキャッシュ miss + オフラインなら precache した `/` を返す (shell 戦略)。`blob:` / `data:` は intercept しない（生成結果の DL を握り潰さないため）。`cache.put` は `event.waitUntil()` で SW lifetime に縛る。`npm run build` の `stamp:sw` 段で `dist/sw.js` の `__BUILD_DATE__` を JST 日付に Node 1 行スクリプトで literal 置換する。詳細は DESIGN.md §15
 
 ## 関連プロジェクト
 

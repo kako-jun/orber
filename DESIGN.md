@@ -369,6 +369,55 @@ sticky ではなく **Studio の自然なスクロール末尾に着地** し、
 
 `<nostalgic-counter>` は Custom Element のため Solid の JSX intrinsic に存在しない。`web/src/env.d.ts` で `declare module 'solid-js'` 経由に `IntrinsicElements['nostalgic-counter']` を追加して型を通す。
 
+## 15. PWA (#148)
+
+orber を「manifest だけある static site」から、再訪・オフラインに耐える PWA に
+する。実装は machigai-salad と同じ「手書き Service Worker + 1 行の register +
+PwaInstallPrompt」の薄い構成で、`@vite-pwa/astro` 等の追加依存は入れない。
+
+### Service Worker (`web/public/sw.js`)
+
+- `CACHE_NAME = 'orber-__BUILD_DATE__'` — `__BUILD_DATE__` は `npm run build` の `stamp:sw` 段で `dist/sw.js` に JST 日付 (`YYYY-MM-DD`) を Node 1 行スクリプトで literal 置換する
+- precache は最小: `['/', '/manifest.webmanifest']`
+- `/_astro/*` (Astro/Vite が content-hash 付きで吐く immutable asset) は **CacheFirst**。ファイル名が変われば中身が違うため、一度 cache に乗ったらネット往復ゼロで返せる。orber の wasm (~700KB-1MB) を毎回 fetch しないための重要施策
+- それ以外は **network-first**。レスポンス ok なら `event.waitUntil()` 経由で SW lifetime に縛って `cache.put`、オフライン時はキャッシュ → 503 フォールバック
+- **navigation fallback**: `request.mode === 'navigate'` でキャッシュ miss + オフラインなら、precache した `/` を返してアプリシェルで起動できるようにする (PWA shell 戦略)
+- `blob:` / `data:` URL は intercept しない (生成結果の DL を SW が握り潰さないため)
+- `install` で `skipWaiting()`、`activate` で旧 `CACHE_NAME` を全削除してから `clients.claim()` — 新版デプロイ後 1 ロードで切り替わる
+
+### 登録 (`web/src/layouts/Base.astro`)
+
+`<script is:inline>` で `window.addEventListener('load', ...)` 後に `navigator.serviceWorker.register('/sw.js', { scope: '/' })` を呼ぶ。失敗は `console.warn` だけ。Solid 島は使わず、本体の hydration よりも前に SW 登録の意思表示だけ済ませる。
+
+### Install Prompt (`web/src/components/PwaInstallPrompt.tsx`)
+
+- Solid アイランド。`beforeinstallprompt` を捕まえ、画面下部 (`fixed bottom-4`) にミニトーストを出す
+- 文字列は `installPromptBody` / `installBtn` / `installDismiss` (i18n)
+- `sessionStorage` で 1 セッション中の dismiss を覚える (`orber-pwa-dismissed`)
+- `appinstalled` でトーストを閉じる
+- 配色は Footer の glass button と同じ token (`glassBg` / `glassBorder` / `focusRing`)
+- `index.astro` で `client:load` (browser の install 可能判定がいつ来ても捕まえられるように)
+
+### キャッシュ対象の境界
+
+- precache: HTML (`/`) + manifest
+- CacheFirst: `/_astro/*` (content-hash 付き immutable JS / CSS / wasm)
+- runtime cache (network-first 経由で結果的に乗る): フォント / アイコン / QR PNG / 外部 CDN (Google Fonts / Nostalgic embed)
+- intercept しない (= cache されない): `blob:` / `data:` (生成結果の DL)
+
+### オフライン体験の前提
+
+- 「再訪時の起動が安定する」のは **最初の online 訪問が完走した後** の話。クリーン状態 + 即オフラインで再訪した場合は、`/_astro/*` (wasm/JS) が cache に乗っていないため真っ黒画面になる
+- 一度でも online で起動すれば、`/_astro/*` が CacheFirst に乗り、navigation fallback で `/` の HTML も precache から返せるため、以後は機内モード等でも安定起動する
+- wasm を precache に積む選択もあるが、初回ロードが重くなるトレードオフを避けて runtime cache 任せにしている (review S3 で明示)
+
+### 受け入れ条件 (#148)
+
+- standalone install が現実に使える (manifest + SW + install prompt)
+- 再訪時の起動が安定する (上記「オフライン体験の前提」の条件下で)
+- update 時は `__BUILD_DATE__` で `CACHE_NAME` が変わり、`activate` の旧キャッシュ削除で新版に切り替わる
+- 方針が `DESIGN.md §15` と `CLAUDE.md` に残る
+
 ## Agent Quick Reference
 
 When generating UI for orber:
