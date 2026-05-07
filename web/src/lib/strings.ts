@@ -132,13 +132,17 @@ export const STRINGS = {
     ja: 'GitHub Sponsors で kako-jun を支援する',
     en: 'Support kako-jun on GitHub Sponsors',
   },
+  // User: 「Amazon と 2 回言う必要はない」「サイト維持のため購入を検討くださいみたいな
+  // 表現に」を反映。heading から (Amazon) を外し、disclosure を「サイト維持の支援」
+  // 前向き表現に。en は FTC 推奨テンプレ "As an Amazon Associate..." を残しつつ
+  // 「support orber」を頭に出す。
   affiliateHeading: {
-    ja: 'おすすめ機材 (Amazon)',
-    en: 'Recommended gear (Amazon)',
+    ja: 'おすすめ機材',
+    en: 'Recommended gear',
   },
   affiliateDisclosure: {
-    ja: '※ Amazon アソシエイト・プログラムに参加しています。',
-    en: 'As an Amazon Associate this site earns from qualifying purchases.',
+    ja: 'サイト維持のため、よければ購入をご検討ください。Amazon アソシエイトとして orber に還元されます。',
+    en: 'Buy via these links to support orber. As an Amazon Associate I earn from qualifying purchases.',
   },
   // #146: QR の補助コピー (qrLabel / "Open on phone") は廃止。alt のみ残す。
   qrAlt: {
