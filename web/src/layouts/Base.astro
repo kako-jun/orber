@@ -154,13 +154,14 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
         animation: orb-spin 1.1s linear infinite;
       }
       /* タイル選択中の corner L マーカーのぼんやり呼吸アニメ。
-         opacity を 100% ↔ 65% で 1.6s ループ。reduced-motion では下で停止。 */
+         User: アニメが見えない、を反映して opacity 振幅を 65% → 30% に拡大、
+         サイクルも 1.6s → 1.4s に短縮で「呼吸している」感を強める。 */
       @keyframes orb-selected-pulse {
         0%, 100% { opacity: 1; }
-        50% { opacity: 0.65; }
+        50% { opacity: 0.3; }
       }
       .orb-selected-pulse {
-        animation: orb-selected-pulse 1.6s ease-in-out infinite;
+        animation: orb-selected-pulse 1.4s ease-in-out infinite;
       }
       /* orber#? — タイル生成中の skeleton shimmer。runBatch 開始と同時に
          12 個のプレースホルダを置いてグリッド形状を確定させ、wasm の

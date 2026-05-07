@@ -1713,66 +1713,70 @@ export default function Studio() {
                 </Show>
                 {/* 4-corner L marker — DESIGN.md §4 SelectionMarker
                     skeleton 中は disabled なので hover も発火しない。
-                    白い orb 画像でも見えるよう drop-shadow で黒い影を付け、
-                    selected 時はぼんやり呼吸アニメ (orb-selected-pulse) を当てる。 */}
+                    User: マークが小さすぎ / 影が薄すぎ / アニメ見えない、を反映:
+                      - サイズ 14 → 24 (約 1.7x 拡大)
+                      - stroke 1.5 → 2.5 (太く)
+                      - drop-shadow を 6px + 2px の二重影で濃く (黒 100%)
+                      - orb-selected-pulse の opacity 振幅を 100%↔65% → 100%↔30% に強化 */}
                 <span
                   class={
                     'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
                     (tile.selected ? 'opacity-100 orb-selected-pulse' : 'opacity-0 group-hover:opacity-30')
                   }
                   style={{
-                    filter: 'drop-shadow(0 0 2px rgba(0,0,0,0.85))',
+                    filter:
+                      'drop-shadow(0 0 6px rgba(0,0,0,1)) drop-shadow(0 0 2px rgba(0,0,0,1))',
                   }}
                   aria-hidden="true"
                 >
                   {/* top-left */}
                   <svg
-                    class="absolute top-1 left-1"
-                    width="14"
-                    height="14"
+                    class="absolute top-1.5 left-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M2 5 V2 H5" />
                   </svg>
                   {/* top-right */}
                   <svg
-                    class="absolute top-1 right-1"
-                    width="14"
-                    height="14"
+                    class="absolute top-1.5 right-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M9 2 H12 V5" />
                   </svg>
                   {/* bottom-left */}
                   <svg
-                    class="absolute bottom-1 left-1"
-                    width="14"
-                    height="14"
+                    class="absolute bottom-1.5 left-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M2 9 V12 H5" />
                   </svg>
                   {/* bottom-right */}
                   <svg
-                    class="absolute bottom-1 right-1"
-                    width="14"
-                    height="14"
+                    class="absolute bottom-1.5 right-1.5"
+                    width="24"
+                    height="24"
                     viewBox="0 0 14 14"
                     fill="none"
                     stroke="currentColor"
-                    stroke-width="1.5"
+                    stroke-width="2.5"
                     stroke-linecap="round"
                   >
                     <path d="M9 12 H12 V9" />
