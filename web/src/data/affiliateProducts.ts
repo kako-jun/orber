@@ -29,21 +29,18 @@ export const AFFILIATE_PRODUCTS: AffiliateProduct[] = [
     url: 'https://amzn.to/4nbQcSF',
     title: 'ドラゴンクエストIII そして伝説へ…',
     imageUrl: 'https://m.media-amazon.com/images/I/61mJHMLthgL.jpg',
-    // TODO(kako-jun): 一言コメントを入れる
-    caption: '',
+    caption: 'シルバーオーブだけ難しすぎる！',
   },
   {
     url: 'https://amzn.to/4tpzi4L',
     title: 'HG オオワシアカツキガンダム 1/144',
     imageUrl: 'https://m.media-amazon.com/images/I/51tZBx3ATSL.jpg',
-    // TODO(kako-jun): 一言コメントを入れる
-    caption: '',
+    caption: 'オーブの目立つ秘密兵器！',
   },
   {
     url: 'https://amzn.to/4nfDjHr',
     title: '行って眺めて撮る 巨大工場探訪ガイド',
     imageUrl: 'https://m.media-amazon.com/images/I/51i4p4hJLYL.jpg',
-    // TODO(kako-jun): 一言コメントを入れる
-    caption: '',
+    caption: '写真を撮ってorberで加工しよう！',
   },
 ];
