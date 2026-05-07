@@ -200,10 +200,10 @@ export function detectLang(): Lang {
 // それぞれ自島の signal を更新するため、どちらの構成でも結果は同じ。
 const [lang, setLang] = createSignal<Lang>('en');
 if (typeof window !== 'undefined') {
-  queueMicrotask(() => {
-    const detected = detectLang();
-    if (detected !== 'en') setLang(detected);
-  });
+  // microtask は hydration 用 top-level コードの直後・Subtitle.tsx の onMount より
+  // 前に走ることを期待。`createSignal` はデフォルトで `===` 等値ガード付きなので
+  // en ブラウザで `setLang('en')` を呼んでも no-op (購読側 effect は再走しない)。
+  queueMicrotask(() => setLang(detectLang()));
 }
 export { lang, setLang };
 

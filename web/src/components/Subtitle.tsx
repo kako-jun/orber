@@ -15,8 +15,10 @@ import { t, setLang, detectLang } from '../lib/strings';
 
 export default function Subtitle() {
   onMount(() => {
-    // safety belt: 既に strings.ts module init で設定済みだが、SSR→hydration
-    // の境界で食い違いがあれば再同期する。同じ値なら setLang は no-op。
+    // safety belt: 通常は strings.ts の queueMicrotask が hydration 直後に
+    // setLang(detectLang()) を済ませているが、microtask キューの順序が想定と
+    // 違う環境 (将来の Solid runtime / 低速ブラウザ等) のために再同期しておく。
+    // 同じ値なら createSignal の等値ガードで no-op。
     const next = detectLang();
     setLang(next);
     if (typeof document !== 'undefined') {
