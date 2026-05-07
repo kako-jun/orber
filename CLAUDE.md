@@ -103,6 +103,7 @@ web/                        # Web フロントエンド (#37, #38)
 - **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
 - **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
 - **PWA は手書き Service Worker (#148)** — `web/public/sw.js` を直接書き、`@vite-pwa/astro` 等の追加依存は入れない。machigai-salad と同じく `CACHE_NAME = 'orber-__BUILD_DATE__'`、precache は `['/', '/manifest.webmanifest']` のみ。`/_astro/*` (Astro/Vite content-hash 付き immutable asset) は **CacheFirst**、それ以外は **network-first** + キャッシュ fallback。navigation がキャッシュ miss + オフラインなら precache した `/` を返す (shell 戦略)。`blob:` / `data:` は intercept しない（生成結果の DL を握り潰さないため）。`cache.put` は `event.waitUntil()` で SW lifetime に縛る。`npm run build` の `stamp:sw` 段で `dist/sw.js` の `__BUILD_DATE__` を JST 日付に Node 1 行スクリプトで literal 置換する。詳細は DESIGN.md §15
+- **AffiliateGrid は横展開パターン (#152)** — Footer の Sponsor 直下に置く 3 商品 Amazon affiliate グリッドは、データ層 (`web/src/data/affiliateProducts.ts`) と UI 層 (`web/src/components/AffiliateGrid.tsx`) を分離し、**他 PWA リポにコピペで横展開する**前提で書く (npm パッケージ化はしない)。商品 URL は **amzn.to 短縮リンク** (Associates ダッシュボードで生成) を `url` フィールドに直接入れ、tag を URL に露出しない。商品カードは円形 mask + inset shadow + outer glow の orb スタイルで orber 本体と連続性を持たせる。詳細は DESIGN.md §16
 
 ## 関連プロジェクト
 
