@@ -47,10 +47,10 @@ export const STRINGS = {
   shapeOptionCircle: { ja: '円', en: 'Circle' },
   shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
   glyphCharLabel: { ja: '文字', en: 'Character' },
-  // 例示は ☆ だけだとユーザーが「☆ しか入らない」と誤解するため、
-  // 記号 / アルファベット / 矢印 / 雷 / 花 と幅広く例示する。Noto Sans Symbols 2
-  // に収録されている文字なら ASCII / 記号 / 一部絵文字も入る (収録外は警告表示)。
-  glyphCharPlaceholder: { ja: '例: ☆ A → ⚡ ✿', en: 'e.g., ☆ A → ⚡ ✿' },
+  // 自由入力欄であることを示すため "emoji" 1 単語。下のボタン群と同じ記号を
+  // 例示しても重複情報になるだけなので、ユーザーが「ボタンに無い文字も
+  // 入れられる」と気付けるよう emoji 表記にする (収録外なら警告表示)。
+  glyphCharPlaceholder: { ja: 'emoji', en: 'emoji' },
   glyphCharUnsupported: {
     ja: '同梱フォントに収録されていません',
     en: 'Not in bundled font',

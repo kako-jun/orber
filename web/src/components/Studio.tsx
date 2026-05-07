@@ -112,7 +112,11 @@ export default function Studio() {
   // #131: 4 軸は常時展開で、どのボタンも押した瞬間に runBatch を起動する。
   // 初期値は empty identity を維持し、既存 output regression を防ぐ。
   const [shape, setShape] = createSignal<ShapeChoice>('circle');
-  const [glyphChar, setGlyphChar] = createSignal<string>('☆');
+  // 初期値は空文字。User: 「最初から ☆ が入力されてるせいでプレイスホルダ
+  // を見られない」。空にすればプレイスホルダ (例: emoji) が見え、ユーザーが
+  // 自由入力欄であることに気付ける。glyph shape を選んでも何も入れなければ
+  // line 700 の guard で runBatch が走らないので落ちない。
+  const [glyphChar, setGlyphChar] = createSignal<string>('');
   // #136: Glyph 回転 ON/OFF。glyph_char 切替時に GLYPH_DEFAULT_ROTATE で上書き。
   // ユーザーが checkbox を切替えるとその session 中は尊重し、次の glyph 切替で
   // 再度 default が適用される。既定 true（既存挙動互換）。
