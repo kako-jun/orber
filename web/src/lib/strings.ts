@@ -156,9 +156,11 @@ export const STRINGS = {
   //   - heading: 「機材」だと書籍 / ゲームに合わないので「kako-jun のおすすめ」に
   //   - disclosure: 1 行に収まる短さに圧縮。Amazon Associate の開示は維持
   //     (en は FTC 推奨テンプレ、ja は短文 + Associate キーワードを残す)
+  // #174: Footer 内の他要素 (© kako-jun / アイコンリンク) で著者は自明なため、
+  // 'kako-jun の' / "kako-jun's" は冗長として削除。
   affiliateHeading: {
-    ja: 'kako-jun のおすすめ',
-    en: "kako-jun's picks",
+    ja: 'おすすめ',
+    en: 'Picks',
   },
   affiliateDisclosure: {
     ja: '購入が orber 維持の支援になります (Amazon アソシエイト)',
