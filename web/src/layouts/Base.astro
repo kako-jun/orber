@@ -179,15 +179,66 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
       .glyph-symbol-text {
         font-family: 'Noto Sans Symbols 2', system-ui, sans-serif;
         font-variant-emoji: text;
-        /* #174: Noto Sans Symbols 2 はフォント自体の baseline / metrics box
-           が cap-height に対して下に偏っているため、flex items-center だけで
-           は picker ボタン内で記号が下寄り (もしくは右寄り) に見える。
-           font-feature 指定で metric を均し、line-height を 1 に強制した上で
-           text-align: center を当て、span 側の flex centring と二重に揃える。
-           Y 軸の追加補正は OS / フォントバージョン差で別ズレを誘発するので
-           足さず、まずは line-height + text-align のみで揃えて様子を見る。 */
         line-height: 1;
         text-align: center;
+      }
+      /* #174 (二次対応): Noto Sans Symbols 2 はフォント自体の asc/desc が
+         cap-height に対して下に偏っており、grid place-items-center で line
+         box を中央に置いても glyph 自体は line box 内で下寄りに描画される。
+         picker セル限定で 1px 上に持ち上げ、ボタンの光学中心と一致させる。
+         input / button 自体には適用しない (placeholder の位置がズレるため)。
+         tabular-nums で metric 揺れを抑え、span を inline-grid 化することで
+         line-height: 0 でも下端が切れないようにする。 */
+      .glyph-picker-cell {
+        font-feature-settings: 'tnum' 1;
+        transform: translateY(-1px);
+      }
+      /* #174 (二次対応): 自前チェックボックス。
+         accent-color では iOS / Android で「白箱+白チェック」になり checked が
+         見えなかったため、appearance:none で UA 描画を完全に殺し、
+         ::before の SVG-mask でチェックマークを描く。色は fg / bg / glassBorder
+         トークンのみ使用し、DESIGN.md のモノクロ縛りを守る。
+         - unchecked: 透明背景 + 1.5px hairline の枠
+         - checked:   bg-fg (白) で塗り潰し、::before に bg (#040404) のチェック
+         - focus:     focus-ring を残す (Tailwind side で focus-visible:ring) */
+      .glass-checkbox {
+        appearance: none;
+        -webkit-appearance: none;
+        position: relative;
+        cursor: pointer;
+        background-color: transparent;
+        border: 1.5px solid rgba(255, 255, 255, 0.32);
+        border-radius: 3px;
+        flex-shrink: 0;
+        transition: background-color 120ms ease, border-color 120ms ease;
+      }
+      .glass-checkbox:hover:not(:disabled) {
+        border-color: rgba(255, 255, 255, 0.55);
+      }
+      .glass-checkbox:checked {
+        background-color: #ffffff;
+        border-color: #ffffff;
+      }
+      /* チェックマーク本体: ::after 内に白背景上の暗いチェックを SVG mask で
+         描く。背景は bg トークン (#040404) と同値で、orber のページ背景に
+         自然に溶け込む濃さ。 */
+      .glass-checkbox:checked::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background-color: #040404;
+        -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+        mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+        -webkit-mask-repeat: no-repeat;
+        mask-repeat: no-repeat;
+        -webkit-mask-position: center;
+        mask-position: center;
+        -webkit-mask-size: 90% 90%;
+        mask-size: 90% 90%;
+      }
+      .glass-checkbox:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
       }
       .skeleton {
         background-color: rgba(255, 255, 255, 0.04);
