@@ -110,8 +110,8 @@ export default function Footer() {
             上 = mt-8 (32px) + 内側 py-2 (8px) = 40px
             下 = 内側 py-2 (8px) + gap-8 (32px) = 40px
           下端は main の p-8 (32px) のみに頼り、footer の bottom padding は
-          pb-0 で削る (旧実装と同じ意図)。 */}
-      <div class="mx-auto max-w-3xl px-4 pt-0 pb-0 flex flex-col items-center text-center gap-8">
+          py-0 で削る (旧実装と同じ意図)。 */}
+      <div class="mx-auto max-w-3xl px-4 py-0 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
         <div
           class="flex flex-col items-center gap-2 py-2"
