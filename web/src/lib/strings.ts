@@ -62,7 +62,7 @@ export const STRINGS = {
     ja: '画像を選択してください',
     en: 'Pick an image first',
   },
-  imageShapeInvert: { ja: 'シルエット反転', en: 'Invert silhouette' },
+  // #181: imageShapeInvert (#170) はトグルごと削除済み。
   imageShapeNoContrast: {
     ja: 'この画像にはコントラストがありません',
     en: 'This image has no contrast',

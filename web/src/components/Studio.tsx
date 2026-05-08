@@ -136,9 +136,9 @@ export default function Studio() {
   const [imageShapeName, setImageShapeName] = createSignal<string>('');
   const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
   const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
-  // #170: シルエット反転トグル。auto-polarity (= 少数派 = 被写体) が外れる
-  // 画像 (証明写真など被写体が画面の半分以上) の救済。
-  const [imageShapeInvert, setImageShapeInvert] = createSignal<boolean>(false);
+  // #181: シルエット反転トグル (#170) は #174 のレタボ誤判定修正後に
+  // 実機検証で効果が視認できないレベルになったため削除。auto-polarity が
+  // 外れる画像があれば外部 (magick -negate 等) で反転して再ドロップする。
   // setImageShape を再送するための File ref。runBatch / crash 経路で参照。
   let lastImageFileRef: File | null = null;
   // M1: 初期値は `''`（identity）。UI 側で「標準」ボタンが `aria-pressed` 状態に
@@ -600,17 +600,11 @@ export default function Studio() {
     // を据え置く。
     if (wasmStatus() === 'error') return;
     // #174 invariant: 画像差し替え時は shape / glyphChar / glyphRotate /
-    // imageShapeInvert / countPreset / speedPreset / softnessPreset / aspect
-    // のオプション signal を一切リセットしない。ユーザーが新しい画像を
-    // ドロップした際、下に並ぶ調整ボタンの選択状態は前画像の操作を継承する。
+    // countPreset / speedPreset / softnessPreset / aspect のオプション signal
+    // を一切リセットしない。ユーザーが新しい画像をドロップした際、下に並ぶ
+    // 調整ボタンの選択状態は前画像の操作を継承する。
     // (acceptFile が触るのは pickedName / pickedThumbUrl / phase / decoded /
     // errorMsg のみで、UI 4 軸 + shape は無関係に維持される。)
-    //
-    // imageShapeInvert は shape='image' で使う「画像シルエット」ファイル側の
-    // 極性反転トグルで、ドロップエリアに入れる「ソース画像」とは別の File
-    // 経路 (onImageShapePick / onImageShapeInvertChange) に紐づく。
-    // ソース画像を差し替えてもシルエットファイルは worker キャッシュに残る
-    // ため、invert 状態を継承するのが正しい (ユーザーの意図的選択)。
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
@@ -759,7 +753,7 @@ export default function Studio() {
   const onImageShapePick = async (file: File, triggerRun = true) => {
     try {
       lastImageFileRef = file;
-      await workerSetImageShape(file, imageShapeInvert());
+      await workerSetImageShape(file);
       const oldUrl = imageShapeUrl();
       if (oldUrl) URL.revokeObjectURL(oldUrl);
       setImageShapeUrl(URL.createObjectURL(file));
@@ -770,23 +764,6 @@ export default function Studio() {
       console.warn('failed to load image shape', err);
       setErrorMsg(t('imageShapeLoadFailed'));
       setImageShapeReady(false);
-    }
-  };
-
-  // #170: invert トグル切替時に worker 側 SDF を再生成する。File ref が
-  // 残っていれば再 upload を試み、失敗時は signal をロールバックして UI
-  // と worker 状態の整合を保つ (S2)。スタイルは onImageShapePick の async
-  // /try-catch に揃える (N1)。
-  const onImageShapeInvertChange = async (next: boolean) => {
-    setImageShapeInvert(next);
-    if (!lastImageFileRef || shape() !== 'image') return;
-    try {
-      await workerSetImageShape(lastImageFileRef, next);
-      runBatchIfReady();
-    } catch (err) {
-      console.warn('failed to re-upload image shape on invert toggle', err);
-      setImageShapeInvert(!next);
-      setErrorMsg(formatRunBatchError(err));
     }
   };
 
@@ -1516,19 +1493,10 @@ export default function Studio() {
                 </span>
               </Show>
             </div>
-            {/* #170: シルエット反転トグル。auto-polarity が外れる画像
-                (被写体が画面の半分以上を占める証明写真風など) の救済。 */}
-            <span />
-            <label class={GLASS_CHECKBOX_LABEL}>
-              <input
-                type="checkbox"
-                class={GLASS_CHECKBOX_INPUT}
-                checked={imageShapeInvert()}
-                onChange={(e) => void onImageShapeInvertChange(e.currentTarget.checked)}
-                disabled={!decoded() || downloading() || !imageShapeReady()}
-              />
-              <span>{t('imageShapeInvert')}</span>
-            </label>
+            {/* #181: シルエット反転トグル (#170) は #174 のレタボ修正後に
+                効果が視認できないレベルになったため削除。auto-polarity が
+                外れる画像があれば外部 (magick -negate 等) で反転して再ドロップ
+                で対処する。 */}
           </>
         </Show>
 

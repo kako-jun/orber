@@ -215,24 +215,7 @@ describe('generateImageSdf()', () => {
     expect(r.sdf.every((v) => v === 0)).toBe(true);
   });
 
-  test('#170 invert=true で inside/outside が反転する', () => {
-    // 不透明・中央 1px 白 (= 自動判定で inside=中央)。invert=true で
-    // 中央以外が inside になり、SDF byte 値が大きく変わる。
-    const SIZE = 8;
-    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
-    for (let i = 0; i < SIZE * SIZE; i++) data[i * 4 + 3] = 255;
-    data[(3 * SIZE + 3) * 4 + 0] = 255;
-    data[(3 * SIZE + 3) * 4 + 1] = 255;
-    data[(3 * SIZE + 3) * 4 + 2] = 255;
-    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
-    const fakeBitmap = { width: SIZE, height: SIZE } as unknown as ImageBitmap;
-    const direct = generateImageSdf(fakeBitmap, SIZE, false);
-    const inverted = generateImageSdf(fakeBitmap, SIZE, true);
-    // 中央: direct は inside (signed_px=+0.5 → byte=191)、
-    //       invert は outside (signed_px=-0.5 → byte=64)。
-    expect(direct.sdf[3 * SIZE + 3]).toBe(191);
-    expect(inverted.sdf[3 * SIZE + 3]).toBe(64);
-  });
+  // #181: invert (#170) は削除済み。テストも撤去。
 
   test('#174 非正方形画像 — レタボックスの透明領域に引きずられず被写体輪郭を抽出する', () => {
     // 16×8 の不透明 (alpha=255) 画像を 16×16 SDF サイズへ contain 描画する想定。
