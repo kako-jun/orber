@@ -135,62 +135,96 @@ export function generateImageSdf(
   const img = ctx.getImageData(0, 0, s, s);
   const data = img.data;
 
-  // #171: 透過判定は「alpha < 255 のピクセルが画像全体の 1% 以上」で初めて
-  // 透過画像とみなす。1 px 単位の混入 (JPEG → PNG 変換のロス由来など) で
-  // alpha 経路に倒れて輝度ベースの被写体抽出が走らなくなる事故を防ぐ。
+  // #174: contain-fit で生じるレタボックス領域 (描画矩形 dx..dx+dw / dy..dy+dh
+  // の外側) は `clearRect` 後に alpha=0 のまま残る。旧実装はこのレタボ部分
+  // も含めて s*s 全体で alpha 集計していたため、JPEG (本来不透明) を非正方形
+  // で入力すると `alphaPixelCount` がレタボ分だけ膨らみ `hasMeaningfulAlpha`
+  // が常に true 化、alpha 経路に倒れて「描画矩形 = inside」の純粋な矩形
+  // シルエットになっていた (#174 報告: 白背景 + キャラの絵でもキャラ輪郭が
+  // 取れず矩形のまま)。
+  // 修正: 透過判定 / 輝度判定の両経路とも、評価範囲を描画矩形 (dx..dx+dw,
+  // dy..dy+dh) に限定する。レタボ部分は inside=0 を維持し、最終 SDF では
+  // 確実に背景として扱われる。
+  const drawnPixelCount = dw * dh;
+
+  // #171 + #174: 透過判定は「描画矩形内で alpha<255 のピクセルが 1% 以上」。
+  // 1 px 単位の混入 (JPEG → PNG 変換のロス由来など) で alpha 経路に倒れて
+  // 輝度ベース抽出が無効化される事故を防ぐ閾値はそのまま、母数だけ
+  // s*s → dw*dh に置換。
   let alphaPixelCount = 0;
-  for (let i = 0; i < s * s; i++) {
-    if (data[i * 4 + 3] < 255) alphaPixelCount++;
+  for (let y = dy; y < dy + dh; y++) {
+    for (let x = dx; x < dx + dw; x++) {
+      if (data[(y * s + x) * 4 + 3] < 255) alphaPixelCount++;
+    }
   }
-  // ドキュメント上は「1% 以上」表記なので >= で揃える (boundary を inclusive)。
-  const hasMeaningfulAlpha = alphaPixelCount * 100 >= s * s;
+  const hasMeaningfulAlpha = alphaPixelCount * 100 >= drawnPixelCount;
 
   const inside = new Uint8Array(s * s);
   let insideCount = 0;
   if (hasMeaningfulAlpha) {
-    // alpha しきい値経路
-    for (let i = 0; i < s * s; i++) {
-      if (data[i * 4 + 3] >= 128) {
-        inside[i] = 1;
-        insideCount++;
+    // alpha しきい値経路 — 描画矩形内のみ評価。レタボ部分は inside=0 のまま。
+    for (let y = dy; y < dy + dh; y++) {
+      for (let x = dx; x < dx + dw; x++) {
+        const i = y * s + x;
+        if (data[i * 4 + 3] >= 128) {
+          inside[i] = 1;
+          insideCount++;
+        }
       }
     }
   } else {
-    // 輝度しきい値経路 (auto-polarity: 少数派 = 被写体)
+    // 輝度しきい値経路 (auto-polarity: 少数派 = 被写体)。
+    // 平均輝度・dark/light 集計・しきい値判定すべて描画矩形内に閉じる。
     let sumY = 0;
     const yBuf = new Float32Array(s * s);
-    for (let i = 0; i < s * s; i++) {
-      const r = data[i * 4];
-      const g = data[i * 4 + 1];
-      const b = data[i * 4 + 2];
-      const y = 0.299 * r + 0.587 * g + 0.114 * b;
-      yBuf[i] = y;
-      sumY += y;
+    for (let y = dy; y < dy + dh; y++) {
+      for (let x = dx; x < dx + dw; x++) {
+        const i = y * s + x;
+        const r = data[i * 4];
+        const g = data[i * 4 + 1];
+        const b = data[i * 4 + 2];
+        const yv = 0.299 * r + 0.587 * g + 0.114 * b;
+        yBuf[i] = yv;
+        sumY += yv;
+      }
     }
-    const avgY = sumY / (s * s);
+    const avgY = sumY / drawnPixelCount;
     let darkCount = 0;
-    for (let i = 0; i < s * s; i++) {
-      if (yBuf[i] < avgY) darkCount++;
+    for (let y = dy; y < dy + dh; y++) {
+      for (let x = dx; x < dx + dw; x++) {
+        const i = y * s + x;
+        if (yBuf[i] < avgY) darkCount++;
+      }
     }
-    const insideIsDark = darkCount < s * s / 2;
-    for (let i = 0; i < s * s; i++) {
-      const isInside = insideIsDark ? yBuf[i] < avgY : yBuf[i] >= avgY;
-      if (isInside) {
-        inside[i] = 1;
-        insideCount++;
+    const insideIsDark = darkCount < drawnPixelCount / 2;
+    for (let y = dy; y < dy + dh; y++) {
+      for (let x = dx; x < dx + dw; x++) {
+        const i = y * s + x;
+        const isInside = insideIsDark ? yBuf[i] < avgY : yBuf[i] >= avgY;
+        if (isInside) {
+          inside[i] = 1;
+          insideCount++;
+        }
       }
     }
   }
 
-  // #170: invert が true なら inside/outside を flip。auto-polarity で
-  // 反転誤判定された画像の救済。
+  // #170 + #174: invert は描画矩形内のみで反転。レタボ部分は inside=0 を維持。
+  // 旧実装は s*s 全体で flip していたため、レタボ部分も inside=1 化して
+  // 不要な巨大シルエットが生成されていた。
   if (invert) {
-    for (let i = 0; i < s * s; i++) inside[i] = inside[i] ? 0 : 1;
-    insideCount = s * s - insideCount;
+    for (let y = dy; y < dy + dh; y++) {
+      for (let x = dx; x < dx + dw; x++) {
+        const i = y * s + x;
+        inside[i] = inside[i] ? 0 : 1;
+      }
+    }
+    insideCount = drawnPixelCount - insideCount;
   }
 
   // #169: 全 inside でも全 outside でもコントラスト 0 として扱う。
-  if (insideCount === 0 || insideCount === s * s) {
+  // 母数は描画矩形内 (drawnPixelCount) で判定する。
+  if (insideCount === 0 || insideCount === drawnPixelCount) {
     return { sdf: new Uint8Array(s * s), ok: false };
   }
 

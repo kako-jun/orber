@@ -599,6 +599,12 @@ export default function Studio() {
     // workerSetSource で reject されるだけ。最初の段階で弾いてエラー UI
     // を据え置く。
     if (wasmStatus() === 'error') return;
+    // #174 invariant: 画像差し替え時は shape / glyphChar / glyphRotate /
+    // imageShapeInvert / countPreset / speedPreset / softnessPreset / aspect
+    // のオプション signal を一切リセットしない。ユーザーが新しい画像を
+    // ドロップした際、下に並ぶ調整ボタンの選択状態は前画像の操作を継承する。
+    // (acceptFile が触るのは pickedName / pickedThumbUrl / phase / decoded /
+    // errorMsg のみで、UI 4 軸 + shape は無関係に維持される。)
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
