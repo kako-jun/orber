@@ -605,6 +605,12 @@ export default function Studio() {
     // ドロップした際、下に並ぶ調整ボタンの選択状態は前画像の操作を継承する。
     // (acceptFile が触るのは pickedName / pickedThumbUrl / phase / decoded /
     // errorMsg のみで、UI 4 軸 + shape は無関係に維持される。)
+    //
+    // imageShapeInvert は shape='image' で使う「画像シルエット」ファイル側の
+    // 極性反転トグルで、ドロップエリアに入れる「ソース画像」とは別の File
+    // 経路 (onImageShapePick / onImageShapeInvertChange) に紐づく。
+    // ソース画像を差し替えてもシルエットファイルは worker キャッシュに残る
+    // ため、invert 状態を継承するのが正しい (ユーザーの意図的選択)。
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
@@ -1166,6 +1172,10 @@ export default function Studio() {
   // 視覚変化が乏しく、ユーザーから「チェックマークが出ていない」と
   // 報告されていた。背景指定を外して OS ネイティブの accent-color 塗り
   // (白塗り + 黒/濃グレーのチェックマーク) に委ねる。
+  // unchecked 状態は border-glassBorder (1.5px hairline) で枠を確保するので、
+  // デスクトップ Firefox/Chrome の dark theme でも box 自体は背景から見分け
+  // られる。bg を指定しないことで透けるのは UA 既定 (薄い灰塗り) で
+  // 一貫したチェック描画が得られる。
   const GLASS_CHECKBOX_INPUT =
     'h-4 w-4 rounded-sm border border-glassBorder ' +
     'accent-fg ' +

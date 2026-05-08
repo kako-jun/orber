@@ -103,9 +103,10 @@ export default function Footer() {
       aria-label={t('footerAriaLabel')}
     >
       {/* #174: 旧 border-t border-hairline は削除。区切り線をやめてオーブ
-          モチーフ (●×5) の上下が同サイズの余白になるよう、py-10 を据える。
-          下端は main の p-8 を据え置き (旧 pb-0 と同じ意図)。 */}
-      <div class="mx-auto max-w-3xl px-4 py-10 pb-0 flex flex-col items-center text-center gap-8">
+          モチーフ (●×5) の上下が同サイズの余白になるよう、上端 pt-10 を据える。
+          下端は main の p-8 (32px) のみに頼り、footer 自体の bottom padding
+          は pb-0 で削る (旧実装と同じ意図)。 */}
+      <div class="mx-auto max-w-3xl px-4 pt-10 pb-0 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
         <div
           class="flex flex-col items-center gap-2 py-2"
