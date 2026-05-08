@@ -173,10 +173,15 @@ export const STRINGS = {
   viewsLabelSuffix: { ja: '', en: ' views' },
   // #146 review S2: Footer 全体の aria-label を i18n 化。
   footerAriaLabel: { ja: 'orber フッター', en: 'orber footer' },
-  // Footer 末尾の小さい link 行 (machigai-salad パターン)。
-  // [authorSite] · [GitHub Sponsors テキスト] · © kako-jun を 1 行で。
+  // Footer 末尾の小さい link 行。#174 でテキストリンクからアイコン並びに変更
+  // (osaka-kenpo / sasso / agasteer と統一)。© kako-jun は whitespace-nowrap で
+  // ハイフンを跨ぐ改行を防ぐ (旧: `kako-` で改行され `jun` だけ次行に落ちる)。
   authorSiteLabel: { ja: 'kako-jun の他作品', en: 'More by kako-jun' },
   sponsorTextLabel: { ja: 'GitHub Sponsors', en: 'GitHub Sponsors' },
+  // #174: アイコンリンクの aria-label。
+  authorSiteAriaLabel: { ja: 'kako-jun のサイト', en: "kako-jun's site" },
+  repoLinkAriaLabel: { ja: 'GitHub リポジトリ', en: 'GitHub repository' },
+  sponsorAriaLabel: { ja: 'GitHub Sponsors', en: 'GitHub Sponsors' },
   // #146: About 見出し / aboutBody / aboutBuiltWith / repoLinkLabel は Footer から外した。
   // privacyNote だけ「画像はブラウザ内で処理される」境界条件として残す。
   // #148: PWA install prompt (machigai-salad と同パターンの toast)。
