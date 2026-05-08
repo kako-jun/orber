@@ -1167,18 +1167,16 @@ export default function Studio() {
   const GLASS_CHECKBOX_LABEL =
     'inline-flex items-center gap-2 cursor-pointer text-sm text-fg ' +
     'has-[:disabled]:opacity-40 has-[:disabled]:cursor-not-allowed';
-  // #174: 旧 `bg-glassBg` を削除。iOS Safari / Android Chrome では半透明白
-  // 背景の上に accent-fg (白) でチェックを描画すると checked 状態でも
-  // 視覚変化が乏しく、ユーザーから「チェックマークが出ていない」と
-  // 報告されていた。背景指定を外して OS ネイティブの accent-color 塗り
-  // (白塗り + 黒/濃グレーのチェックマーク) に委ねる。
-  // unchecked 状態は border-glassBorder (1.5px hairline) で枠を確保するので、
-  // デスクトップ Firefox/Chrome の dark theme でも box 自体は背景から見分け
-  // られる。bg を指定しないことで透けるのは UA 既定 (薄い灰塗り) で
-  // 一貫したチェック描画が得られる。
+  // #174 (二次対応): accent-color: white は iOS Safari / Android Chrome では
+  // 「白い箱に白いチェックマーク」となり、checked かどうか視認できない。
+  // 旧版は accent-fg + bg-glassBg だったが効果が無かったため、appearance:none
+  // にして自前で checked 状態を描画する方式に切り替える。
+  // - unchecked: border-glassBorder + 透明背景 (UA defaults を完全置換)
+  // - checked: bg-fg (白塗り) + ::after の SVG 風チェックマークを CSS で描画
+  // クラス `glass-checkbox` を Base.astro に置き、Tailwind では到達できない
+  // ::after / :checked + ::after を CSS 側で表現する。
   const GLASS_CHECKBOX_INPUT =
-    'h-4 w-4 rounded-sm border border-glassBorder ' +
-    'accent-fg ' +
+    'glass-checkbox h-4 w-4 ' +
     'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
     'disabled:cursor-not-allowed';
   const isRunning = () =>
@@ -1448,10 +1446,13 @@ export default function Studio() {
                         Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
                         font-variant-emoji: text で対応済み。selector は display 用で、
                         value (sym) には付けないので状態管理は影響を受けない。
-                        Noto Sans Symbols 2 はフォント独自の baseline でボタン中央
-                        からズレるので、span を flex で h-full 化して再度
-                        items-center / justify-center を当てて強制センタリングする。 */}
-                    <span class="flex h-full w-full items-center justify-center leading-none">
+                        #174 (二次対応): flex items-center だけでは Noto Sans Symbols 2
+                        のフォント metrics (asc/desc 不均等) によりボタン中央からズレ
+                        続けるため、grid place-items-center に切り替え + line-height: 1
+                        で line box を最小化、かつ class .glyph-picker-cell を当てて
+                        Base.astro 側の `transform: translateY(...)` で X-height 中心と
+                        ボタン中央のズレを微補正する。 */}
+                    <span class="glyph-picker-cell grid h-full w-full place-items-center leading-none">
                       {sym + '︎'}
                     </span>
                   </button>

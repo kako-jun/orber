@@ -99,14 +99,19 @@ export default function Footer() {
 
   return (
     <footer
-      class="mt-16"
+      class="mt-8"
       aria-label={t('footerAriaLabel')}
     >
-      {/* #174: 旧 border-t border-hairline は削除。区切り線をやめてオーブ
-          モチーフ (●×5) の上下が同サイズの余白になるよう、上端 pt-10 を据える。
-          下端は main の p-8 (32px) のみに頼り、footer 自体の bottom padding
-          は pb-0 で削る (旧実装と同じ意図)。 */}
-      <div class="mx-auto max-w-3xl px-4 pt-10 pb-0 flex flex-col items-center text-center gap-8">
+      {/* #174: 旧 border-t border-hairline は削除済み。border が無いままで
+          pt-10 を残すと「水平線が消えただけで上の余白が広すぎる」見え方に
+          なるため、上端パディングを 0 に。footer 自体の上下分離は mt-8
+          (Studio との区切り) のみに頼り、オーブモチーフ (●×5) の上下が
+          gap-8 ベースで同サイズの余白になる:
+            上 = mt-8 (32px) + 内側 py-2 (8px) = 40px
+            下 = 内側 py-2 (8px) + gap-8 (32px) = 40px
+          下端は main の p-8 (32px) のみに頼り、footer の bottom padding は
+          py-0 で削る (旧実装と同じ意図)。 */}
+      <div class="mx-auto max-w-3xl px-4 py-0 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
         <div
           class="flex flex-col items-center gap-2 py-2"
