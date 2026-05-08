@@ -350,7 +350,10 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 
 ### Image 入力 (#160)
 
-- shape segmented pill は `Circle / Glyph / Image` の 3 択
+- shape segmented pill は `Orb / Glyph / Image` の 3 択 (内部値 `circle` /
+  `glyph` / `image` は wasm enum と紐付くため不変。UI ラベルのみ #174 で
+  Circle → Orb に改名し、専用ぼかし経路と Glyph の汎用 SDF 経路の挙動差を
+  明示)
 - `Image` を選ぶとシェイプ row の下に画像入力 row が出現する: ファイル選択
   ボタン + 9×9 サムネイル + ファイル名表示
 - 入力画像 (PNG / JPG / WebP / GIF / SVG) は **`File` を worker に
