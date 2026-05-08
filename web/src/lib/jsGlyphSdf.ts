@@ -97,8 +97,9 @@ export interface ImageSdfResult {
  *   平均輝度を境界に **inside ピクセルが少数派** になる側を採用する (典型的
  *   な被写体は背景より小領域である前提のヒューリスティック)
  *
- * #170: `invert` が true なら inside / outside を強制的に逆転させる
- * (被写体が画面の半分以上を占める画像で自動判定が反転するときの救済)。
+ * #181: 旧 invert 引数 (#170) は #174 のレタボ修正後に効果が視認できない
+ * レベルになり削除。auto-polarity (= 少数派 = 被写体) のみで判定する。
+ * 自動判定が外れる画像があれば外部 (magick -negate 等) で反転入力する。
  *
  * #169: シルエットが抽出できない (= inside ピクセルが 0、または全画素が
  * inside でコントラストが無い) 場合は `ok: false` を返し、呼び出し側で UI
@@ -110,7 +111,6 @@ export interface ImageSdfResult {
 export function generateImageSdf(
   bitmap: ImageBitmap,
   size: number,
-  invert: boolean = false,
 ): ImageSdfResult {
   const s = Math.max(1, size | 0);
   if (typeof OffscreenCanvas === 'undefined') {
@@ -209,18 +209,8 @@ export function generateImageSdf(
     }
   }
 
-  // #170 + #174: invert は描画矩形内のみで反転。レタボ部分は inside=0 を維持。
-  // 旧実装は s*s 全体で flip していたため、レタボ部分も inside=1 化して
-  // 不要な巨大シルエットが生成されていた。
-  if (invert) {
-    for (let y = dy; y < dy + dh; y++) {
-      for (let x = dx; x < dx + dw; x++) {
-        const i = y * s + x;
-        inside[i] = inside[i] ? 0 : 1;
-      }
-    }
-    insideCount = drawnPixelCount - insideCount;
-  }
+  // #181: invert 反転 (#170) は削除済み。auto-polarity の精度が #174 で
+  // 上がって以降、UI トグルとしての価値が消えていた。
 
   // #169: 全 inside でも全 outside でもコントラスト 0 として扱う。
   // 母数は描画矩形内 (drawnPixelCount) で判定する。
