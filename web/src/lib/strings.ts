@@ -142,7 +142,9 @@ export const STRINGS = {
   },
   // #128 / #156: Footer (Amazon affiliate / QR / Copyright / Counter)。
   // sponsorLabel / sponsorTitle は #156 で大きい GH Sponsors button を削除して
-  // 以来未使用 (テキストリンクは sponsorTextLabel 側) なので削除済み。
+  // 以来未使用なので削除済み。authorSiteLabel / sponsorTextLabel も #174 で
+  // テキストリンク → アイコン化に伴い未使用になり削除済み (置換キー:
+  // authorSiteAriaLabel / repoLinkAriaLabel / sponsorAriaLabel)。
   //
   // affiliate 文言:
   //   - User 「本やゲームは機材じゃない」「Amazon と 2 回言う必要はない」
@@ -173,10 +175,13 @@ export const STRINGS = {
   viewsLabelSuffix: { ja: '', en: ' views' },
   // #146 review S2: Footer 全体の aria-label を i18n 化。
   footerAriaLabel: { ja: 'orber フッター', en: 'orber footer' },
-  // Footer 末尾の小さい link 行 (machigai-salad パターン)。
-  // [authorSite] · [GitHub Sponsors テキスト] · © kako-jun を 1 行で。
-  authorSiteLabel: { ja: 'kako-jun の他作品', en: 'More by kako-jun' },
-  sponsorTextLabel: { ja: 'GitHub Sponsors', en: 'GitHub Sponsors' },
+  // Footer 末尾の小さい link 行。#174 でテキストリンクからアイコン並びに変更
+  // (osaka-kenpo / sasso / agasteer と統一)。© kako-jun は whitespace-nowrap で
+  // ハイフンを跨ぐ改行を防ぐ (旧: `kako-` で改行され `jun` だけ次行に落ちる)。
+  // 各アイコンリンクの aria-label / title。
+  authorSiteAriaLabel: { ja: 'kako-jun のサイト', en: "kako-jun's site" },
+  repoLinkAriaLabel: { ja: 'GitHub リポジトリ', en: 'GitHub repository' },
+  sponsorAriaLabel: { ja: 'GitHub Sponsors', en: 'GitHub Sponsors' },
   // #146: About 見出し / aboutBody / aboutBuiltWith / repoLinkLabel は Footer から外した。
   // privacyNote だけ「画像はブラウザ内で処理される」境界条件として残す。
   // #148: PWA install prompt (machigai-salad と同パターンの toast)。

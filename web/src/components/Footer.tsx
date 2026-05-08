@@ -99,12 +99,13 @@ export default function Footer() {
 
   return (
     <footer
-      class="mt-16 border-t border-hairline"
+      class="mt-16"
       aria-label={t('footerAriaLabel')}
     >
-      {/* レビュー: 下のスペースは main の p-8 (32px) のみに頼り、footer 自体の
-          bottom padding は削る (pb-0)。これで © kako-jun の下のスペースが
-          ヘッダ「orber」の上のスペースと揃う。 */}
+      {/* #174: 旧 border-t border-hairline は削除。区切り線をやめてオーブ
+          モチーフ (●×5) の上下が同サイズの余白になるよう、上端 pt-10 を据える。
+          下端は main の p-8 (32px) のみに頼り、footer 自体の bottom padding
+          は pb-0 で削る (旧実装と同じ意図)。 */}
       <div class="mx-auto max-w-3xl px-4 pt-10 pb-0 flex flex-col items-center text-center gap-8">
         {/* Orb motif — 縦 5 個のドット (DESIGN.md §14) */}
         <div
@@ -172,30 +173,74 @@ export default function Footer() {
           <span>v{buildDate}</span>
         </div>
 
-        {/* D. Copyright + 関連リンク (machigai-salad パターン)。
-            [llll-ll.com] · [GitHub Sponsors テキスト] · © kako-jun を 1 行で。
-            上の大きな Sponsor button は CTA として残しつつ、ここでも小さい
-            テキストリンクを再掲して machigai-salad の終端 UI と揃える。 */}
-        <div class="flex flex-wrap items-center justify-center gap-3 text-xs text-fgSubtle">
+        {/* #174: D. Copyright 行 — テキストリンク (`More by kako-jun` /
+            `GitHub Sponsors`) を SVG アイコン並びに置換。osaka-kenpo / sasso /
+            agasteer で使われる home / GitHub / Sponsors アイコンと同形式。
+            旧版は `GitHub Sponsors` の長さでスマホ幅に収まらず、`© kako-jun`
+            がハイフン直後で改行されて `kako-` のみ前行に残る不格好な崩れが
+            発生していた。アイコン化で行が短くなり、さらに `© kako-jun` 自体に
+            whitespace-nowrap を当てて折り返しを禁じる。 */}
+        <div class="flex flex-wrap items-center justify-center gap-4 text-xs text-fgSubtle">
           <a
             href="https://llll-ll.com"
             target="_blank"
             rel="noopener noreferrer"
-            class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+            aria-label={t('authorSiteAriaLabel')}
+            title={t('authorSiteAriaLabel')}
+            class="hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg rounded"
           >
-            {t('authorSiteLabel')}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+            </svg>
           </a>
-          <span aria-hidden="true">·</span>
+          <a
+            href="https://github.com/kako-jun/orber"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={t('repoLinkAriaLabel')}
+            title={t('repoLinkAriaLabel')}
+            class="hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg rounded"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              aria-hidden="true"
+            >
+              <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.01-.02-1.98-3.2.69-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.96.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.18 1.18a11 11 0 015.79 0c2.21-1.5 3.18-1.18 3.18-1.18.62 1.58.23 2.75.11 3.04.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.4-5.25 5.68.41.36.78 1.06.78 2.13 0 1.54-.01 2.78-.01 3.16 0 .31.21.68.79.56C20.21 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z" />
+            </svg>
+          </a>
           <a
             href="https://github.com/sponsors/kako-jun"
             target="_blank"
             rel="noopener noreferrer"
-            class="underline decoration-hairline underline-offset-2 hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+            aria-label={t('sponsorAriaLabel')}
+            title={t('sponsorAriaLabel')}
+            class="hover:text-fg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing focus-visible:ring-offset-2 focus-visible:ring-offset-bg rounded"
           >
-            {t('sponsorTextLabel')}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              aria-hidden="true"
+            >
+              <path d="M12 21s-7-4.5-9.5-9C.5 8 3 4 7 4c2 0 3.5 1 5 3 1.5-2 3-3 5-3 4 0 6.5 4 4.5 8C19 16.5 12 21 12 21z" />
+            </svg>
           </a>
           <span aria-hidden="true">·</span>
-          <span class="font-display font-light">© kako-jun</span>
+          <span class="font-display font-light whitespace-nowrap">© kako-jun</span>
         </div>
       </div>
     </footer>

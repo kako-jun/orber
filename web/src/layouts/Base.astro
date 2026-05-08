@@ -179,6 +179,15 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
       .glyph-symbol-text {
         font-family: 'Noto Sans Symbols 2', system-ui, sans-serif;
         font-variant-emoji: text;
+        /* #174: Noto Sans Symbols 2 はフォント自体の baseline / metrics box
+           が cap-height に対して下に偏っているため、flex items-center だけで
+           は picker ボタン内で記号が下寄り (もしくは右寄り) に見える。
+           font-feature 指定で metric を均し、line-height を 1 に強制した上で
+           text-align: center を当て、span 側の flex centring と二重に揃える。
+           Y 軸の追加補正は OS / フォントバージョン差で別ズレを誘発するので
+           足さず、まずは line-height + text-align のみで揃えて様子を見る。 */
+        line-height: 1;
+        text-align: center;
       }
       .skeleton {
         background-color: rgba(255, 255, 255, 0.04);

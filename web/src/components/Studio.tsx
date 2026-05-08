@@ -599,6 +599,18 @@ export default function Studio() {
     // workerSetSource で reject されるだけ。最初の段階で弾いてエラー UI
     // を据え置く。
     if (wasmStatus() === 'error') return;
+    // #174 invariant: 画像差し替え時は shape / glyphChar / glyphRotate /
+    // imageShapeInvert / countPreset / speedPreset / softnessPreset / aspect
+    // のオプション signal を一切リセットしない。ユーザーが新しい画像を
+    // ドロップした際、下に並ぶ調整ボタンの選択状態は前画像の操作を継承する。
+    // (acceptFile が触るのは pickedName / pickedThumbUrl / phase / decoded /
+    // errorMsg のみで、UI 4 軸 + shape は無関係に維持される。)
+    //
+    // imageShapeInvert は shape='image' で使う「画像シルエット」ファイル側の
+    // 極性反転トグルで、ドロップエリアに入れる「ソース画像」とは別の File
+    // 経路 (onImageShapePick / onImageShapeInvertChange) に紐づく。
+    // ソース画像を差し替えてもシルエットファイルは worker キャッシュに残る
+    // ため、invert 状態を継承するのが正しい (ユーザーの意図的選択)。
     setErrorMsg('');
     setPickedName(file.name);
     // サムネイル URL を差し替え。前回分は revoke してメモリリークを防ぐ。
@@ -1155,8 +1167,17 @@ export default function Studio() {
   const GLASS_CHECKBOX_LABEL =
     'inline-flex items-center gap-2 cursor-pointer text-sm text-fg ' +
     'has-[:disabled]:opacity-40 has-[:disabled]:cursor-not-allowed';
+  // #174: 旧 `bg-glassBg` を削除。iOS Safari / Android Chrome では半透明白
+  // 背景の上に accent-fg (白) でチェックを描画すると checked 状態でも
+  // 視覚変化が乏しく、ユーザーから「チェックマークが出ていない」と
+  // 報告されていた。背景指定を外して OS ネイティブの accent-color 塗り
+  // (白塗り + 黒/濃グレーのチェックマーク) に委ねる。
+  // unchecked 状態は border-glassBorder (1.5px hairline) で枠を確保するので、
+  // デスクトップ Firefox/Chrome の dark theme でも box 自体は背景から見分け
+  // られる。bg を指定しないことで透けるのは UA 既定 (薄い灰塗り) で
+  // 一貫したチェック描画が得られる。
   const GLASS_CHECKBOX_INPUT =
-    'h-4 w-4 rounded-sm border border-glassBorder bg-glassBg ' +
+    'h-4 w-4 rounded-sm border border-glassBorder ' +
     'accent-fg ' +
     'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
     'disabled:cursor-not-allowed';
@@ -1365,9 +1386,12 @@ export default function Studio() {
           </button>
         </div>
 
-        {/* #133: glyph 入力欄は datalist combobox 化。
-            候補は supportedGlyphChoices() (Noto Sans Symbols 2 同梱記号)、
-            自由入力は IME 経由で emoji なども受け付ける。
+        {/* #133 / #174: glyph 入力欄。旧 datalist combobox は iOS Safari /
+            Android Chrome でドロップダウンが表示されない (PWA モードでは更に
+            不安定) という問題があったため、#174 で datalist と list 属性を
+            削除した。下に並ぶ 9×2 picker grid が代替 UI として既に存在し、
+            機能的に等価。input は素の text 入力として残し、IME 経由で emoji
+            なども自由入力できる挙動は維持する。
             glyph-symbol-text class で picker / input 表示を Noto Sans Symbols 2
             に揃え、⚡ などの白ベタ描画を実現する (Base.astro)。 */}
         <Show when={shape() === 'glyph'}>
@@ -1375,7 +1399,6 @@ export default function Studio() {
             <span />
             <input
               type="text"
-              list="glyph-suggestions"
               aria-label={t('glyphCharLabel')}
               value={glyphChar()}
               placeholder={t('glyphCharPlaceholder')}
@@ -1402,11 +1425,6 @@ export default function Studio() {
                 'disabled:opacity-40 disabled:cursor-not-allowed'
               }
             />
-            <datalist id="glyph-suggestions">
-              <For each={supportedGlyphChoices()}>
-                {(sym) => <option value={sym} />}
-              </For>
-            </datalist>
             <span />
             {/* 9 列 × 2 段の固定グリッド。各ボタンは w-full でセル幅を埋め、
                 右端が他の segmented control 行とぴったり揃う。 */}

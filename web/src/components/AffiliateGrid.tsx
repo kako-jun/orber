@@ -25,10 +25,10 @@ export default function AffiliateGrid() {
       <h2 class="text-xs text-fgMuted mb-4 tracking-wide text-center">
         {t('affiliateHeading')}
       </h2>
-      {/* レビュー: max-w-sm (24rem) では caption が折り返されたため max-w-xl
-          (36rem) に拡大。3 列 × ~180px/cell でフリガナの長い caption も 1-2 行で
-          収まる。Footer のコンテナ (max-w-3xl) より小さい範囲で中央寄せを保つ。 */}
-      <ul class="grid grid-cols-3 gap-4 max-w-xl mx-auto">
+      {/* #174: max-w-xl (36rem) を外して Footer の max-w-3xl いっぱい
+          (= ドロップエリアと同じ幅) まで広げる。スマホ窮屈問題の解消。
+          gap はスマホ gap-3, sm 以上 gap-4 で caption の折り返しを抑える。 */}
+      <ul class="grid grid-cols-3 gap-3 sm:gap-4 w-full">
         {AFFILIATE_PRODUCTS.map((p) => (
           <li>
             <a

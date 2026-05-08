@@ -234,6 +234,57 @@ describe('generateImageSdf()', () => {
     expect(inverted.sdf[3 * SIZE + 3]).toBe(64);
   });
 
+  test('#174 非正方形画像 — レタボックスの透明領域に引きずられず被写体輪郭を抽出する', () => {
+    // 16×8 の不透明 (alpha=255) 画像を 16×16 SDF サイズへ contain 描画する想定。
+    // bitmap.width=16, bitmap.height=8 → scale=1, dw=16, dh=8, dx=0, dy=4。
+    // 描画矩形 = rows 4..11、それ以外 (rows 0..3 と 12..15) はレタボ alpha=0。
+    //
+    // 旧実装は s*s 全体で alpha 集計したため、レタボ 8 行分 (128 px)で
+    // hasMeaningfulAlpha=true → alpha 経路に倒れ、描画矩形全 128 px が inside と
+    // 判定されて結果が「16×8 の矩形シルエット」になっていた (#174)。
+    //
+    // 新実装は描画矩形 (0..16, 4..12) 内だけで alpha を集計する。drawn pixel は
+    // 全 alpha=255 なので alphaPixelCount=0 → 輝度経路 → 「少数派 = 被写体」で
+    // 中央 2×2 の暗パッチだけが inside、白背景は outside になる。
+    const SIZE = 16;
+    const data = new Uint8ClampedArray(SIZE * SIZE * 4);
+    // レタボ部分は alpha=0 のまま (clearRect 後の initial state を再現)。
+    // 描画矩形 (rows 4..11) は白背景 alpha=255 + 中央 2×2 を黒で塗る。
+    for (let y = 4; y < 12; y++) {
+      for (let x = 0; x < 16; x++) {
+        const i = y * SIZE + x;
+        data[i * 4] = 255;
+        data[i * 4 + 1] = 255;
+        data[i * 4 + 2] = 255;
+        data[i * 4 + 3] = 255;
+      }
+    }
+    // 中央 2×2 の暗パッチ (= 被写体)。位置 (7,7), (8,7), (7,8), (8,8)。
+    for (const [x, y] of [
+      [7, 7],
+      [8, 7],
+      [7, 8],
+      [8, 8],
+    ] as const) {
+      const i = y * SIZE + x;
+      data[i * 4] = 0;
+      data[i * 4 + 1] = 0;
+      data[i * 4 + 2] = 0;
+    }
+    vi.stubGlobal('OffscreenCanvas', makeStubCanvas(data, SIZE));
+    const fakeBitmap = { width: 16, height: 8 } as unknown as ImageBitmap;
+    const r = generateImageSdf(fakeBitmap, SIZE);
+    expect(r.ok).toBe(true);
+    // 中央 2×2 の暗パッチ ((7,7) etc.) は inside (= byte > 127)。
+    expect(r.sdf[7 * SIZE + 7]).toBeGreaterThan(127);
+    // 描画矩形内の白背景 ((2,7) など、被写体と同じ row だが背景側) は outside。
+    expect(r.sdf[7 * SIZE + 2]).toBeLessThan(127);
+    // レタボ部分 (row 0 や row 15) も outside。旧実装ではここも inside 判定
+    // された結果矩形シルエットになっていた。
+    expect(r.sdf[0 * SIZE + 0]).toBeLessThan(127);
+    expect(r.sdf[15 * SIZE + 8]).toBeLessThan(127);
+  });
+
   test('#171 alpha<255 が 1px だけの「実質不透明」画像は alpha 経路に入らない', () => {
     // 8×8 の隅 1 px だけ alpha=128、他 alpha=255、輝度差は中央 1 px に持たせる。
     // alphaPixelCount = 1、s*s = 64、1*100 = 100、64 と比べて 100 > 64 → true。
