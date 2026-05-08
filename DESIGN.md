@@ -372,10 +372,6 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - **コントラスト不足検出 (#169)**: シルエット抽出が成功しない (= inside 0 個、
   または全画素 inside) 場合は worker が `image-shape-no-contrast` エラーを
   投げ、UI に「この画像にはコントラストがありません」を表示する
-- **シルエット反転トグル (#170)**: 画像入力 row に `imageShapeInvert`
-  checkbox を置く。auto-polarity が外れる画像 (証明写真風など被写体が画面
-  半分以上を占める) の救済。トグル ON で inside / outside を強制反転、
-  worker 側 SDF が再生成される
 - 画像はアスペクト比を保ったまま 256×256 に「contain」リサンプルされ、
   上下/左右の余白は SDF 上の outside になる。これにより縦長/横長の画像も
   シルエットが歪まない
