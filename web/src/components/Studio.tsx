@@ -1443,16 +1443,13 @@ export default function Studio() {
                   >
                     {/* #133 review Q2: U+FE0E (text variation selector) を付けて
                         Safari/iOS で ⚡ などが OS 絵文字フォントに resolve されるのを防ぎ、
-                        Noto Sans Symbols 2 のモノクロ描画を強制する。Chromium は
-                        font-variant-emoji: text で対応済み。selector は display 用で、
-                        value (sym) には付けないので状態管理は影響を受けない。
-                        #174 (二次対応): flex items-center だけでは Noto Sans Symbols 2
-                        のフォント metrics (asc/desc 不均等) によりボタン中央からズレ
-                        続けるため、grid place-items-center に切り替え + line-height: 1
-                        で line box を最小化、かつ class .glyph-picker-cell を当てて
-                        Base.astro 側の `transform: translateY(...)` で X-height 中心と
-                        ボタン中央のズレを微補正する。 */}
-                    <span class="glyph-picker-cell grid h-full w-full place-items-center leading-none">
+                        Noto Sans Symbols 2 のモノクロ描画を強制する。
+                        中央配置: flex items-center / justify-center で X / Y を確実に
+                        揃える (grid place-items-center は単一テキスト + auto-track
+                        で grid track が左上配置になり右上寄せに見える既知パターンの
+                        ため不採用)。class .glyph-picker-cell で Y 軸の微調整のみ
+                        Base.astro 側で行う。 */}
+                    <span class="glyph-picker-cell flex h-full w-full items-center justify-center leading-none">
                       {sym + '︎'}
                     </span>
                   </button>
