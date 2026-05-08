@@ -190,12 +190,14 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
          tabular-nums で metric 揺れを抑え、span を inline-grid 化することで
          line-height: 0 でも下端が切れないようにする。 */
       .glyph-picker-cell {
-        font-feature-settings: 'tnum' 1;
         /* #174 review S2: 旧 transform: translateY(-1px) は paint だけでなく
            合成レイヤを生み 9×2 全セルで GPU レイヤ分裂のおそれ。低スペック
            Android での stutter 回避のため position-relative + top に切替。 */
         position: relative;
         top: -1px;
+        /* tnum (tabular-nums) は数字用フィーチャーだが、シンボルフォントに
+           適用するとグリフが右寄せされる挙動が出るため不採用 (#174 二次
+           レビュー後に判明)。 */
       }
       /* #174 (二次対応): 自前チェックボックス。
          accent-color では iOS / Android で「白箱+白チェック」になり checked が
