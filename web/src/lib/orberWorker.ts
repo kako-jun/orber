@@ -17,10 +17,6 @@
 
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
-import {
-  encodeAnimationAlphaFromCanvas,
-  isVp9AlphaSupported,
-} from './encodeWebmAlpha';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
 import { generateImageSdf, generateJsGlyphSdf } from './jsGlyphSdf';
 
@@ -211,19 +207,20 @@ type Req =
       index: number;
       format: 'png' | 'webp';
     }
-  // #56: 透過 WebM (VP9 alpha 'keep') を返す動画 alpha 経路。`encodeMp4.ts` と
-  // 同じ frame loop だが、エンコーダ・muxer が VP9 + WebM になる。Safari は
-  // VP9 alpha 非対応なので、呼び出し側は `vp9AlphaSupported` で事前 probe する。
+  // #184: 透過動画用の PNG フレーム列を返す。worker は wasm 経路で各 frame
+  // (透過背景 + orb) を OffscreenCanvas に描画 → PNG 化 → progress message
+  // で 1 枚ずつ main に流す。main 側は ffmpeg.wasm (libvpx-vp9 + yuva420p) で
+  // 透過 WebM に muxing する。worker 内に ffmpeg.wasm を抱え込まないのは、
+  // FFmpeg class が更に内部 worker を spawn する nested-worker パスを避けて
+  // 安定性を優先するため (#184)。
   | {
-      kind: 'animateOneAlpha';
+      kind: 'renderAlphaFrames';
       id: number;
       params: BaseParams;
       n: number;
       index: number;
       totalFrames: number;
     }
-  // #56: VP9 alpha encode が使えるかの probe。Safari 検出用。
-  | { kind: 'vp9AlphaSupported'; id: number }
   // Phase B (#55): UI が typed-in glyph 文字が同梱フォントに収録されているか
   // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
   | { kind: 'glyphSupported'; id: number; ch: string }
@@ -359,10 +356,12 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
-      case 'animateOneAlpha': {
-        // #56: 動画 alpha 経路。frame loop は encodeMp4 と同形だが、エンコーダ・muxer
-        // を VP9 alpha + WebM に差し替える。Safari は VP9 alpha 非対応なので、
-        // 呼び出し側で `vp9AlphaSupported` を probe して落とすこと。
+      case 'renderAlphaFrames': {
+        // #184: 透過動画用 PNG フレーム列 (worker → main)。各 frame は
+        // `alphaFrame` kind の message で 1 枚ずつ Transferable 経由で送る。
+        // 全 frame を flat array で抱え込まないことで GPU メモリと postMessage の
+        // 一括コピーコストを抑える。main 側は ffmpeg.wasm に投入する。
+        // 進捗 UI は `animateProgress` を流用 (encodeMp4 と同形)。
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);
         const width = req.params.width;
@@ -375,24 +374,31 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         }
         renderer.setRenderData(withTransparentBackground(data));
         const PROGRESS_STRIDE = 4;
-        const blob = await encodeAnimationAlphaFromCanvas(
-          canvas,
-          (t) => renderer.renderFrame(t),
-          req.totalFrames,
-          width,
-          height,
-          (frame, total) => {
-            if (frame !== total && frame % PROGRESS_STRIDE !== 0) return;
-            post({ kind: 'animateProgress', id: req.id, frame, total });
-          },
-        );
-        const buf = await blob.arrayBuffer();
-        post({ id: req.id, ok: true, data: buf }, [buf]);
-        break;
-      }
-      case 'vp9AlphaSupported': {
-        const ok = await isVp9AlphaSupported();
-        post({ id: req.id, ok: true, data: ok });
+        for (let i = 0; i < req.totalFrames; i++) {
+          const t = i / req.totalFrames;
+          renderer.renderFrame(t);
+          const blob = await canvas.convertToBlob({ type: 'image/png' });
+          const buf = await blob.arrayBuffer();
+          post(
+            {
+              kind: 'alphaFrame',
+              id: req.id,
+              frame: i,
+              total: req.totalFrames,
+              data: buf,
+            },
+            [buf],
+          );
+          if (i + 1 === req.totalFrames || (i + 1) % PROGRESS_STRIDE === 0) {
+            post({
+              kind: 'animateProgress',
+              id: req.id,
+              frame: i + 1,
+              total: req.totalFrames,
+            });
+          }
+        }
+        post({ id: req.id, ok: true });
         break;
       }
       default: {

@@ -108,16 +108,32 @@ describe('lang signal + t()', () => {
     );
   });
 
-  test('alphaVideoUnsupportedNotice キーが ja/en 両方定義されている (#56 後続)', async () => {
-    // VP9 alpha 非対応環境で checkbox 直下に出す警告 (Studio.tsx)。
+  test('alphaEncoderLoadFailed / alphaEncodingInProgress キーが ja/en 両方定義されている (#184)', async () => {
+    // ffmpeg.wasm ロード時 / ロード失敗時に Studio.tsx が出す文言。
     // i18n キー漏れで本番ビルドに `{key}` がそのまま出るリグレッションを防ぐ。
     vi.stubGlobal('navigator', { language: 'en-US' });
     const { setLang, t } = await import('./strings');
     await Promise.resolve();
     setLang('ja');
-    expect(t('alphaVideoUnsupportedNotice')).toMatch(/透過動画/);
+    expect(t('alphaEncoderLoadFailed')).toMatch(/透過動画/);
+    expect(t('alphaEncodingInProgress')).toMatch(/透過動画/);
     setLang('en');
-    expect(t('alphaVideoUnsupportedNotice')).toMatch(/transparent video/);
+    expect(t('alphaEncoderLoadFailed')).toMatch(/transparent video/);
+    expect(t('alphaEncodingInProgress')).toMatch(/transparent video/);
+  });
+
+  test('削除済みキー alphaVideoUnsupportedNotice は STRINGS に存在しない (#184)', async () => {
+    // #184 で透過動画が ffmpeg.wasm 化され全環境で動くようになったため、
+    // 旧 unsupported 文言キーを削除した。キー残存があると UI 側に死んだ
+    // 文言が紐づき続けるリグレッションになるので、ここで存在しないことを直接押さえる。
+    const { STRINGS } = await import('./strings');
+    expect('alphaVideoUnsupportedNotice' in STRINGS).toBe(false);
+  });
+
+  test('削除済みキー includeAlphaDisabledTitle は STRINGS に存在しない (#184)', async () => {
+    // 同上: 「透過動画は非対応」ツールチップ用 title 文言キー。
+    const { STRINGS } = await import('./strings');
+    expect('includeAlphaDisabledTitle' in STRINGS).toBe(false);
   });
 
   test('viewsLabelPrefix / Suffix の語順が言語ごとに切り替わる (Footer counter)', async () => {

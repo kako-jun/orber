@@ -128,23 +128,24 @@ export const STRINGS = {
     ja: 'ダウンロード準備に失敗しました',
     en: 'Failed to prepare download',
   },
-  // #56: ZIP DL に透過版 (PNG / WebP / WebM VP9 alpha) を同梱するかの checkbox。
-  // 既定 OFF（既存 byte-exact 出力を保つため）。disabled tooltip は Safari など
-  // VP9 alpha encoding 非対応ブラウザでのフォールバック用。
+  // #56 / #184: ZIP DL に透過版 (PNG / WebP / WebM) を同梱するかの checkbox。
+  // 既定 OFF (既存 byte-exact 出力を保つため)。#184 で動画経路は ffmpeg.wasm
+  // + libvpx-vp9 (yuva420p) に切り替え、ブラウザ / OS / GPU の codec backend
+  // 非依存で全環境で出力可能。よって probe / 非対応 UI は廃止。
   includeAlphaLabel: {
     ja: '透過版を DL に含める',
     en: 'Include transparent versions',
   },
-  includeAlphaDisabledTitle: {
-    ja: 'お使いのブラウザは透過動画 (WebM VP9 alpha) のエンコードに対応していません',
-    en: "This browser cannot encode transparent video (WebM VP9 alpha)",
+  // #184: 透過 DL を押した後、ffmpeg.wasm core (約 31MB) のロード中に出す進捗。
+  alphaEncodingInProgress: {
+    ja: '透過動画エンコーダを読み込み中…',
+    en: 'Loading transparent video encoder…',
   },
-  // 透過動画 (VP9/AV1 alpha) が非対応の環境で checkbox 直下に常時表示する
-  // 警告。silent skip を可視化し、動画タイルの透過版が ZIP に入らないことを
-  // DL 前に伝える。静止タイルの透過 PNG/WebP は引き続き出力される。
-  alphaVideoUnsupportedNotice: {
-    ja: '⚠ この環境は透過動画に対応していません（動画タイルの透過 WebM は出力されません。静止タイルの透過 PNG/WebP は出力されます）',
-    en: '⚠ This environment does not support transparent video (animated tiles will not produce transparent WebM; still tiles will still produce transparent PNG/WebP)',
+  // #184: ffmpeg.wasm core のロードに失敗した時のエラー文言 (ネットワーク断 /
+  // 配信欠落等)。errorMsg 経由で DL ボタン下に出る。
+  alphaEncoderLoadFailed: {
+    ja: '透過動画エンコーダの読み込みに失敗しました',
+    en: 'Failed to load transparent video encoder',
   },
   variationAlt: { ja: 'バリエーション {n}', en: 'Variation {n}' },
   variationAnimatedAlt: {

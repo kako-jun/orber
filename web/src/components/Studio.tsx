@@ -13,8 +13,8 @@ import {
   workerInit,
   workerSetImageShape,
   workerSetSource,
-  workerVp9AlphaSupported,
 } from '../lib/orberClient';
+import { loadFfmpegAlphaEncoder, prefetchFfmpegCore } from '../lib/encodeWebmAlphaWasm';
 import { t, lang } from '../lib/strings';
 
 type Aspect = 'portrait' | 'landscape';
@@ -56,6 +56,37 @@ const GLYPH_DEFAULT_ROTATE: Record<string, boolean> = {
   '⚡': false,
   '☀': false,
 };
+
+// #184: ffmpeg-core (~31 MB) をアイドル時にプリフェッチしてよいかを判定する
+// saver guard。`navigator.connection` の Network Information API を見て、
+// データ節約モード (`saveData`) または低速回線 (`slow-2g` / `2g` / `3g`) の
+// ユーザーには勝手に 31 MB を取らせない。connection API 未対応 (Safari 等) や
+// 通常回線 (`4g` 等) では `true` を返してプリフェッチを許可する。
+//
+// レビュー Q2: `3g` も skip 条件に含める。
+//   3G で 31 MB を勝手に取るのは惜しい (実 DL 押下時に取ればよい)。トレードオフは
+//   docs/overview.md に記載。
+// レビュー S4: `NetworkInformation` / `requestIdleCallback` の型を module 上端に集約。
+interface NetworkInformation {
+  saveData?: boolean;
+  effectiveType?: 'slow-2g' | '2g' | '3g' | '4g' | (string & {});
+}
+interface NavigatorWithConnection {
+  connection?: NetworkInformation;
+}
+interface WindowWithIdleCallback {
+  requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+}
+
+function shouldPrefetchFfmpegCore(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const conn = (navigator as unknown as NavigatorWithConnection).connection;
+  if (!conn) return true;
+  if (conn.saveData) return false;
+  const et = conn.effectiveType;
+  if (et === 'slow-2g' || et === '2g' || et === '3g') return false;
+  return true;
+}
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
@@ -122,14 +153,23 @@ export default function Studio() {
   // ユーザーが checkbox を切替えるとその session 中は尊重し、次の glyph 切替で
   // 再度 default が適用される。既定 true（既存挙動互換）。
   const [glyphRotate, setGlyphRotate] = createSignal<boolean>(true);
-  // #56: 透過版を ZIP DL に同梱するかの checkbox。既定 OFF を厳守
-  // （OFF なら既存挙動と byte-exact identity を保つ）。Safari / Edge / Chrome on
-  // Windows などで VP9 alpha encode が使えないと vp9AlphaSupported が false に
-  // なる。この場合でも checkbox 自体はクリック可能（静止タイルの透過 PNG/WebP
-  // は VP9 と無関係に作れるため）。動画タイルの透過 WebM だけが silent skip され、
-  // checkbox 直下の inline 通知 (alphaVideoUnsupportedNotice) で DL 前に明示する。
+  // #56 / #184: 透過版を ZIP DL に同梱するかの checkbox。既定 OFF を厳守
+  // (OFF なら既存挙動と byte-exact identity を保つ)。#184 で動画経路は
+  // ffmpeg.wasm + libvpx-vp9 (yuva420p) に切り替えたためブラウザ / OS / GPU
+  // の codec backend に依存せず全環境で出力できる。ffmpeg.wasm のロード
+  // (約 31MB の core) に失敗 (ネットワーク断 / 配信欠落) した場合のみ DL 経路
+  // でエラー UI を出す。
   const [includeAlpha, setIncludeAlpha] = createSignal<boolean>(false);
-  const [vp9AlphaSupported, setVp9AlphaSupported] = createSignal<boolean>(true);
+  // #184: ffmpeg.wasm のロード状態。`'idle'` = まだ DL してない、`'loading'`
+  // = ロード中、`'ready'` = 利用可能。透過 DL を初めて押した時に遅延ロードする
+  // (preload は core 31MB を毎回振り撒くため避ける)。
+  // ロード失敗は `errorMsg` で UI 表示し、state は `'idle'` に戻して再試行を
+  // 許可する (UI 上の 'error' 専用文言は不要なため union から除外)。
+  // レビュー Q3: 現状 UI 分岐は `'loading'` 表示にしか使っていない (`'ready'` は
+  // 内部フラグとしてのみ使用)。将来 "encoder ready" を明示する小バッジ等を
+  // 出したくなった時に値を流用できるよう、3 値 union のまま意図的に温存している。
+  const [alphaEncoderState, setAlphaEncoderState] =
+    createSignal<'idle' | 'loading' | 'ready'>('idle');
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
@@ -227,19 +267,9 @@ export default function Studio() {
       // 待つことで、初回ドロップ時の体感を「即生成開始」に保つ。
       await workerInit();
       setWasmStatus('ready');
-      // #56: VP9 alpha encode は Safari / Edge / Chrome on Windows など環境に
-      // よって非対応。checkbox 直下の inline 通知 (alphaVideoUnsupportedNotice)
-      // を出すかどうかの判定に使うので事前 probe する。失敗しても致命ではない
-      // （false に倒すだけ）。worker 内でキャッシュされる。
-      try {
-        const ok = await workerVp9AlphaSupported();
-        setVp9AlphaSupported(ok);
-        if (!ok) setIncludeAlpha(false);
-      } catch (probeErr) {
-        console.warn('vp9 alpha probe failed', probeErr);
-        setVp9AlphaSupported(false);
-        setIncludeAlpha(false);
-      }
+      // #184: VP9 alpha probe / 環境非対応 UI は撤去。ffmpeg.wasm + libvpx-vp9
+      // (yuva420p) は全環境で確実に出力できる。ffmpeg.wasm 本体のロードは
+      // 「ユーザーが透過 DL を実際に押した時」に遅延発火する。
     } catch (e) {
       console.error('failed to init orber worker', e);
       setWasmErr(String(e));
@@ -268,6 +298,28 @@ export default function Studio() {
       const u = imageShapeUrl();
       if (u) URL.revokeObjectURL(u);
     });
+    // #184: ffmpeg-core (~31 MB) を「ユーザーがオーブを設計している間」に
+    // 裏で SW キャッシュへ先取りしておく。透過 DL ボタンを押した瞬間に
+    // 初めて 30 MB を取りに行く初回体験を回避するための投機的プリフェッチ。
+    // - `requestIdleCallback` でメイン UI / wasm 初期化と帯域を奪い合わない
+    // - データ節約モード (`saveData` / `effectiveType === 'slow-2g'|'2g'|'3g'`) では
+    //   skip して、モバイル回線ユーザーに 31 MB を取らせない
+    // - SSR (Astro static build) で `window` が無い経路は no-op
+    const schedulePrefetch = () => {
+      if (!shouldPrefetchFfmpegCore()) return;
+      prefetchFfmpegCore();
+    };
+    // レビュー S3: onMount は client-side でしか走らないので `typeof window` ガード
+    // は理論上冗長。ただし Astro hydration の極端なタイミング (例: 静的解析パス) で
+    // window 不在の経路を踏む事故を防ぐ防衛策として残す。
+    if (typeof window !== 'undefined') {
+      const ric = (window as unknown as WindowWithIdleCallback).requestIdleCallback;
+      if (ric) {
+        ric(schedulePrefetch, { timeout: 5000 });
+      } else {
+        setTimeout(schedulePrefetch, 2000);
+      }
+    }
   });
 
   // #131 / #159: シンボルピッカーに並べる候補は、wasm 同梱フォントで描画できる
@@ -950,7 +1002,6 @@ export default function Studio() {
         : [DL_W_LANDSCAPE, DL_H_LANDSCAPE];
     const total = batchN();
     const stillCount = total - VIDEO_TILE_COUNT;
-    const useWebCodecs = isWebCodecsSupported();
 
     const hiParams = {
       k: 5,
@@ -978,8 +1029,9 @@ export default function Studio() {
           workerGenerateOneAlpha(hiParams, total, i, 'webp'),
         ]);
         out.set(i, { still: { png, webp } });
-      } else if (useWebCodecs && vp9AlphaSupported()) {
-        // 動画タイル: 透過 WebM (VP9 alpha 'keep')。
+      } else {
+        // #184: 動画タイル: ffmpeg.wasm + libvpx-vp9 (yuva420p) で透過 WebM。
+        // ブラウザ / OS / GPU の codec backend に依存せず全環境で出力できる。
         const webm = await workerAnimateOneAlpha(
           hiParams,
           total,
@@ -988,9 +1040,6 @@ export default function Studio() {
         );
         out.set(i, { video: webm });
       }
-      // VP9 alpha 非対応 + 動画タイル の組合せは silent skip。checkbox 直下に
-      // alphaVideoUnsupportedNotice 警告を常時表示しているので、ユーザーは DL
-      // 前に「動画タイルの透過版は出ない」と認識できる（#56 後続対応）。
       setDlProgress((p) => ({ ...p, done: p.done + 1 }));
       await yieldFrame();
     }
@@ -1002,15 +1051,26 @@ export default function Studio() {
     setDownloading(true);
     setErrorMsg('');
     try {
-      // #56: alpha 同梱時は hi-res 経路を 2 周走らせるので、進捗 total は 2x。
-      // renderHiResForIndices 冒頭で setDlProgress({done:0, total:indices.length})
-      // していたのを上書きするため、ここで先に正しい total を立てる。
-      // User: 「透過版を含めるチェックを入れたのに含まれていなかった」を反映。
-      // 旧 `wantAlpha = includeAlpha() && vp9AlphaSupported()` は VP9 alpha
-      // 非対応ブラウザ (Safari 等) で alpha 経路が一切走らない状態だった。
-      // PNG / WebP 透過は VP9 と無関係なのでチェックされたら必ず走らせ、
-      // WebM 透過は renderAlphaForIndices 内 (line 915) で個別に VP9 ガードする。
+      // #56 / #184: alpha 同梱時は hi-res 経路を 2 周走らせるので、進捗 total は 2x。
       const wantAlpha = includeAlpha();
+      // #184: 透過動画エンコーダ (ffmpeg.wasm) を必要時にロードする。失敗時は
+      // alphaEncoderLoadFailed 文言を errorMsg に立てて DL 経路を打ち切る。
+      // 静止 PNG / WebP は影響を受けないが、ZIP が「動画なし alpha フォルダ」に
+      // 黙って縮退するのは混乱を招くため、ロード失敗時は alpha 一式を諦める方針。
+      if (wantAlpha) {
+        try {
+          setAlphaEncoderState('loading');
+          await loadFfmpegAlphaEncoder();
+          setAlphaEncoderState('ready');
+        } catch (loadErr) {
+          console.error('ffmpeg.wasm load failed', loadErr);
+          // 再試行で再 loading に入れるよう state は 'idle' に戻す。
+          // UI 表示は errorMsg (alphaEncoderLoadFailed) に集約。
+          setAlphaEncoderState('idle');
+          setErrorMsg(t('alphaEncoderLoadFailed'));
+          return;
+        }
+      }
       setDlProgress({
         done: 0,
         total: wantAlpha ? indices.length * 2 : indices.length,
@@ -1919,32 +1979,32 @@ export default function Studio() {
           </For>
         </div>
 
-        {/* #56 / 配置調整: 透過版同梱 checkbox は DL ボタン行の直上に置く。
-            VP9 alpha 非対応ブラウザ (Edge/Chrome on Windows / Safari 等) でも
-            checkbox はクリック可能にし、静止タイルの透過 PNG/WebP は引き続き
-            出力する。動画タイルの透過 WebM だけが作れない旨を checkbox 直下に
-            常時警告として表示し、silent skip を可視化する。 */}
+        {/* #56 / #184: 透過版同梱 checkbox は DL ボタン行の直上に置く。
+            #184 で動画経路を ffmpeg.wasm + libvpx-vp9 (yuva420p) に切り替え、
+            ブラウザ / OS / GPU の codec backend 非依存で全環境で出力できる
+            ようになった。よって VP9 alpha probe / 環境非対応 UI は撤去した。
+            ロード中の進捗 / ロード失敗時のエラーは DL ボタンの進捗 / errorMsg
+            に集約する。 */}
         <div class="flex flex-col items-center pt-2 gap-1">
-          <label
-            class={GLASS_CHECKBOX_LABEL}
-            title={!vp9AlphaSupported() ? t('includeAlphaDisabledTitle') : ''}
-          >
+          <label class={GLASS_CHECKBOX_LABEL}>
             <input
               type="checkbox"
               class={GLASS_CHECKBOX_INPUT}
               checked={includeAlpha()}
               onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
+              // downloading() 中は encoder loading フェーズも含むので
+              // alphaEncoderState() の追加チェックは不要 (二重防止になる)。
               disabled={!decoded() || downloading()}
             />
             <span>{t('includeAlphaLabel')}</span>
           </label>
-          <Show when={!vp9AlphaSupported()}>
+          <Show when={alphaEncoderState() === 'loading'}>
             <p
               class="text-xs text-fgMuted text-center max-w-md px-2"
               role="status"
               aria-live="polite"
             >
-              {t('alphaVideoUnsupportedNotice')}
+              {t('alphaEncodingInProgress')}
             </p>
           </Show>
         </div>
