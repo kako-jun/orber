@@ -568,11 +568,25 @@ Implementation notes:
   the wasm module — completely independent of the host's codec stack —
   so transparent video output is **reliable on every environment that
   can run wasm**.
-- ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the same
-  origin under `/ffmpeg/ffmpeg-core.{js,wasm}` (copied from
-  `node_modules/@ffmpeg/core/dist/umd/` by the `copy:ffmpeg` npm script
-  at dev / build time). The single-threaded core is used so no
-  COOP / COEP headers are required and the rest of the site (embedded
+- ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the
+  **jsdelivr CDN** (`https://cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/umd/ffmpeg-core.{js,wasm}`)
+  with the version pinned in `web/src/lib/encodeWebmAlphaWasm.ts`
+  (`FFMPEG_CORE_VERSION`). Cloudflare Pages enforces a **25 MiB per-file
+  upload limit**, and `ffmpeg-core.wasm` (~31 MB) blows past it — so the
+  earlier "copy into `public/ffmpeg/` and serve same-origin" approach
+  failed at deploy time. jsdelivr is a Fastly + Cloudflare mirror with
+  HTTPS and `immutable` long-lived caching when a specific version is
+  requested, so the cost of going cross-origin is one fetch per visitor.
+  The Service Worker (`web/public/sw.js`) layers **CacheFirst** on top
+  of this for any request whose URL starts with
+  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@` (cache name
+  `ffmpeg-core-v<version>`, swept on `activate` when the pinned version
+  changes), so after the first online visit the wasm core is available
+  offline forever. The `@ffmpeg/core` package itself stays in
+  `devDependencies` only so the pinned version is visible in
+  `package.json` / lockfile — no file from it ships in `dist/` and the
+  old `copy:ffmpeg` script is gone. The single-threaded core is used so
+  no COOP / COEP headers are required and the rest of the site (embedded
   Nostalgic Counter iframe, etc.) keeps working unchanged. The `FFmpeg`
   instance is a module-level singleton with lazy initialisation: the
   31 MB wasm is fetched only when the user actually triggers an alpha
