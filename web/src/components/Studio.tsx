@@ -123,8 +123,11 @@ export default function Studio() {
   // 再度 default が適用される。既定 true（既存挙動互換）。
   const [glyphRotate, setGlyphRotate] = createSignal<boolean>(true);
   // #56: 透過版を ZIP DL に同梱するかの checkbox。既定 OFF を厳守
-  // （OFF なら既存挙動と byte-exact identity を保つ）。Safari などで VP9 alpha
-  // encode が使えないと vp9AlphaSupported が false になり、checkbox は disabled。
+  // （OFF なら既存挙動と byte-exact identity を保つ）。Safari / Edge / Chrome on
+  // Windows などで VP9 alpha encode が使えないと vp9AlphaSupported が false に
+  // なる。この場合でも checkbox 自体はクリック可能（静止タイルの透過 PNG/WebP
+  // は VP9 と無関係に作れるため）。動画タイルの透過 WebM だけが silent skip され、
+  // checkbox 直下の inline 通知 (alphaVideoUnsupportedNotice) で DL 前に明示する。
   const [includeAlpha, setIncludeAlpha] = createSignal<boolean>(false);
   const [vp9AlphaSupported, setVp9AlphaSupported] = createSignal<boolean>(true);
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
@@ -224,9 +227,10 @@ export default function Studio() {
       // 待つことで、初回ドロップ時の体感を「即生成開始」に保つ。
       await workerInit();
       setWasmStatus('ready');
-      // #56: VP9 alpha encode は Safari (現時点で WebCodecs 非対応分岐) では
-      // 使えないので、checkbox を disabled に倒すために事前 probe する。失敗
-      // しても致命ではない（false に倒すだけ）。worker 内でキャッシュされる。
+      // #56: VP9 alpha encode は Safari / Edge / Chrome on Windows など環境に
+      // よって非対応。checkbox 直下の inline 通知 (alphaVideoUnsupportedNotice)
+      // を出すかどうかの判定に使うので事前 probe する。失敗しても致命ではない
+      // （false に倒すだけ）。worker 内でキャッシュされる。
       try {
         const ok = await workerVp9AlphaSupported();
         setVp9AlphaSupported(ok);
@@ -984,8 +988,9 @@ export default function Studio() {
         );
         out.set(i, { video: webm });
       }
-      // VP9 alpha 非対応 + 動画タイル の組合せは silently skip。checkbox を
-      // disabled で塞ぐ実装なので通常パスでは到達しない（防御的 fallback）。
+      // VP9 alpha 非対応 + 動画タイル の組合せは silent skip。checkbox 直下に
+      // alphaVideoUnsupportedNotice 警告を常時表示しているので、ユーザーは DL
+      // 前に「動画タイルの透過版は出ない」と認識できる（#56 後続対応）。
       setDlProgress((p) => ({ ...p, done: p.done + 1 }));
       await yieldFrame();
     }
@@ -1915,11 +1920,11 @@ export default function Studio() {
         </div>
 
         {/* #56 / 配置調整: 透過版同梱 checkbox は DL ボタン行の直上に置く。
-            VP9 alpha 非対応ブラウザ (Safari 等) でも checkbox はクリック可能に
-            し、tooltip で「WebM 透過は出ない (PNG/WebP のみ)」と説明する。
-            disabled の条件は !decoded() / downloading() のみ (ユーザー指示で
-            灰色不可活状態を解除)。 */}
-        <div class="flex justify-center pt-2">
+            VP9 alpha 非対応ブラウザ (Edge/Chrome on Windows / Safari 等) でも
+            checkbox はクリック可能にし、静止タイルの透過 PNG/WebP は引き続き
+            出力する。動画タイルの透過 WebM だけが作れない旨を checkbox 直下に
+            常時警告として表示し、silent skip を可視化する。 */}
+        <div class="flex flex-col items-center pt-2 gap-1">
           <label
             class={GLASS_CHECKBOX_LABEL}
             title={!vp9AlphaSupported() ? t('includeAlphaDisabledTitle') : ''}
@@ -1933,6 +1938,15 @@ export default function Studio() {
             />
             <span>{t('includeAlphaLabel')}</span>
           </label>
+          <Show when={!vp9AlphaSupported()}>
+            <p
+              class="text-xs text-fgMuted text-center max-w-md px-2"
+              role="status"
+              aria-live="polite"
+            >
+              {t('alphaVideoUnsupportedNotice')}
+            </p>
+          </Show>
         </div>
 
         <div class="flex flex-wrap items-center justify-center gap-2">

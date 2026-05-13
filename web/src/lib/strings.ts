@@ -139,6 +139,13 @@ export const STRINGS = {
     ja: 'お使いのブラウザは透過動画 (WebM VP9 alpha) のエンコードに対応していません',
     en: "This browser cannot encode transparent video (WebM VP9 alpha)",
   },
+  // 透過動画 (VP9/AV1 alpha) が非対応の環境で checkbox 直下に常時表示する
+  // 警告。silent skip を可視化し、動画タイルの透過版が ZIP に入らないことを
+  // DL 前に伝える。静止タイルの透過 PNG/WebP は引き続き出力される。
+  alphaVideoUnsupportedNotice: {
+    ja: '⚠ この環境は透過動画に対応していません（動画タイルの透過 WebM は出力されません。静止タイルの透過 PNG/WebP は出力されます）',
+    en: '⚠ This environment does not support transparent video (animated tiles will not produce transparent WebM; still tiles will still produce transparent PNG/WebP)',
+  },
   variationAlt: { ja: 'バリエーション {n}', en: 'Variation {n}' },
   variationAnimatedAlt: {
     ja: 'バリエーション {n} (動画)',

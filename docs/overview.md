@@ -552,14 +552,23 @@ Implementation notes:
   `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` + `webm-muxer` for
   videos. The encoder branch lives in `web/src/lib/encodeWebmAlpha.ts`,
   parallel to the existing `encodeMp4.ts`.
-- Browser support: Chromium and recent Firefox encode VP9 alpha. Safari
-  does **not** at the time of writing, so the worker probes
-  `VideoEncoder.isConfigSupported({codec, alpha:'keep'})` once and exposes
-  the result as `workerVp9AlphaSupported()`. When it returns `false`, the
-  Studio surface forces the checkbox into a disabled state with a tooltip
-  rather than splitting the bundle (no partial WebP-only fallback — the
-  whole feature is gated). The probe result is cached for the worker's
-  lifetime.
+- Browser support: VP9 alpha encoding via WebCodecs is currently reliable
+  on Linux Chrome, Android Chrome, and recent Firefox. Safari does not
+  implement it, and Chromium-based browsers on Windows (Chrome / Edge)
+  frequently return `supported: false` as well depending on the platform
+  encoder backend.
+  The worker probes `VideoEncoder.isConfigSupported({codec, alpha:'keep'})`
+  once at startup and exposes the result as `workerVp9AlphaSupported()`.
+  When it returns `false`, the Studio checkbox stays clickable (so the
+  user can still get transparent PNG/WebP for still tiles, which is
+  unaffected by VP9), and a small inline notice rendered directly under
+  the checkbox tells the user up-front that animated-tile transparent WebM
+  will not be produced in this environment (i18n key
+  `alphaVideoUnsupportedNotice`). The non-VP9 branch in
+  `renderAlphaForIndices` then silently no-ops for animated tiles — the
+  silent skip is intentional and surfaced via the UI notice rather than
+  by an error or fallback bundle. The probe result is cached for the
+  worker's lifetime.
 - Progress: when the toggle is ON, `dlProgress.total` is set to
   `indices.length * 2` so the existing "Rendering high-res… N / Total"
   text covers both the background-filled pass and the alpha pass with

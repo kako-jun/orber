@@ -108,6 +108,18 @@ describe('lang signal + t()', () => {
     );
   });
 
+  test('alphaVideoUnsupportedNotice キーが ja/en 両方定義されている (#56 後続)', async () => {
+    // VP9 alpha 非対応環境で checkbox 直下に出す警告 (Studio.tsx)。
+    // i18n キー漏れで本番ビルドに `{key}` がそのまま出るリグレッションを防ぐ。
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    const { setLang, t } = await import('./strings');
+    await Promise.resolve();
+    setLang('ja');
+    expect(t('alphaVideoUnsupportedNotice')).toMatch(/透過動画/);
+    setLang('en');
+    expect(t('alphaVideoUnsupportedNotice')).toMatch(/transparent video/);
+  });
+
   test('viewsLabelPrefix / Suffix の語順が言語ごとに切り替わる (Footer counter)', async () => {
     // ja は「閲覧数: {n}」(prefix のみ)、en は「{n} views」(suffix のみ) の
     // 非対称構成。Footer の <nostalgic-counter> をこの 2 キーで挟む設計
