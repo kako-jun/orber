@@ -150,10 +150,10 @@ describe('encodeAnimationAlphaWasm', () => {
     expect(wasmCall![1]).toBe('application/wasm');
     expect(coreCall![0]).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
     expect(coreCall![0]).toContain(FFMPEG_CORE_VERSION);
-    expect(coreCall![0]).toMatch(/\/dist\/umd\/ffmpeg-core\.js$/);
+    expect(coreCall![0]).toMatch(/\/dist\/esm\/ffmpeg-core\.js$/);
     expect(wasmCall![0]).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
     expect(wasmCall![0]).toContain(FFMPEG_CORE_VERSION);
-    expect(wasmCall![0]).toMatch(/\/dist\/umd\/ffmpeg-core\.wasm$/);
+    expect(wasmCall![0]).toMatch(/\/dist\/esm\/ffmpeg-core\.wasm$/);
     // 同一オリジン `/ffmpeg/...` 配信に戻していないこと
     expect(coreCall![0]).not.toMatch(/^\/ffmpeg\//);
     expect(wasmCall![0]).not.toMatch(/^\/ffmpeg\//);

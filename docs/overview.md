@@ -569,7 +569,7 @@ Implementation notes:
   so transparent video output is **reliable on every environment that
   can run wasm**.
 - ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the
-  **jsdelivr CDN** (`https://cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/umd/ffmpeg-core.{js,wasm}`)
+  **jsdelivr CDN** (`https://cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/esm/ffmpeg-core.{js,wasm}`)
   with the version pinned in `web/src/lib/encodeWebmAlphaWasm.ts`
   (`FFMPEG_CORE_VERSION`). Cloudflare Pages enforces a **25 MiB per-file
   upload limit**, and `ffmpeg-core.wasm` (~31 MB) blows past it — so the
