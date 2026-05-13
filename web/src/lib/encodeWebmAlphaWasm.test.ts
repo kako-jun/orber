@@ -420,7 +420,7 @@ describe('encodeAnimationAlphaWasm', () => {
 });
 
 describe('prefetchFfmpegCore', () => {
-  it('呼ぶと FFMPEG_CORE_URL / FFMPEG_WASM_URL に対して no-cors fetch を発火する (#184 アイドルプリフェッチ)', async () => {
+  it('呼ぶと FFMPEG_CORE_URL / FFMPEG_WASM_URL に対して cors-mode (= mode 未指定) で fetch を発火する (#184 review M1: opaque を焼かない)', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     try {
@@ -433,10 +433,72 @@ describe('prefetchFfmpegCore', () => {
       expect(urls).toContain(FFMPEG_CORE_URL);
       expect(urls).toContain(FFMPEG_WASM_URL);
       for (const call of fetchMock.mock.calls) {
-        const init = call[1] as RequestInit;
-        expect(init.mode).toBe('no-cors');
+        const init = (call[1] ?? {}) as RequestInit;
+        // mode は明示指定せず、ブラウザ既定 (cors) に委ねる。
+        // 'no-cors' で opaque response を SW cache に焼くと
+        // importScripts / streaming compile が壊れる (#184 review M1)。
+        expect(init.mode).toBeUndefined();
         expect(init.credentials).toBe('omit');
       }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('プリフェッチが pending 中に loadFfmpegAlphaEncoder を呼ぶと、プリフェッチ完了後に ffmpeg.load が走る (#184 review S1: 二重 fetch race 解消)', async () => {
+    // プリフェッチ fetch を pending のまま手で解決できるよう deferred を作る。
+    let resolveCore: (r: Response) => void = () => {};
+    let resolveWasm: (r: Response) => void = () => {};
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.endsWith('.wasm')) {
+        return new Promise<Response>((res) => {
+          resolveWasm = res;
+        });
+      }
+      return new Promise<Response>((res) => {
+        resolveCore = res;
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { prefetchFfmpegCore, loadFfmpegAlphaEncoder } = await import(
+        './encodeWebmAlphaWasm'
+      );
+      prefetchFfmpegCore();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // ffmpeg.load を一度 pending にして、プリフェッチ完了前に解決していない
+      // ことをタイムラインで確認する。
+      const timeline: string[] = [];
+      let resolveLoad: () => void = () => {};
+      mockState.nextLoadImpl = () => {
+        timeline.push('load:start');
+        return new Promise<void>((res) => {
+          resolveLoad = () => {
+            timeline.push('load:resolved');
+            res();
+          };
+        });
+      };
+
+      // プリフェッチが pending のまま load を呼ぶ。
+      const loadP = loadFfmpegAlphaEncoder();
+      // microtask を 1 回挟んで load 内部の await prefetchPromise が走る機会を作る。
+      await new Promise((r) => setTimeout(r, 0));
+      // この時点では `ffmpeg.load` はまだ呼ばれていない (プリフェッチ完走待ち)。
+      expect(timeline).not.toContain('load:start');
+
+      // プリフェッチ完了 → 続いて ffmpeg.load が走る。
+      resolveCore(new Response('', { status: 200 }));
+      resolveWasm(new Response('', { status: 200 }));
+      // microtask を進めて load 開始まで到達させる。
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(timeline).toContain('load:start');
+
+      resolveLoad();
+      await loadP;
+      expect(timeline).toEqual(['load:start', 'load:resolved']);
     } finally {
       vi.unstubAllGlobals();
     }

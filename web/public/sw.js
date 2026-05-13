@@ -27,9 +27,10 @@ const CACHE_NAME = 'orber-__BUILD_DATE__';
 // 超えるため、`@ffmpeg/core` を jsdelivr CDN から配信する。バージョンを
 // pin することで immutable cache を効かせ、SW で CacheFirst して初回 fetch 後
 // はオフラインでも透過動画エンコードができる状態を維持する。
-// バージョン更新時は `encodeWebmAlphaWasm.ts` の `FFMPEG_CORE_VERSION` と
-// 下記 `FFMPEG_CORE_VERSION` を揃え、古いキャッシュ名は activate で破棄される。
-const FFMPEG_CORE_VERSION = '0.12.10';
+// バージョン更新時は `encodeWebmAlphaWasm.ts` の `FFMPEG_CORE_VERSION` から
+// `package.json` の `scripts.stamp:sw` で build 時に `__FFMPEG_CORE_VERSION__`
+// を置換する (二重定義回避、レビュー N1)。古いキャッシュ名は activate で破棄。
+const FFMPEG_CORE_VERSION = '__FFMPEG_CORE_VERSION__';
 const FFMPEG_CORE_CACHE = `ffmpeg-core-v${FFMPEG_CORE_VERSION}`;
 const FFMPEG_CORE_URL_PREFIX = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@';
 
@@ -86,10 +87,11 @@ self.addEventListener('fetch', (event) => {
   if (url.protocol === 'blob:' || url.protocol === 'data:') return;
 
   // ffmpeg-core (jsdelivr CDN, cross-origin) は CacheFirst で永続化する。
-  // バージョン pin により immutable とみなせる。`no-cors` で opaque
-  // response になっても問題ない (cache.put は opaque も格納できる)。
+  // バージョン pin により immutable とみなせる。レビュー M1: opaque response
+  // (`mode: 'no-cors'` 時) は importScripts / WebAssembly streaming compile が
+  // CORS で落ちる原因になるため cache に積まない (下記 ffmpegCoreCacheFirst 内)。
   if (isFfmpegCoreRequest(request.url)) {
-    event.respondWith(ffmpegCoreCacheFirst(request));
+    event.respondWith(ffmpegCoreCacheFirst(event, request));
     return;
   }
 
@@ -119,20 +121,28 @@ async function cacheFirst(request) {
   }
 }
 
-async function ffmpegCoreCacheFirst(request) {
+async function ffmpegCoreCacheFirst(event, request) {
   const cache = await caches.open(FFMPEG_CORE_CACHE);
-  const cached = await cache.match(request);
+  // レビュー S2: 過剰防御として ignoreVary を付ける。M1 で `mode: 'cors'` 統一
+  // されたので Vary 不整合は理論上発生しないが、将来 jsdelivr が Vary ヘッダを
+  // 変えても cache hit が外れて再 DL になる事故を防ぐ。
+  const cached = await cache.match(request, { ignoreVary: true });
   if (cached) return cached;
   try {
-    // ffmpeg.wasm 側は CORS 付き普通の fetch で取りに来るが、SW 内では
-    // mode を維持したまま fetch する。jsdelivr は CORS を許可しているので
-    // opaque にせずとも通る。万一 CORS 設定が変わっても opaque で保存可能。
+    // ffmpeg.wasm 側は CORS 付き普通の fetch で取りに来る。jsdelivr は CORS
+    // 許可済みなので通常 fetch で通る。
     const response = await fetch(request);
-    if (response && (response.ok || response.type === 'opaque')) {
-      cache.put(request, response.clone());
+    // レビュー M1: opaque response はキャッシュに積まない。
+    //   過去に `mode: 'no-cors'` で焼かれた opaque 既存キャッシュは将来
+    //   `cache.match` でヒットしてもこのチェックを通ったクリーンな response
+    //   で上書きされるため自然に置き換わる。
+    // レビュー M2: cache.put は async / SW lifetime 外で完走させるべきなので
+    //   event.waitUntil で SW に「処理継続」を宣言する。
+    if (response && response.ok && response.type !== 'opaque') {
+      event.waitUntil(cache.put(request, response.clone()));
     }
     return response;
-  } catch (err) {
+  } catch {
     return new Response('Offline', { status: 503 });
   }
 }

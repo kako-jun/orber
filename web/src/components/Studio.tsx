@@ -59,17 +59,32 @@ const GLYPH_DEFAULT_ROTATE: Record<string, boolean> = {
 
 // #184: ffmpeg-core (~31 MB) をアイドル時にプリフェッチしてよいかを判定する
 // saver guard。`navigator.connection` の Network Information API を見て、
-// データ節約モード (`saveData`) または極端な低速回線 (`slow-2g` / `2g`) の
+// データ節約モード (`saveData`) または低速回線 (`slow-2g` / `2g` / `3g`) の
 // ユーザーには勝手に 31 MB を取らせない。connection API 未対応 (Safari 等) や
-// 通常回線では `true` を返してプリフェッチを許可する。
+// 通常回線 (`4g` 等) では `true` を返してプリフェッチを許可する。
+//
+// レビュー Q2: `3g` も skip 条件に含める。
+//   3G で 31 MB を勝手に取るのは惜しい (実 DL 押下時に取ればよい)。トレードオフは
+//   docs/overview.md に記載。
+// レビュー S4: `NetworkInformation` / `requestIdleCallback` の型を module 上端に集約。
+interface NetworkInformation {
+  saveData?: boolean;
+  effectiveType?: 'slow-2g' | '2g' | '3g' | '4g' | (string & {});
+}
+interface NavigatorWithConnection {
+  connection?: NetworkInformation;
+}
+interface WindowWithIdleCallback {
+  requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+}
+
 function shouldPrefetchFfmpegCore(): boolean {
   if (typeof navigator === 'undefined') return false;
-  const conn = (navigator as unknown as {
-    connection?: { saveData?: boolean; effectiveType?: string };
-  }).connection;
+  const conn = (navigator as unknown as NavigatorWithConnection).connection;
   if (!conn) return true;
   if (conn.saveData) return false;
-  if (conn.effectiveType === 'slow-2g' || conn.effectiveType === '2g') return false;
+  const et = conn.effectiveType;
+  if (et === 'slow-2g' || et === '2g' || et === '3g') return false;
   return true;
 }
 
@@ -150,6 +165,9 @@ export default function Studio() {
   // (preload は core 31MB を毎回振り撒くため避ける)。
   // ロード失敗は `errorMsg` で UI 表示し、state は `'idle'` に戻して再試行を
   // 許可する (UI 上の 'error' 専用文言は不要なため union から除外)。
+  // レビュー Q3: 現状 UI 分岐は `'loading'` 表示にしか使っていない (`'ready'` は
+  // 内部フラグとしてのみ使用)。将来 "encoder ready" を明示する小バッジ等を
+  // 出したくなった時に値を流用できるよう、3 値 union のまま意図的に温存している。
   const [alphaEncoderState, setAlphaEncoderState] =
     createSignal<'idle' | 'loading' | 'ready'>('idle');
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
@@ -291,10 +309,11 @@ export default function Studio() {
       if (!shouldPrefetchFfmpegCore()) return;
       prefetchFfmpegCore();
     };
+    // レビュー S3: onMount は client-side でしか走らないので `typeof window` ガード
+    // は理論上冗長。ただし Astro hydration の極端なタイミング (例: 静的解析パス) で
+    // window 不在の経路を踏む事故を防ぐ防衛策として残す。
     if (typeof window !== 'undefined') {
-      const ric = (window as unknown as {
-        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
-      }).requestIdleCallback;
+      const ric = (window as unknown as WindowWithIdleCallback).requestIdleCallback;
       if (ric) {
         ric(schedulePrefetch, { timeout: 5000 });
       } else {

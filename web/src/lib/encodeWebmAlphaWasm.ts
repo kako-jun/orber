@@ -41,6 +41,12 @@ export const FFMPEG_WASM_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.wasm`;
 
 let ffmpegSingleton: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
+// orber#184 review S1: in-flight プリフェッチを保持する。`loadFfmpegAlphaEncoder`
+// が呼ばれた時点でプリフェッチがまだ走っていれば完了を待ち、SW cache に積まれた
+// 状態から `ffmpeg.load(...)` に入ることで二重 fetch race (プリフェッチ + 実ロード
+// が両方走って同じ 31 MB を重複ダウンロードする) を解消する。
+// プリフェッチ失敗 (offline 等) は無視して通常 load 経路に進む。
+let prefetchPromise: Promise<void> | null = null;
 
 // orber#184: シングルトン FFmpeg は内部 virtual FS を 1 つしか持たないため、
 // 並行に encodeAnimationAlphaWasm を呼ぶと writeFile / deleteFile / exec が
@@ -61,17 +67,24 @@ const frameName = (i: number) =>
  * - シングルトン (`ffmpegSingleton` / `ffmpegLoadPromise`) には**一切触れない**。
  *   純粋に HTTP fetch を走らせて SW (`public/sw.js` の `ffmpegCoreCacheFirst`)
  *   に拾わせるだけ。失敗しても透過 DL を実行した時に普通に再 fetch される。
- * - `mode: 'no-cors'` で opaque response でも問題ない (SW 側 CacheFirst は
- *   opaque を含めて cache に積む)。
- * - 例外は静かに握りつぶす (UI / console に出さない)。
+ * - レビュー M1: `mode: 'cors'` (= デフォルト、`mode` を指定しない) で走らせる。
+ *   旧 `mode: 'no-cors'` は opaque response を返し、それが SW の
+ *   `ffmpeg-core-v<version>` cache に焼き付くと後続の `importScripts(ffmpeg-core.js)`
+ *   や WebAssembly streaming compile が CORS チェックで失敗するリスクがある。
+ *   jsdelivr は CORS を許可しているので普通の cors fetch で問題なく通る。
+ * - レビュー S1: in-flight Promise を `prefetchPromise` に保持し、`loadFfmpegAlphaEncoder`
+ *   が裏で待てるようにする。これで「プリフェッチ in-flight 中に DL ボタン押下」の
+ *   ケースでも 1 回の DL に収束する。
+ * - 例外は静かに握りつぶす (UI / console に出さない)。fetch は同期 throw しない
+ *   ため外側 try は不要 (レビュー N3)。
  */
 export function prefetchFfmpegCore(): void {
-  try {
-    fetch(FFMPEG_CORE_URL, { mode: 'no-cors', credentials: 'omit' }).catch(() => {});
-    fetch(FFMPEG_WASM_URL, { mode: 'no-cors', credentials: 'omit' }).catch(() => {});
-  } catch {
-    // SSR / no fetch 環境では何もしない。
-  }
+  if (typeof fetch === 'undefined') return;
+  // 既に走っているプリフェッチがあれば再発火しない (idempotent)。
+  if (prefetchPromise) return;
+  const coreP = fetch(FFMPEG_CORE_URL, { credentials: 'omit' }).catch(() => {});
+  const wasmP = fetch(FFMPEG_WASM_URL, { credentials: 'omit' }).catch(() => {});
+  prefetchPromise = Promise.all([coreP, wasmP]).then(() => {});
 }
 
 /**
@@ -85,6 +98,13 @@ export async function loadFfmpegAlphaEncoder(): Promise<FFmpeg> {
   if (ffmpegLoadPromise) return ffmpegLoadPromise;
   const ffmpeg = new FFmpeg();
   ffmpegLoadPromise = (async () => {
+    // レビュー S1: プリフェッチが in-flight ならその完走を待ってから load する。
+    // SW (`ffmpegCoreCacheFirst`) がプリフェッチ Response を cache に積み終わって
+    // いれば、`ffmpeg.load` 内部の fetch は cache hit になり 31 MB の二重 DL を回避。
+    // プリフェッチ失敗 (offline / CORS 等) は無視して通常 load 経路に進む。
+    if (prefetchPromise) {
+      await prefetchPromise.catch(() => {});
+    }
     await ffmpeg.load({
       coreURL: FFMPEG_CORE_URL,
       wasmURL: FFMPEG_WASM_URL,
