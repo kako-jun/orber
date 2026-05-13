@@ -21,6 +21,8 @@
 // signature は維持する。
 
 import OrberWorker from './orberWorker?worker';
+import { encodeAnimationAlphaWasm } from './encodeWebmAlphaWasm';
+import { ANIM_FPS } from './encodeMp4';
 
 interface PendingResolver {
   resolve: (v: unknown) => void;
@@ -29,6 +31,9 @@ interface PendingResolver {
   // 'animateProgress' kind の message が届くので、その経路で発火する。
   // pending は消さない（resolve は本体メッセージで行う）。
   onProgress?: (frame: number, total: number) => void;
+  // #184: 透過動画用の per-frame PNG buffer を受け取る callback。
+  // worker は `alphaFrame` kind の message で 1 枚ずつ送ってくる。
+  onAlphaFrame?: (frame: number, total: number, data: ArrayBuffer) => void;
   // #108: 元リクエストの kind。`hasInFlight()` で init / setSource を
   // 「ユーザー操作の進行中扱い」から除外して、再ガチャ判定の精度を上げる
   // ために使う。init は wasm 起動だけ、setSource はキャッシュ更新だけで
@@ -92,7 +97,14 @@ function ensureWorker(): Worker {
     // 将来 kind が増えるなら明示分岐を追加すること。
     type RespResult = { id: number; ok: boolean; data?: unknown; error?: string };
     type RespProgress = { kind: 'animateProgress'; id: number; frame: number; total: number };
-    type Resp = RespResult | RespProgress;
+    type RespAlphaFrame = {
+      kind: 'alphaFrame';
+      id: number;
+      frame: number;
+      total: number;
+      data: ArrayBuffer;
+    };
+    type Resp = RespResult | RespProgress | RespAlphaFrame;
     const msg = e.data as Resp;
     if ('kind' in msg && msg.kind === 'animateProgress') {
       const pp = pending.get(msg.id);
@@ -101,6 +113,17 @@ function ensureWorker(): Worker {
           pp.onProgress(msg.frame, msg.total);
         } catch (err) {
           console.error('orber onProgress callback failed', err);
+        }
+      }
+      return;
+    }
+    if ('kind' in msg && msg.kind === 'alphaFrame') {
+      const pp = pending.get(msg.id);
+      if (pp && pp.onAlphaFrame) {
+        try {
+          pp.onAlphaFrame(msg.frame, msg.total, msg.data);
+        } catch (err) {
+          console.error('orber onAlphaFrame callback failed', err);
         }
       }
       return;
@@ -143,6 +166,7 @@ function call<T>(
   req: Record<string, unknown> & { kind: string },
   transfers: Transferable[] = [],
   onProgress?: (frame: number, total: number) => void,
+  onAlphaFrame?: (frame: number, total: number, data: ArrayBuffer) => void,
 ): Promise<T> {
   const w = ensureWorker();
   const id = ++nextId;
@@ -151,6 +175,7 @@ function call<T>(
       resolve: resolve as (v: unknown) => void,
       reject: reject as (e: unknown) => void,
       onProgress,
+      onAlphaFrame,
       kind: req.kind,
     });
     w.postMessage({ ...req, id }, transfers);
@@ -308,9 +333,19 @@ export async function workerGenerateOneAlpha(
 }
 
 /**
- * #56: 1 タイルぶんの透過 WebM (VP9 alpha 'keep') を返す。Safari など VP9 alpha
- * 非対応ブラウザでは worker 側 encode が throw する。呼び出し側は事前に
- * `workerVp9AlphaSupported()` で probe して checkbox を disable すること。
+ * #184: 1 タイルぶんの透過 WebM (libvpx-vp9 + yuva420p) を返す。
+ *
+ * worker は wasm + OffscreenCanvas で各 frame を透過 PNG として描画し、
+ * `alphaFrame` message で 1 枚ずつ main に流す。main 側で集めた PNG を
+ * ffmpeg.wasm に投入し libvpx-vp9 + yuva420p で muxing する。
+ *
+ * 旧 WebCodecs `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` 経路は
+ * Edge / Android Chrome 等多くの環境で supported:false を返したため撤去。
+ * ffmpeg.wasm は内蔵 libvpx-vp9 を使うため、ブラウザ / OS / GPU の codec
+ * backend に依存せず全環境で確実に出力できる。
+ *
+ * ffmpeg.wasm のロード失敗 (ネットワーク断 / 配信欠落) は Error が伝播する。
+ * 呼び出し側は `alphaEncoderLoadFailed` 文言の UI で通知すること。
  */
 export async function workerAnimateOneAlpha(
   params: BaseParams,
@@ -319,9 +354,13 @@ export async function workerAnimateOneAlpha(
   totalFrames: number,
   onProgress?: (frame: number, total: number) => void,
 ): Promise<Blob> {
-  const buf = await call<ArrayBuffer>(
+  // PNG フレームを順序保証付きで収集する。worker は serial に送ってくる
+  // 想定 (worker case 'renderAlphaFrames' の for ループは index 順) なので
+  // 配列の単純 push で OK。順序の念のための保険として frame index も保存する。
+  const frames: Uint8Array[] = new Array(totalFrames);
+  await call<void>(
     {
-      kind: 'animateOneAlpha',
+      kind: 'renderAlphaFrames',
       params,
       n,
       index,
@@ -329,14 +368,23 @@ export async function workerAnimateOneAlpha(
     },
     [],
     onProgress,
+    (frame, _total, data) => {
+      frames[frame] = new Uint8Array(data);
+    },
   );
-  return new Blob([buf], { type: 'video/webm' });
-}
-
-/**
- * #56: 現在のブラウザで VP9 alpha encode が使えるかの probe。Safari fallback 判定用。
- * worker は probe 結果をキャッシュするので、複数回呼んでも cost はゼロに近い。
- */
-export async function workerVp9AlphaSupported(): Promise<boolean> {
-  return await call<boolean>({ kind: 'vp9AlphaSupported' });
+  // 欠損チェック (worker が途中で post を取りこぼした場合のセーフティ)。
+  for (let i = 0; i < totalFrames; i++) {
+    if (!frames[i]) {
+      throw new Error(
+        `missing alpha frame ${i}/${totalFrames} from worker (animateOneAlpha)`,
+      );
+    }
+  }
+  return await encodeAnimationAlphaWasm(
+    frames,
+    params.width,
+    params.height,
+    ANIM_FPS,
+    onProgress,
+  );
 }
