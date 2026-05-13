@@ -584,6 +584,11 @@ Implementation notes:
   outage), `alphaEncoderLoadFailed` ("透過動画エンコーダの読み込みに
   失敗しました / Failed to load transparent video encoder") is shown
   via `errorMsg` and the download is aborted before any zip is produced.
+  The whole alpha bundle (transparent PNG / WebP / WebM) is skipped in
+  this case — we don't silently degrade to "alpha folder without video",
+  since users opting into the transparent toggle expect the video form
+  too. The state then returns to `'idle'` so retrying the download can
+  re-enter `'loading'`.
 - Progress: when the toggle is ON, `dlProgress.total` is set to
   `indices.length * 2` so the existing "Rendering high-res… N / Total"
   text covers both the background-filled pass and the alpha pass with
