@@ -36,7 +36,11 @@ import { ANIM_FPS } from './encodeMp4';
 // jsdelivr は Fastly + Cloudflare の二重ミラーで unpkg より安定 & immutable
 // cache が効くため CDN として採用。
 export const FFMPEG_CORE_VERSION = '0.12.10';
-export const FFMPEG_CORE_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
+// `@ffmpeg/ffmpeg` 0.12.15 は `type: "module"` Worker を spawn し、Worker 内で
+// `importScripts` が使えないため fallback の `import(coreURL)` が走る。
+// UMD ビルドは ES module ではないため `import()` が失敗する (本番再現:
+// `failed to import ffmpeg-core.js`)。ESM ビルドを使う必要がある。
+export const FFMPEG_CORE_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
 export const FFMPEG_CORE_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.js`;
 export const FFMPEG_WASM_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.wasm`;
 
