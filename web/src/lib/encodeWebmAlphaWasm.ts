@@ -15,8 +15,12 @@
 //     COOP/COEP ヘッダ不要なので Nostalgic Counter iframe 等を壊さない)
 //   - `FFmpeg` インスタンスは module 内シングルトンで lazy 初期化
 //     (透過 DL を複数回使ってもロードは 1 度だけ)
-//   - core は同一オリジン `/ffmpeg/ffmpeg-core.{js,wasm}` から取得
-//     (CDN ロードを避け外部依存を増やさない)
+//   - core は jsdelivr CDN (`cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/umd`)
+//     から取得。Cloudflare Pages の単一ファイル上限 25 MiB に
+//     `ffmpeg-core.wasm` (~31 MB) が引っかかるため、同一オリジン配信を諦め
+//     CDN 経由にする。バージョンを pin して immutable cache を効かせ、
+//     Service Worker (`public/sw.js`) で CacheFirst により初回後はオフラインで
+//     再利用できる経路を維持する。
 //   - 1 frame ずつ PNG として virtual FS に書き込み、`ffmpeg.exec()` で
 //     `-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0` で WebM 化
 //
@@ -25,6 +29,15 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 
 import { ANIM_FPS } from './encodeMp4';
+
+// `@ffmpeg/core` のバージョンは package.json の devDependencies に pin。
+// 数字は `node_modules/@ffmpeg/core/package.json` の `version` と同期する。
+// jsdelivr は Fastly + Cloudflare の二重ミラーで unpkg より安定 & immutable
+// cache が効くため CDN として採用。
+export const FFMPEG_CORE_VERSION = '0.12.10';
+export const FFMPEG_CORE_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
+export const FFMPEG_CORE_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.js`;
+export const FFMPEG_WASM_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.wasm`;
 
 let ffmpegSingleton: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
@@ -52,8 +65,8 @@ export async function loadFfmpegAlphaEncoder(): Promise<FFmpeg> {
   const ffmpeg = new FFmpeg();
   ffmpegLoadPromise = (async () => {
     await ffmpeg.load({
-      coreURL: '/ffmpeg/ffmpeg-core.js',
-      wasmURL: '/ffmpeg/ffmpeg-core.wasm',
+      coreURL: FFMPEG_CORE_URL,
+      wasmURL: FFMPEG_WASM_URL,
     });
     ffmpegSingleton = ffmpeg;
     return ffmpeg;

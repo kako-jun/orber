@@ -110,6 +110,27 @@ describe('encodeAnimationAlphaWasm', () => {
     expect(mockState.instances.length).toBe(0);
   });
 
+  it('ffmpeg.load に jsdelivr CDN の coreURL / wasmURL が渡される (CF Pages 25 MiB 上限回避 #184)', async () => {
+    const { loadFfmpegAlphaEncoder, FFMPEG_CORE_VERSION } = await import(
+      './encodeWebmAlphaWasm'
+    );
+    await loadFfmpegAlphaEncoder();
+    const inst = mockState.instances[0];
+    const arg = inst.load.mock.calls[0][0] as {
+      coreURL: string;
+      wasmURL: string;
+    };
+    expect(arg.coreURL).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
+    expect(arg.coreURL).toContain(FFMPEG_CORE_VERSION);
+    expect(arg.coreURL).toMatch(/\/dist\/umd\/ffmpeg-core\.js$/);
+    expect(arg.wasmURL).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
+    expect(arg.wasmURL).toContain(FFMPEG_CORE_VERSION);
+    expect(arg.wasmURL).toMatch(/\/dist\/umd\/ffmpeg-core\.wasm$/);
+    // 同一オリジン `/ffmpeg/...` 配信に戻していないこと
+    expect(arg.coreURL).not.toMatch(/^\/ffmpeg\//);
+    expect(arg.wasmURL).not.toMatch(/^\/ffmpeg\//);
+  });
+
   it('loadFfmpegAlphaEncoder を 2 回連続呼出しても new FFmpeg() / .load() は 1 回のみ', async () => {
     const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
     await loadFfmpegAlphaEncoder();

@@ -23,7 +23,21 @@
 
 const CACHE_NAME = 'orber-__BUILD_DATE__';
 
+// orber#184 — ffmpeg-core (~31 MB) は CF Pages の単一ファイル上限 25 MiB を
+// 超えるため、`@ffmpeg/core` を jsdelivr CDN から配信する。バージョンを
+// pin することで immutable cache を効かせ、SW で CacheFirst して初回 fetch 後
+// はオフラインでも透過動画エンコードができる状態を維持する。
+// バージョン更新時は `encodeWebmAlphaWasm.ts` の `FFMPEG_CORE_VERSION` と
+// 下記 `FFMPEG_CORE_VERSION` を揃え、古いキャッシュ名は activate で破棄される。
+const FFMPEG_CORE_VERSION = '0.12.10';
+const FFMPEG_CORE_CACHE = `ffmpeg-core-v${FFMPEG_CORE_VERSION}`;
+const FFMPEG_CORE_URL_PREFIX = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@';
+
 const PRECACHE_URLS = ['/', '/manifest.webmanifest'];
+
+function isFfmpegCoreRequest(url) {
+  return url.startsWith(FFMPEG_CORE_URL_PREFIX);
+}
 
 // Astro/Vite が出す content-hash 付き asset の prefix。`/_astro/foo.HASH.js`
 // 等は immutable なので CacheFirst で返してよい。
@@ -45,7 +59,11 @@ self.addEventListener('activate', (event) => {
       .then((names) =>
         Promise.all(
           names
-            .filter((name) => name !== CACHE_NAME)
+            // 現行 orber-{date} キャッシュ、現行 ffmpeg-core-vX.Y.Z 以外は破棄。
+            // バージョン更新時に古い ffmpeg-core-* 領域を確実に解放する。
+            .filter(
+              (name) => name !== CACHE_NAME && name !== FFMPEG_CORE_CACHE
+            )
             .map((name) => caches.delete(name))
         )
       )
@@ -67,6 +85,14 @@ self.addEventListener('fetch', (event) => {
   // blob: / data: は intercept しない (生成結果の DL を阻害しない)
   if (url.protocol === 'blob:' || url.protocol === 'data:') return;
 
+  // ffmpeg-core (jsdelivr CDN, cross-origin) は CacheFirst で永続化する。
+  // バージョン pin により immutable とみなせる。`no-cors` で opaque
+  // response になっても問題ない (cache.put は opaque も格納できる)。
+  if (isFfmpegCoreRequest(request.url)) {
+    event.respondWith(ffmpegCoreCacheFirst(request));
+    return;
+  }
+
   if (isImmutableAsset(url)) {
     // CacheFirst: hit したらそれを返し、miss だったら network → cache に積む。
     event.respondWith(cacheFirst(request));
@@ -85,6 +111,24 @@ async function cacheFirst(request) {
       const cache = await caches.open(CACHE_NAME);
       // 同期的な put は respondWith の Promise 解決とは独立なので waitUntil は
       // 不要 (await でこの async 関数の lifetime に既に縛られている)。
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch (err) {
+    return new Response('Offline', { status: 503 });
+  }
+}
+
+async function ffmpegCoreCacheFirst(request) {
+  const cache = await caches.open(FFMPEG_CORE_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  try {
+    // ffmpeg.wasm 側は CORS 付き普通の fetch で取りに来るが、SW 内では
+    // mode を維持したまま fetch する。jsdelivr は CORS を許可しているので
+    // opaque にせずとも通る。万一 CORS 設定が変わっても opaque で保存可能。
+    const response = await fetch(request);
+    if (response && (response.ok || response.type === 'opaque')) {
       cache.put(request, response.clone());
     }
     return response;

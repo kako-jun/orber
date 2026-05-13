@@ -29,7 +29,3 @@ web/.astro/
 web/src/wasm/*
 !web/src/wasm/.gitkeep
 web/.wrangler/
-
-# ffmpeg.wasm core (#184) — copied from node_modules by `copy:ffmpeg` script
-# at build/dev time. Keeping it out of git avoids LFS / CF Pages bundle bloat.
-web/public/ffmpeg/
