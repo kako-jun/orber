@@ -552,11 +552,16 @@ Implementation notes:
   `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` + `webm-muxer` for
   videos. The encoder branch lives in `web/src/lib/encodeWebmAlpha.ts`,
   parallel to the existing `encodeMp4.ts`.
-- Browser support: VP9 alpha encoding via WebCodecs is currently reliable
-  on Linux Chrome, Android Chrome, and recent Firefox. Safari does not
-  implement it, and Chromium-based browsers on Windows (Chrome / Edge)
-  frequently return `supported: false` as well depending on the platform
-  encoder backend.
+- Browser support: VP9 alpha encoding via WebCodecs is **not reliably
+  available across browsers**. In practice the
+  `VideoEncoder.isConfigSupported({codec, alpha:'keep'})` probe returns
+  `supported: false` on Safari, Chromium-based browsers on Windows
+  (Chrome / Edge), Android Chrome, and many other combinations — the
+  result depends on OS-level codec backends, GPU acceleration state, and
+  Chromium build flags, so claiming any specific platform works in
+  general is misleading. AV1 alpha (`av01.0.04M.08`) is even less widely
+  supported. Treat transparent video as best-effort and rely on the
+  probe + UI notice rather than a platform allowlist.
   The worker probes `VideoEncoder.isConfigSupported({codec, alpha:'keep'})`
   once at startup and exposes the result as `workerVp9AlphaSupported()`.
   When it returns `false`, the Studio checkbox stays clickable (so the
