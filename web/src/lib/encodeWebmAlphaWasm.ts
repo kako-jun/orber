@@ -29,6 +29,17 @@ import { ANIM_FPS } from './encodeMp4';
 let ffmpegSingleton: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
 
+// orber#184: シングルトン FFmpeg は内部 virtual FS を 1 つしか持たないため、
+// 並行に encodeAnimationAlphaWasm を呼ぶと writeFile / deleteFile / exec が
+// 同じファイル名 (`frame-%04d.png` / `out.webm`) を奪い合って壊れる。
+// module-level の serial mutex で呼び出しを必ず直列化する。
+let encodeMutex: Promise<void> = Promise.resolve();
+
+// frame ファイル名のヘルパー (`-i frame-%04d.png` と桁数を同期させる目的)。
+const FRAME_PAD = 4;
+const frameName = (i: number) =>
+  `frame-${String(i).padStart(FRAME_PAD, '0')}.png`;
+
 /**
  * ffmpeg.wasm をロードする (シングルトン)。
  *
@@ -66,6 +77,8 @@ export async function loadFfmpegAlphaEncoder(): Promise<FFmpeg> {
  *
  * frames の各 ArrayBuffer は呼び出し後の参照は保持しない (writeFile で
  * 内部コピーされる)。
+ *
+ * シングルトン共有 virtual FS のため内部で直列化される (`encodeMutex`)。
  */
 export async function encodeAnimationAlphaWasm(
   frames: Uint8Array[],
@@ -77,21 +90,64 @@ export async function encodeAnimationAlphaWasm(
   if (frames.length === 0) {
     throw new Error('frames must be > 0');
   }
+  // 直列化: 先行 encode が完了 (resolve / reject 問わず) してから走る。
+  // 自分の完了を mutex の next-tail にする。
+  const prev = encodeMutex;
+  let release: () => void = () => {};
+  encodeMutex = new Promise<void>((res) => {
+    release = res;
+  });
+  try {
+    await prev.catch(() => {});
+    return await runEncode(frames, width, height, fps, onProgress);
+  } finally {
+    release();
+  }
+}
+
+async function runEncode(
+  frames: Uint8Array[],
+  width: number,
+  height: number,
+  fps: number,
+  onProgress?: (frame: number, total: number) => void,
+): Promise<Blob> {
   const ffmpeg = await loadFfmpegAlphaEncoder();
   const total = frames.length;
 
-  const inputPattern = 'frame-%04d.png';
+  const inputPattern = `frame-%0${FRAME_PAD}d.png`;
   const outputName = 'out.webm';
 
   // 既存ファイルの掃除 (前回 encode 残骸が virtual FS に残っている可能性あり)。
-  // listDir で総当りせず、想定名のみ deleteFile を試みて失敗は無視する。
-  // (singleton なので前回ファイル残存はあり得る)
-  for (let i = 0; i < total; i++) {
-    const name = `frame-${String(i).padStart(4, '0')}.png`;
-    try {
-      await ffmpeg.deleteFile(name);
-    } catch {
-      /* 初回 / 不存在は無視 */
+  // singleton 再利用時、`listDir('/')` で実際に残っている `frame-*.png` だけを
+  // 総当り削除する。前回 ≤ 今回フレーム数なら問題ないが、前回 > 今回のとき
+  // 想定名ループだけでは古い余剰フレームが残り `-i frame-%04d.png` が拾って
+  // しまう恐れがあるため。`listDir` 自体が落ちた場合 (古い API 等) は想定名
+  // ループにフォールバックする。
+  let cleanupNames: string[] | null = null;
+  try {
+    const entries = await ffmpeg.listDir('/');
+    cleanupNames = entries
+      .filter((e) => !e.isDir && /^frame-\d+\.png$/.test(e.name))
+      .map((e) => e.name);
+  } catch {
+    cleanupNames = null;
+  }
+  if (cleanupNames) {
+    for (const name of cleanupNames) {
+      try {
+        await ffmpeg.deleteFile(name);
+      } catch {
+        /* 不存在は無視 */
+      }
+    }
+  } else {
+    for (let i = 0; i < total; i++) {
+      try {
+        await ffmpeg.deleteFile(frameName(i));
+      } catch {
+        /* 初回 / 不存在は無視 */
+      }
     }
   }
   try {
@@ -103,8 +159,7 @@ export async function encodeAnimationAlphaWasm(
   // 1 frame ずつ書き込む。Promise.all すると wasm 内部のシリアル処理に
   // 並べ替えが入ってメモリ使用量がピークで膨らむため、await ループで進める。
   for (let i = 0; i < total; i++) {
-    const name = `frame-${String(i).padStart(4, '0')}.png`;
-    await ffmpeg.writeFile(name, frames[i]);
+    await ffmpeg.writeFile(frameName(i), frames[i]);
   }
 
   const progressHandler = ({ progress }: { progress: number; time: number }) => {
@@ -150,9 +205,8 @@ export async function encodeAnimationAlphaWasm(
 
   // 後片付け (virtual FS のメモリ解放)。
   for (let i = 0; i < total; i++) {
-    const name = `frame-${String(i).padStart(4, '0')}.png`;
     try {
-      await ffmpeg.deleteFile(name);
+      await ffmpeg.deleteFile(frameName(i));
     } catch {
       /* ignore */
     }

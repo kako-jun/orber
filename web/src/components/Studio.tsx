@@ -130,10 +130,12 @@ export default function Studio() {
   // でエラー UI を出す。
   const [includeAlpha, setIncludeAlpha] = createSignal<boolean>(false);
   // #184: ffmpeg.wasm のロード状態。`'idle'` = まだ DL してない、`'loading'`
-  // = ロード中、`'ready'` = 利用可能、`'error'` = ロード失敗。透過 DL を初めて
-  // 押した時に遅延ロードする (preload は core 31MB を毎回振り撒くため避ける)。
+  // = ロード中、`'ready'` = 利用可能。透過 DL を初めて押した時に遅延ロードする
+  // (preload は core 31MB を毎回振り撒くため避ける)。
+  // ロード失敗は `errorMsg` で UI 表示し、state は `'idle'` に戻して再試行を
+  // 許可する (UI 上の 'error' 専用文言は不要なため union から除外)。
   const [alphaEncoderState, setAlphaEncoderState] =
-    createSignal<'idle' | 'loading' | 'ready' | 'error'>('idle');
+    createSignal<'idle' | 'loading' | 'ready'>('idle');
   const [supportedGlyphChoices, setSupportedGlyphChoices] =
     createSignal<string[]>(SYMBOL_PICKER_DEFAULT);
   const [isGlyphComposing, setIsGlyphComposing] = createSignal(false);
@@ -1006,7 +1008,9 @@ export default function Studio() {
           setAlphaEncoderState('ready');
         } catch (loadErr) {
           console.error('ffmpeg.wasm load failed', loadErr);
-          setAlphaEncoderState('error');
+          // 再試行で再 loading に入れるよう state は 'idle' に戻す。
+          // UI 表示は errorMsg (alphaEncoderLoadFailed) に集約。
+          setAlphaEncoderState('idle');
           setErrorMsg(t('alphaEncoderLoadFailed'));
           return;
         }
@@ -1932,6 +1936,8 @@ export default function Studio() {
               class={GLASS_CHECKBOX_INPUT}
               checked={includeAlpha()}
               onChange={(e) => setIncludeAlpha(e.currentTarget.checked)}
+              // downloading() 中は encoder loading フェーズも含むので
+              // alphaEncoderState() の追加チェックは不要 (二重防止になる)。
               disabled={!decoded() || downloading()}
             />
             <span>{t('includeAlphaLabel')}</span>

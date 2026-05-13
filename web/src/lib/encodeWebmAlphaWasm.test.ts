@@ -1,6 +1,6 @@
 // orber#184 — encodeWebmAlphaWasm の単体テスト。
 //
-// @ffmpeg/ffmpeg / @ffmpeg/util を vi.mock で完全置換し、libvpx-vp9 引数生成・
+// @ffmpeg/ffmpeg を vi.mock で完全置換し、libvpx-vp9 引数生成・
 // シングルトン挙動・progress 中継・後片付けまわりの仕様をピン留めする。
 // 実 wasm はロードしない (jsdom では動かない)。
 
@@ -15,6 +15,7 @@ interface MockFFmpeg {
   exec: ReturnType<typeof vi.fn>;
   readFile: ReturnType<typeof vi.fn>;
   deleteFile: ReturnType<typeof vi.fn>;
+  listDir: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
   off: ReturnType<typeof vi.fn>;
   __progressHandlers: ProgressHandler[];
@@ -61,6 +62,7 @@ vi.mock('@ffmpeg/ffmpeg', () => {
         return Promise.resolve(new Uint8Array([1, 2, 3]));
       }),
       deleteFile: vi.fn().mockResolvedValue(undefined),
+      listDir: vi.fn().mockResolvedValue([]),
       on: vi.fn().mockImplementation((event: string, handler: ProgressHandler) => {
         if (event === 'progress') inst.__progressHandlers.push(handler);
       }),
@@ -76,10 +78,6 @@ vi.mock('@ffmpeg/ffmpeg', () => {
   });
   return { FFmpeg };
 });
-
-vi.mock('@ffmpeg/util', () => ({
-  toBlobURL: vi.fn().mockResolvedValue('blob:mock'),
-}));
 
 beforeEach(() => {
   // シングルトン状態をリセットするため毎テストで動的 import し直す。
@@ -312,9 +310,90 @@ describe('encodeAnimationAlphaWasm', () => {
     // を取る: まず loadFfmpegAlphaEncoder を呼んでから差し替える。
     const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
     const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
+    // listDir で残骸を 1 件返し、pre-cleanup で deleteFile が呼ばれる経路を作る
+    ff.listDir.mockResolvedValue([
+      { name: 'frame-0000.png', isDir: false },
+    ]);
     ff.deleteFile.mockRejectedValue(new Error('not found'));
     await expect(
       encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
     ).resolves.toBeInstanceOf(Blob);
+  });
+
+  it('listDir が落ちても想定名ループで pre-cleanup を継続する (fallback)', async () => {
+    const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
+      await import('./encodeWebmAlphaWasm');
+    const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
+    ff.listDir.mockRejectedValue(new Error('listDir not supported'));
+    await expect(
+      encodeAnimationAlphaWasm([makeFrame(1), makeFrame(2)], 16, 16),
+    ).resolves.toBeInstanceOf(Blob);
+    // 想定名 (frame-0000.png / frame-0001.png) で deleteFile が呼ばれている
+    const names = ff.deleteFile.mock.calls.map((c) => c[0] as string);
+    expect(names).toContain('frame-0000.png');
+    expect(names).toContain('frame-0001.png');
+  });
+
+  it('listDir で発見した frame-*.png 残骸を pre-cleanup で削除する', async () => {
+    const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
+      await import('./encodeWebmAlphaWasm');
+    const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
+    // 前回 5 フレーム、今回 2 フレームのケース。古い 3 本も消えてほしい。
+    ff.listDir.mockResolvedValueOnce([
+      { name: 'frame-0000.png', isDir: false },
+      { name: 'frame-0001.png', isDir: false },
+      { name: 'frame-0002.png', isDir: false },
+      { name: 'frame-0003.png', isDir: false },
+      { name: 'frame-0004.png', isDir: false },
+      { name: 'unrelated.txt', isDir: false },
+      { name: 'tmpdir', isDir: true },
+    ]);
+    await encodeAnimationAlphaWasm([makeFrame(1), makeFrame(2)], 16, 16);
+    const deleted = ff.deleteFile.mock.calls.map((c) => c[0] as string);
+    expect(deleted).toContain('frame-0002.png');
+    expect(deleted).toContain('frame-0003.png');
+    expect(deleted).toContain('frame-0004.png');
+    // 関係ないファイル / ディレクトリには触らない
+    expect(deleted).not.toContain('unrelated.txt');
+    expect(deleted).not.toContain('tmpdir');
+  });
+
+  it('並行に 2 回呼んでも内部 mutex で直列化される (2 つ目の writeFile は 1 つ目の deleteFile より後)', async () => {
+    const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
+      await import('./encodeWebmAlphaWasm');
+    const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
+
+    // 操作順をタイムラインに記録する。
+    const timeline: string[] = [];
+    ff.writeFile.mockImplementation(async (name: string) => {
+      timeline.push(`write:${name}`);
+    });
+    ff.deleteFile.mockImplementation(async (name: string) => {
+      timeline.push(`delete:${name}`);
+    });
+    // 1 つ目の exec を 1 tick 遅延させて、もし直列化されていなければ
+    // 2 つ目の writeFile が割り込めるようにする。
+    let firstExec = true;
+    ff.exec.mockImplementation(async () => {
+      if (firstExec) {
+        firstExec = false;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      timeline.push('exec');
+    });
+
+    const p1 = encodeAnimationAlphaWasm([makeFrame(1)], 16, 16);
+    const p2 = encodeAnimationAlphaWasm([makeFrame(2)], 16, 16);
+    await Promise.all([p1, p2]);
+
+    // 2 つ目の最初の writeFile (frame-0000.png) のインデックスは
+    // 1 つ目の post-cleanup delete (frame-0000.png) より後でなければならない。
+    // 1 つ目の post-cleanup 内に "delete:frame-0000.png" が 2 回現れる
+    // (pre-cleanup は listDir が [] を返すので走らない) ので "delete:out.webm"
+    // をマーカーにする: これが 1 つ目の最後の操作。
+    const firstOutDeleteIdx = timeline.indexOf('delete:out.webm');
+    const lastWriteIdx = timeline.lastIndexOf('write:frame-0000.png');
+    expect(firstOutDeleteIdx).toBeGreaterThanOrEqual(0);
+    expect(lastWriteIdx).toBeGreaterThan(firstOutDeleteIdx);
   });
 });
