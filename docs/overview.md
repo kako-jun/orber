@@ -603,8 +603,9 @@ Implementation notes:
   user clicks the transparent-DL button" first-run cliff, `Studio.tsx`
   schedules a speculative `prefetchFfmpegCore()` from `onMount` via
   `requestIdleCallback` (with a `setTimeout(2000)` fallback). The
-  prefetch fires two opaque (`mode: 'no-cors'`) `fetch()` calls against
-  the jsdelivr URLs; the Service Worker's CacheFirst layer picks them up
+  prefetch fires two CORS-mode `fetch()` calls (no explicit `mode`,
+  browser default) against the jsdelivr URLs; the Service Worker's
+  CacheFirst layer picks them up
   and stores them in `ffmpeg-core-v<version>`, so by the time the user
   is done designing their orb the core is already in cache and the real
   download is a cache hit. The prefetch deliberately does **not** touch
@@ -619,10 +620,10 @@ Implementation notes:
   toggle, so we defer to the explicit "user clicked DL" moment instead.
   4G / WiFi users still get the smooth first-run experience. SSR (Astro
   static build) has no `window` so the scheduler is a no-op there.
-  The prefetch is also CORS-mode (not `no-cors`): an opaque response
-  would poison the SW cache and break the subsequent `importScripts`
-  / WebAssembly streaming load, so the SW also refuses to cache opaque
-  responses defensively.
+  CORS mode is required (not `no-cors`): an opaque response would
+  poison the SW cache and break the subsequent `importScripts` /
+  WebAssembly streaming load that ffmpeg.wasm performs internally, so
+  the SW also refuses to cache opaque responses defensively.
 - Loading UX: when the user clicks download with the transparent toggle
   ON, the Studio surface shows `alphaEncodingInProgress` ("透過動画
   エンコーダを読み込み中… / Loading transparent video encoder…") while

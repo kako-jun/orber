@@ -30,6 +30,9 @@ const CACHE_NAME = 'orber-__BUILD_DATE__';
 // バージョン更新時は `encodeWebmAlphaWasm.ts` の `FFMPEG_CORE_VERSION` から
 // `package.json` の `scripts.stamp:sw` で build 時に `__FFMPEG_CORE_VERSION__`
 // を置換する (二重定義回避、レビュー N1)。古いキャッシュ名は activate で破棄。
+// 注: `astro dev` は stamp:sw を実行しないため、開発中は sentinel 文字列
+// `__FFMPEG_CORE_VERSION__` のまま登録され、cache 名も `ffmpeg-core-v__...__`
+// となる。動作上は他キャッシュと衝突しないので問題ないが debug 時に注意。
 const FFMPEG_CORE_VERSION = '__FFMPEG_CORE_VERSION__';
 const FFMPEG_CORE_CACHE = `ffmpeg-core-v${FFMPEG_CORE_VERSION}`;
 const FFMPEG_CORE_URL_PREFIX = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@';

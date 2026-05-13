@@ -46,6 +46,9 @@ let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
 // 状態から `ffmpeg.load(...)` に入ることで二重 fetch race (プリフェッチ + 実ロード
 // が両方走って同じ 31 MB を重複ダウンロードする) を解消する。
 // プリフェッチ失敗 (offline 等) は無視して通常 load 経路に進む。
+// 一度 resolve したら null に戻さない (再発火しない設計)。SW がバージョン bump で
+// 旧キャッシュを破棄した直後の同一セッションでは `await prefetchPromise` が即
+// resolve するだけで、実 fetch は `ffmpeg.load` 側が CDN に取りに行く。
 let prefetchPromise: Promise<void> | null = null;
 
 // orber#184: シングルトン FFmpeg は内部 virtual FS を 1 つしか持たないため、

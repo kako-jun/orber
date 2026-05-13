@@ -302,7 +302,7 @@ export default function Studio() {
     // 裏で SW キャッシュへ先取りしておく。透過 DL ボタンを押した瞬間に
     // 初めて 30 MB を取りに行く初回体験を回避するための投機的プリフェッチ。
     // - `requestIdleCallback` でメイン UI / wasm 初期化と帯域を奪い合わない
-    // - データ節約モード (`saveData` / `effectiveType === 'slow-2g'|'2g'`) では
+    // - データ節約モード (`saveData` / `effectiveType === 'slow-2g'|'2g'|'3g'`) では
     //   skip して、モバイル回線ユーザーに 31 MB を取らせない
     // - SSR (Astro static build) で `window` が無い経路は no-op
     const schedulePrefetch = () => {
