@@ -14,7 +14,7 @@ import {
   workerSetImageShape,
   workerSetSource,
 } from '../lib/orberClient';
-import { loadFfmpegAlphaEncoder } from '../lib/encodeWebmAlphaWasm';
+import { loadFfmpegAlphaEncoder, prefetchFfmpegCore } from '../lib/encodeWebmAlphaWasm';
 import { t, lang } from '../lib/strings';
 
 type Aspect = 'portrait' | 'landscape';
@@ -56,6 +56,22 @@ const GLYPH_DEFAULT_ROTATE: Record<string, boolean> = {
   '⚡': false,
   '☀': false,
 };
+
+// #184: ffmpeg-core (~31 MB) をアイドル時にプリフェッチしてよいかを判定する
+// saver guard。`navigator.connection` の Network Information API を見て、
+// データ節約モード (`saveData`) または極端な低速回線 (`slow-2g` / `2g`) の
+// ユーザーには勝手に 31 MB を取らせない。connection API 未対応 (Safari 等) や
+// 通常回線では `true` を返してプリフェッチを許可する。
+function shouldPrefetchFfmpegCore(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const conn = (navigator as unknown as {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+  if (!conn) return true;
+  if (conn.saveData) return false;
+  if (conn.effectiveType === 'slow-2g' || conn.effectiveType === '2g') return false;
+  return true;
+}
 
 interface Tile {
   // 静止画フレーム（前半 still と、後半 video の poster 兼フォールバック）。
@@ -264,6 +280,27 @@ export default function Studio() {
       const u = imageShapeUrl();
       if (u) URL.revokeObjectURL(u);
     });
+    // #184: ffmpeg-core (~31 MB) を「ユーザーがオーブを設計している間」に
+    // 裏で SW キャッシュへ先取りしておく。透過 DL ボタンを押した瞬間に
+    // 初めて 30 MB を取りに行く初回体験を回避するための投機的プリフェッチ。
+    // - `requestIdleCallback` でメイン UI / wasm 初期化と帯域を奪い合わない
+    // - データ節約モード (`saveData` / `effectiveType === 'slow-2g'|'2g'`) では
+    //   skip して、モバイル回線ユーザーに 31 MB を取らせない
+    // - SSR (Astro static build) で `window` が無い経路は no-op
+    const schedulePrefetch = () => {
+      if (!shouldPrefetchFfmpegCore()) return;
+      prefetchFfmpegCore();
+    };
+    if (typeof window !== 'undefined') {
+      const ric = (window as unknown as {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      }).requestIdleCallback;
+      if (ric) {
+        ric(schedulePrefetch, { timeout: 5000 });
+      } else {
+        setTimeout(schedulePrefetch, 2000);
+      }
+    }
   });
 
   // #131 / #159: シンボルピッカーに並べる候補は、wasm 同梱フォントで描画できる

@@ -418,3 +418,61 @@ describe('encodeAnimationAlphaWasm', () => {
     expect(lastWriteIdx).toBeGreaterThan(firstOutDeleteIdx);
   });
 });
+
+describe('prefetchFfmpegCore', () => {
+  it('呼ぶと FFMPEG_CORE_URL / FFMPEG_WASM_URL に対して no-cors fetch を発火する (#184 アイドルプリフェッチ)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { prefetchFfmpegCore, FFMPEG_CORE_URL, FFMPEG_WASM_URL } = await import(
+        './encodeWebmAlphaWasm'
+      );
+      prefetchFfmpegCore();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const urls = fetchMock.mock.calls.map((c) => c[0]);
+      expect(urls).toContain(FFMPEG_CORE_URL);
+      expect(urls).toContain(FFMPEG_WASM_URL);
+      for (const call of fetchMock.mock.calls) {
+        const init = call[1] as RequestInit;
+        expect(init.mode).toBe('no-cors');
+        expect(init.credentials).toBe('omit');
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('fetch が reject してもエラーを伝播しない (catch で握りつぶす)', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('offline'));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { prefetchFfmpegCore } = await import('./encodeWebmAlphaWasm');
+      // throw しなければ OK。reject Promise が unhandled になる前に await で吸う。
+      expect(() => prefetchFfmpegCore()).not.toThrow();
+      // catch ハンドラが回るのを待つ
+      await new Promise((r) => setTimeout(r, 0));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('シングルトン状態 (ffmpegLoadPromise / ffmpegSingleton) には影響しない — 直後の load も new instance を作る', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { prefetchFfmpegCore, loadFfmpegAlphaEncoder } = await import(
+        './encodeWebmAlphaWasm'
+      );
+      prefetchFfmpegCore();
+      // プリフェッチでは FFmpeg インスタンスは作られない
+      expect(mockState.instances.length).toBe(0);
+      // 直後に loadFfmpegAlphaEncoder を呼ぶと改めて 1 つ作られる (プリフェッチが
+      // singleton を奪っていない証拠)
+      await loadFfmpegAlphaEncoder();
+      expect(mockState.instances.length).toBe(1);
+      expect(mockState.instances[0].load).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

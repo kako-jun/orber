@@ -591,6 +591,22 @@ Implementation notes:
   instance is a module-level singleton with lazy initialisation: the
   31 MB wasm is fetched only when the user actually triggers an alpha
   download, and only once per session.
+- Idle-time prefetch: to avoid the "30 MB download starts the moment the
+  user clicks the transparent-DL button" first-run cliff, `Studio.tsx`
+  schedules a speculative `prefetchFfmpegCore()` from `onMount` via
+  `requestIdleCallback` (with a `setTimeout(2000)` fallback). The
+  prefetch fires two opaque (`mode: 'no-cors'`) `fetch()` calls against
+  the jsdelivr URLs; the Service Worker's CacheFirst layer picks them up
+  and stores them in `ffmpeg-core-v<version>`, so by the time the user
+  is done designing their orb the core is already in cache and the real
+  download is a cache hit. The prefetch deliberately does **not** touch
+  the `FFmpeg` singleton (`ffmpegSingleton` / `ffmpegLoadPromise`), so a
+  prefetch failure can't break the eventual real load path. To respect
+  metered mobile users, the prefetch is skipped when
+  `navigator.connection.saveData` is true or `effectiveType` is
+  `slow-2g` / `2g` (Network Information API); browsers without the API
+  (Safari etc.) fall through to "prefetch enabled". SSR (Astro static
+  build) has no `window` so the scheduler is a no-op there.
 - Loading UX: when the user clicks download with the transparent toggle
   ON, the Studio surface shows `alphaEncodingInProgress` ("透過動画
   エンコーダを読み込み中… / Loading transparent video encoder…") while

@@ -54,6 +54,27 @@ const frameName = (i: number) =>
   `frame-${String(i).padStart(FRAME_PAD, '0')}.png`;
 
 /**
+ * ffmpeg-core (~31 MB) を Service Worker の CacheFirst に先取りで温めるための
+ * プリフェッチ。Studio の onMount から `requestIdleCallback` 経由で呼び、
+ * ユーザーがオーブを設計している間に裏で fetch が完走するようにする。
+ *
+ * - シングルトン (`ffmpegSingleton` / `ffmpegLoadPromise`) には**一切触れない**。
+ *   純粋に HTTP fetch を走らせて SW (`public/sw.js` の `ffmpegCoreCacheFirst`)
+ *   に拾わせるだけ。失敗しても透過 DL を実行した時に普通に再 fetch される。
+ * - `mode: 'no-cors'` で opaque response でも問題ない (SW 側 CacheFirst は
+ *   opaque を含めて cache に積む)。
+ * - 例外は静かに握りつぶす (UI / console に出さない)。
+ */
+export function prefetchFfmpegCore(): void {
+  try {
+    fetch(FFMPEG_CORE_URL, { mode: 'no-cors', credentials: 'omit' }).catch(() => {});
+    fetch(FFMPEG_WASM_URL, { mode: 'no-cors', credentials: 'omit' }).catch(() => {});
+  } catch {
+    // SSR / no fetch 環境では何もしない。
+  }
+}
+
+/**
  * ffmpeg.wasm をロードする (シングルトン)。
  *
  * 失敗時はネットワーク断 / 配信欠落と判断できるよう Error を伝播する。
