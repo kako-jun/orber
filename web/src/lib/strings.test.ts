@@ -122,6 +122,20 @@ describe('lang signal + t()', () => {
     expect(t('alphaEncodingInProgress')).toMatch(/transparent video/);
   });
 
+  test('削除済みキー alphaVideoUnsupportedNotice は STRINGS に存在しない (#184)', async () => {
+    // #184 で透過動画が ffmpeg.wasm 化され全環境で動くようになったため、
+    // 旧 unsupported 文言キーを削除した。キー残存があると UI 側に死んだ
+    // 文言が紐づき続けるリグレッションになるので、ここで存在しないことを直接押さえる。
+    const { STRINGS } = await import('./strings');
+    expect('alphaVideoUnsupportedNotice' in STRINGS).toBe(false);
+  });
+
+  test('削除済みキー includeAlphaDisabledTitle は STRINGS に存在しない (#184)', async () => {
+    // 同上: 「透過動画は非対応」ツールチップ用 title 文言キー。
+    const { STRINGS } = await import('./strings');
+    expect('includeAlphaDisabledTitle' in STRINGS).toBe(false);
+  });
+
   test('viewsLabelPrefix / Suffix の語順が言語ごとに切り替わる (Footer counter)', async () => {
     // ja は「閲覧数: {n}」(prefix のみ)、en は「{n} views」(suffix のみ) の
     // 非対称構成。Footer の <nostalgic-counter> をこの 2 キーで挟む設計

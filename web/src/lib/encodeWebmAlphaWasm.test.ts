@@ -1,0 +1,320 @@
+// orber#184 — encodeWebmAlphaWasm の単体テスト。
+//
+// @ffmpeg/ffmpeg / @ffmpeg/util を vi.mock で完全置換し、libvpx-vp9 引数生成・
+// シングルトン挙動・progress 中継・後片付けまわりの仕様をピン留めする。
+// 実 wasm はロードしない (jsdom では動かない)。
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// 各テストの "this run" 中に最後に生成された FFmpeg instance に触れたいので
+// グローバル参照を hoisted で持つ。vi.mock factory もここから参照する。
+type ProgressHandler = (e: { progress: number; time: number }) => void;
+interface MockFFmpeg {
+  load: ReturnType<typeof vi.fn>;
+  writeFile: ReturnType<typeof vi.fn>;
+  exec: ReturnType<typeof vi.fn>;
+  readFile: ReturnType<typeof vi.fn>;
+  deleteFile: ReturnType<typeof vi.fn>;
+  on: ReturnType<typeof vi.fn>;
+  off: ReturnType<typeof vi.fn>;
+  __progressHandlers: ProgressHandler[];
+}
+
+const mockState = vi.hoisted(() => {
+  return {
+    instances: [] as MockFFmpeg[],
+    // テスト側で次回 load() の挙動を差し替える。
+    nextLoadImpl: null as null | (() => Promise<void>),
+    // exec の挙動を差し替える (進捗発火・失敗注入)。
+    nextExecImpl: null as null | ((ff: MockFFmpeg, args: string[]) => Promise<void>),
+    // readFile の返り値を差し替える。
+    nextReadFileImpl: null as null | (() => Promise<Uint8Array | string>),
+  };
+});
+
+vi.mock('@ffmpeg/ffmpeg', () => {
+  const FFmpeg = vi.fn().mockImplementation(() => {
+    const inst: MockFFmpeg = {
+      load: vi.fn().mockImplementation(() => {
+        if (mockState.nextLoadImpl) {
+          const impl = mockState.nextLoadImpl;
+          mockState.nextLoadImpl = null;
+          return impl();
+        }
+        return Promise.resolve();
+      }),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      exec: vi.fn().mockImplementation((args: string[]) => {
+        if (mockState.nextExecImpl) {
+          const impl = mockState.nextExecImpl;
+          mockState.nextExecImpl = null;
+          return impl(inst, args);
+        }
+        return Promise.resolve();
+      }),
+      readFile: vi.fn().mockImplementation(() => {
+        if (mockState.nextReadFileImpl) {
+          const impl = mockState.nextReadFileImpl;
+          mockState.nextReadFileImpl = null;
+          return impl();
+        }
+        return Promise.resolve(new Uint8Array([1, 2, 3]));
+      }),
+      deleteFile: vi.fn().mockResolvedValue(undefined),
+      on: vi.fn().mockImplementation((event: string, handler: ProgressHandler) => {
+        if (event === 'progress') inst.__progressHandlers.push(handler);
+      }),
+      off: vi.fn().mockImplementation((event: string, handler: ProgressHandler) => {
+        if (event !== 'progress') return;
+        const idx = inst.__progressHandlers.indexOf(handler);
+        if (idx >= 0) inst.__progressHandlers.splice(idx, 1);
+      }),
+      __progressHandlers: [],
+    };
+    mockState.instances.push(inst);
+    return inst;
+  });
+  return { FFmpeg };
+});
+
+vi.mock('@ffmpeg/util', () => ({
+  toBlobURL: vi.fn().mockResolvedValue('blob:mock'),
+}));
+
+beforeEach(() => {
+  // シングルトン状態をリセットするため毎テストで動的 import し直す。
+  vi.resetModules();
+  vi.clearAllMocks();
+  mockState.instances.length = 0;
+  mockState.nextLoadImpl = null;
+  mockState.nextExecImpl = null;
+  mockState.nextReadFileImpl = null;
+});
+
+function makeFrame(byte: number, size = 8): Uint8Array {
+  return new Uint8Array(size).fill(byte);
+}
+
+describe('encodeAnimationAlphaWasm', () => {
+  it('1 フレーム入力で video/webm の Blob を返す (正常系)', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const blob = await encodeAnimationAlphaWasm([makeFrame(1)], 32, 32);
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe('video/webm');
+  });
+
+  it('frames.length === 0 では Error を投げ ffmpeg.load を呼ばない', async () => {
+    const mod = await import('./encodeWebmAlphaWasm');
+    await expect(mod.encodeAnimationAlphaWasm([], 16, 16)).rejects.toThrow(
+      /frames must be > 0/,
+    );
+    // load が一度も走っていない
+    expect(mockState.instances.length).toBe(0);
+  });
+
+  it('loadFfmpegAlphaEncoder を 2 回連続呼出しても new FFmpeg() / .load() は 1 回のみ', async () => {
+    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    await loadFfmpegAlphaEncoder();
+    await loadFfmpegAlphaEncoder();
+    expect(mockState.instances.length).toBe(1);
+    expect(mockState.instances[0].load).toHaveBeenCalledTimes(1);
+  });
+
+  it('await せず並行に 2 回呼んでも load promise を共有する (FFmpeg は 1 回のみ生成)', async () => {
+    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    let resolveLoad: () => void = () => {};
+    mockState.nextLoadImpl = () =>
+      new Promise<void>((res) => {
+        resolveLoad = res;
+      });
+    const p1 = loadFfmpegAlphaEncoder();
+    const p2 = loadFfmpegAlphaEncoder();
+    // この時点では 1 個しか生成されていないはず
+    expect(mockState.instances.length).toBe(1);
+    resolveLoad();
+    const a = await p1;
+    const b = await p2;
+    expect(a).toBe(b);
+    expect(mockState.instances.length).toBe(1);
+  });
+
+  it('load 失敗後に再度呼ぶと new FFmpeg() が再走する (retry 可能状態へ戻る)', async () => {
+    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    mockState.nextLoadImpl = () => Promise.reject(new Error('net down'));
+    await expect(loadFfmpegAlphaEncoder()).rejects.toThrow(/net down/);
+    // retry
+    await expect(loadFfmpegAlphaEncoder()).resolves.toBeDefined();
+    expect(mockState.instances.length).toBe(2);
+  });
+
+  it('1 回目失敗 / 2 回目成功で singleton が確立される', async () => {
+    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    mockState.nextLoadImpl = () => Promise.reject(new Error('boom'));
+    await expect(loadFfmpegAlphaEncoder()).rejects.toThrow();
+    const ff1 = await loadFfmpegAlphaEncoder();
+    const ff2 = await loadFfmpegAlphaEncoder();
+    expect(ff1).toBe(ff2);
+    // 1 回目 reject 後 + 2 回目以降は instances[1] が共有される
+    expect(mockState.instances.length).toBe(2);
+    expect(mockState.instances[1].load).toHaveBeenCalledTimes(1);
+  });
+
+  it('ffmpeg.exec に libvpx-vp9 / yuva420p / auto-alt-ref 0 / -s WxH / -framerate fps が含まれる', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    await encodeAnimationAlphaWasm([makeFrame(1)], 128, 64, 30);
+    const inst = mockState.instances[0];
+    const args = inst.exec.mock.calls[0][0] as string[];
+    // 個別フラグの存在チェック
+    expect(args).toEqual(expect.arrayContaining(['-c:v', 'libvpx-vp9']));
+    expect(args).toEqual(expect.arrayContaining(['-pix_fmt', 'yuva420p']));
+    expect(args).toEqual(expect.arrayContaining(['-auto-alt-ref', '0']));
+    expect(args).toEqual(expect.arrayContaining(['-s', '128x64']));
+    expect(args).toEqual(expect.arrayContaining(['-framerate', '30']));
+  });
+
+  it('width / height が `-s WxH` に正確に埋め込まれる (256x384)', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    await encodeAnimationAlphaWasm([makeFrame(1)], 256, 384);
+    const args = mockState.instances[0].exec.mock.calls[0][0] as string[];
+    const i = args.indexOf('-s');
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe('256x384');
+  });
+
+  it('fps 省略時は ANIM_FPS (24) が使われる', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { ANIM_FPS } = await import('./encodeMp4');
+    await encodeAnimationAlphaWasm([makeFrame(1)], 16, 16);
+    const args = mockState.instances[0].exec.mock.calls[0][0] as string[];
+    const i = args.indexOf('-framerate');
+    expect(args[i + 1]).toBe(String(ANIM_FPS));
+  });
+
+  it('on("progress") の通知が onProgress(round(p*total), total) で中継される', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const seen: Array<[number, number]> = [];
+    mockState.nextExecImpl = async (ff) => {
+      for (const h of ff.__progressHandlers) {
+        h({ progress: 0.5, time: 0 });
+      }
+    };
+    await encodeAnimationAlphaWasm([makeFrame(1), makeFrame(2)], 16, 16, 24, (f, t) => {
+      seen.push([f, t]);
+    });
+    expect(seen.length).toBeGreaterThan(0);
+    // total = 2, progress=0.5 → frame = round(1) = 1
+    expect(seen[0]).toEqual([1, 2]);
+  });
+
+  it('progress 値は [0, total] にクランプされる (負値 / 超過時も)', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const seen: Array<[number, number]> = [];
+    mockState.nextExecImpl = async (ff) => {
+      for (const h of ff.__progressHandlers) {
+        h({ progress: 0, time: 0 });
+        h({ progress: 0.5, time: 0 });
+        h({ progress: 1, time: 0 });
+        h({ progress: 1.5, time: 0 });
+        h({ progress: -0.2, time: 0 });
+      }
+    };
+    const total = 4;
+    await encodeAnimationAlphaWasm(
+      [makeFrame(1), makeFrame(2), makeFrame(3), makeFrame(4)],
+      16,
+      16,
+      24,
+      (f, t) => seen.push([f, t]),
+    );
+    for (const [f, t] of seen) {
+      expect(t).toBe(total);
+      expect(f).toBeGreaterThanOrEqual(0);
+      expect(f).toBeLessThanOrEqual(total);
+    }
+    // 期待値 (round(p*4)): [0, 2, 4, 4 (clamped), 0 (clamped)]
+    expect(seen).toEqual([
+      [0, 4],
+      [2, 4],
+      [4, 4],
+      [4, 4],
+      [0, 4],
+    ]);
+  });
+
+  it('onProgress 未指定でも progress event で throw しない', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    mockState.nextExecImpl = async (ff) => {
+      for (const h of ff.__progressHandlers) {
+        h({ progress: 0.5, time: 0 });
+      }
+    };
+    await expect(
+      encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
+    ).resolves.toBeInstanceOf(Blob);
+  });
+
+  it('成功時に各フレームの deleteFile + outputName deleteFile が呼ばれる', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const N = 3;
+    await encodeAnimationAlphaWasm(
+      [makeFrame(1), makeFrame(2), makeFrame(3)],
+      16,
+      16,
+    );
+    const inst = mockState.instances[0];
+    const deletedNames = inst.deleteFile.mock.calls.map((c) => c[0] as string);
+    // pre-cleanup + post-cleanup の両方で呼ばれているはず → 2N + 2 回 (out.webm 含む)
+    for (let i = 0; i < N; i++) {
+      const name = `frame-${String(i).padStart(4, '0')}.png`;
+      expect(deletedNames.filter((n) => n === name).length).toBeGreaterThanOrEqual(1);
+    }
+    expect(deletedNames).toContain('out.webm');
+  });
+
+  it('成功時に ffmpeg.off("progress", handler) が finally で呼ばれる', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    await encodeAnimationAlphaWasm([makeFrame(1)], 16, 16);
+    const inst = mockState.instances[0];
+    expect(inst.off).toHaveBeenCalledWith('progress', expect.any(Function));
+    // on と off の handler が一致 (購読が解除されている)
+    const onHandler = inst.on.mock.calls.find((c) => c[0] === 'progress')?.[1];
+    const offHandler = inst.off.mock.calls.find((c) => c[0] === 'progress')?.[1];
+    expect(onHandler).toBe(offHandler);
+  });
+
+  it('exec が throw しても ffmpeg.off("progress", ...) が呼ばれる', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    mockState.nextExecImpl = () => Promise.reject(new Error('exec fail'));
+    await expect(
+      encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
+    ).rejects.toThrow(/exec fail/);
+    const inst = mockState.instances[0];
+    expect(inst.off).toHaveBeenCalledWith('progress', expect.any(Function));
+  });
+
+  it('readFile が string を返したら Error を投げる (型ガード)', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    mockState.nextReadFileImpl = () => Promise.resolve('unexpected string');
+    await expect(
+      encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
+    ).rejects.toThrow(/unexpected string/);
+  });
+
+  it('pre-cleanup の deleteFile が reject しても全体は成功する', async () => {
+    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    // 最初の load を済ませて、その後 deleteFile を reject に差し替える。
+    // (load 内では deleteFile を呼ばないので影響しない)
+    // この時点で reset 済みなので 1 回 encode 呼んだ後の状態で reject させたい。
+    // → 最初の呼び出しで instance を確保しつつ、その instance の deleteFile を
+    //   後付けで reject に変更する方が確実だが、現時点では encodeAnimation の
+    //   1 回目 (singleton 構築 + clean pass) で reject させたい。
+    // 簡単のため、新 instance 取得直後に直接 deleteFile を rejectMock に置く方式
+    // を取る: まず loadFfmpegAlphaEncoder を呼んでから差し替える。
+    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
+    ff.deleteFile.mockRejectedValue(new Error('not found'));
+    await expect(
+      encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
+    ).resolves.toBeInstanceOf(Blob);
+  });
+});
