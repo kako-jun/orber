@@ -591,6 +591,14 @@ Implementation notes:
   instance is a module-level singleton with lazy initialisation: the
   31 MB wasm is fetched only when the user actually triggers an alpha
   download, and only once per session.
+- Future migration to the **multi-threaded** ffmpeg-core (≈ 2–4× faster
+  encoding via pthreads / SharedArrayBuffer): would require adding
+  `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
+  require-corp` (or `credentialless`) to `web/public/_headers`, plus a
+  compatibility audit of every cross-origin iframe / asset on the site
+  (Nostalgic Counter embed, Amazon affiliate images, GitHub Sponsors
+  button, jsdelivr core itself). Out of scope for #184; tracked as a
+  future opt-in.
 - Idle-time prefetch: to avoid the "30 MB download starts the moment the
   user clicks the transparent-DL button" first-run cliff, `Studio.tsx`
   schedules a speculative `prefetchFfmpegCore()` from `onMount` via
@@ -604,9 +612,17 @@ Implementation notes:
   prefetch failure can't break the eventual real load path. To respect
   metered mobile users, the prefetch is skipped when
   `navigator.connection.saveData` is true or `effectiveType` is
-  `slow-2g` / `2g` (Network Information API); browsers without the API
-  (Safari etc.) fall through to "prefetch enabled". SSR (Astro static
-  build) has no `window` so the scheduler is a no-op there.
+  `slow-2g` / `2g` / `3g` (Network Information API); browsers without
+  the API (Safari etc.) fall through to "prefetch enabled". The `3g`
+  skip is a deliberate trade-off: on 3G the speculative 31 MB download
+  is too expensive to risk losing for users who never click the alpha
+  toggle, so we defer to the explicit "user clicked DL" moment instead.
+  4G / WiFi users still get the smooth first-run experience. SSR (Astro
+  static build) has no `window` so the scheduler is a no-op there.
+  The prefetch is also CORS-mode (not `no-cors`): an opaque response
+  would poison the SW cache and break the subsequent `importScripts`
+  / WebAssembly streaming load, so the SW also refuses to cache opaque
+  responses defensively.
 - Loading UX: when the user clicks download with the transparent toggle
   ON, the Studio surface shows `alphaEncodingInProgress` ("透過動画
   エンコーダを読み込み中… / Loading transparent video encoder…") while
