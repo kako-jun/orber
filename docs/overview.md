@@ -591,6 +591,22 @@ Implementation notes:
   instance is a module-level singleton with lazy initialisation: the
   31 MB wasm is fetched only when the user actually triggers an alpha
   download, and only once per session.
+- ffmpeg.wasm load path uses **`toBlobURL`** (hotfix after #185 merge):
+  `@ffmpeg/ffmpeg` v0.12 spawns a classic Worker from `ffmpeg.load(...)`
+  and runs `importScripts(coreURL)` inside that Worker. When `coreURL`
+  is cross-origin (jsdelivr CDN) the importScripts call fails at
+  runtime even though the server returns the right CORS headers —
+  observed in production (`ffmpeg.wasm load failed: failed to import
+  ffmpeg-core.js`) on the live `orber.llll-ll.com` deploy. The fix is
+  the official README pattern: pass the URLs through
+  `@ffmpeg/util`'s `toBlobURL(url, mime)` so `ffmpeg.load` receives
+  `blob:` URLs that are same-origin to the document, taking the Worker
+  out of the cross-origin importScripts code path entirely. Prefetch
+  is preserved because `toBlobURL` internally fetches the URL, and the
+  Service Worker (`ffmpegCoreCacheFirst`) serves it from cache when the
+  speculative `prefetchFfmpegCore()` has already warmed the cache — so
+  the first real `ffmpeg.load` still pays zero extra bytes when the
+  prefetch landed.
 - Future migration to the **multi-threaded** ffmpeg-core (≈ 2–4× faster
   encoding via pthreads / SharedArrayBuffer): would require adding
   `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:

@@ -33,6 +33,19 @@ const mockState = vi.hoisted(() => {
   };
 });
 
+// orber#184 hotfix: `@ffmpeg/util` の `toBlobURL` を fake 化する。
+// 実装は CDN を fetch して blob: URL を作るため、jsdom では走らせられない。
+// `coreURL` / `wasmURL` の引数 URL とプレフィックスだけ検証できれば十分。
+vi.mock('@ffmpeg/util', () => {
+  return {
+    toBlobURL: vi.fn(async (url: string, mime: string) => {
+      if (mime === 'text/javascript') return 'blob:mock-core';
+      if (mime === 'application/wasm') return 'blob:mock-wasm';
+      return `blob:mock-${mime}`;
+    }),
+  };
+});
+
 vi.mock('@ffmpeg/ffmpeg', () => {
   const FFmpeg = vi.fn().mockImplementation(() => {
     const inst: MockFFmpeg = {
@@ -110,25 +123,40 @@ describe('encodeAnimationAlphaWasm', () => {
     expect(mockState.instances.length).toBe(0);
   });
 
-  it('ffmpeg.load に jsdelivr CDN の coreURL / wasmURL が渡される (CF Pages 25 MiB 上限回避 #184)', async () => {
-    const { loadFfmpegAlphaEncoder, FFMPEG_CORE_VERSION } = await import(
-      './encodeWebmAlphaWasm'
-    );
+  it('ffmpeg.load には blob: URL が渡され、toBlobURL に jsdelivr CDN の coreURL / wasmURL が渡される (#184 hotfix: cross-origin importScripts 回避)', async () => {
+    const { loadFfmpegAlphaEncoder, FFMPEG_CORE_VERSION, FFMPEG_CORE_URL, FFMPEG_WASM_URL } =
+      await import('./encodeWebmAlphaWasm');
+    const utilMod = await import('@ffmpeg/util');
+    const toBlobURLMock = utilMod.toBlobURL as unknown as ReturnType<typeof vi.fn>;
     await loadFfmpegAlphaEncoder();
     const inst = mockState.instances[0];
     const arg = inst.load.mock.calls[0][0] as {
       coreURL: string;
       wasmURL: string;
     };
-    expect(arg.coreURL).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
-    expect(arg.coreURL).toContain(FFMPEG_CORE_VERSION);
-    expect(arg.coreURL).toMatch(/\/dist\/umd\/ffmpeg-core\.js$/);
-    expect(arg.wasmURL).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
-    expect(arg.wasmURL).toContain(FFMPEG_CORE_VERSION);
-    expect(arg.wasmURL).toMatch(/\/dist\/umd\/ffmpeg-core\.wasm$/);
+    // ffmpeg.load に渡るのは blob: URL (same-origin になり Worker の importScripts
+    // が CORS 制約を受けない)
+    expect(arg.coreURL).toMatch(/^blob:/);
+    expect(arg.wasmURL).toMatch(/^blob:/);
+
+    // toBlobURL の引数として jsdelivr CDN の URL + MIME が渡される
+    const toBlobCalls = toBlobURLMock.mock.calls as Array<[string, string]>;
+    expect(toBlobCalls.length).toBeGreaterThanOrEqual(2);
+    const coreCall = toBlobCalls.find((c) => c[0] === FFMPEG_CORE_URL);
+    const wasmCall = toBlobCalls.find((c) => c[0] === FFMPEG_WASM_URL);
+    expect(coreCall).toBeDefined();
+    expect(wasmCall).toBeDefined();
+    expect(coreCall![1]).toBe('text/javascript');
+    expect(wasmCall![1]).toBe('application/wasm');
+    expect(coreCall![0]).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
+    expect(coreCall![0]).toContain(FFMPEG_CORE_VERSION);
+    expect(coreCall![0]).toMatch(/\/dist\/umd\/ffmpeg-core\.js$/);
+    expect(wasmCall![0]).toContain('cdn.jsdelivr.net/npm/@ffmpeg/core@');
+    expect(wasmCall![0]).toContain(FFMPEG_CORE_VERSION);
+    expect(wasmCall![0]).toMatch(/\/dist\/umd\/ffmpeg-core\.wasm$/);
     // 同一オリジン `/ffmpeg/...` 配信に戻していないこと
-    expect(arg.coreURL).not.toMatch(/^\/ffmpeg\//);
-    expect(arg.wasmURL).not.toMatch(/^\/ffmpeg\//);
+    expect(coreCall![0]).not.toMatch(/^\/ffmpeg\//);
+    expect(wasmCall![0]).not.toMatch(/^\/ffmpeg\//);
   });
 
   it('loadFfmpegAlphaEncoder を 2 回連続呼出しても new FFmpeg() / .load() は 1 回のみ', async () => {
@@ -150,6 +178,10 @@ describe('encodeAnimationAlphaWasm', () => {
     const p2 = loadFfmpegAlphaEncoder();
     // この時点では 1 個しか生成されていないはず
     expect(mockState.instances.length).toBe(1);
+    // hotfix #184: load 経路は `await toBlobURL(...)` を 2 つ通ってから
+    // `ffmpeg.load` を呼ぶようになったため、`nextLoadImpl` が `resolveLoad`
+    // を捕まえるまでに microtask を数回進める必要がある。
+    await new Promise((r) => setTimeout(r, 0));
     resolveLoad();
     const a = await p1;
     const b = await p2;

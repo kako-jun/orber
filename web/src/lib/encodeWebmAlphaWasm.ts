@@ -27,6 +27,7 @@
 // `-auto-alt-ref 0` は VP9 alpha と同時に使えない (libvpx 制約) ので必須。
 
 import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { toBlobURL } from '@ffmpeg/util';
 
 import { ANIM_FPS } from './encodeMp4';
 
@@ -108,9 +109,26 @@ export async function loadFfmpegAlphaEncoder(): Promise<FFmpeg> {
     if (prefetchPromise) {
       await prefetchPromise.catch(() => {});
     }
+    // orber#184 hotfix: `@ffmpeg/ffmpeg` v0.12 系は `load({coreURL, wasmURL})`
+    // 内部で classic Worker を spawn し、Worker 内で `importScripts(coreURL)` を
+    // 呼ぶ。`coreURL` が cross-origin (jsdelivr CDN) だと、サーバ側で
+    // `Access-Control-Allow-Origin` が許可されていても Worker spec の制約で
+    // importScripts が失敗するケースがある (本番 orber.llll-ll.com で再現:
+    // `failed to import ffmpeg-core.js`)。ffmpeg.wasm 公式 README の標準パターン
+    // である `@ffmpeg/util` の `toBlobURL` で blob: URL に変換してから渡す:
+    // Worker の importScripts は same-origin の blob: URL になるので CORS 制約
+    // から外れる。
+    //
+    // プリフェッチとの互換: `toBlobURL` 内部 fetch は SW (`ffmpegCoreCacheFirst`)
+    // のキャッシュにヒットするので、prefetch で温めた状態なら 31 MB の再 DL は
+    // 発生しない。プリフェッチの効果は維持される。
+    const [coreBlobURL, wasmBlobURL] = await Promise.all([
+      toBlobURL(FFMPEG_CORE_URL, 'text/javascript'),
+      toBlobURL(FFMPEG_WASM_URL, 'application/wasm'),
+    ]);
     await ffmpeg.load({
-      coreURL: FFMPEG_CORE_URL,
-      wasmURL: FFMPEG_WASM_URL,
+      coreURL: coreBlobURL,
+      wasmURL: wasmBlobURL,
     });
     ffmpegSingleton = ffmpeg;
     return ffmpeg;
