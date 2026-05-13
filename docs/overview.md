@@ -526,17 +526,17 @@ orber-{ts}.zip
    ├─ orber-{ts}_01-alpha.png          (transparent PNG, lossless)
    ├─ orber-{ts}_01-alpha.webp         (transparent WebP, quality 0.9)
    ├─ ...
-   ├─ orber-{ts}_09-alpha.webm         (transparent VP9 alpha 'keep')
+   ├─ orber-{ts}_09-alpha.webm         (transparent VP9, yuva420p, via ffmpeg.wasm)
    ├─ orber-{ts}_10-alpha.webm
    ├─ orber-{ts}_11-alpha.webm
    └─ orber-{ts}_12-alpha.webm
 ```
 
 Stills get both PNG (lossless reference) and WebP (smaller, lossy q=0.9) so
-downstream workflows can pick either. Videos use **VP9 with `alpha: 'keep'`**
-muxed into WebM via `webm-muxer`. MP4 has no alpha track in any commonly
-supported profile, so the transparent video format is necessarily different
-from the background-filled `.mp4`.
+downstream workflows can pick either. Videos use **libvpx-vp9 with
+`-pix_fmt yuva420p`** muxed into WebM via ffmpeg.wasm (#184). MP4 has no
+alpha track in any commonly supported profile, so the transparent video
+format is necessarily different from the background-filled `.mp4`.
 
 Implementation notes:
 
@@ -548,40 +548,50 @@ Implementation notes:
   This guarantees the alpha tile is the *same variation* as the visible
   preview tile, just unfilled.
 - Encoders: `OffscreenCanvas.convertToBlob({type:'image/png'})` and
-  `convertToBlob({type:'image/webp', quality:0.9})` for stills;
-  `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` + `webm-muxer` for
-  videos. The encoder branch lives in `web/src/lib/encodeWebmAlpha.ts`,
-  parallel to the existing `encodeMp4.ts`.
-- Browser support: VP9 alpha encoding via WebCodecs is **not reliably
-  available across browsers**. In practice the
-  `VideoEncoder.isConfigSupported({codec, alpha:'keep'})` probe returns
-  `supported: false` on Safari, Chromium-based browsers on Windows
-  (Chrome / Edge), Android Chrome, and many other combinations — the
-  result depends on OS-level codec backends, GPU acceleration state, and
-  Chromium build flags, so claiming any specific platform works in
-  general is misleading. AV1 alpha (`av01.0.04M.08`) is even less widely
-  supported. Treat transparent video as best-effort and rely on the
-  probe + UI notice rather than a platform allowlist.
-  The worker probes `VideoEncoder.isConfigSupported({codec, alpha:'keep'})`
-  once at startup and exposes the result as `workerVp9AlphaSupported()`.
-  When it returns `false`, the Studio checkbox stays clickable (so the
-  user can still get transparent PNG/WebP for still tiles, which is
-  unaffected by VP9), and a small inline notice rendered directly under
-  the checkbox tells the user up-front that animated-tile transparent WebM
-  will not be produced in this environment (i18n key
-  `alphaVideoUnsupportedNotice`). The non-VP9 branch in
-  `renderAlphaForIndices` then silently no-ops for animated tiles — the
-  silent skip is intentional and surfaced via the UI notice rather than
-  by an error or fallback bundle. The probe result is cached for the
-  worker's lifetime.
+  `convertToBlob({type:'image/webp', quality:0.9})` for stills; for videos
+  the worker renders each frame as a transparent PNG (`renderAlphaFrames`
+  RPC, frames streamed to main via Transferable `alphaFrame` messages)
+  and the main thread invokes **ffmpeg.wasm** to mux them into a WebM
+  with `-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0`. The encoder
+  helper lives in `web/src/lib/encodeWebmAlphaWasm.ts`. `-auto-alt-ref 0`
+  is mandatory because libvpx's alt-ref frames are incompatible with VP9
+  alpha encoding.
+- Why ffmpeg.wasm instead of WebCodecs: WebCodecs `VideoEncoder` with
+  `{codec:'vp09.00.10.08', alpha:'keep'}` reports `supported: false` on
+  Edge / Chrome on Windows, Android Chrome, Safari, and many other
+  combinations because the underlying decision depends on OS-level codec
+  backends, GPU acceleration state, and Chromium build flags. The
+  earlier #56 implementation used WebCodecs and probed support at
+  startup, but the probe was rejected on the majority of real-world
+  devices so the feature was effectively unavailable. #184 swaps the
+  encoder to ffmpeg.wasm, which bundles its own libvpx-vp9 build inside
+  the wasm module — completely independent of the host's codec stack —
+  so transparent video output is **reliable on every environment that
+  can run wasm**.
+- ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the same
+  origin under `/ffmpeg/ffmpeg-core.{js,wasm}` (copied from
+  `node_modules/@ffmpeg/core/dist/umd/` by the `copy:ffmpeg` npm script
+  at dev / build time). The single-threaded core is used so no
+  COOP / COEP headers are required and the rest of the site (embedded
+  Nostalgic Counter iframe, etc.) keeps working unchanged. The `FFmpeg`
+  instance is a module-level singleton with lazy initialisation: the
+  31 MB wasm is fetched only when the user actually triggers an alpha
+  download, and only once per session.
+- Loading UX: when the user clicks download with the transparent toggle
+  ON, the Studio surface shows `alphaEncodingInProgress` ("透過動画
+  エンコーダを読み込み中… / Loading transparent video encoder…") while
+  the core wasm is fetched. If the fetch fails (offline, CDN/origin
+  outage), `alphaEncoderLoadFailed` ("透過動画エンコーダの読み込みに
+  失敗しました / Failed to load transparent video encoder") is shown
+  via `errorMsg` and the download is aborted before any zip is produced.
 - Progress: when the toggle is ON, `dlProgress.total` is set to
   `indices.length * 2` so the existing "Rendering high-res… N / Total"
   text covers both the background-filled pass and the alpha pass with
   monotonically increasing N. No extra UI string is needed.
 - OFF path identity: when the checkbox is OFF (default), `downloadIndices`
   never instantiates the alpha helpers and never calls the new worker
-  RPCs (`generateOneAlpha` / `animateOneAlpha`). The pre-#56 download is
-  byte-exact identical.
+  RPCs (`generateOneAlpha` / `renderAlphaFrames`) and never loads
+  ffmpeg.wasm. The pre-#56 download is byte-exact identical.
 
 The CLI is unaffected — it already takes file paths, and adding alpha
-flags there is out of scope for #56.
+flags there is out of scope for #56 / #184.
