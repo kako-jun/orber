@@ -1,4 +1,4 @@
-// orber#184 — encodeWebmAlphaWasm の単体テスト。
+// orber#184 — encodeAlphaVideoWasm の単体テスト。
 //
 // @ffmpeg/ffmpeg を vi.mock で完全置換し、libvpx-vp9 引数生成・
 // シングルトン挙動・progress 中継・後片付けまわりの仕様をピン留めする。
@@ -108,14 +108,14 @@ function makeFrame(byte: number, size = 8): Uint8Array {
 
 describe('encodeAnimationAlphaWasm', () => {
   it('1 フレーム入力で video/quicktime (MOV) の Blob を返す (正常系)', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     const blob = await encodeAnimationAlphaWasm([makeFrame(1)], 32, 32);
     expect(blob).toBeInstanceOf(Blob);
     expect(blob.type).toBe('video/quicktime');
   });
 
   it('frames.length === 0 では Error を投げ ffmpeg.load を呼ばない', async () => {
-    const mod = await import('./encodeWebmAlphaWasm');
+    const mod = await import('./encodeAlphaVideoWasm');
     await expect(mod.encodeAnimationAlphaWasm([], 16, 16)).rejects.toThrow(
       /frames must be > 0/,
     );
@@ -125,7 +125,7 @@ describe('encodeAnimationAlphaWasm', () => {
 
   it('ffmpeg.load には blob: URL が渡され、toBlobURL に jsdelivr CDN の coreURL / wasmURL が渡される (#184 hotfix: cross-origin importScripts 回避)', async () => {
     const { loadFfmpegAlphaEncoder, FFMPEG_CORE_VERSION, FFMPEG_CORE_URL, FFMPEG_WASM_URL } =
-      await import('./encodeWebmAlphaWasm');
+      await import('./encodeAlphaVideoWasm');
     const utilMod = await import('@ffmpeg/util');
     const toBlobURLMock = utilMod.toBlobURL as unknown as ReturnType<typeof vi.fn>;
     await loadFfmpegAlphaEncoder();
@@ -160,7 +160,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('loadFfmpegAlphaEncoder を 2 回連続呼出しても new FFmpeg() / .load() は 1 回のみ', async () => {
-    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const { loadFfmpegAlphaEncoder } = await import('./encodeAlphaVideoWasm');
     await loadFfmpegAlphaEncoder();
     await loadFfmpegAlphaEncoder();
     expect(mockState.instances.length).toBe(1);
@@ -168,7 +168,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('await せず並行に 2 回呼んでも load promise を共有する (FFmpeg は 1 回のみ生成)', async () => {
-    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const { loadFfmpegAlphaEncoder } = await import('./encodeAlphaVideoWasm');
     let resolveLoad: () => void = () => {};
     mockState.nextLoadImpl = () =>
       new Promise<void>((res) => {
@@ -190,7 +190,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('load 失敗後に再度呼ぶと new FFmpeg() が再走する (retry 可能状態へ戻る)', async () => {
-    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const { loadFfmpegAlphaEncoder } = await import('./encodeAlphaVideoWasm');
     mockState.nextLoadImpl = () => Promise.reject(new Error('net down'));
     await expect(loadFfmpegAlphaEncoder()).rejects.toThrow(/net down/);
     // retry
@@ -199,7 +199,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('1 回目失敗 / 2 回目成功で singleton が確立される', async () => {
-    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const { loadFfmpegAlphaEncoder } = await import('./encodeAlphaVideoWasm');
     mockState.nextLoadImpl = () => Promise.reject(new Error('boom'));
     await expect(loadFfmpegAlphaEncoder()).rejects.toThrow();
     const ff1 = await loadFfmpegAlphaEncoder();
@@ -211,7 +211,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('ffmpeg.exec に png codec / rgba / mov 容器 / -s WxH / -framerate fps が含まれる', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     await encodeAnimationAlphaWasm([makeFrame(1)], 128, 64, 30);
     const inst = mockState.instances[0];
     const args = inst.exec.mock.calls[0][0] as string[];
@@ -224,7 +224,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('width / height が `-s WxH` に正確に埋め込まれる (256x384)', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     await encodeAnimationAlphaWasm([makeFrame(1)], 256, 384);
     const args = mockState.instances[0].exec.mock.calls[0][0] as string[];
     const i = args.indexOf('-s');
@@ -233,7 +233,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('fps 省略時は ANIM_FPS (24) が使われる', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     const { ANIM_FPS } = await import('./encodeMp4');
     await encodeAnimationAlphaWasm([makeFrame(1)], 16, 16);
     const args = mockState.instances[0].exec.mock.calls[0][0] as string[];
@@ -242,7 +242,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('on("progress") の通知が onProgress(round(p*total), total) で中継される', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     const seen: Array<[number, number]> = [];
     mockState.nextExecImpl = async (ff) => {
       for (const h of ff.__progressHandlers) {
@@ -258,7 +258,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('progress 値は [0, total] にクランプされる (負値 / 超過時も)', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     const seen: Array<[number, number]> = [];
     mockState.nextExecImpl = async (ff) => {
       for (const h of ff.__progressHandlers) {
@@ -293,7 +293,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('onProgress 未指定でも progress event で throw しない', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     mockState.nextExecImpl = async (ff) => {
       for (const h of ff.__progressHandlers) {
         h({ progress: 0.5, time: 0 });
@@ -305,7 +305,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('成功時に各フレームの deleteFile + outputName deleteFile が呼ばれる', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     const N = 3;
     await encodeAnimationAlphaWasm(
       [makeFrame(1), makeFrame(2), makeFrame(3)],
@@ -323,7 +323,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('成功時に ffmpeg.off("progress", handler) が finally で呼ばれる', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     await encodeAnimationAlphaWasm([makeFrame(1)], 16, 16);
     const inst = mockState.instances[0];
     expect(inst.off).toHaveBeenCalledWith('progress', expect.any(Function));
@@ -334,7 +334,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('exec が throw しても ffmpeg.off("progress", ...) が呼ばれる', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     mockState.nextExecImpl = () => Promise.reject(new Error('exec fail'));
     await expect(
       encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
@@ -344,7 +344,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('readFile が string を返したら Error を投げる (型ガード)', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     mockState.nextReadFileImpl = () => Promise.resolve('unexpected string');
     await expect(
       encodeAnimationAlphaWasm([makeFrame(1)], 16, 16),
@@ -352,7 +352,7 @@ describe('encodeAnimationAlphaWasm', () => {
   });
 
   it('pre-cleanup の deleteFile が reject しても全体は成功する', async () => {
-    const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
+    const { encodeAnimationAlphaWasm } = await import('./encodeAlphaVideoWasm');
     // 最初の load を済ませて、その後 deleteFile を reject に差し替える。
     // (load 内では deleteFile を呼ばないので影響しない)
     // この時点で reset 済みなので 1 回 encode 呼んだ後の状態で reject させたい。
@@ -361,7 +361,7 @@ describe('encodeAnimationAlphaWasm', () => {
     //   1 回目 (singleton 構築 + clean pass) で reject させたい。
     // 簡単のため、新 instance 取得直後に直接 deleteFile を rejectMock に置く方式
     // を取る: まず loadFfmpegAlphaEncoder を呼んでから差し替える。
-    const { loadFfmpegAlphaEncoder } = await import('./encodeWebmAlphaWasm');
+    const { loadFfmpegAlphaEncoder } = await import('./encodeAlphaVideoWasm');
     const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
     // listDir で残骸を 1 件返し、pre-cleanup で deleteFile が呼ばれる経路を作る
     ff.listDir.mockResolvedValue([
@@ -375,7 +375,7 @@ describe('encodeAnimationAlphaWasm', () => {
 
   it('listDir が落ちても想定名ループで pre-cleanup を継続する (fallback)', async () => {
     const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
-      await import('./encodeWebmAlphaWasm');
+      await import('./encodeAlphaVideoWasm');
     const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
     ff.listDir.mockRejectedValue(new Error('listDir not supported'));
     await expect(
@@ -389,7 +389,7 @@ describe('encodeAnimationAlphaWasm', () => {
 
   it('listDir で発見した frame-*.png 残骸を pre-cleanup で削除する', async () => {
     const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
-      await import('./encodeWebmAlphaWasm');
+      await import('./encodeAlphaVideoWasm');
     const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
     // 前回 5 フレーム、今回 2 フレームのケース。古い 3 本も消えてほしい。
     ff.listDir.mockResolvedValueOnce([
@@ -413,7 +413,7 @@ describe('encodeAnimationAlphaWasm', () => {
 
   it('並行に 2 回呼んでも内部 mutex で直列化される (2 つ目の writeFile は 1 つ目の deleteFile より後)', async () => {
     const { encodeAnimationAlphaWasm, loadFfmpegAlphaEncoder } =
-      await import('./encodeWebmAlphaWasm');
+      await import('./encodeAlphaVideoWasm');
     const ff = (await loadFfmpegAlphaEncoder()) as unknown as MockFFmpeg;
 
     // 操作順をタイムラインに記録する。
@@ -457,7 +457,7 @@ describe('prefetchFfmpegCore', () => {
     vi.stubGlobal('fetch', fetchMock);
     try {
       const { prefetchFfmpegCore, FFMPEG_CORE_URL, FFMPEG_WASM_URL } = await import(
-        './encodeWebmAlphaWasm'
+        './encodeAlphaVideoWasm'
       );
       prefetchFfmpegCore();
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -494,7 +494,7 @@ describe('prefetchFfmpegCore', () => {
     vi.stubGlobal('fetch', fetchMock);
     try {
       const { prefetchFfmpegCore, loadFfmpegAlphaEncoder } = await import(
-        './encodeWebmAlphaWasm'
+        './encodeAlphaVideoWasm'
       );
       prefetchFfmpegCore();
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -540,7 +540,7 @@ describe('prefetchFfmpegCore', () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('offline'));
     vi.stubGlobal('fetch', fetchMock);
     try {
-      const { prefetchFfmpegCore } = await import('./encodeWebmAlphaWasm');
+      const { prefetchFfmpegCore } = await import('./encodeAlphaVideoWasm');
       // throw しなければ OK。reject Promise が unhandled になる前に await で吸う。
       expect(() => prefetchFfmpegCore()).not.toThrow();
       // catch ハンドラが回るのを待つ
@@ -555,7 +555,7 @@ describe('prefetchFfmpegCore', () => {
     vi.stubGlobal('fetch', fetchMock);
     try {
       const { prefetchFfmpegCore, loadFfmpegAlphaEncoder } = await import(
-        './encodeWebmAlphaWasm'
+        './encodeAlphaVideoWasm'
       );
       prefetchFfmpegCore();
       // プリフェッチでは FFmpeg インスタンスは作られない

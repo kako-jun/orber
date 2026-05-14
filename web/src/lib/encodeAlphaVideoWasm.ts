@@ -255,58 +255,31 @@ async function runEncode(
   };
   ffmpeg.on('progress', progressHandler);
 
-  // #184 diagnostic: ffmpeg 内部ログを捕捉する。`memory access out of bounds`
-  // 等の wasm trap が起きた時に、ffmpeg 側がどこまで進んでいたか / どんな
-  // メッセージを出していたかを Error 文に同梱して console / UI に伝えるため。
-  const logLines: string[] = [];
-  const logHandler = ({ message }: { message: string; type: string }) => {
-    logLines.push(message);
-    if (logLines.length > 80) logLines.shift();
-    // 本番ではブラウザ console にも直接出す (deploy 中の調査用、後で外す)
-    // eslint-disable-next-line no-console
-    console.log('[ffmpeg]', message);
-  };
-  ffmpeg.on('log', logHandler);
-
   try {
-    // 透過 WebM (libvpx-vp9 + yuva420p)。
-    // - `-auto-alt-ref 0`: VP9 alpha と同時に使えない libvpx の制約。必須。
-    // - codec: `png` で PNG codec を MOV container に muxing するだけ。
-    //   libvpx (VP8/VP9) は単スレッド wasm ffmpeg.wasm でアルファプレーンが
-    //   silent に all-255 になる現象を実機で確認 (BlockAdditional は書かれるが
-    //   中身が空)。PNG codec は frame ごとに PNG をそのまま container に
-    //   packing するため、実エンコード = 無し、メモリ問題 = 無し、alpha 完全保持。
-    // - `-c:v copy` で PNG decoder すら通さず passthrough にすると pix_fmt
-    //   ネゴシエーションがコンテナ側で失敗するケースがあるため `-c:v png` で
-    //   一度デコード→PNGエンコードを通す。lossless なので品質劣化なし。
-    // - 容器を `.mov` に切替: PNG-in-MOV は NLE (Premiere / DaVinci / AE)
-    //   全部が単一クリップとして取り込み可能。WebM PNG codec は非標準なので避ける。
-    try {
-      await ffmpeg.exec([
-        '-framerate',
-        String(fps),
-        '-i',
-        inputPattern,
-        '-c:v',
-        'png',
-        '-pix_fmt',
-        'rgba',
-        '-s',
-        `${width}x${height}`,
-        '-f',
-        'mov',
-        outputName,
-      ]);
-    } catch (e) {
-      const tail = logLines.slice(-30).join('\n');
-      const orig = e instanceof Error ? e.message : String(e);
-      throw new Error(
-        `ffmpeg.exec failed (${width}x${height}, ${total}f): ${orig}\n--- ffmpeg log tail ---\n${tail}`,
-      );
-    }
+    // 透過動画は PNG-in-MOV 経路:
+    // libvpx (VP8/VP9) + yuva420p は単スレッド wasm ffmpeg.wasm でアルファ
+    // プレーンが silent に空 (all-255) になるか OOB で死ぬ問題があり、本番で
+    // 複数パターン試行も全滅。`-c:v png -f mov` は frame ごとに PNG をそのまま
+    // MOV container に packing するだけなので、実エンコード = 無し、メモリ問題
+    // = 無し、alpha 完全保持。NLE (Premiere / DaVinci / After Effects) 全部が
+    // 単一クリップとして取り込み可能。
+    await ffmpeg.exec([
+      '-framerate',
+      String(fps),
+      '-i',
+      inputPattern,
+      '-c:v',
+      'png',
+      '-pix_fmt',
+      'rgba',
+      '-s',
+      `${width}x${height}`,
+      '-f',
+      'mov',
+      outputName,
+    ]);
   } finally {
     ffmpeg.off('progress', progressHandler);
-    ffmpeg.off('log', logHandler);
   }
 
   const data = await ffmpeg.readFile(outputName);

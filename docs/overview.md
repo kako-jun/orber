@@ -526,17 +526,25 @@ orber-{ts}.zip
    ├─ orber-{ts}_01-alpha.png          (transparent PNG, lossless)
    ├─ orber-{ts}_01-alpha.webp         (transparent WebP, quality 0.9)
    ├─ ...
-   ├─ orber-{ts}_09-alpha.webm         (transparent VP9, yuva420p, via ffmpeg.wasm)
-   ├─ orber-{ts}_10-alpha.webm
-   ├─ orber-{ts}_11-alpha.webm
-   └─ orber-{ts}_12-alpha.webm
+   ├─ orber-{ts}_09-alpha.mov          (transparent PNG-in-MOV, rgba lossless, via ffmpeg.wasm)
+   ├─ orber-{ts}_10-alpha.mov
+   ├─ orber-{ts}_11-alpha.mov
+   └─ orber-{ts}_12-alpha.mov
 ```
 
 Stills get both PNG (lossless reference) and WebP (smaller, lossy q=0.9) so
-downstream workflows can pick either. Videos use **libvpx-vp9 with
-`-pix_fmt yuva420p`** muxed into WebM via ffmpeg.wasm (#184). MP4 has no
-alpha track in any commonly supported profile, so the transparent video
-format is necessarily different from the background-filled `.mp4`.
+downstream workflows can pick either. Videos use **PNG codec muxed into a
+QuickTime/MOV container** (`-c:v png -pix_fmt rgba -f mov`) via ffmpeg.wasm
+(#184) — ffmpeg.wasm is used purely as a muxer, no actual video encoding
+happens, the per-frame PNGs are packed as-is into MOV sample chunks. MP4
+has no alpha track in any commonly supported profile, so the transparent
+video format is necessarily different from the background-filled `.mp4`.
+Each tile lands at ~60–70 MB (rgba 32-bit lossless × 192 frames × 540×960),
+which is the trade-off for skipping the encode step entirely; the full
+alpha bundle for one 12-tile batch fits in roughly a 250–300 MB ZIP.
+Playback: VLC plays the file directly; **Windows Media Player does not**
+(it has no PNG-codec demuxer). NLEs decode it natively as a lossless
+intermediate.
 
 Implementation notes:
 
@@ -551,26 +559,34 @@ Implementation notes:
   `convertToBlob({type:'image/webp', quality:0.9})` for stills; for videos
   the worker renders each frame as a transparent PNG (`renderAlphaFrames`
   RPC, frames streamed to main via Transferable `alphaFrame` messages)
-  and the main thread invokes **ffmpeg.wasm** to mux them into a WebM
-  with `-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0`. The encoder
-  helper lives in `web/src/lib/encodeWebmAlphaWasm.ts`. `-auto-alt-ref 0`
-  is mandatory because libvpx's alt-ref frames are incompatible with VP9
-  alpha encoding.
-- Why ffmpeg.wasm instead of WebCodecs: WebCodecs `VideoEncoder` with
+  and the main thread invokes **ffmpeg.wasm purely as a muxer** to pack
+  the PNG bytes into a MOV container with
+  `-c:v png -pix_fmt rgba -f mov`. No actual encoding step runs — the
+  per-frame PNG bytes are written into the MOV's sample chunks as-is
+  (PNG codec inside QuickTime is a standard lossless intermediate
+  format supported by every major NLE). The encoder helper lives in
+  `web/src/lib/encodeAlphaVideoWasm.ts`.
+- Why PNG-in-MOV instead of VP9 alpha or VP8 alpha (path taken to get
+  here): WebCodecs `VideoEncoder` with
   `{codec:'vp09.00.10.08', alpha:'keep'}` reports `supported: false` on
   Edge / Chrome on Windows, Android Chrome, Safari, and many other
   combinations because the underlying decision depends on OS-level codec
   backends, GPU acceleration state, and Chromium build flags. The
   earlier #56 implementation used WebCodecs and probed support at
   startup, but the probe was rejected on the majority of real-world
-  devices so the feature was effectively unavailable. #184 swaps the
-  encoder to ffmpeg.wasm, which bundles its own libvpx-vp9 build inside
-  the wasm module — completely independent of the host's codec stack —
-  so transparent video output is **reliable on every environment that
-  can run wasm**.
+  devices so the feature was effectively unavailable. #184 first
+  attempted ffmpeg.wasm + libvpx-vp9 (`yuva420p`), which hit
+  `RuntimeError: memory access out of bounds` in single-threaded wasm
+  even at half-res. The fallback to libvpx-vp8 alpha encoded without
+  errors but produced silently-empty alpha planes (likely a bug in the
+  single-threaded core's vp8 alpha path). PNG-in-MOV sidesteps both
+  problems entirely: no encoder runs in wasm, so neither memory
+  pressure nor codec correctness can fail — the result is **reliable on
+  every environment that can run wasm**, at the cost of much larger
+  files (lossless raster, ~60–70 MB per tile).
 - ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the
   **jsdelivr CDN** (`https://cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/esm/ffmpeg-core.{js,wasm}`)
-  with the version pinned in `web/src/lib/encodeWebmAlphaWasm.ts`
+  with the version pinned in `web/src/lib/encodeAlphaVideoWasm.ts`
   (`FFMPEG_CORE_VERSION`). Cloudflare Pages enforces a **25 MiB per-file
   upload limit**, and `ffmpeg-core.wasm` (~31 MB) blows past it — so the
   earlier "copy into `public/ffmpeg/` and serve same-origin" approach
@@ -607,24 +623,24 @@ Implementation notes:
   speculative `prefetchFfmpegCore()` has already warmed the cache — so
   the first real `ffmpeg.load` still pays zero extra bytes when the
   prefetch landed.
-- **Alpha video half-res** (hotfix after #185 / toBlobURL fix): transparent
-  videos (`alpha/*-alpha.webm`) are rendered and encoded at **540×960**
-  (portrait) / **960×540** (landscape) — half the resolution of the
-  non-transparent `mp4` outputs which stay at 1080×1920 / 1920×1080. The
-  single-threaded ffmpeg.wasm has a hard ~2 GB heap ceiling, and
-  1080×1920 × 192 frames of libvpx-vp9 in `yuva420p` (alpha plane
-  doubles the working buffer cost vs `yuv420p`) tipped over that
-  ceiling in production with `RuntimeError: memory access out of
-  bounds`. Halving each dimension cuts the per-frame footprint to
-  ~25 % which comfortably fits. Transparent stills (`alpha/*-alpha.png`
+- **Alpha video half-res**: transparent videos (`alpha/*-alpha.mov`) are
+  rendered at **540×960** (portrait) / **960×540** (landscape) — half
+  the resolution of the non-transparent `mp4` outputs which stay at
+  1080×1920 / 1920×1080. Originally introduced to dodge the
+  single-threaded ffmpeg.wasm ~2 GB heap ceiling under libvpx-vp9
+  `yuva420p`; on the current PNG-in-MOV path there is no encoder
+  running in wasm so that pressure is gone, but half-res is kept for a
+  different reason: **ZIP size**. PNG-in-MOV is lossless rgba 32-bit,
+  so each tile is already ~60–70 MB at 540×960 × 192 frames; doubling
+  each dimension would quadruple per-tile size to ~240–280 MB and push
+  the 4-video alpha bundle past 1 GB inside the ZIP, which is not a
+  reasonable browser download. Half-res keeps the full 12-tile alpha
+  ZIP in the 250–300 MB range. Transparent stills (`alpha/*-alpha.png`
   and `alpha/*-alpha.webp`) are **not** affected and keep the full
-  1080×1920 / 1920×1080 resolution — they don't go through ffmpeg.wasm
-  and have no memory pressure. NLE workflows (Premiere, DaVinci, After
-  Effects) are expected to scale the alpha WebM up 2× when compositing;
-  bilinear / bicubic upscaling is fine because orb renders are
-  intentionally blurry and the loss is essentially imperceptible. A
-  future multi-threaded-core migration (see next bullet) would let us
-  restore full-res alpha video.
+  1080×1920 / 1920×1080 resolution. NLE workflows (Premiere, DaVinci,
+  After Effects) are expected to scale the alpha MOV up 2× when
+  compositing; bilinear / bicubic upscaling is fine because orb renders
+  are intentionally blurry and the loss is essentially imperceptible.
 - Future migration to the **multi-threaded** ffmpeg-core (≈ 2–4× faster
   encoding via pthreads / SharedArrayBuffer): would require adding
   `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
@@ -665,7 +681,7 @@ Implementation notes:
   outage), `alphaEncoderLoadFailed` ("透過動画エンコーダの読み込みに
   失敗しました / Failed to load transparent video encoder") is shown
   via `errorMsg` and the download is aborted before any zip is produced.
-  The whole alpha bundle (transparent PNG / WebP / WebM) is skipped in
+  The whole alpha bundle (transparent PNG / WebP / MOV) is skipped in
   this case — we don't silently degrade to "alpha folder without video",
   since users opting into the transparent toggle expect the video form
   too. The state then returns to `'idle'` so retrying the download can

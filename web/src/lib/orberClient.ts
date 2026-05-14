@@ -21,7 +21,7 @@
 // signature は維持する。
 
 import OrberWorker from './orberWorker?worker';
-import { encodeAnimationAlphaWasm } from './encodeWebmAlphaWasm';
+import { encodeAnimationAlphaWasm } from './encodeAlphaVideoWasm';
 import { ANIM_FPS } from './encodeMp4';
 
 interface PendingResolver {

@@ -14,7 +14,7 @@ import {
   workerSetImageShape,
   workerSetSource,
 } from '../lib/orberClient';
-import { loadFfmpegAlphaEncoder, prefetchFfmpegCore } from '../lib/encodeWebmAlphaWasm';
+import { loadFfmpegAlphaEncoder, prefetchFfmpegCore } from '../lib/encodeAlphaVideoWasm';
 import { t, lang } from '../lib/strings';
 
 type Aspect = 'portrait' | 'landscape';

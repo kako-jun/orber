@@ -1,7 +1,7 @@
 // orber#184 — workerAnimateOneAlpha の単体テスト。
 //
 // - `./orberWorker?worker` を vi.mock で fake Worker constructor に置換
-// - `./encodeWebmAlphaWasm` を vi.mock で encode 関数を spy 化
+// - `./encodeAlphaVideoWasm` を vi.mock で encode 関数を spy 化
 //   (実 wasm はロードしない)
 //
 // 観点: worker への post 内容、frame 集約の順序保証、欠損検出、worker 失敗時、
@@ -63,7 +63,7 @@ const encodeState = vi.hoisted(() => ({
   lastOnProgress: undefined as undefined | ((f: number, t: number) => void),
 }));
 
-vi.mock('./encodeWebmAlphaWasm', () => ({
+vi.mock('./encodeAlphaVideoWasm', () => ({
   encodeAnimationAlphaWasm: vi.fn(
     async (
       frames: Uint8Array[],
@@ -204,7 +204,7 @@ describe('workerAnimateOneAlpha', () => {
 
   it('worker が {ok:false, error} を返すと reject し encode は呼ばれない', async () => {
     const { workerAnimateOneAlpha } = await import('./orberClient');
-    const encMod = await import('./encodeWebmAlphaWasm');
+    const encMod = await import('./encodeAlphaVideoWasm');
     const total = 2;
     const p = workerAnimateOneAlpha(baseParams(), 1, 0, total);
     const inst = workerState.instances[0];
