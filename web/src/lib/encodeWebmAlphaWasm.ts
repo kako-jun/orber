@@ -249,30 +249,52 @@ async function runEncode(
   };
   ffmpeg.on('progress', progressHandler);
 
+  // #184 diagnostic: ffmpeg 内部ログを捕捉する。`memory access out of bounds`
+  // 等の wasm trap が起きた時に、ffmpeg 側がどこまで進んでいたか / どんな
+  // メッセージを出していたかを Error 文に同梱して console / UI に伝えるため。
+  const logLines: string[] = [];
+  const logHandler = ({ message }: { message: string; type: string }) => {
+    logLines.push(message);
+    if (logLines.length > 80) logLines.shift();
+    // 本番ではブラウザ console にも直接出す (deploy 中の調査用、後で外す)
+    // eslint-disable-next-line no-console
+    console.log('[ffmpeg]', message);
+  };
+  ffmpeg.on('log', logHandler);
+
   try {
     // 透過 WebM (libvpx-vp9 + yuva420p)。
     // - `-auto-alt-ref 0`: VP9 alpha と同時に使えない libvpx の制約。必須。
     // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式。
     // - bitrate 2M: encodeMp4 / 旧 encodeWebmAlpha と揃える。
-    await ffmpeg.exec([
-      '-framerate',
-      String(fps),
-      '-i',
-      inputPattern,
-      '-c:v',
-      'libvpx-vp9',
-      '-pix_fmt',
-      'yuva420p',
-      '-b:v',
-      '2M',
-      '-auto-alt-ref',
-      '0',
-      '-s',
-      `${width}x${height}`,
-      outputName,
-    ]);
+    try {
+      await ffmpeg.exec([
+        '-framerate',
+        String(fps),
+        '-i',
+        inputPattern,
+        '-c:v',
+        'libvpx-vp9',
+        '-pix_fmt',
+        'yuva420p',
+        '-b:v',
+        '2M',
+        '-auto-alt-ref',
+        '0',
+        '-s',
+        `${width}x${height}`,
+        outputName,
+      ]);
+    } catch (e) {
+      const tail = logLines.slice(-30).join('\n');
+      const orig = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `ffmpeg.exec failed (${width}x${height}, ${total}f): ${orig}\n--- ffmpeg log tail ---\n${tail}`,
+      );
+    }
   } finally {
     ffmpeg.off('progress', progressHandler);
+    ffmpeg.off('log', logHandler);
   }
 
   const data = await ffmpeg.readFile(outputName);
