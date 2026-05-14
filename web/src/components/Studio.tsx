@@ -129,6 +129,14 @@ const DL_W_PORTRAIT = 1080;
 const DL_H_PORTRAIT = 1920;
 const DL_W_LANDSCAPE = 1920;
 const DL_H_LANDSCAPE = 1080;
+// orber#184: 透過動画 (libvpx-vp9 + yuva420p) は単一スレッド ffmpeg.wasm の
+// メモリ上限 (~2 GB) を超えやすいため、半解像度でエンコードする。orb は
+// blurry なので NLE で 2x スケールアップしても品質劣化はほぼ感知できない。
+// 静止透過 PNG/WebP は触らない (メモリ問題なし、品質維持優先)。
+const DL_ALPHA_VIDEO_W_PORTRAIT = 540;
+const DL_ALPHA_VIDEO_H_PORTRAIT = 960;
+const DL_ALPHA_VIDEO_W_LANDSCAPE = 960;
+const DL_ALPHA_VIDEO_H_LANDSCAPE = 540;
 
 export default function Studio() {
   const [wasmStatus, setWasmStatus] = createSignal<'loading' | 'ready' | 'error'>('loading');
@@ -1032,8 +1040,23 @@ export default function Studio() {
       } else {
         // #184: 動画タイル: ffmpeg.wasm + libvpx-vp9 (yuva420p) で透過 WebM。
         // ブラウザ / OS / GPU の codec backend に依存せず全環境で出力できる。
+        // 単一スレッド ffmpeg.wasm のメモリ上限 (~2 GB) のため、透過動画のみ
+        // 半解像度 (540×960 / 960×540) でレンダリング・エンコードする
+        // (NLE 側で 2x スケールアップ前提。orb は blurry なので品質劣化は
+        // ほぼ感知できない)。静止透過 PNG/WebP は hiParams のまま維持。
+        const alphaParams = {
+          ...hiParams,
+          width:
+            a === 'portrait'
+              ? DL_ALPHA_VIDEO_W_PORTRAIT
+              : DL_ALPHA_VIDEO_W_LANDSCAPE,
+          height:
+            a === 'portrait'
+              ? DL_ALPHA_VIDEO_H_PORTRAIT
+              : DL_ALPHA_VIDEO_H_LANDSCAPE,
+        };
         const webm = await workerAnimateOneAlpha(
-          hiParams,
+          alphaParams,
           total,
           i,
           ANIM_TOTAL_FRAMES,

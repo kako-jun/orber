@@ -607,6 +607,24 @@ Implementation notes:
   speculative `prefetchFfmpegCore()` has already warmed the cache — so
   the first real `ffmpeg.load` still pays zero extra bytes when the
   prefetch landed.
+- **Alpha video half-res** (hotfix after #185 / toBlobURL fix): transparent
+  videos (`alpha/*-alpha.webm`) are rendered and encoded at **540×960**
+  (portrait) / **960×540** (landscape) — half the resolution of the
+  non-transparent `mp4` outputs which stay at 1080×1920 / 1920×1080. The
+  single-threaded ffmpeg.wasm has a hard ~2 GB heap ceiling, and
+  1080×1920 × 192 frames of libvpx-vp9 in `yuva420p` (alpha plane
+  doubles the working buffer cost vs `yuv420p`) tipped over that
+  ceiling in production with `RuntimeError: memory access out of
+  bounds`. Halving each dimension cuts the per-frame footprint to
+  ~25 % which comfortably fits. Transparent stills (`alpha/*-alpha.png`
+  and `alpha/*-alpha.webp`) are **not** affected and keep the full
+  1080×1920 / 1920×1080 resolution — they don't go through ffmpeg.wasm
+  and have no memory pressure. NLE workflows (Premiere, DaVinci, After
+  Effects) are expected to scale the alpha WebM up 2× when compositing;
+  bilinear / bicubic upscaling is fine because orb renders are
+  intentionally blurry and the loss is essentially imperceptible. A
+  future multi-threaded-core migration (see next bullet) would let us
+  restore full-res alpha video.
 - Future migration to the **multi-threaded** ffmpeg-core (≈ 2–4× faster
   encoding via pthreads / SharedArrayBuffer): would require adding
   `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
