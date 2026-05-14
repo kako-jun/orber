@@ -266,15 +266,16 @@ async function runEncode(
     // 透過 WebM (libvpx-vp9 + yuva420p)。
     // - `-auto-alt-ref 0`: VP9 alpha と同時に使えない libvpx の制約。必須。
     // - codec: `libvpx` (VP8) に切替。`libvpx-vp9` + `yuva420p` は単スレッド
-    //   wasm ffmpeg.wasm 環境で根本的に不安定 (本番で複数パターン試行も全滅:
-    //   default → frame 27 で OOB / realtime preset → init で即 OOB /
-    //   lag-in-frames 0 → frame 1 encode 開始直後で OOB)。VP8 alpha は枯れていて
-    //   wasm 動作実績豊富、容器は同じ .webm、NLE 互換性も同じ。
-    //   - bitrate 2M はそのまま (#184)
-    // - `-lag-in-frames 0`: lookahead 無効化 (念のため。VP8 では既定が違うが
-    //   per-frame 処理を強制してメモリピーク抑制)
-    // - `-auto-alt-ref 0`: VP8 では無関係だが安全策で残す
-    // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式
+    //   wasm ffmpeg.wasm 環境で根本的に不安定 (本番で複数パターン試行も全滅)。
+    //   VP8 alpha は枯れていて wasm 動作実績豊富、容器は同じ .webm、
+    //   NLE 互換性も同じ。
+    // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式。VP8 で
+    //   yuva420p を指定するとは libvpx 内部で 2 つの encoder instance を起動して
+    //   YUV プレーンと alpha プレーンを別々に encode し、WebM の BlockAdditional
+    //   経由でアルファトラックを格納する (`alpha_mode=1` タグ自動付与)。
+    // - VP9 用フラグ (`-auto-alt-ref` / `-lag-in-frames`) は撤去:
+    //   VP8 で渡すと libvpx の alpha encoder セットアップを壊して空アルファに
+    //   なる現象を実機で確認済み。VP8 のデフォルト挙動に任せる。
     try {
       await ffmpeg.exec([
         '-framerate',
@@ -287,10 +288,6 @@ async function runEncode(
         'yuva420p',
         '-b:v',
         '2M',
-        '-auto-alt-ref',
-        '0',
-        '-lag-in-frames',
-        '0',
         '-s',
         `${width}x${height}`,
         outputName,
