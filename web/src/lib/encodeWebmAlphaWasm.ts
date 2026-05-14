@@ -269,8 +269,9 @@ async function runEncode(
     //   lookahead を抱えたまま yuva420p (YUV + alpha 二重) の初回 output を
     //   出そうとすると wasm 単スレッド ffmpeg のヒープが枯渇して
     //   `RuntimeError: memory access out of bounds` で死ぬ。本番再現済み (#184)。
-    // - `-deadline realtime -cpu-used 8`: 最速プリセット (品質落ちる代わりに
-    //   メモリ使用量も激減)。orb は blurry なので品質劣化は実用上問題なし。
+    //   `-deadline realtime -cpu-used 8` も試したが、yuva420p alpha encoder と
+    //   非互換で init 段階で即 OOB。RTC encoder パスは VP9 alpha 非対応の模様。
+    //   `-lag-in-frames 0` のみで普通の "good" deadline (cpu-used 0) を使う。
     // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式。
     // - bitrate 2M: encodeMp4 / 旧 encodeWebmAlpha と揃える。
     try {
@@ -289,10 +290,6 @@ async function runEncode(
         '0',
         '-lag-in-frames',
         '0',
-        '-deadline',
-        'realtime',
-        '-cpu-used',
-        '8',
         '-s',
         `${width}x${height}`,
         outputName,
