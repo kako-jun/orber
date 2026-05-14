@@ -1,163 +1,34 @@
-// orber#184 — 透過 WebM エンコードを ffmpeg.wasm + libvpx-vp9 (yuva420p) で行う。
+// orber#192 — JS-only MOV muxer による透過動画出力。
 //
-// 旧 `encodeWebmAlpha.ts` は WebCodecs の `VideoEncoder({codec:'vp09.00.10.08',
-// alpha:'keep'})` を使っていたが、Edge / Android Chrome 等の大多数の環境で
-// `VideoEncoder.isConfigSupported({codec, alpha:'keep'})` が `supported:false`
-// を返し実用にならなかった (#56 / session 412)。
+// 経緯: orber#184 でアルファ動画を ffmpeg.wasm + libvpx (VP8/VP9) yuva420p で
+// エンコードしようとしたが、単一スレッド wasm では実機でメモリ枯渇 OOB / 空アルファ
+// の問題に当たり、最終的に `-c:v png -f mov` (PNG-in-MOV) で着地。実エンコードを
+// 行わず PNG bytes をそのまま MOV container に並べるだけの構成だった。
 //
-// ここでは ffmpeg.wasm を導入し、libvpx-vp9 のソフトウェアエンコーダで
-// 透過 WebM (yuva420p) を生成する。wasm 内部に libvpx-vp9 を内蔵しているため
-// ブラウザ / OS / GPU の codec backend に一切依存せず、全環境で確実に出力できる。
+// #192: ffmpeg.wasm は事実上 MOV muxer 役にしかなっていなかったため、JS だけで
+// MOV atom tree を書く `movMuxer.ts` に置き換え、`@ffmpeg/ffmpeg` / `@ffmpeg/util`
+// / `@ffmpeg/core` (~30MB CDN ロード) 依存を撤去した。jsdelivr 経由の cross-origin
+// fetch、Service Worker の `ffmpegCoreCacheFirst`、`prefetchFfmpegCore` のアイドル
+// 投機ロード、`saveData` / `2g`/`3g` saver guard 等の周辺コードもすべて不要。
 //
-// 設計:
-//   - main thread で動かす (worker 内では `FFmpeg` class が更に内部 worker を
-//     spawn するため nested worker 互換性問題を避ける。single-threaded core は
-//     COOP/COEP ヘッダ不要なので Nostalgic Counter iframe 等を壊さない)
-//   - `FFmpeg` インスタンスは module 内シングルトンで lazy 初期化
-//     (透過 DL を複数回使ってもロードは 1 度だけ)
-//   - core は jsdelivr CDN (`cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/umd`)
-//     から取得。Cloudflare Pages の単一ファイル上限 25 MiB に
-//     `ffmpeg-core.wasm` (~31 MB) が引っかかるため、同一オリジン配信を諦め
-//     CDN 経由にする。バージョンを pin して immutable cache を効かせ、
-//     Service Worker (`public/sw.js`) で CacheFirst により初回後はオフラインで
-//     再利用できる経路を維持する。
-//   - 1 frame ずつ PNG として virtual FS に書き込み、`ffmpeg.exec()` で
-//     `-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0` で WebM 化
-//
-// `-auto-alt-ref 0` は VP9 alpha と同時に使えない (libvpx 制約) ので必須。
-
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { toBlobURL } from '@ffmpeg/util';
+// 出力形式 (前後互換):
+//   - alpha/*-alpha.mov、`video/quicktime`
+//   - PNG codec (lossless rgba)、解像度 540×960 / 960×540
+//   - 192 frames @ 24fps (= 8 秒、ANIM_FPS / ANIM_TOTAL_FRAMES 既定)
+//   - NLE 取り込み可 (Premiere / DaVinci / After Effects、VLC)
 
 import { ANIM_FPS } from './encodeMp4';
-
-// `@ffmpeg/core` のバージョンは package.json の devDependencies に pin。
-// 数字は `node_modules/@ffmpeg/core/package.json` の `version` と同期する。
-// jsdelivr は Fastly + Cloudflare の二重ミラーで unpkg より安定 & immutable
-// cache が効くため CDN として採用。
-export const FFMPEG_CORE_VERSION = '0.12.10';
-// `@ffmpeg/ffmpeg` 0.12.15 は `type: "module"` Worker を spawn し、Worker 内で
-// `importScripts` が使えないため fallback の `import(coreURL)` が走る。
-// UMD ビルドは ES module ではないため `import()` が失敗する (本番再現:
-// `failed to import ffmpeg-core.js`)。ESM ビルドを使う必要がある。
-export const FFMPEG_CORE_CDN_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
-export const FFMPEG_CORE_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.js`;
-export const FFMPEG_WASM_URL = `${FFMPEG_CORE_CDN_BASE}/ffmpeg-core.wasm`;
-
-let ffmpegSingleton: FFmpeg | null = null;
-let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
-// orber#184 review S1: in-flight プリフェッチを保持する。`loadFfmpegAlphaEncoder`
-// が呼ばれた時点でプリフェッチがまだ走っていれば完了を待ち、SW cache に積まれた
-// 状態から `ffmpeg.load(...)` に入ることで二重 fetch race (プリフェッチ + 実ロード
-// が両方走って同じ 31 MB を重複ダウンロードする) を解消する。
-// プリフェッチ失敗 (offline 等) は無視して通常 load 経路に進む。
-// 一度 resolve したら null に戻さない (再発火しない設計)。SW がバージョン bump で
-// 旧キャッシュを破棄した直後の同一セッションでは `await prefetchPromise` が即
-// resolve するだけで、実 fetch は `ffmpeg.load` 側が CDN に取りに行く。
-let prefetchPromise: Promise<void> | null = null;
-
-// orber#184: シングルトン FFmpeg は内部 virtual FS を 1 つしか持たないため、
-// 並行に encodeAnimationAlphaWasm を呼ぶと writeFile / deleteFile / exec が
-// 同じファイル名 (`frame-%04d.png` / `out.webm`) を奪い合って壊れる。
-// module-level の serial mutex で呼び出しを必ず直列化する。
-let encodeMutex: Promise<void> = Promise.resolve();
-
-// frame ファイル名のヘルパー (`-i frame-%04d.png` と桁数を同期させる目的)。
-const FRAME_PAD = 4;
-const frameName = (i: number) =>
-  `frame-${String(i).padStart(FRAME_PAD, '0')}.png`;
+import { muxPngFramesToMov } from './movMuxer';
 
 /**
- * ffmpeg-core (~31 MB) を Service Worker の CacheFirst に先取りで温めるための
- * プリフェッチ。Studio の onMount から `requestIdleCallback` 経由で呼び、
- * ユーザーがオーブを設計している間に裏で fetch が完走するようにする。
+ * 透過 PNG フレーム列 (1 frame = 1 PNG ArrayBuffer) を MOV container に詰めて
+ * `video/quicktime` Blob を返す。
  *
- * - シングルトン (`ffmpegSingleton` / `ffmpegLoadPromise`) には**一切触れない**。
- *   純粋に HTTP fetch を走らせて SW (`public/sw.js` の `ffmpegCoreCacheFirst`)
- *   に拾わせるだけ。失敗しても透過 DL を実行した時に普通に再 fetch される。
- * - レビュー M1: `mode: 'cors'` (= デフォルト、`mode` を指定しない) で走らせる。
- *   旧 `mode: 'no-cors'` は opaque response を返し、それが SW の
- *   `ffmpeg-core-v<version>` cache に焼き付くと後続の `importScripts(ffmpeg-core.js)`
- *   や WebAssembly streaming compile が CORS チェックで失敗するリスクがある。
- *   jsdelivr は CORS を許可しているので普通の cors fetch で問題なく通る。
- * - レビュー S1: in-flight Promise を `prefetchPromise` に保持し、`loadFfmpegAlphaEncoder`
- *   が裏で待てるようにする。これで「プリフェッチ in-flight 中に DL ボタン押下」の
- *   ケースでも 1 回の DL に収束する。
- * - 例外は静かに握りつぶす (UI / console に出さない)。fetch は同期 throw しない
- *   ため外側 try は不要 (レビュー N3)。
- */
-export function prefetchFfmpegCore(): void {
-  if (typeof fetch === 'undefined') return;
-  // 既に走っているプリフェッチがあれば再発火しない (idempotent)。
-  if (prefetchPromise) return;
-  const coreP = fetch(FFMPEG_CORE_URL, { credentials: 'omit' }).catch(() => {});
-  const wasmP = fetch(FFMPEG_WASM_URL, { credentials: 'omit' }).catch(() => {});
-  prefetchPromise = Promise.all([coreP, wasmP]).then(() => {});
-}
-
-/**
- * ffmpeg.wasm をロードする (シングルトン)。
+ * 実エンコードは行わない (PNG bytes をそのまま mdat に並べる)。
  *
- * 失敗時はネットワーク断 / 配信欠落と判断できるよう Error を伝播する。
- * 呼び出し側 (Studio) は `alphaEncoderLoadFailed` 文言の UI で通知する。
- */
-export async function loadFfmpegAlphaEncoder(): Promise<FFmpeg> {
-  if (ffmpegSingleton) return ffmpegSingleton;
-  if (ffmpegLoadPromise) return ffmpegLoadPromise;
-  const ffmpeg = new FFmpeg();
-  ffmpegLoadPromise = (async () => {
-    // レビュー S1: プリフェッチが in-flight ならその完走を待ってから load する。
-    // SW (`ffmpegCoreCacheFirst`) がプリフェッチ Response を cache に積み終わって
-    // いれば、`ffmpeg.load` 内部の fetch は cache hit になり 31 MB の二重 DL を回避。
-    // プリフェッチ失敗 (offline / CORS 等) は無視して通常 load 経路に進む。
-    if (prefetchPromise) {
-      await prefetchPromise.catch(() => {});
-    }
-    // orber#184 hotfix: `@ffmpeg/ffmpeg` v0.12 系は `load({coreURL, wasmURL})`
-    // 内部で classic Worker を spawn し、Worker 内で `importScripts(coreURL)` を
-    // 呼ぶ。`coreURL` が cross-origin (jsdelivr CDN) だと、サーバ側で
-    // `Access-Control-Allow-Origin` が許可されていても Worker spec の制約で
-    // importScripts が失敗するケースがある (本番 orber.llll-ll.com で再現:
-    // `failed to import ffmpeg-core.js`)。ffmpeg.wasm 公式 README の標準パターン
-    // である `@ffmpeg/util` の `toBlobURL` で blob: URL に変換してから渡す:
-    // Worker の importScripts は same-origin の blob: URL になるので CORS 制約
-    // から外れる。
-    //
-    // プリフェッチとの互換: `toBlobURL` 内部 fetch は SW (`ffmpegCoreCacheFirst`)
-    // のキャッシュにヒットするので、prefetch で温めた状態なら 31 MB の再 DL は
-    // 発生しない。プリフェッチの効果は維持される。
-    const [coreBlobURL, wasmBlobURL] = await Promise.all([
-      toBlobURL(FFMPEG_CORE_URL, 'text/javascript'),
-      toBlobURL(FFMPEG_WASM_URL, 'application/wasm'),
-    ]);
-    await ffmpeg.load({
-      coreURL: coreBlobURL,
-      wasmURL: wasmBlobURL,
-    });
-    ffmpegSingleton = ffmpeg;
-    return ffmpeg;
-  })();
-  try {
-    return await ffmpegLoadPromise;
-  } catch (e) {
-    // ロード失敗時は singleton を立てず、次回 retry できる状態にする。
-    ffmpegLoadPromise = null;
-    throw e;
-  }
-}
-
-/**
- * 透過 PNG フレーム列 (1 frame = 1 PNG ArrayBuffer) を受け取り、
- * libvpx-vp9 + yuva420p で透過 WebM Blob を返す。
- *
- * `onProgress(frame, total)` は ffmpeg.wasm の progress event を中継する。
- * 書き込み / readFile / 削除のフェーズも含めると ffmpeg progress は途中で
- * 90% に達して止まったりするので、UI 側は近似インジケータと割り切る。
- *
- * frames の各 ArrayBuffer は呼び出し後の参照は保持しない (writeFile で
- * 内部コピーされる)。
- *
- * シングルトン共有 virtual FS のため内部で直列化される (`encodeMutex`)。
+ * `onProgress(frame, total)` は呼出し側 API の互換のため受け取るが、muxing は
+ * メモリ内シングルパス処理で 1 タイル数十 MB 程度であれば即完了する。開始 / 完了
+ * の 2 点だけ通知して UI 側の進捗 UI を破綻させない。
  */
 export async function encodeAnimationAlphaWasm(
   frames: Uint8Array[],
@@ -169,140 +40,8 @@ export async function encodeAnimationAlphaWasm(
   if (frames.length === 0) {
     throw new Error('frames must be > 0');
   }
-  // 直列化: 先行 encode が完了 (resolve / reject 問わず) してから走る。
-  // 自分の完了を mutex の next-tail にする。
-  const prev = encodeMutex;
-  let release: () => void = () => {};
-  encodeMutex = new Promise<void>((res) => {
-    release = res;
-  });
-  try {
-    await prev.catch(() => {});
-    return await runEncode(frames, width, height, fps, onProgress);
-  } finally {
-    release();
-  }
-}
-
-async function runEncode(
-  frames: Uint8Array[],
-  width: number,
-  height: number,
-  fps: number,
-  onProgress?: (frame: number, total: number) => void,
-): Promise<Blob> {
-  const ffmpeg = await loadFfmpegAlphaEncoder();
-  const total = frames.length;
-
-  const inputPattern = `frame-%0${FRAME_PAD}d.png`;
-  // orber#184: WebM/libvpx (VP8/VP9 両方) は単スレッド wasm ffmpeg.wasm で
-  // alpha プレーンが正しく encode されず all-255 になる現象を実機で確認。
-  // PNG codec を MOV container に packing する経路に切替: 実エンコードを
-  // 行わず PNG を muxer に渡すだけなので、メモリ問題も alpha 欠落もなし。
-  // NLE (Premiere / DaVinci / After Effects) は PNG-in-MOV を単一クリップで
-  // 取り込み可能。lossless で alpha プレーンも完全保持。
-  const outputName = 'out.mov';
-
-  // 既存ファイルの掃除 (前回 encode 残骸が virtual FS に残っている可能性あり)。
-  // singleton 再利用時、`listDir('/')` で実際に残っている `frame-*.png` だけを
-  // 総当り削除する。前回 ≤ 今回フレーム数なら問題ないが、前回 > 今回のとき
-  // 想定名ループだけでは古い余剰フレームが残り `-i frame-%04d.png` が拾って
-  // しまう恐れがあるため。`listDir` 自体が落ちた場合 (古い API 等) は想定名
-  // ループにフォールバックする。
-  let cleanupNames: string[] | null = null;
-  try {
-    const entries = await ffmpeg.listDir('/');
-    cleanupNames = entries
-      .filter((e) => !e.isDir && /^frame-\d+\.png$/.test(e.name))
-      .map((e) => e.name);
-  } catch {
-    cleanupNames = null;
-  }
-  if (cleanupNames) {
-    for (const name of cleanupNames) {
-      try {
-        await ffmpeg.deleteFile(name);
-      } catch {
-        /* 不存在は無視 */
-      }
-    }
-  } else {
-    for (let i = 0; i < total; i++) {
-      try {
-        await ffmpeg.deleteFile(frameName(i));
-      } catch {
-        /* 初回 / 不存在は無視 */
-      }
-    }
-  }
-  try {
-    await ffmpeg.deleteFile(outputName);
-  } catch {
-    /* 初回 / 不存在は無視 */
-  }
-
-  // 1 frame ずつ書き込む。Promise.all すると wasm 内部のシリアル処理に
-  // 並べ替えが入ってメモリ使用量がピークで膨らむため、await ループで進める。
-  for (let i = 0; i < total; i++) {
-    await ffmpeg.writeFile(frameName(i), frames[i]);
-  }
-
-  const progressHandler = ({ progress }: { progress: number; time: number }) => {
-    // ffmpeg.wasm の progress は 0..1 の近似値。frame に換算して中継する。
-    if (!onProgress) return;
-    const f = Math.min(total, Math.max(0, Math.round(progress * total)));
-    onProgress(f, total);
-  };
-  ffmpeg.on('progress', progressHandler);
-
-  try {
-    // 透過動画は PNG-in-MOV 経路:
-    // libvpx (VP8/VP9) + yuva420p は単スレッド wasm ffmpeg.wasm でアルファ
-    // プレーンが silent に空 (all-255) になるか OOB で死ぬ問題があり、本番で
-    // 複数パターン試行も全滅。`-c:v png -f mov` は frame ごとに PNG をそのまま
-    // MOV container に packing するだけなので、実エンコード = 無し、メモリ問題
-    // = 無し、alpha 完全保持。NLE (Premiere / DaVinci / After Effects) 全部が
-    // 単一クリップとして取り込み可能。
-    await ffmpeg.exec([
-      '-framerate',
-      String(fps),
-      '-i',
-      inputPattern,
-      '-c:v',
-      'png',
-      '-pix_fmt',
-      'rgba',
-      '-s',
-      `${width}x${height}`,
-      '-f',
-      'mov',
-      outputName,
-    ]);
-  } finally {
-    ffmpeg.off('progress', progressHandler);
-  }
-
-  const data = await ffmpeg.readFile(outputName);
-  if (typeof data === 'string') {
-    // 我々は encoding を指定していないので Uint8Array が返るはずだが、
-    // 型を絞り込むためのガード。
-    throw new Error('unexpected string result from ffmpeg.readFile');
-  }
-
-  // 後片付け (virtual FS のメモリ解放)。
-  for (let i = 0; i < total; i++) {
-    try {
-      await ffmpeg.deleteFile(frameName(i));
-    } catch {
-      /* ignore */
-    }
-  }
-  try {
-    await ffmpeg.deleteFile(outputName);
-  } catch {
-    /* ignore */
-  }
-
-  // Uint8Array<ArrayBufferLike> → Blob 互換のため buffer view を明示。
-  return new Blob([new Uint8Array(data)], { type: 'video/quicktime' });
+  if (onProgress) onProgress(0, frames.length);
+  const mov = muxPngFramesToMov(frames, width, height, fps);
+  if (onProgress) onProgress(frames.length, frames.length);
+  return new Blob([mov], { type: 'video/quicktime' });
 }

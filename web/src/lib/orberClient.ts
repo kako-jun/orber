@@ -337,15 +337,14 @@ export async function workerGenerateOneAlpha(
  *
  * worker は wasm + OffscreenCanvas で各 frame を透過 PNG として描画し、
  * `alphaFrame` message で 1 枚ずつ main に流す。main 側で集めた PNG を
- * ffmpeg.wasm に投入し libvpx-vp9 + yuva420p で muxing する。
+ * JS-only MOV muxer (`movMuxer.ts`) で PNG-in-MOV に詰める。
  *
- * 旧 WebCodecs `VideoEncoder({codec:'vp09.00.10.08', alpha:'keep'})` 経路は
- * Edge / Android Chrome 等多くの環境で supported:false を返したため撤去。
- * ffmpeg.wasm は内蔵 libvpx-vp9 を使うため、ブラウザ / OS / GPU の codec
- * backend に依存せず全環境で確実に出力できる。
- *
- * ffmpeg.wasm のロード失敗 (ネットワーク断 / 配信欠落) は Error が伝播する。
- * 呼び出し側は `alphaEncoderLoadFailed` 文言の UI で通知すること。
+ * #184 履歴: 旧 WebCodecs `VideoEncoder({codec:'vp09', alpha:'keep'})` は Edge /
+ * Android Chrome 等で軒並み supported:false。ffmpeg.wasm + libvpx-vp9 yuva420p
+ * へ切替えたが、wasm 単スレッドで alpha plane が空 / OOB になり PNG-in-MOV へ
+ * 着地。
+ * #192: ffmpeg.wasm が muxer 役にしか使われていなかったため JS-only に置換、
+ * ~30MB CDN ロード / saver guard / プリフェッチ / SW CacheFirst 一式を撤去。
  */
 export async function workerAnimateOneAlpha(
   params: BaseParams,

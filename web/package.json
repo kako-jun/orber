@@ -7,7 +7,7 @@
     "wasm:ensure-rust": "which rustup || (unset RUSTUP_VERSION && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && . $HOME/.cargo/env && rustup target add wasm32-unknown-unknown)",
     "wasm:install": ". $HOME/.cargo/env 2>/dev/null; which wasm-pack || cargo install wasm-pack --locked",
     "wasm:build": "cd .. && wasm-pack build crates/wasm --target web --out-dir ../../web/src/wasm --release",
-    "stamp:sw": "node -e \"const f=require('fs'),p='dist/sw.js',d=new Date(Date.now()+9*36e5).toISOString().slice(0,10),s=f.readFileSync('src/lib/encodeAlphaVideoWasm.ts','utf-8'),m=s.match(/FFMPEG_CORE_VERSION\\s*=\\s*'([^']+)'/);if(!m)throw new Error('FFMPEG_CORE_VERSION not found in encodeAlphaVideoWasm.ts');f.writeFileSync(p,f.readFileSync(p,'utf-8').replaceAll('__BUILD_DATE__',d).replaceAll('__FFMPEG_CORE_VERSION__',m[1]))\"",
+    "stamp:sw": "node -e \"const f=require('fs'),p='dist/sw.js',d=new Date(Date.now()+9*36e5).toISOString().slice(0,10);f.writeFileSync(p,f.readFileSync(p,'utf-8').replaceAll('__BUILD_DATE__',d))\"",
     "dev": "npm run wasm:build && astro dev",
     "build": "npm run wasm:build && astro build && npm run stamp:sw",
     "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && astro build && npm run stamp:sw",
@@ -19,8 +19,6 @@
   "dependencies": {
     "@astrojs/solid-js": "^4.4.0",
     "@astrojs/tailwind": "^5.1.0",
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2",
     "astro": "^4.16.0",
     "jszip": "^3.10.1",
     "mp4-muxer": "^5.2.2",
@@ -29,7 +27,6 @@
     "webm-muxer": "^5.1.4"
   },
   "devDependencies": {
-    "@ffmpeg/core": "^0.12.10",
     "jsdom": "^29.1.1",
     "typescript": "^5.6.0",
     "vitest": "^3.2.4",

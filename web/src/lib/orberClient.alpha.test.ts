@@ -80,7 +80,7 @@ vi.mock('./encodeAlphaVideoWasm', () => ({
       encodeState.lastOnProgress = onProgress;
       // 進捗が中継できるかテスト用に 1 発発火
       onProgress?.(1, frames.length);
-      return new Blob([new Uint8Array([0xff])], { type: 'video/webm' });
+      return new Blob([new Uint8Array([0xff])], { type: 'video/quicktime' });
     },
   ),
 }));
@@ -214,7 +214,7 @@ describe('workerAnimateOneAlpha', () => {
     expect(encMod.encodeAnimationAlphaWasm).not.toHaveBeenCalled();
   });
 
-  it('onProgress は worker 経路 (animateProgress) と ffmpeg 経路の両方で発火する', async () => {
+  it('onProgress は worker 経路 (animateProgress) と muxer 経路 (encodeAnimationAlphaWasm) の両方で発火する', async () => {
     const { workerAnimateOneAlpha } = await import('./orberClient');
     const total = 2;
     const seen: Array<[number, number]> = [];

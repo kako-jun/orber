@@ -128,24 +128,21 @@ export const STRINGS = {
     ja: 'ダウンロード準備に失敗しました',
     en: 'Failed to prepare download',
   },
-  // #56 / #184: ZIP DL に透過版 (PNG / WebP / WebM) を同梱するかの checkbox。
-  // 既定 OFF (既存 byte-exact 出力を保つため)。#184 で動画経路は ffmpeg.wasm
-  // + libvpx-vp9 (yuva420p) に切り替え、ブラウザ / OS / GPU の codec backend
-  // 非依存で全環境で出力可能。よって probe / 非対応 UI は廃止。
+  // #56 / #184 / #192: ZIP DL に透過版 (PNG / WebP / MOV) を同梱するかの
+  // checkbox。既定 OFF (既存 byte-exact 出力を保つため)。動画経路は
+  // #184 で PNG-in-MOV、#192 で JS-only MOV muxer に置換され、ブラウザ /
+  // OS / GPU の codec backend に依存せず全環境で出力できる。よって probe /
+  // 非対応 UI は廃止。
   includeAlphaLabel: {
     ja: '透過版を DL に含める',
     en: 'Include transparent versions',
   },
-  // #184: 透過 DL を押した後、ffmpeg.wasm core (約 31MB) のロード中に出す進捗。
+  // #184/#192: 透過動画の進捗が出る場合の文言 (現在は JS-only MOV muxer で
+  // 一瞬で完了するため UI には載らないが、将来 frame 数が増えた時に再利用できる
+  // よう温存)。
   alphaEncodingInProgress: {
-    ja: '透過動画エンコーダを読み込み中…',
-    en: 'Loading transparent video encoder…',
-  },
-  // #184: ffmpeg.wasm core のロードに失敗した時のエラー文言 (ネットワーク断 /
-  // 配信欠落等)。errorMsg 経由で DL ボタン下に出る。
-  alphaEncoderLoadFailed: {
-    ja: '透過動画エンコーダの読み込みに失敗しました',
-    en: 'Failed to load transparent video encoder',
+    ja: '透過動画を書き出し中…',
+    en: 'Writing transparent video…',
   },
   variationAlt: { ja: 'バリエーション {n}', en: 'Variation {n}' },
   variationAnimatedAlt: {

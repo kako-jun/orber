@@ -108,18 +108,24 @@ describe('lang signal + t()', () => {
     );
   });
 
-  test('alphaEncoderLoadFailed / alphaEncodingInProgress キーが ja/en 両方定義されている (#184)', async () => {
-    // ffmpeg.wasm ロード時 / ロード失敗時に Studio.tsx が出す文言。
-    // i18n キー漏れで本番ビルドに `{key}` がそのまま出るリグレッションを防ぐ。
+  test('alphaEncodingInProgress キーが ja/en 両方定義されている (#184/#192)', async () => {
+    // #192 で MOV muxer 化したため alphaEncoderLoadFailed は削除済。
+    // alphaEncodingInProgress は将来 frame 数が増えた時の再利用枠で温存している。
     vi.stubGlobal('navigator', { language: 'en-US' });
     const { setLang, t } = await import('./strings');
     await Promise.resolve();
     setLang('ja');
-    expect(t('alphaEncoderLoadFailed')).toMatch(/透過動画/);
     expect(t('alphaEncodingInProgress')).toMatch(/透過動画/);
     setLang('en');
-    expect(t('alphaEncoderLoadFailed')).toMatch(/transparent video/);
     expect(t('alphaEncodingInProgress')).toMatch(/transparent video/);
+  });
+
+  test('削除済みキー alphaEncoderLoadFailed は STRINGS に存在しない (#192)', async () => {
+    // #192 で ffmpeg.wasm を撤去し外部 CDN ロード失敗のシナリオ自体が消滅した。
+    // 文言キーが残っていると Studio.tsx 側で復活させて二重管理になるため、
+    // 存在しないことを直接押さえる。
+    const { STRINGS } = await import('./strings');
+    expect('alphaEncoderLoadFailed' in STRINGS).toBe(false);
   });
 
   test('削除済みキー alphaVideoUnsupportedNotice は STRINGS に存在しない (#184)', async () => {

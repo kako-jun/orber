@@ -207,12 +207,14 @@ type Req =
       index: number;
       format: 'png' | 'webp';
     }
-  // #184: 透過動画用の PNG フレーム列を返す。worker は wasm 経路で各 frame
+  // #184/#192: 透過動画用の PNG フレーム列を返す。worker は wasm 経路で各 frame
   // (透過背景 + orb) を OffscreenCanvas に描画 → PNG 化 → progress message
-  // で 1 枚ずつ main に流す。main 側は ffmpeg.wasm (libvpx-vp9 + yuva420p) で
-  // 透過 WebM に muxing する。worker 内に ffmpeg.wasm を抱え込まないのは、
-  // FFmpeg class が更に内部 worker を spawn する nested-worker パスを避けて
-  // 安定性を優先するため (#184)。
+  // で 1 枚ずつ main に流す。main 側は JS-only MOV muxer (`movMuxer.ts`) で
+  // PNG-in-MOV に詰める。#184 当時は ffmpeg.wasm を muxer 役に使う構成で、
+  // FFmpeg class が更に内部 worker を spawn する nested-worker パスを避ける
+  // ために worker 側にエンコーダを抱え込まない判断だった。#192 で encoder
+  // 自体が消えたためその制約は無くなったが、責務 (描画 = worker / コンテナ
+  // 組立 = main) の分離は今も自然なのでそのまま維持。
   | {
       kind: 'renderAlphaFrames';
       id: number;
@@ -360,7 +362,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         // #184: 透過動画用 PNG フレーム列 (worker → main)。各 frame は
         // `alphaFrame` kind の message で 1 枚ずつ Transferable 経由で送る。
         // 全 frame を flat array で抱え込まないことで GPU メモリと postMessage の
-        // 一括コピーコストを抑える。main 側は ffmpeg.wasm に投入する。
+        // 一括コピーコストを抑える。main 側は JS-only MOV muxer に投入する。
         // 進捗 UI は `animateProgress` を流用 (encodeMp4 と同形)。
         const params = mergeParams(req.params);
         const data = wasm.get_render_data(params, req.n, req.index);

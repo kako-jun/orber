@@ -526,7 +526,7 @@ orber-{ts}.zip
    ├─ orber-{ts}_01-alpha.png          (transparent PNG, lossless)
    ├─ orber-{ts}_01-alpha.webp         (transparent WebP, quality 0.9)
    ├─ ...
-   ├─ orber-{ts}_09-alpha.mov          (transparent PNG-in-MOV, rgba lossless, via ffmpeg.wasm)
+   ├─ orber-{ts}_09-alpha.mov          (transparent PNG-in-MOV, rgba lossless, JS-only muxer)
    ├─ orber-{ts}_10-alpha.mov
    ├─ orber-{ts}_11-alpha.mov
    └─ orber-{ts}_12-alpha.mov
@@ -534,12 +534,13 @@ orber-{ts}.zip
 
 Stills get both PNG (lossless reference) and WebP (smaller, lossy q=0.9) so
 downstream workflows can pick either. Videos use **PNG codec muxed into a
-QuickTime/MOV container** (`-c:v png -pix_fmt rgba -f mov`) via ffmpeg.wasm
-(#184) — ffmpeg.wasm is used purely as a muxer, no actual video encoding
-happens, the per-frame PNGs are packed as-is into MOV sample chunks. MP4
-has no alpha track in any commonly supported profile, so the transparent
-video format is necessarily different from the background-filled `.mp4`.
-Each tile lands at ~60–70 MB (rgba 32-bit lossless × 192 frames × 540×960),
+QuickTime/MOV container** (#184) — the per-frame PNGs are packed as-is into
+MOV sample chunks. #184 originally used ffmpeg.wasm purely as a muxer;
+#192 replaced that with a **JS-only MOV muxer** (`web/src/lib/movMuxer.ts`,
+~280 lines) since no actual encoding was happening anyway. MP4 has no
+alpha track in any commonly supported profile, so the transparent video
+format is necessarily different from the background-filled `.mp4`. Each
+tile lands at ~60–70 MB (rgba 32-bit lossless × 192 frames × 540×960),
 which is the trade-off for skipping the encode step entirely; the full
 alpha bundle for one 12-tile batch fits in roughly a 250–300 MB ZIP.
 Playback: VLC plays the file directly; **Windows Media Player does not**
@@ -559,13 +560,18 @@ Implementation notes:
   `convertToBlob({type:'image/webp', quality:0.9})` for stills; for videos
   the worker renders each frame as a transparent PNG (`renderAlphaFrames`
   RPC, frames streamed to main via Transferable `alphaFrame` messages)
-  and the main thread invokes **ffmpeg.wasm purely as a muxer** to pack
-  the PNG bytes into a MOV container with
-  `-c:v png -pix_fmt rgba -f mov`. No actual encoding step runs — the
-  per-frame PNG bytes are written into the MOV's sample chunks as-is
-  (PNG codec inside QuickTime is a standard lossless intermediate
-  format supported by every major NLE). The encoder helper lives in
-  `web/src/lib/encodeAlphaVideoWasm.ts`.
+  and the main thread feeds them into the **JS-only MOV muxer** in
+  `web/src/lib/movMuxer.ts` (#192). The muxer builds a complete
+  QuickTime atom tree (`ftyp` / `moov` (`mvhd` / `trak` (`tkhd` /
+  `mdia` (`mdhd` / `hdlr` / `minf` (`vmhd` / `dinf` / `stbl`)))) /
+  `mdat`) and writes the per-frame PNG bytes into a single `mdat` chunk
+  as-is. `stsd` advertises the `png ` sample format with depth 32 and
+  `color_table_id = -1`. `stss` (sync sample) is intentionally omitted —
+  per QuickTime spec, no `stss` means every sample is a sync sample,
+  which is correct for PNG codec (no inter-frame prediction). The
+  thin async wrapper `web/src/lib/encodeAlphaVideoWasm.ts` preserves
+  the prior `encodeAnimationAlphaWasm` signature for callers and
+  returns a `video/quicktime` `Blob`.
 - Why PNG-in-MOV instead of VP9 alpha or VP8 alpha (path taken to get
   here): WebCodecs `VideoEncoder` with
   `{codec:'vp09.00.10.08', alpha:'keep'}` reports `supported: false` on
@@ -580,57 +586,44 @@ Implementation notes:
   even at half-res. The fallback to libvpx-vp8 alpha encoded without
   errors but produced silently-empty alpha planes (likely a bug in the
   single-threaded core's vp8 alpha path). PNG-in-MOV sidesteps both
-  problems entirely: no encoder runs in wasm, so neither memory
-  pressure nor codec correctness can fail — the result is **reliable on
-  every environment that can run wasm**, at the cost of much larger
-  files (lossless raster, ~60–70 MB per tile).
-- ffmpeg.wasm core (`@ffmpeg/core`, ~31 MB) is served from the
-  **jsdelivr CDN** (`https://cdn.jsdelivr.net/npm/@ffmpeg/core@<ver>/dist/esm/ffmpeg-core.{js,wasm}`)
-  with the version pinned in `web/src/lib/encodeAlphaVideoWasm.ts`
-  (`FFMPEG_CORE_VERSION`). Cloudflare Pages enforces a **25 MiB per-file
-  upload limit**, and `ffmpeg-core.wasm` (~31 MB) blows past it — so the
-  earlier "copy into `public/ffmpeg/` and serve same-origin" approach
-  failed at deploy time. jsdelivr is a Fastly + Cloudflare mirror with
-  HTTPS and `immutable` long-lived caching when a specific version is
-  requested, so the cost of going cross-origin is one fetch per visitor.
-  The Service Worker (`web/public/sw.js`) layers **CacheFirst** on top
-  of this for any request whose URL starts with
-  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@` (cache name
-  `ffmpeg-core-v<version>`, swept on `activate` when the pinned version
-  changes), so after the first online visit the wasm core is available
-  offline forever. The `@ffmpeg/core` package itself stays in
-  `devDependencies` only so the pinned version is visible in
-  `package.json` / lockfile — no file from it ships in `dist/` and the
-  old `copy:ffmpeg` script is gone. The single-threaded core is used so
-  no COOP / COEP headers are required and the rest of the site (embedded
-  Nostalgic Counter iframe, etc.) keeps working unchanged. The `FFmpeg`
-  instance is a module-level singleton with lazy initialisation: the
-  31 MB wasm is fetched only when the user actually triggers an alpha
-  download, and only once per session.
-- ffmpeg.wasm load path uses **`toBlobURL`** (hotfix after #185 merge):
-  `@ffmpeg/ffmpeg` v0.12 spawns a classic Worker from `ffmpeg.load(...)`
-  and runs `importScripts(coreURL)` inside that Worker. When `coreURL`
-  is cross-origin (jsdelivr CDN) the importScripts call fails at
-  runtime even though the server returns the right CORS headers —
-  observed in production (`ffmpeg.wasm load failed: failed to import
-  ffmpeg-core.js`) on the live `orber.llll-ll.com` deploy. The fix is
-  the official README pattern: pass the URLs through
-  `@ffmpeg/util`'s `toBlobURL(url, mime)` so `ffmpeg.load` receives
-  `blob:` URLs that are same-origin to the document, taking the Worker
-  out of the cross-origin importScripts code path entirely. Prefetch
-  is preserved because `toBlobURL` internally fetches the URL, and the
-  Service Worker (`ffmpegCoreCacheFirst`) serves it from cache when the
-  speculative `prefetchFfmpegCore()` has already warmed the cache — so
-  the first real `ffmpeg.load` still pays zero extra bytes when the
-  prefetch landed.
+  problems entirely: no encoder runs at all — neither in wasm nor in
+  the browser — so neither memory pressure nor codec correctness can
+  fail. The result is **reliable on every environment that can run
+  JavaScript**, at the cost of much larger files (lossless raster,
+  ~60–70 MB per tile).
+- Why a hand-rolled JS muxer (#192): #184 used ffmpeg.wasm as the MOV
+  muxer, which dragged in `@ffmpeg/ffmpeg` + `@ffmpeg/util` + a ~30 MB
+  `@ffmpeg/core` wasm fetched cross-origin from jsdelivr, plus a
+  Service Worker `CacheFirst` route, an idle-time `prefetchFfmpegCore`
+  speculation, and a `saveData` / `2g` / `3g` saver guard. With no
+  actual encoding happening, all of that machinery existed solely to
+  pack PNG bytes into a known QuickTime atom layout. The MOV container
+  spec is small enough to write directly: `movMuxer.ts` is ~280 lines
+  and the atom tree it produces is byte-identical in shape to what
+  ffmpeg's `movenc.c` emits for PNG-codec single-track video. The
+  payoff: zero cross-origin fetch, zero ~30 MB initial download, no
+  Service Worker special-case, no prefetch race / saver guard, no
+  cold-start latency before the first transparent download.
+- Dependency footprint (#192): the transparent video path is now
+  100% in-tree JavaScript. `@ffmpeg/ffmpeg`, `@ffmpeg/util`, and
+  `@ffmpeg/core` were removed from `package.json` entirely. No
+  cross-origin fetch, no `copy:ffmpeg` script, no special Cloudflare
+  Pages handling for the prior ~31 MB `ffmpeg-core.wasm` (which had
+  exceeded the 25 MiB per-file upload limit and was the original reason
+  the wasm core had to be served from jsdelivr). The Service Worker
+  no longer needs a `ffmpeg-core-v<version>` cache route or
+  `__FFMPEG_CORE_VERSION__` build-time stencil; the `activate` handler
+  sweeps any leftover `ffmpeg-core-*` caches on the next visit so
+  existing users automatically reclaim the disk space.
 - **Alpha video half-res**: transparent videos (`alpha/*-alpha.mov`) are
   rendered at **540×960** (portrait) / **960×540** (landscape) — half
   the resolution of the non-transparent `mp4` outputs which stay at
   1080×1920 / 1920×1080. Originally introduced to dodge the
   single-threaded ffmpeg.wasm ~2 GB heap ceiling under libvpx-vp9
-  `yuva420p`; on the current PNG-in-MOV path there is no encoder
-  running in wasm so that pressure is gone, but half-res is kept for a
-  different reason: **ZIP size**. PNG-in-MOV is lossless rgba 32-bit,
+  `yuva420p`; on the current PNG-in-MOV path (and especially after the
+  #192 muxer rewrite that drops the wasm encoder entirely) there is no
+  memory pressure left, but half-res is kept for a different reason:
+  **ZIP size**. PNG-in-MOV is lossless rgba 32-bit,
   so each tile is already ~60–70 MB at 540×960 × 192 frames; doubling
   each dimension would quadruple per-tile size to ~240–280 MB and push
   the 4-video alpha bundle past 1 GB inside the ZIP, which is not a
@@ -641,51 +634,20 @@ Implementation notes:
   After Effects) are expected to scale the alpha MOV up 2× when
   compositing; bilinear / bicubic upscaling is fine because orb renders
   are intentionally blurry and the loss is essentially imperceptible.
-- Future migration to the **multi-threaded** ffmpeg-core (≈ 2–4× faster
-  encoding via pthreads / SharedArrayBuffer): would require adding
-  `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
-  require-corp` (or `credentialless`) to `web/public/_headers`, plus a
-  compatibility audit of every cross-origin iframe / asset on the site
-  (Nostalgic Counter embed, Amazon affiliate images, GitHub Sponsors
-  button, jsdelivr core itself). Out of scope for #184; tracked as a
-  future opt-in.
-- Idle-time prefetch: to avoid the "30 MB download starts the moment the
-  user clicks the transparent-DL button" first-run cliff, `Studio.tsx`
-  schedules a speculative `prefetchFfmpegCore()` from `onMount` via
-  `requestIdleCallback` (with a `setTimeout(2000)` fallback). The
-  prefetch fires two CORS-mode `fetch()` calls (no explicit `mode`,
-  browser default) against the jsdelivr URLs; the Service Worker's
-  CacheFirst layer picks them up
-  and stores them in `ffmpeg-core-v<version>`, so by the time the user
-  is done designing their orb the core is already in cache and the real
-  download is a cache hit. The prefetch deliberately does **not** touch
-  the `FFmpeg` singleton (`ffmpegSingleton` / `ffmpegLoadPromise`), so a
-  prefetch failure can't break the eventual real load path. To respect
-  metered mobile users, the prefetch is skipped when
-  `navigator.connection.saveData` is true or `effectiveType` is
-  `slow-2g` / `2g` / `3g` (Network Information API); browsers without
-  the API (Safari etc.) fall through to "prefetch enabled". The `3g`
-  skip is a deliberate trade-off: on 3G the speculative 31 MB download
-  is too expensive to risk losing for users who never click the alpha
-  toggle, so we defer to the explicit "user clicked DL" moment instead.
-  4G / WiFi users still get the smooth first-run experience. SSR (Astro
-  static build) has no `window` so the scheduler is a no-op there.
-  CORS mode is required (not `no-cors`): an opaque response would
-  poison the SW cache and break the subsequent `importScripts` /
-  WebAssembly streaming load that ffmpeg.wasm performs internally, so
-  the SW also refuses to cache opaque responses defensively.
-- Loading UX: when the user clicks download with the transparent toggle
-  ON, the Studio surface shows `alphaEncodingInProgress` ("透過動画
-  エンコーダを読み込み中… / Loading transparent video encoder…") while
-  the core wasm is fetched. If the fetch fails (offline, CDN/origin
-  outage), `alphaEncoderLoadFailed` ("透過動画エンコーダの読み込みに
-  失敗しました / Failed to load transparent video encoder") is shown
-  via `errorMsg` and the download is aborted before any zip is produced.
-  The whole alpha bundle (transparent PNG / WebP / MOV) is skipped in
-  this case — we don't silently degrade to "alpha folder without video",
-  since users opting into the transparent toggle expect the video form
-  too. The state then returns to `'idle'` so retrying the download can
-  re-enter `'loading'`.
+- No idle-time prefetch / saver guard (#192): with the JS-only muxer
+  the transparent download path has zero external assets to fetch, so
+  the prior `requestIdleCallback` → `prefetchFfmpegCore()` speculation,
+  the `navigator.connection.saveData` / `effectiveType` opt-out, and
+  the `Network Information API` typing have all been deleted from
+  `Studio.tsx`. First-click latency on the transparent DL is bound only
+  by per-frame rendering + a single-pass in-memory MOV assembly that
+  completes in well under 100 ms for a 192-frame tile.
+- No loading-failure UX (#192): the old `alphaEncoderLoadFailed` state
+  machine and i18n key have been removed because the failure scenario
+  it covered (ffmpeg-core wasm fetch dies under network failure) no
+  longer exists. The `alphaEncodingInProgress` string is kept for
+  potential future use (e.g. if frame counts grow large enough to
+  warrant a progress indicator) but is currently unrendered.
 - Progress: when the toggle is ON, `dlProgress.total` is set to
   `indices.length * 2` so the existing "Rendering high-res… N / Total"
   text covers both the background-filled pass and the alpha pass with
