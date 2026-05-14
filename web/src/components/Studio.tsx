@@ -1141,7 +1141,7 @@ export default function Studio() {
             }
             if (parts.video) {
               alphaFolder.file(
-                `orber-${ts}_${padded}-alpha.webm`,
+                `orber-${ts}_${padded}-alpha.mov`,
                 parts.video,
               );
             }

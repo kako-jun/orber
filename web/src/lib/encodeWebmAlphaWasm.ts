@@ -195,7 +195,13 @@ async function runEncode(
   const total = frames.length;
 
   const inputPattern = `frame-%0${FRAME_PAD}d.png`;
-  const outputName = 'out.webm';
+  // orber#184: WebM/libvpx (VP8/VP9 両方) は単スレッド wasm ffmpeg.wasm で
+  // alpha プレーンが正しく encode されず all-255 になる現象を実機で確認。
+  // PNG codec を MOV container に packing する経路に切替: 実エンコードを
+  // 行わず PNG を muxer に渡すだけなので、メモリ問題も alpha 欠落もなし。
+  // NLE (Premiere / DaVinci / After Effects) は PNG-in-MOV を単一クリップで
+  // 取り込み可能。lossless で alpha プレーンも完全保持。
+  const outputName = 'out.mov';
 
   // 既存ファイルの掃除 (前回 encode 残骸が virtual FS に残っている可能性あり)。
   // singleton 再利用時、`listDir('/')` で実際に残っている `frame-*.png` だけを
@@ -265,20 +271,16 @@ async function runEncode(
   try {
     // 透過 WebM (libvpx-vp9 + yuva420p)。
     // - `-auto-alt-ref 0`: VP9 alpha と同時に使えない libvpx の制約。必須。
-    // - codec: `libvpx` (VP8) に切替。`libvpx-vp9` + `yuva420p` は単スレッド
-    //   wasm ffmpeg.wasm 環境で根本的に不安定 (本番で複数パターン試行も全滅)。
-    //   VP8 alpha は枯れていて wasm 動作実績豊富、容器は同じ .webm、
-    //   NLE 互換性も同じ。
-    // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式。VP8 で
-    //   yuva420p を指定するとは libvpx 内部で 2 つの encoder instance を起動して
-    //   YUV プレーンと alpha プレーンを別々に encode し、WebM の BlockAdditional
-    //   経由でアルファトラックを格納する (`alpha_mode=1` タグ自動付与)。
-    // - `-auto-alt-ref 0`: VP8 alpha でも必須。libvpx は default で auto_alt_ref=1
-    //   だが、これは alpha と非互換で encoder 初期化が `Transparency encoding
-    //   with auto_alt_ref does not work` で失敗する (実機ログで確認)。
-    // - `-lag-in-frames` は付けない。VP8 で付けると 2 つの encoder instance の
-    //   タイミングがずれて alpha プレーンが全 255 (透明度無し) になる現象を
-    //   実機で確認済み。VP8 のデフォルト lag に任せる。
+    // - codec: `png` で PNG codec を MOV container に muxing するだけ。
+    //   libvpx (VP8/VP9) は単スレッド wasm ffmpeg.wasm でアルファプレーンが
+    //   silent に all-255 になる現象を実機で確認 (BlockAdditional は書かれるが
+    //   中身が空)。PNG codec は frame ごとに PNG をそのまま container に
+    //   packing するため、実エンコード = 無し、メモリ問題 = 無し、alpha 完全保持。
+    // - `-c:v copy` で PNG decoder すら通さず passthrough にすると pix_fmt
+    //   ネゴシエーションがコンテナ側で失敗するケースがあるため `-c:v png` で
+    //   一度デコード→PNGエンコードを通す。lossless なので品質劣化なし。
+    // - 容器を `.mov` に切替: PNG-in-MOV は NLE (Premiere / DaVinci / AE)
+    //   全部が単一クリップとして取り込み可能。WebM PNG codec は非標準なので避ける。
     try {
       await ffmpeg.exec([
         '-framerate',
@@ -286,15 +288,13 @@ async function runEncode(
         '-i',
         inputPattern,
         '-c:v',
-        'libvpx',
+        'png',
         '-pix_fmt',
-        'yuva420p',
-        '-b:v',
-        '2M',
-        '-auto-alt-ref',
-        '0',
+        'rgba',
         '-s',
         `${width}x${height}`,
+        '-f',
+        'mov',
         outputName,
       ]);
     } catch (e) {
@@ -331,5 +331,5 @@ async function runEncode(
   }
 
   // Uint8Array<ArrayBufferLike> → Blob 互換のため buffer view を明示。
-  return new Blob([new Uint8Array(data)], { type: 'video/webm' });
+  return new Blob([new Uint8Array(data)], { type: 'video/quicktime' });
 }

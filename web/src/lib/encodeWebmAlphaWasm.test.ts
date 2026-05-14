@@ -107,11 +107,11 @@ function makeFrame(byte: number, size = 8): Uint8Array {
 }
 
 describe('encodeAnimationAlphaWasm', () => {
-  it('1 フレーム入力で video/webm の Blob を返す (正常系)', async () => {
+  it('1 フレーム入力で video/quicktime (MOV) の Blob を返す (正常系)', async () => {
     const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
     const blob = await encodeAnimationAlphaWasm([makeFrame(1)], 32, 32);
     expect(blob).toBeInstanceOf(Blob);
-    expect(blob.type).toBe('video/webm');
+    expect(blob.type).toBe('video/quicktime');
   });
 
   it('frames.length === 0 では Error を投げ ffmpeg.load を呼ばない', async () => {
@@ -210,15 +210,15 @@ describe('encodeAnimationAlphaWasm', () => {
     expect(mockState.instances[1].load).toHaveBeenCalledTimes(1);
   });
 
-  it('ffmpeg.exec に libvpx-vp9 / yuva420p / auto-alt-ref 0 / -s WxH / -framerate fps が含まれる', async () => {
+  it('ffmpeg.exec に png codec / rgba / mov 容器 / -s WxH / -framerate fps が含まれる', async () => {
     const { encodeAnimationAlphaWasm } = await import('./encodeWebmAlphaWasm');
     await encodeAnimationAlphaWasm([makeFrame(1)], 128, 64, 30);
     const inst = mockState.instances[0];
     const args = inst.exec.mock.calls[0][0] as string[];
-    // 個別フラグの存在チェック
-    expect(args).toEqual(expect.arrayContaining(['-c:v', 'libvpx-vp9']));
-    expect(args).toEqual(expect.arrayContaining(['-pix_fmt', 'yuva420p']));
-    expect(args).toEqual(expect.arrayContaining(['-auto-alt-ref', '0']));
+    // 個別フラグの存在チェック (#184: PNG-in-MOV へ移行、libvpx は wasm で alpha 不安定)
+    expect(args).toEqual(expect.arrayContaining(['-c:v', 'png']));
+    expect(args).toEqual(expect.arrayContaining(['-pix_fmt', 'rgba']));
+    expect(args).toEqual(expect.arrayContaining(['-f', 'mov']));
     expect(args).toEqual(expect.arrayContaining(['-s', '128x64']));
     expect(args).toEqual(expect.arrayContaining(['-framerate', '30']));
   });
@@ -314,12 +314,12 @@ describe('encodeAnimationAlphaWasm', () => {
     );
     const inst = mockState.instances[0];
     const deletedNames = inst.deleteFile.mock.calls.map((c) => c[0] as string);
-    // pre-cleanup + post-cleanup の両方で呼ばれているはず → 2N + 2 回 (out.webm 含む)
+    // pre-cleanup + post-cleanup の両方で呼ばれているはず → 2N + 2 回 (out.mov 含む)
     for (let i = 0; i < N; i++) {
       const name = `frame-${String(i).padStart(4, '0')}.png`;
       expect(deletedNames.filter((n) => n === name).length).toBeGreaterThanOrEqual(1);
     }
-    expect(deletedNames).toContain('out.webm');
+    expect(deletedNames).toContain('out.mov');
   });
 
   it('成功時に ffmpeg.off("progress", handler) が finally で呼ばれる', async () => {
@@ -442,9 +442,9 @@ describe('encodeAnimationAlphaWasm', () => {
     // 2 つ目の最初の writeFile (frame-0000.png) のインデックスは
     // 1 つ目の post-cleanup delete (frame-0000.png) より後でなければならない。
     // 1 つ目の post-cleanup 内に "delete:frame-0000.png" が 2 回現れる
-    // (pre-cleanup は listDir が [] を返すので走らない) ので "delete:out.webm"
+    // (pre-cleanup は listDir が [] を返すので走らない) ので "delete:out.mov"
     // をマーカーにする: これが 1 つ目の最後の操作。
-    const firstOutDeleteIdx = timeline.indexOf('delete:out.webm');
+    const firstOutDeleteIdx = timeline.indexOf('delete:out.mov');
     const lastWriteIdx = timeline.lastIndexOf('write:frame-0000.png');
     expect(firstOutDeleteIdx).toBeGreaterThanOrEqual(0);
     expect(lastWriteIdx).toBeGreaterThan(firstOutDeleteIdx);
