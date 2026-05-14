@@ -273,9 +273,12 @@ async function runEncode(
     //   yuva420p を指定するとは libvpx 内部で 2 つの encoder instance を起動して
     //   YUV プレーンと alpha プレーンを別々に encode し、WebM の BlockAdditional
     //   経由でアルファトラックを格納する (`alpha_mode=1` タグ自動付与)。
-    // - VP9 用フラグ (`-auto-alt-ref` / `-lag-in-frames`) は撤去:
-    //   VP8 で渡すと libvpx の alpha encoder セットアップを壊して空アルファに
-    //   なる現象を実機で確認済み。VP8 のデフォルト挙動に任せる。
+    // - `-auto-alt-ref 0`: VP8 alpha でも必須。libvpx は default で auto_alt_ref=1
+    //   だが、これは alpha と非互換で encoder 初期化が `Transparency encoding
+    //   with auto_alt_ref does not work` で失敗する (実機ログで確認)。
+    // - `-lag-in-frames` は付けない。VP8 で付けると 2 つの encoder instance の
+    //   タイミングがずれて alpha プレーンが全 255 (透明度無し) になる現象を
+    //   実機で確認済み。VP8 のデフォルト lag に任せる。
     try {
       await ffmpeg.exec([
         '-framerate',
@@ -288,6 +291,8 @@ async function runEncode(
         'yuva420p',
         '-b:v',
         '2M',
+        '-auto-alt-ref',
+        '0',
         '-s',
         `${width}x${height}`,
         outputName,
