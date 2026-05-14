@@ -265,15 +265,16 @@ async function runEncode(
   try {
     // 透過 WebM (libvpx-vp9 + yuva420p)。
     // - `-auto-alt-ref 0`: VP9 alpha と同時に使えない libvpx の制約。必須。
-    // - `-lag-in-frames 0`: lookahead バッファ無効化。デフォルト 25 frame の
-    //   lookahead を抱えたまま yuva420p (YUV + alpha 二重) の初回 output を
-    //   出そうとすると wasm 単スレッド ffmpeg のヒープが枯渇して
-    //   `RuntimeError: memory access out of bounds` で死ぬ。本番再現済み (#184)。
-    //   `-deadline realtime -cpu-used 8` も試したが、yuva420p alpha encoder と
-    //   非互換で init 段階で即 OOB。RTC encoder パスは VP9 alpha 非対応の模様。
-    //   `-lag-in-frames 0` のみで普通の "good" deadline (cpu-used 0) を使う。
-    // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式。
-    // - bitrate 2M: encodeMp4 / 旧 encodeWebmAlpha と揃える。
+    // - codec: `libvpx` (VP8) に切替。`libvpx-vp9` + `yuva420p` は単スレッド
+    //   wasm ffmpeg.wasm 環境で根本的に不安定 (本番で複数パターン試行も全滅:
+    //   default → frame 27 で OOB / realtime preset → init で即 OOB /
+    //   lag-in-frames 0 → frame 1 encode 開始直後で OOB)。VP8 alpha は枯れていて
+    //   wasm 動作実績豊富、容器は同じ .webm、NLE 互換性も同じ。
+    //   - bitrate 2M はそのまま (#184)
+    // - `-lag-in-frames 0`: lookahead 無効化 (念のため。VP8 では既定が違うが
+    //   per-frame 処理を強制してメモリピーク抑制)
+    // - `-auto-alt-ref 0`: VP8 では無関係だが安全策で残す
+    // - `-pix_fmt yuva420p`: alpha plane を保持する 4:2:0 形式
     try {
       await ffmpeg.exec([
         '-framerate',
@@ -281,7 +282,7 @@ async function runEncode(
         '-i',
         inputPattern,
         '-c:v',
-        'libvpx-vp9',
+        'libvpx',
         '-pix_fmt',
         'yuva420p',
         '-b:v',
