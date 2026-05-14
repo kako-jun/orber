@@ -41,7 +41,11 @@ const canonicalUrl = new URL(Astro.url.pathname, SITE_URL).toString();
     {/* #126: iOS Safari は manifest.display を見ないため、Apple 専用 meta で
         standalone モードと statusbar 色を別途指定する。black-translucent で
         statusbar が背景と一体化し、splash の #040404 から site bg #040404 への
-        遷移がシームレスになる。 */}
+        遷移がシームレスになる。
+        Chromium 系は `apple-mobile-web-app-capable` を deprecated 警告するため、
+        WHATWG 標準の `mobile-web-app-capable` を併記する (Android Chrome /
+        Edge は標準側を見る、iOS Safari は apple-* を見る、両併記で全環境カバー)。 */}
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="orber" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
