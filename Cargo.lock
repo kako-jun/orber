@@ -92,6 +92,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aquarelle"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cb59f42b90640043000546381e4348b374d752d6ccbee3f9ba1f7dba950b81b"
+dependencies = [
+ "palette",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "tiny-skia",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -817,6 +829,7 @@ dependencies = [
 name = "orber-core"
 version = "0.3.0"
 dependencies = [
+ "aquarelle",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "image",

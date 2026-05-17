@@ -16,6 +16,7 @@ categories = ["graphics", "multimedia"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+aquarelle = { workspace = true }
 image = { workspace = true, features = ["png"] }
 kmeans_colors = { workspace = true }
 palette = { workspace = true }

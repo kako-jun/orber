@@ -15,7 +15,7 @@
 //!   blur=1 → 中心の不透明領域が点に近く、緩やかに減衰
 //! - 彩度調整は palette の HSL 経由
 
-use crate::aquarelle::{render_aquarelle_orb, AquarelleParams};
+use aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
 use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
@@ -40,7 +40,7 @@ pub enum OrbStyle {
 }
 
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
-/// 質感セット（[`crate::aquarelle`]）、`Glyph` は同梱フォント 1 文字のアウトライン
+/// 質感セット（[`aquarelle`] crate）、`Glyph` は同梱フォント 1 文字のアウトライン
 /// 塗りを有効にする。
 ///
 /// `Glyph` のフォントは [`GlyphFontId`] enum で識別する設計のため、`OrbShape` は
