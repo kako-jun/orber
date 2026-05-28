@@ -14,10 +14,20 @@ import { _FS_FOR_TEST, GLYPH_SDF_SIZE } from './orberGl';
 
 describe('orberGl fragment shader (#203 mask × profile)', () => {
   test('Glyph アームで SDF を smoothstep マスクに変換している', () => {
-    // SDF マスクの宣言と smoothstep 適用が両方残っていること。0.05 の閾値は
-    // SDF 解像度 256 に対する経験則値で、これが書き換えられたらレビュー対象。
+    // SDF マスクの宣言と smoothstep 適用が両方残っていること。
+    // #205: 旧 ±0.05 ハードコードを廃止し、smoothstep 幅を u_glyph_edge_softness
+    // (softness preset 連動) で駆動する。下限が広く、上限は半分の比率で控えめ。
     expect(_FS_FOR_TEST).toContain('float sdf_mask;');
-    expect(_FS_FOR_TEST).toContain('smoothstep(-0.05, 0.05, signed_unit);');
+    expect(_FS_FOR_TEST).toContain(
+      'smoothstep(-u_glyph_edge_softness, u_glyph_edge_softness * 0.5, signed_unit);',
+    );
+    // 旧式 (±0.05 ハードコード) は復活していない。
+    expect(_FS_FOR_TEST).not.toContain('smoothstep(-0.05, 0.05, signed_unit);');
+  });
+
+  test('#205: u_glyph_edge_softness uniform が shader に宣言されている', () => {
+    // softness preset 連動の smoothstep 幅。Circle アームは参照しない。
+    expect(_FS_FOR_TEST).toContain('uniform float u_glyph_edge_softness;');
   });
 
   test('Glyph アームの radial_alpha は Circle と同じ falloff_curve(r_euclid)', () => {
