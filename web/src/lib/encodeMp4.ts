@@ -1,4 +1,4 @@
-// 後半タイルのアニメーションを WebCodecs + mp4-muxer で h264 mp4 化する。
+// 後半タイルのアニメーションを WebCodecs + mp4-muxer で mp4 化する。
 //
 // #112 の WebGL 経路では OffscreenCanvas (WebGL2) に 1 frame 描画して
 // `new VideoFrame(canvas)` で直接エンコーダに食わせる。RGBA バッファの GPU→CPU
@@ -8,6 +8,11 @@
 // 互換性: VideoEncoder / VideoFrame(canvas) が要る。
 // Chrome 94+ / Safari 16.4+ / Firefox 130+。非対応ブラウザでは throw する
 // （Studio 側で catch して静止画フォールバックする）。
+//
+// #196: Linux Chrome / Edge / Firefox は H.264 エンコーダを持たないため、
+// `pickSupportedVideoCodec` で H.264 → VP9 → AV1 を順に probe し、最初に
+// サポートされた codec を encoder / muxer 両方に流す。mp4-muxer は
+// `'avc' | 'vp9' | 'av1'` をサポート済みなので、mp4 拡張子は維持できる。
 
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
@@ -23,6 +28,92 @@ export const ANIM_TOTAL_FRAMES = ANIM_FPS * ANIM_DURATION_SECONDS;
 
 export function isWebCodecsSupported(): boolean {
   return typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+// #196: Linux Chrome / Edge / Firefox は H.264 エンコーダを持たないため
+// (`VideoEncoder.isConfigSupported({ codec: 'avc1.*' })` が false で返る)、
+// VP9 / AV1 にフォールバックする必要がある。muxer 側は mp4-muxer が
+// `'avc' | 'vp9' | 'av1'` をサポートしているのでそのまま乗せる。
+export interface PickedVideoCodec {
+  /** WebCodecs `VideoEncoder.configure({ codec })` に渡す文字列。 */
+  codec: string;
+  /** mp4-muxer `Muxer({ video: { codec } })` に渡すタグ。 */
+  muxerCodec: 'avc' | 'vp9' | 'av1';
+  /** `VideoEncoder.configure({ hardwareAcceleration })` で採用する hint。 */
+  hardwareAcceleration: 'prefer-hardware' | 'no-preference';
+}
+
+interface CodecCandidate {
+  codec: string;
+  muxerCodec: 'avc' | 'vp9' | 'av1';
+}
+
+function buildCandidates(width: number, height: number): CodecCandidate[] {
+  // H.264 codec string は既存ロジックを維持: Level 3.1 (≤ 720p 相当) / 4.2 (1080p)。
+  const codedArea = Math.ceil(width / 16) * 16 * Math.ceil(height / 16) * 16;
+  const avcCodec = codedArea <= 921_600 ? 'avc1.42E01F' : 'avc1.42E02A';
+  // VP9 / AV1 は 1080×1920 で安全に通る Level 4.1 を既定にし、`isConfigSupported`
+  // が false を返したら次の候補へ落とす。
+  //   - vp09.<profile>.<level>.<bitDepth>  → Profile 0 / Level 4.1 / 8bit
+  //   - av01.<profile>.<level><tier>.<bitDepth> → Main / Level 4.1 / Main tier / 8bit
+  return [
+    { codec: avcCodec, muxerCodec: 'avc' },
+    { codec: 'vp09.00.41.08', muxerCodec: 'vp9' },
+    { codec: 'av01.0.09M.08', muxerCodec: 'av1' },
+  ];
+}
+
+/**
+ * VideoEncoder.isConfigSupported で H.264 → VP9 → AV1 の順に probe し、
+ * 最初にサポートされた codec を返す。`prefer-hardware` で全滅した場合は
+ * `no-preference` で再 probe する 2 段リトライ構成。
+ *
+ * 戻り値は `encoder.configure()` と `Muxer({ video.codec })` の両方に
+ * そのまま流し込めるオブジェクト。全 codec で false なら null を返す。
+ *
+ * #196: Linux Chrome / Edge は H.264 エンコーダ未提供。
+ */
+export async function pickSupportedVideoCodec(
+  width: number,
+  height: number,
+): Promise<PickedVideoCodec | null> {
+  if (typeof VideoEncoder === 'undefined' || typeof VideoEncoder.isConfigSupported !== 'function') {
+    return null;
+  }
+  const candidates = buildCandidates(width, height);
+  const accelHints: Array<'prefer-hardware' | 'no-preference'> = [
+    'prefer-hardware',
+    'no-preference',
+  ];
+  for (const hardwareAcceleration of accelHints) {
+    for (const cand of candidates) {
+      try {
+        // probe 時の bitrate / framerate / 解像度は実際の encoder.configure と
+        // 完全一致させる方針。probe で OK と判定された組み合わせをそのまま
+        // configure に渡すことで、isConfigSupported: true だったのに configure
+        // で失敗するケースを最小化する。
+        const result = await VideoEncoder.isConfigSupported({
+          codec: cand.codec,
+          width,
+          height,
+          framerate: ANIM_FPS,
+          bitrate: 2_000_000,
+          hardwareAcceleration,
+        });
+        if (result.supported) {
+          return {
+            codec: cand.codec,
+            muxerCodec: cand.muxerCodec,
+            hardwareAcceleration,
+          };
+        }
+      } catch {
+        // 不正な codec string などで throw する実装もあるが、その場合は次の
+        // 候補に進めばよい。
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -52,10 +143,18 @@ export async function encodeAnimationFromCanvas(
     throw new Error('totalFrames must be > 0');
   }
 
+  // #196: H.264 → VP9 → AV1 の順で probe。Linux Chrome / Edge / Firefox は
+  // H.264 エンコーダを持たないので、ここで VP9 / AV1 に倒れて Studio の
+  // partial failure 経路（静止画フォールバック）に巻き込まれずに済む。
+  const picked = await pickSupportedVideoCodec(width, height);
+  if (picked === null) {
+    throw new Error('No supported VideoEncoder codec (tried H.264 / VP9 / AV1)');
+  }
+
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: {
-      codec: 'avc',
+      codec: picked.muxerCodec,
       width,
       height,
       frameRate: ANIM_FPS,
@@ -72,18 +171,13 @@ export async function encodeAnimationFromCanvas(
       if (firstError === null) firstError = e;
     },
   });
-  // 解像度に応じて AVC level を選択する。
-  //   - Level 3.1 (0x1F): coded area 上限 921,600px（≈ 720p まで）
-  //   - Level 4.2 (0x2A): coded area 上限 2,228,224px（1080p で余裕）
-  const codedArea = Math.ceil(width / 16) * 16 * Math.ceil(height / 16) * 16;
-  const codecString = codedArea <= 921_600 ? 'avc1.42E01F' : 'avc1.42E02A';
   encoder.configure({
-    codec: codecString,
+    codec: picked.codec,
     width,
     height,
     framerate: ANIM_FPS,
     bitrate: 2_000_000,
-    hardwareAcceleration: 'prefer-hardware',
+    hardwareAcceleration: picked.hardwareAcceleration,
   });
 
   const microsecondsPerFrame = 1_000_000 / ANIM_FPS;

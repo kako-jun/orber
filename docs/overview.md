@@ -289,7 +289,9 @@ DOM) and a **dedicated Worker thread** (wasm + WebGL2 + WebCodecs):
    │   └ workerAnimateOne(i) ─────────→  │   for i in 0..192:
    │                                     │     - shader.renderFrame(t = i/192)
    │                                     │     - new VideoFrame(canvas) → encode
-   │                                     ├ WebCodecs VideoEncoder (prefer-hardware)
+   │                                     ├ WebCodecs VideoEncoder
+   │                                     │   (codec probe: H.264 → VP9 → AV1,
+   │                                     │    hwAccel probe: prefer-hardware → no-preference; #196)
    │                                     │   └→ mp4 Blob (Transferable)
    └ DL high-res                         └ same APIs, with width/height = 1080×1920
        └ workerGenerateOne / workerAnimateOne (per selected index)
@@ -351,6 +353,14 @@ in Worker context. iOS Safari 16.4+, current Android Chrome / Firefox 130+.
 There is no fallback path for older browsers — the GUI shows an error if
 WebCodecs is unavailable. WebGL2 support is a strict superset of WebCodecs in
 practice, so any browser that can run the encoder can also run the renderer.
+The animated-tile path requires *some* `VideoEncoder` codec to be available:
+H.264 → VP9 → AV1 are probed in that order via
+`VideoEncoder.isConfigSupported`, falling back from `prefer-hardware` to
+`no-preference` per candidate (#196). Linux Chrome / Edge / Firefox ship
+without an H.264 encoder but accept VP9 / AV1, so this probe is what keeps the
+animated tiles working there. If every candidate is rejected the per-tile
+encode throws and Studio surfaces the existing
+"some tiles could not be animated" warning while keeping the stills.
 
 **Progressive UX.** While the Worker is busy:
 

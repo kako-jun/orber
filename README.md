@@ -167,8 +167,9 @@ divisor count (1/2/3/4/6/12) lets the grid lay out cleanly across phone widths.
 Unlike the CLI's fixed `--variations` preset, the GUI samples direction / speed /
 count / orb size / blur randomly per drop, so the same image yields a different
 layout each time. The first **8 tiles** are static PNGs; the **last 4 tiles**
-are H.264 mp4 loops generated client-side via WebCodecs and inlined as
-`<video muted playsinline loop>`. Each of the 4 video tiles flows in a
+are mp4 loops generated client-side via WebCodecs (H.264 by default, with VP9 /
+AV1 fallback for browsers without an H.264 encoder, e.g. Linux Chrome / Edge /
+Firefox) and inlined as `<video muted playsinline loop>`. Each of the 4 video tiles flows in a
 different direction (left→right, right→left, top→bottom, bottom→top), shown in
 that order so every batch always offers all four motion axes side by side. The
 4 videos start playing **simultaneously** once all encodes finish, so the field
@@ -181,9 +182,16 @@ source image full-size in an overlay, release to close — handy for verifying
 which photo is loaded without losing the rest of the GUI.
 
 The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
-(measured ≈ 220 KB gzipped at v0.3.0); H.264 encoding is done in the browser via
-the WebCodecs API (Chrome 94+ / Safari 16.4+ / Firefox 130+). On older browsers
-the video tiles fall back to the static PNG. Source: `web/` (Astro + Solid +
+(measured ≈ 220 KB gzipped at v0.3.0); video encoding is done in the browser
+via the WebCodecs API (Chrome 94+ / Safari 16.4+ / Firefox 130+). The encoder
+probes H.264 → VP9 → AV1 and falls back automatically, so browsers without an
+H.264 encoder (Linux Chrome / Edge / Firefox) still produce mp4 loops via VP9
+or AV1. Generation and playback happen in the same browser session (a freshly
+encoded video Blob is rendered as an inline `<video>`), so codec compatibility
+with other browsers is not a concern — Safari users always get H.264 because
+their browser has it, Linux Chrome users get VP9 / AV1 and play it back
+themselves. On older browsers with no WebCodecs support at all, the video tiles
+fall back to the static PNG. Source: `web/` (Astro + Solid +
 Tailwind). The visual language and component conventions are documented in
 [`DESIGN.md`](./DESIGN.md). UI text is auto-localized: Japanese for `ja-*`
 browsers, English everywhere else, with no language picker.
