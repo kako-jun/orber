@@ -47,6 +47,7 @@ use crate::color_track::interpolate_color_track;
 use crate::keyframe_track::{interpolate_keyframe_track, KeyframeClusterPoint};
 use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
 use crate::style::{FalloffProfile, SoftnessPreset};
+use aquarelle::{render_aquarelle_bleed_pass, AquarelleBleedParams};
 use image::RgbaImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -676,6 +677,16 @@ pub fn render_frame_with_params(
                 render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
             }
         }
+    }
+
+    // Glyph shape のときだけ、全 orb 描画後に aquarelle v0.2 の bleed pass を 1 回かける。
+    // per-orb ではなく per-frame で 1 回にすることで、static 経路 (orb.rs の render_static)
+    // と同じ paper-bleed 質感を animation でも維持する (#195)。
+    // seed=0 固定。RenderOptions / AnimateOptions に seed フィールドが入った時は
+    // そちらと連動させて再現性をユーザーから制御できるようにする。
+    // seed をフレーム間で固定することで、bleed パターンが t に対してチラつかない。
+    if let OrbShape::Glyph { .. } = opts.shape {
+        render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
     }
 
     finalize_pixmap(pixmap, width, height)
@@ -1613,6 +1624,52 @@ mod tests {
         assert!(
             pixels_equal(&kf_only, &both),
             "keyframe_tracks must take precedence over color_tracks (output should match keyframe-only render)"
+        );
+    }
+
+    /// Glyph shape の animate frame が決定論的であること（#195 review S2）。
+    ///
+    /// 同じ clusters / opts / t で 2 回 render しても byte-equal を保つことを保証する。
+    /// per-frame で走らせる bleed pass の seed が 0 固定なので、ここが破れていれば
+    /// bleed pass の seed が動的に変化している（= フレーム間でチラつく）兆候になる。
+    #[test]
+    fn animate_glyph_frame_is_deterministic() {
+        use crate::glyph::GlyphFontId;
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = OrbShape::Glyph {
+            ch: '★',
+            font: GlyphFontId::NotoSymbols2,
+        };
+        let a = render_frame(&clusters, &opts, 0.37);
+        let b = render_frame(&clusters, &opts, 0.37);
+        assert!(
+            pixels_equal(&a, &b),
+            "Glyph animate frame must be byte-equal on repeated calls (per-frame bleed pass with fixed seed)"
+        );
+    }
+
+    /// Glyph shape の animate frame が Circle と byte-equal にならないこと（#195 review S2）。
+    ///
+    /// 同条件で shape だけ Glyph / Circle に切り替えてフレームを比較し、両者が一致しないことを
+    /// 確認する。これにより Glyph 経路で per-frame bleed pass が実際に効いている
+    /// （= Glyph 経路だけが追加処理を持つ）ことが保たれる。
+    #[test]
+    fn animate_glyph_frame_differs_from_circle() {
+        use crate::glyph::GlyphFontId;
+        let clusters = sample_clusters();
+        let mut opts_glyph = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_glyph.shape = OrbShape::Glyph {
+            ch: '★',
+            font: GlyphFontId::NotoSymbols2,
+        };
+        let opts_circle = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+
+        let g = render_frame(&clusters, &opts_glyph, 0.25);
+        let c = render_frame(&clusters, &opts_circle, 0.25);
+        assert!(
+            !pixels_equal(&g, &c),
+            "Glyph and Circle animate frames must differ (Glyph adds a per-frame bleed pass)"
         );
     }
 }

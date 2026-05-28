@@ -197,6 +197,8 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
     // Glyph shape のときだけ、全 orb 描画後に aquarelle v0.2 の bleed pass を 1 回かける。
     // per-orb ではなく全体 1 回にすることで、グリフ群が水彩のにじみで馴染むようにする (#195)。
     // seed は決定論性のため固定 0。AquarelleBleedParams::default() = radius=3, intensity=0.5, halo=0.3。
+    // seed=0 固定。RenderOptions / AnimateOptions に seed フィールドが入った時は
+    // そちらと連動させて再現性をユーザーから制御できるようにする。
     if let OrbShape::Glyph { .. } = opts.shape {
         render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
     }
@@ -711,8 +713,8 @@ mod tests {
                     "alpha=0 pixel must have RGB normalized to 0"
                 );
             }
-            // u8 の range は型で保証されるが、明示的にチェックして不変条件を残す。
-            assert!(px[0] <= 255 && px[1] <= 255 && px[2] <= 255);
+            // RGB の上限 (≤255) は u8 の型で保証されるので runtime assert は不要。
+            // 不変条件として残したいのは alpha=0 の RGB 正規化 (上の assert_eq!) だけ。
         }
     }
 

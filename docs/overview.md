@@ -450,7 +450,10 @@ color. The pipeline:
    paper-bleed-style softening to the SDF-derived outline so the Glyph result
    sits closer to the Circle and Aquarelle shapes in overall feel. The bleed
    pass runs **only for `OrbShape::Glyph`** — Circle and Aquarelle renders are
-   bit-identical to before this pass was added.
+   bit-identical to before this pass was added. The animated Glyph path
+   (`render_frame_with_params`) applies the same single `render_aquarelle_bleed_pass`
+   per frame with a fixed seed of `0`, so the bleed pattern stays stable
+   across frames instead of flickering frame to frame.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
