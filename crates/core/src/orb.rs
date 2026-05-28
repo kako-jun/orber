@@ -151,43 +151,45 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
 
         let [r, g, b] = adjust_saturation(cluster.color, saturation);
 
-        // Aquarelle は別モジュールへ委譲。同じ Pixmap に SourceOver で書き込む。
-        if let OrbShape::Aquarelle(params) = opts.shape {
-            // i (cluster index) を seed の差分にして orb 同士で異なるオフセットを得る。
-            render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
-            continue;
+        // 3 shape を対等な match で分岐させる。Circle が暗黙の default fall-through に
+        // ならないよう、各アームで明示的にヘルパを呼ぶ（#195）。
+        match opts.shape {
+            OrbShape::Circle => {
+                // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
+                // softness 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
+                // 動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
+                render_one_orb(
+                    &mut pixmap,
+                    (cx, cy),
+                    radius,
+                    [r, g, b],
+                    blur,
+                    alpha_mul,
+                    OrbStyle::Rim,
+                );
+            }
+            OrbShape::Aquarelle(params) => {
+                // Aquarelle は別モジュールへ委譲。同じ Pixmap に SourceOver で書き込む。
+                // i (cluster index) を seed の差分にして orb 同士で異なるオフセットを得る。
+                render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
+            }
+            OrbShape::Glyph { ch, font } => {
+                // Glyph: 1 文字の SDF を Circle と同じ半径・blur・softness の意味で描く。
+                // 静止画経路では回転だけ 0 固定にして、見た目の falloff は Circle と揃える。
+                render_glyph_orb(
+                    &mut pixmap,
+                    (cx, cy),
+                    radius,
+                    [r, g, b],
+                    blur,
+                    alpha_mul,
+                    FalloffProfile::Rim,
+                    font,
+                    ch,
+                    0.0,
+                );
+            }
         }
-
-        // Glyph: 1 文字の SDF を Circle と同じ半径・blur・softness の意味で描く。
-        // 静止画経路では回転だけ 0 固定にして、見た目の falloff は Circle と揃える。
-        if let OrbShape::Glyph { ch, font } = opts.shape {
-            render_glyph_orb(
-                &mut pixmap,
-                (cx, cy),
-                radius,
-                [r, g, b],
-                blur,
-                alpha_mul,
-                FalloffProfile::Rim,
-                font,
-                ch,
-                0.0,
-            );
-            continue;
-        }
-
-        // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
-        // softness 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
-        // 動的揺らぎが必要な経路は render_one_orb を直接呼ぶ。
-        render_one_orb(
-            &mut pixmap,
-            (cx, cy),
-            radius,
-            [r, g, b],
-            blur,
-            alpha_mul,
-            OrbStyle::Rim,
-        );
     }
 
     // tiny-skia の Pixmap は premultiplied alpha なので un-premultiply して straight に戻す。
