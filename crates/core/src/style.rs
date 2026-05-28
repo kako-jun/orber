@@ -329,7 +329,8 @@ pub fn render_css(clusters: &[Cluster], opts: &StyleOptions) -> String {
         // （mid_pct < end_pct を構造的に担保する）。
         let mid_pct = (end_f * mid_factor).round() as i32;
         let mid_pct = mid_pct.clamp(0, end_pct - 1);
-        // softness 軸: alpha 全体に倍率を掛ける。Mid なら 1.0/0.5/0.0 のまま（regression なし）。
+        // softness 軸: alpha 全体に倍率を掛ける。Mid なら alpha_mul=0.55 (#205 後)。
+        // CSS 文字列パースを伴うテストは Low 明示で baseline を取る。
         let stop0 = alpha_mul;
         let stop_mid = 0.5 * alpha_mul;
         gradients.push(format!(

@@ -483,8 +483,21 @@ The `edge softness` column drives the Glyph / image arm's smoothstep mask
 (`smoothstep(-edge_softness, edge_softness * 0.5, signed_unit)`) in the
 fragment shader. The Circle arm uses Euclidean distance + `falloff_curve`,
 so it is unaffected by this column. Higher values produce a softer
-silhouette outline — the screen-space transition width grows from ~4% of orb
-radius at Low to ~17% at High.
+silhouette outline. The full transition width in `signed_unit` space is
+`1.5 * edge_softness` (from `-edge_softness` to `0.5 * edge_softness`),
+which projects to roughly the following fraction of orb radius:
+
+| preset | edge_softness | full transition width | half-width |
+|---|---|---|---|
+| `low` | 0.3 | ~7.5% of orb radius | ~3.75% |
+| `mid` | 0.6 | ~15% of orb radius | ~7.5% |
+| `high` | 1.0 | ~25% of orb radius | ~12.5% |
+
+Note: edge_softness is consumed only by the WebGL2 fragment shader
+(Glyph/image arm). The CPU path (`render_static` / `animate.rs`) achieves
+the analogous softness via `blur_offset` and the post-render
+`aquarelle bleed pass` (#195/#199). The two implementations differ but
+target the same visual goal.
 
 The preset is implemented as `SoftnessPreset { Low, Mid, High }` in
 `crates/core/src/style.rs`. The values flow into the WebGL2 path via

@@ -261,9 +261,13 @@ void main() {
       // proportionally with softness. UV outside the SDF box is forced to
       // mask=0 so no texture lookup leaks beyond the silhouette.
       //
-      // Screen-space transition width is roughly 4% (Low) to 17% (High) of orb
-      // radius — visibly orb-like at Mid/High, still close to the legacy
-      // +/-0.05 baseline near Low. Previously a hard-coded 0.05 half-width.
+      // Screen-space full transition width is 1.5 * edge_softness in
+      // signed_unit space, which projects to roughly:
+      //   Low  (edge_softness=0.3) — full ~7.5% / half ~3.75% of orb radius
+      //   Mid  (edge_softness=0.6) — full ~15%  / half ~7.5%  of orb radius
+      //   High (edge_softness=1.0) — full ~25%  / half ~12.5% of orb radius
+      // Visibly orb-like at Mid/High; Low stays close to the legacy
+      // +/-0.05 half-width baseline. Previously a hard-coded 0.05 half-width.
       float sdf_mask;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
