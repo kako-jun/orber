@@ -58,9 +58,8 @@ orber/
     │       ├── animate.rs      # 時間 t におけるフレーム生成
     │       ├── style.rs        # CSS / SVG 静的書き出し
     │       ├── variations.rs   # バリエーション spec 定義
-    │       ├── batch.rs        # generate_batch — 1 入力から複数 PNG を一括生成（GUI / WASM 用）
-    │       └── aquarelle/      # にじみ形状（将来別 crate に分離する境界）
-    │           └── mod.rs
+    │       └── batch.rs        # generate_batch — 1 入力から複数 PNG を一括生成（GUI / WASM 用）
+    │                           # にじみ処理は外部 crate `aquarelle = "0.2"` に分離済み（旧 src/aquarelle/ は撤去）
     ├── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
     │   ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
     │   └── src/
@@ -103,7 +102,7 @@ web/                        # Web フロントエンド (#37, #38)
 
 - **prototype 段階はローカル Rust バイナリ単体で完結する** — Web フロント・WASM・crate.io 公開は将来 Issue
 - **入力 → 静的 PNG が出るところまで先に通す** — 動画化はその後
-- **にじみ処理は `src/aquarelle/` に隔離する** — 将来 `aquarelle` crate として独立させる前提でモジュール境界を切る。orber 本体（円形 orb）はにじみ処理に依存しない
+- **にじみ処理は外部 crate `aquarelle` に切り出し済み** — `Cargo.toml` で `aquarelle = "0.2"` を依存。`OrbShape::Aquarelle` は per-orb のにじみ描画に、`OrbShape::Glyph` は全 orb 描画後の bleed pass 1 回に、それぞれ利用する。`OrbShape::Circle` はにじみ処理を呼ばない
 - **動画書き出しは ffmpeg 子プロセス呼び出し** — 自前エンコードはやらない
 - **動画入力対応も ffmpeg でフレーム抽出** — 抽出後は静止画パイプラインに合流させる
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
@@ -120,7 +119,7 @@ web/                        # Web フロントエンド (#37, #38)
 
 ## 関連プロジェクト
 
-- [aquarelle](https://github.com/kako-jun/aquarelle)（将来作る予定）— にじみエンジンを独立 crate 化したもの。orber と blueprinter から共有依存される
+- [aquarelle](https://github.com/kako-jun/aquarelle)（v0.2 として独立済み）— にじみエンジンを独立 crate 化したもの。orber は `aquarelle = "0.2"` を依存し、`OrbShape::Aquarelle`（per-orb）と `OrbShape::Glyph`（全体 bleed pass）から呼ぶ。blueprinter からも共有依存される想定
 
 ## 技術ルール
 

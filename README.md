@@ -121,9 +121,13 @@ geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
 and other characters outside this subset are silently skipped instead of
 drawing tofu. The glyph outline is converted to a cached **signed-distance
 field**, so `--blur` and `--softness` now affect glyphs with the same visual
-meaning as circle orbs: soft edge falloff, not a hard text fill. Glyphs also
-get a seed-derived base angle so stills are not a wall of identically oriented
-symbols; animated outputs continue rotating per orb from that base angle.
+meaning as circle orbs: soft edge falloff, not a hard text fill. After every
+glyph orb has been painted, a single watercolor **bleed pass** from the
+`aquarelle` crate is applied over the whole image, so the SDF outline gains a
+paper-bleed softness on top of the edge falloff (Circle renders are unaffected).
+Glyphs also get a seed-derived base angle so stills are not a wall of
+identically oriented symbols; animated outputs continue rotating per orb from
+that base angle.
 
 > **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
 > Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
