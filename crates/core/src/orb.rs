@@ -385,12 +385,16 @@ mod tests {
 
     #[test]
     fn single_cluster_centered_color() {
+        // #205: SoftnessPreset の新デフォルト Mid は alpha=0.55 で center が 140 程度まで
+        // 落ちるので、「center R > 200」を担保したい本テストは sharp baseline の Low を
+        // 明示する（旧仕様の default 挙動と等価）。
         let opts = RenderOptions {
             width: 100,
             height: 100,
             blur: 0.5,
             saturation: 1.0,
             orb_size: 1.0,
+            softness: SoftnessPreset::Low,
             ..Default::default()
         };
         let img = render_static(&[cluster([255, 0, 0], 0.5, 0.5, 1.0)], &opts);
@@ -643,6 +647,9 @@ mod tests {
     #[test]
     fn glyph_shape_renders_via_render_static() {
         // OrbShape::Glyph が render_static 経由でも一定数のピクセルを描く。
+        // #205: 新デフォルト Mid は alpha=0.55 + blur+0.25 で lit pixel が大幅に薄れる。
+        // 「Glyph 経路が機能していること」を担保するのが目的なので sharp baseline の
+        // Low を明示する（旧仕様の default 挙動と等価）。
         use crate::glyph::GlyphFontId;
         let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
         let opts = RenderOptions {
@@ -652,6 +659,7 @@ mod tests {
                 ch: '☆',
                 font: GlyphFontId::NotoSymbols2,
             },
+            softness: SoftnessPreset::Low,
             ..Default::default()
         };
         let img = render_static(&[c], &opts);
@@ -793,6 +801,8 @@ mod tests {
     fn glyph_lit_pixels_remain_visible_after_bleed() {
         // bleed pass を通してもグリフの白塗りピクセルが極端に薄まって消えていないこと。
         // 既存 glyph_shape_renders_via_render_static と同じ閾値 (lit > 32) で担保する。
+        // #205: 新デフォルト Mid は alpha/blur が強くなり閾値を割るので sharp baseline の
+        // Low を明示する。
         use crate::glyph::GlyphFontId;
         let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
         let opts = RenderOptions {
@@ -802,6 +812,7 @@ mod tests {
                 ch: '☆',
                 font: GlyphFontId::NotoSymbols2,
             },
+            softness: SoftnessPreset::Low,
             ..Default::default()
         };
         let img = render_static(&[c], &opts);
@@ -840,6 +851,9 @@ mod tests {
                 ch: '☆',
                 font: GlyphFontId::NotoSymbols2,
             },
+            // #205: 新デフォルト Mid は alpha/blur が強くなって halo R がほぼ消える。
+            // bleed pass の到達範囲を計測するのが目的なので Low (旧 default) を使う。
+            softness: SoftnessPreset::Low,
             ..Default::default()
         };
         let img = render_static(&[c], &opts);

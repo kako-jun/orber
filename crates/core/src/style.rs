@@ -21,45 +21,69 @@ pub(crate) const STYLE_WIDTH: u32 = 1080;
 /// SVG viewBox 高さ。PNG / 動画と揃える。
 pub(crate) const STYLE_HEIGHT: u32 = 1920;
 
-/// orb の見た目の「ぼかし具合」を 1 軸 3 段階で制御する preset (#55)。
+/// orb の見た目の「ぼかし具合」を 1 軸 3 段階で制御する preset (#55, #205)。
 ///
-/// - `Low`: ぼかし弱め / 縁シャープ
-/// - `Mid`: 既存の振る舞いと同じ（regression なし、デフォルト）
-/// - `High`: ぼかし強め / 縁ソフト / alpha 控えめ
+/// #205 で全スケールを blurry 方向にシフト:
+/// - `Low`: 旧 Mid 相当。最も sharp な baseline。
+/// - `Mid` (デフォルト): 旧 High 相当。orb 並みのソフトさを全 shape に適用する新標準。
+/// - `High`: 新規。最も blurry。alpha も更に控えめ。
+///
+/// 旧 Low (`blur_offset = -0.25` の極端な sharp 描画) は #205 で廃止。
 ///
 /// 内部効果:
-/// - alpha 倍率: Low=1.0, Mid=1.0, High=0.55
-/// - blur オフセット: Low=-0.25, Mid=0.0, High=+0.25
+/// - alpha 倍率: Low=1.0, Mid=0.55, High=0.35
+/// - blur オフセット: Low=0.0, Mid=+0.25, High=+0.5
+/// - edge softness (Glyph/image アーム smoothstep 幅): Low=0.3, Mid=0.6, High=1.0
 ///
 /// PNG (animate / render_static) と SVG / CSS の全経路で同じ意味で適用する。
+/// edge_softness は WebGL2 fragment shader (`web/src/lib/orberGl.ts`) の Glyph アーム
+/// でのみ参照され、Circle アームには影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum SoftnessPreset {
-    /// ぼかし弱め。縁シャープ。
+    /// 最も sharp。新スケールの baseline (旧 Mid 相当)。
     Low,
-    /// 既存の振る舞いと完全同値（デフォルト）。
+    /// orb 並みのソフトさを全 shape に適用する新デフォルト (旧 High 相当)。
     #[default]
     Mid,
-    /// ぼかし強め。縁ソフトで alpha も控えめ。
+    /// 最も blurry。alpha も更に控えめで、テキストオーバーレイ下敷きに向く。
     High,
 }
 
 impl SoftnessPreset {
-    /// orb 中心の不透明度に掛ける倍率。Mid = 1.0（既存と同値）。
+    /// orb 中心の不透明度に掛ける倍率。新デフォルト Mid = 0.55（旧 High 相当）。
     pub fn alpha_mul(self) -> f32 {
         match self {
+            // 旧 Mid 相当 (最も sharp、新スケールの下限)
             SoftnessPreset::Low => 1.0,
-            SoftnessPreset::Mid => 1.0,
-            SoftnessPreset::High => 0.55,
+            // 旧 High 相当 (新デフォルト)
+            SoftnessPreset::Mid => 0.55,
+            // 新規 (最強、alpha もより透過)
+            SoftnessPreset::High => 0.35,
         }
     }
 
     /// blur パラメータに足すオフセット。最終 blur は呼び出し側で `[0, 1]` に clamp する。
-    /// Mid = 0.0（既存と同値）。Low は -0.25（よりシャープ）、High は +0.25（よりソフト）。
+    /// 新スケールでは Low = 0.0 (旧 Mid 相当の baseline)、Mid = +0.25 (旧 High 相当)、
+    /// High = +0.5 (新規、blur max)。
     pub fn blur_offset(self) -> f32 {
         match self {
-            SoftnessPreset::Low => -0.25,
-            SoftnessPreset::Mid => 0.0,
-            SoftnessPreset::High => 0.25,
+            SoftnessPreset::Low => 0.0,
+            SoftnessPreset::Mid => 0.25,
+            SoftnessPreset::High => 0.5,
+        }
+    }
+
+    /// Glyph / image アームの輪郭 smoothstep 幅（#205）。
+    ///
+    /// WebGL2 fragment shader (`web/src/lib/orberGl.ts`) の Glyph アームで
+    /// `smoothstep(-edge_softness, edge_softness * 0.5, signed_unit)` の閾値として
+    /// 使う。値域は `[0.3, 1.0]` で、対応するスクリーン幅は概ね 4% 〜 17% 程度。
+    /// Circle アームは Euclidean distance + falloff_curve なのでこの値の影響を受けない。
+    pub fn edge_softness(self) -> f32 {
+        match self {
+            SoftnessPreset::Low => 0.3,
+            SoftnessPreset::Mid => 0.6,
+            SoftnessPreset::High => 1.0,
         }
     }
 }
@@ -502,7 +526,14 @@ mod tests {
 
     #[test]
     fn css_stops_strictly_monotonic_default() {
-        let css = render_css(&six_clusters(), &StyleOptions::default());
+        // #205: extract_css_stops は alpha が "1" / "0.5" であることを前提にした文字列
+        // パーサなので、Low (alpha_mul=1.0、旧 default 相当) を明示する。
+        // テストの目的は stop の monotonicity 担保で、softness preset は関係ない。
+        let opts = StyleOptions {
+            softness: SoftnessPreset::Low,
+            ..StyleOptions::default()
+        };
+        let css = render_css(&six_clusters(), &opts);
         let stops = extract_css_stops(&css);
         assert_eq!(stops.len(), 6);
         for (s0, m, e) in stops {
@@ -516,6 +547,7 @@ mod tests {
     fn css_stops_strictly_monotonic_boundary_values() {
         // weight=1.0 / blur=0.0 / orb_size=2.0 の極端なケースで mid/end の
         // 衝突が起きないことを保証する。
+        // #205: extract_css_stops が ",1) " / ",0.5) " 前提なので Low を明示する。
         let extreme_clusters = vec![
             cluster([200, 100, 50], 0.5, 0.5, 1.0),   // 最大 weight
             cluster([50, 200, 100], 0.5, 0.5, 0.001), // 微小 weight
@@ -526,6 +558,7 @@ mod tests {
                     orb_size,
                     blur,
                     saturation: 1.0,
+                    softness: SoftnessPreset::Low,
                     ..Default::default()
                 };
                 let css = render_css(&extreme_clusters, &opts);
@@ -543,9 +576,12 @@ mod tests {
     }
 
     #[test]
-    fn softness_mid_is_regression_compatible_svg() {
-        // softness=Mid を明示的に渡しても、デフォルト（=Mid）と完全一致。
-        // これが回帰の最後の砦。
+    fn softness_default_matches_explicit_mid() {
+        // #205: SoftnessPreset::default() == Mid。明示的な Mid 指定でも
+        // デフォルト（=Mid）と完全一致することを担保する。
+        // 旧仕様の「Mid = legacy default と byte-equal」という意味は #205 で失効した
+        // (Mid は旧 High 相当の値に格上げされた) が、「default() と explicit Mid の一致」
+        // は仕様として保ち続ける。
         let clusters = six_clusters();
         let opts_default = StyleOptions::default();
         let opts_mid = StyleOptions {
@@ -595,17 +631,30 @@ mod tests {
     }
 
     #[test]
-    fn softness_alpha_mul_and_blur_offset_table() {
-        // SoftnessPreset の数値テーブルが仕様通りであることを担保する回帰テスト。
-        // Mid は alpha 1.0 / blur offset 0.0（既存挙動）。
-        assert!((SoftnessPreset::Mid.alpha_mul() - 1.0).abs() < 1e-6);
-        assert!((SoftnessPreset::Mid.blur_offset() - 0.0).abs() < 1e-6);
-        // Low は blur を弱める（よりシャープ）。
-        assert!((SoftnessPreset::Low.alpha_mul() - SoftnessPreset::Mid.alpha_mul()).abs() < 1e-6);
+    fn softness_table_after_shift() {
+        // #205: SoftnessPreset 値テーブルを blurry 方向にシフトした後の回帰テスト。
+        // 旧仕様: Low=(1.0, -0.25)、Mid=(1.0, 0.0)、High=(0.55, 0.25)。
+        // 新仕様: Low=(1.0, 0.0)、Mid=(0.55, 0.25)、High=(0.35, 0.5)。
+        // edge_softness は新規 method で Low=0.3 / Mid=0.6 / High=1.0。
+        assert!((SoftnessPreset::Low.alpha_mul() - 1.0).abs() < 1e-6);
+        assert!((SoftnessPreset::Low.blur_offset() - 0.0).abs() < 1e-6);
+        assert!((SoftnessPreset::Mid.alpha_mul() - 0.55).abs() < 1e-6);
+        assert!((SoftnessPreset::Mid.blur_offset() - 0.25).abs() < 1e-6);
+        assert!((SoftnessPreset::High.alpha_mul() - 0.35).abs() < 1e-6);
+        assert!((SoftnessPreset::High.blur_offset() - 0.5).abs() < 1e-6);
+
+        // 順序: alpha は Low > Mid > High（だんだん透過）、blur は Low < Mid < High。
+        assert!(SoftnessPreset::Low.alpha_mul() > SoftnessPreset::Mid.alpha_mul());
+        assert!(SoftnessPreset::Mid.alpha_mul() > SoftnessPreset::High.alpha_mul());
         assert!(SoftnessPreset::Low.blur_offset() < SoftnessPreset::Mid.blur_offset());
-        // High は alpha を弱め、blur を強める（よりソフト）。
-        assert!(SoftnessPreset::High.alpha_mul() < SoftnessPreset::Mid.alpha_mul());
-        assert!(SoftnessPreset::High.blur_offset() > SoftnessPreset::Mid.blur_offset());
+        assert!(SoftnessPreset::Mid.blur_offset() < SoftnessPreset::High.blur_offset());
+
+        // edge_softness は Low < Mid < High（smoothstep 幅が広がる = 縁がぼける）。
+        assert!((SoftnessPreset::Low.edge_softness() - 0.3).abs() < 1e-6);
+        assert!((SoftnessPreset::Mid.edge_softness() - 0.6).abs() < 1e-6);
+        assert!((SoftnessPreset::High.edge_softness() - 1.0).abs() < 1e-6);
+        assert!(SoftnessPreset::Low.edge_softness() < SoftnessPreset::Mid.edge_softness());
+        assert!(SoftnessPreset::Mid.edge_softness() < SoftnessPreset::High.edge_softness());
     }
 
     #[test]
