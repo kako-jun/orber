@@ -1,5 +1,6 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
 // orber#55 Phase B — Glyph shape (SDF sampling) 経路と softness 軸を追加。
+// orber#198 で SDF + Euclidean を合成して Glyph/image を Circle と同レベルにソフト化。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
@@ -60,6 +61,7 @@ void main() {
 
 // fragment shader: per-pixel に全 orb をループして Source-Over で合成する。
 // 仕様の数式 (extent / pos / 呼吸 / rim/soft グラデ) を 1:1 で再現。
+// テスト経路から source を inspect できるよう、`_FS_FOR_TEST` で再 export する。
 const FS = `#version 300 es
 precision highp float;
 out vec4 outColor;
@@ -189,24 +191,60 @@ void main() {
     float cx = nx * u_resolution.x;
     float cy = ny * u_resolution.y;
 
-    // alpha 計算: shape == 0 (Circle) は既存の r=distance/radius、shape == 1
-    // (Glyph) は SDF sampling 後に同じ falloff_curve へ流す。
+    // alpha calculation: shape == 0 (Circle) uses Euclidean r = distance/radius
+    // unchanged from the legacy path. shape == 1 (Glyph / image) combines the
+    // SDF-derived r with the same Euclidean r via max(), so both shapes get a
+    // Circle-level soft falloff outside the glyph boundary while keeping the
+    // glyph silhouette near the boundary. See orber#198.
     float alpha = 0.0;
     if (u_shape_id == 1) {
       vec2 local = px - vec2(cx, cy);
-      // #136: u_glyph_rotate=0 のときは t 依存項を 0 にして base_angle 固定。
-      // OFF でも base_angle は per-orb の seed 由来初期向きとして残る。
+      // #136: when u_glyph_rotate=0, drop the t-dependent term so base_angle
+      // stays fixed. base_angle is still the per-orb seed-derived initial
+      // orientation even in the OFF case.
       float angle = base_angle + u_t * rot_speed_signed * TAU * u_cycle * u_glyph_rotate;
       float c = cos(angle);
       float s = sin(angle);
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
       vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
+
+      // orber#198: blend SDF and Euclidean r so Glyph / image get the same
+      // softness as Circle.
+      //
+      //   r_sdf    — shape-derived r from the SDF signed distance.
+      //              Only meaningful while the rotated sample lands inside
+      //              the SDF texture UV box; otherwise we force it large so
+      //              the Euclidean term dominates.
+      //   r_euclid — Circle-style r = distance / radius. Defined everywhere.
+      //
+      // Effective r = max(r_sdf, r_euclid):
+      //   - Inside the glyph: both small  → opaque core preserved.
+      //   - Near the glyph edge: r_sdf ≈ 1 drives falloff_curve into the
+      //                          rim/soft transition.
+      //   - Outside the glyph (and outside UV box): r_sdf is forced large,
+      //                          r_euclid takes over and produces the same
+      //                          Circle-style halo all the way out to
+      //                          r_euclid = 1.
+      //
+      // For Glyph='●' (filled circle SDF), r_sdf ≈ r_euclid, so max() collapses
+      // back to the Circle path and the two shapes become visually indistinct.
+      //
+      // The Circle arm below (u_shape_id == 0) is intentionally untouched.
+      float dist = distance(px, vec2(cx, cy));
+      float r_euclid = dist / radius;
+      float r_sdf;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
         float signed_unit = sdf01 * 2.0 - 1.0;
-        float r = 1.0 - signed_unit;
-        alpha = falloff_curve(style_bit, r, blur, opacity);
+        r_sdf = 1.0 - signed_unit;
+      } else {
+        // Outside the SDF UV box the texture lookup is meaningless. Push r_sdf
+        // past 1.0 so falloff_curve treats this sample as fully transparent
+        // for the SDF term, letting r_euclid drive the result via max().
+        r_sdf = 2.0;
       }
+      float r = max(r_sdf, r_euclid);
+      alpha = falloff_curve(style_bit, r, blur, opacity);
     } else {
       float dist = distance(px, vec2(cx, cy));
       float r = dist / radius;
@@ -226,6 +264,12 @@ void main() {
 
   outColor = vec4(acc_rgb, acc_a);
 }`;
+
+/**
+ * orber#198: テスト用に fragment shader の source を再 export する。
+ * 本番コードからは参照しないこと（変更検知用の inspection 専用）。
+ */
+export const _FS_FOR_TEST = FS;
 
 export interface GlRenderer {
   /** 解像度を変更する。canvas のサイズは呼び出し側で予め変更しておくこと。 */
