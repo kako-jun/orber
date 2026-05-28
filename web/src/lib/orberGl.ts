@@ -1,8 +1,8 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
 // orber#55 Phase B — Glyph shape (SDF sampling) 経路と softness 軸を追加。
-// orber#198 で SDF + Euclidean を合成して Glyph/image を Circle と同レベルにソフト化。
-// orber#201: 当初 r 値で max を取っていたが、グリフ外側で r_sdf > 1 が支配して
-// halo が出ない問題があった。alpha 値で max を取るように修正。
+// orber#198 → #201 → #203 で Glyph/image アームの softening 合成を最終的に
+// 「SDF マスク × Circle profile」の乗算形に確定。過去の試行履歴は shader 本体
+// のコメントブロックを参照。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
@@ -193,12 +193,31 @@ void main() {
     float cx = nx * u_resolution.x;
     float cy = ny * u_resolution.y;
 
-    // alpha calculation: shape == 0 (Circle) uses Euclidean r = distance/radius
-    // unchanged from the legacy path. shape == 1 (Glyph / image) computes TWO
-    // alpha contributions (SDF-derived and Euclidean) via the shared
-    // falloff_curve and takes max(alpha_sdf, alpha_euclid), so the Glyph arm
-    // gains a Circle-level soft halo while keeping the glyph silhouette.
-    // See orber#198 (initial design) and orber#201 (alpha-max fix).
+    // orber#198 → #201 → #203: Glyph/image の softening を Circle と揃える試行履歴。
+    //
+    //   #198 (r-max):  r 値で max を取ると外側で r_sdf > 1 が支配して halo が出ない
+    //   #201 (alpha-max): alpha 値で max を取ると内側で alpha_sdf が saturate し
+    //                     Circle 風 fade が消え、画像シルエットも円形 halo に呑まれる
+    //   #203 (mask × profile): SDF を形状マスク、Circle profile (r_euclid) を fade
+    //                          として分離して乗算
+    //
+    // Implementation:
+    //   sdf_mask: 1 inside silhouette, 0 outside, smooth transition (smoothstep
+    //             on signed_unit). Pure shape gate.
+    //   radial_alpha: falloff_curve(r_euclid) — identical to the Circle branch,
+    //                 produces the smooth center-to-edge fade.
+    //   alpha = radial_alpha * sdf_mask
+    //
+    // Glyph='●' case: the SDF is a filled circle. Inside the entire orb the mask
+    // is 1, so alpha = falloff_curve(r_euclid) — visually indistinguishable from
+    // shape=Circle.
+    //
+    // Glyph='A' / image silhouette case: sdf_mask carries the shape (A or
+    // silhouette), Circle profile carries the soft inner fade. Outside the
+    // silhouette the mask is 0 so no orb-shaped halo leaks out; the silhouette's
+    // individuality is preserved.
+    //
+    // The Circle arm below (u_shape_id == 0) is intentionally untouched.
     float alpha = 0.0;
     if (u_shape_id == 1) {
       vec2 local = px - vec2(cx, cy);
@@ -211,51 +230,29 @@ void main() {
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
       vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
 
-      // orber#198 + #201: combine SDF outline and Euclidean halo as TWO alpha
-      // contributions and take the brighter one.
-      //
-      //   alpha_sdf:    glyph shape (r_sdf goes 0..1 across the SDF transition).
-      //                 Inside the glyph it stays opaque, at the outline it falls.
-      //                 Outside the glyph (r_sdf > 1) it is zero.
-      //   alpha_euclid: Circle-style halo computed exactly like the u_shape_id == 0
-      //                 branch (r_euclid = distance / radius).
-      //
-      // alpha = max(alpha_sdf, alpha_euclid) means:
-      //   - Inside glyph: alpha_sdf high (and alpha_euclid also high), opaque.
-      //   - At glyph outline: alpha_sdf drops, alpha_euclid carries the falloff.
-      //   - Outside glyph but within radius: alpha_sdf = 0, alpha_euclid > 0,
-      //     giving the Circle-style halo around the glyph.
-      //   - Outside radius: both 0, transparent.
-      //
-      // The earlier #198 implementation took max on r values, which let r_sdf > 1
-      // outside the SDF transition dominate the result and kill the halo. Taking
-      // max on alpha instead keeps each contribution independent.
-      //
-      // The r_sdf = 2.0 fallback for UV-outside is still emitted defensively, but
-      // falloff_curve(r_sdf=2) returns 0 so alpha_sdf is always 0 there; the
-      // result is decided purely by alpha_euclid in that band.
-      //
-      // Glyph='●' case: the SDF is a filled circle whose r_sdf curve mirrors
-      // r_euclid, so alpha_sdf ≈ alpha_euclid everywhere and the max collapses to
-      // the Circle formula — visually indistinguishable from shape=Circle.
-      //
-      // The Circle arm below (u_shape_id == 0) is intentionally untouched.
-      float dist = distance(px, vec2(cx, cy));
-      float r_euclid = dist / radius;
-      float r_sdf;
+      // SDF -> smooth shape mask. signed_unit > 0 inside, < 0 outside.
+      // The 0.05 half-width is an empirical edge-softness tuning constant for
+      // the 256x256 SDF resolution; widen for a softer outline, narrow for a
+      // crisper one. UV outside the SDF box is forced to mask=0 so no
+      // texture lookup leaks outside the silhouette.
+      float sdf_mask;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
         float signed_unit = sdf01 * 2.0 - 1.0;
-        r_sdf = 1.0 - signed_unit;
+        sdf_mask = smoothstep(-0.05, 0.05, signed_unit);
       } else {
-        // Outside the SDF UV box the texture lookup is meaningless. Push r_sdf
-        // past 1.0 so falloff_curve treats the SDF term as fully transparent,
-        // letting alpha_euclid drive the result via max().
-        r_sdf = 2.0;
+        sdf_mask = 0.0;
       }
-      float alpha_sdf = falloff_curve(style_bit, r_sdf, blur, opacity);
-      float alpha_euclid = falloff_curve(style_bit, r_euclid, blur, opacity);
-      alpha = max(alpha_sdf, alpha_euclid);
+
+      // Circle-identical radial profile, computed from Euclidean r_euclid.
+      // Same falloff_curve call as the Circle arm — only the variable name
+      // differs to avoid shadowing.
+      float dist = distance(px, vec2(cx, cy));
+      float r_euclid = dist / radius;
+      float radial_alpha = falloff_curve(style_bit, r_euclid, blur, opacity);
+
+      // Multiply: shape gate × Circle-style fade.
+      alpha = radial_alpha * sdf_mask;
     } else {
       float dist = distance(px, vec2(cx, cy));
       float r = dist / radius;

@@ -1,7 +1,8 @@
-// orber#198 / #201 — fragment shader の Glyph アームに SDF + Euclidean の
-// alpha-max 合成が入っていることを最小限の boilerplate で検査する。視覚パリティ
-// (Circle と Glyph='●' がぱっと見区別つかない) は kako-jun の手目視で確認する
-// 前提なので、ここでは「shader source が想定通りの形で書かれているか」だけを押さえる。
+// orber#198 → #201 → #203 — fragment shader の Glyph アームが
+// 「SDF マスク × Circle profile」の乗算合成で構成されていることを最小限の
+// boilerplate で検査する。視覚パリティ (Circle と Glyph='●' がぱっと見区別つかない)
+// は kako-jun の手目視で確認する前提なので、ここでは「shader source が想定通りの
+// 形で書かれているか」だけを押さえる。
 //
 // 直接 createGlRenderer を vitest (jsdom) で叩くと WebGL2 context が取れず
 // throw するため、`_FS_FOR_TEST` でエクスポートした raw shader source を
@@ -11,25 +12,39 @@ import { describe, expect, test } from 'vitest';
 
 import { _FS_FOR_TEST, GLYPH_SDF_SIZE } from './orberGl';
 
-describe('orberGl fragment shader (#198 / #201)', () => {
-  test('Glyph アームで r_sdf と r_euclid の両方を計算している', () => {
+describe('orberGl fragment shader (#203 mask × profile)', () => {
+  test('Glyph アームで SDF を smoothstep マスクに変換している', () => {
+    // SDF マスクの宣言と smoothstep 適用が両方残っていること。0.05 の閾値は
+    // SDF 解像度 256 に対する経験則値で、これが書き換えられたらレビュー対象。
+    expect(_FS_FOR_TEST).toContain('float sdf_mask;');
+    expect(_FS_FOR_TEST).toContain('smoothstep(-0.05, 0.05, signed_unit);');
+  });
+
+  test('Glyph アームの radial_alpha は Circle と同じ falloff_curve(r_euclid)', () => {
     expect(_FS_FOR_TEST).toContain('float r_euclid = dist / radius;');
-    expect(_FS_FOR_TEST).toContain('r_sdf = 1.0 - signed_unit;');
+    expect(_FS_FOR_TEST).toContain(
+      'float radial_alpha = falloff_curve(style_bit, r_euclid, blur, opacity);',
+    );
   });
 
-  test('Glyph アームで alpha_sdf / alpha_euclid を計算し max を採用している (#201)', () => {
-    expect(_FS_FOR_TEST).toContain(
-      'float alpha_sdf = falloff_curve(style_bit, r_sdf, blur, opacity);',
-    );
-    expect(_FS_FOR_TEST).toContain(
-      'float alpha_euclid = falloff_curve(style_bit, r_euclid, blur, opacity);',
-    );
-    expect(_FS_FOR_TEST).toContain('alpha = max(alpha_sdf, alpha_euclid);');
+  test('Glyph アームの合成は radial_alpha * sdf_mask の乗算 (#203)', () => {
+    // この行が #203 の核心。max(...) や ぼやけた合成式に退行していないことを担保する。
+    expect(_FS_FOR_TEST).toContain('alpha = radial_alpha * sdf_mask;');
   });
 
-  test('UV 範囲外では r_sdf を 1.0 超に固定する', () => {
-    // 値は実装上 2.0。falloff_curve(r >= 1.0) が 0 を返す挙動に乗る。
-    expect(_FS_FOR_TEST).toContain('r_sdf = 2.0;');
+  test('UV 範囲外では sdf_mask = 0 で透明確定', () => {
+    // grafer 外側のテクスチャ参照を無効化するガード。
+    expect(_FS_FOR_TEST).toContain('sdf_mask = 0.0;');
+  });
+
+  test('旧仕様 (r-max / alpha-max) の痕跡が残っていない', () => {
+    // #198 / #201 の合成式が復活していないこと。alpha_sdf / alpha_euclid という
+    // 旧変数名は使わない方針。
+    expect(_FS_FOR_TEST).not.toContain('float alpha_sdf');
+    expect(_FS_FOR_TEST).not.toContain('float alpha_euclid');
+    expect(_FS_FOR_TEST).not.toContain('max(alpha_sdf, alpha_euclid)');
+    // r_sdf 変数自体が #203 で消滅したのでリテラル代入も無い。
+    expect(_FS_FOR_TEST).not.toMatch(/\br_sdf\s*=/);
   });
 
   test('Circle アーム (u_shape_id == 0) は従来式 r = dist / radius のまま', () => {
@@ -39,10 +54,22 @@ describe('orberGl fragment shader (#198 / #201)', () => {
     expect(_FS_FOR_TEST).toMatch(/float dist = distance\(px, vec2\(cx, cy\)\);\s*\n\s*float r = dist \/ radius;/);
   });
 
-  test('Circle 経路の falloff_curve 呼び出しは Glyph 経路と同じ関数を共有している', () => {
-    // falloff_curve がただ 1 つ定義されている (refactor で 2 系統に分裂していない) こと。
+  test('falloff_curve の定義は 1 つだけ (Glyph と Circle で共有)', () => {
     const defCount = (_FS_FOR_TEST.match(/float falloff_curve\(/g) ?? []).length;
     expect(defCount).toBe(1);
+  });
+
+  test('falloff_curve の実呼び出しは Glyph 1 + Circle 1 = 2 回 (#203 で旧 3 回から削減)', () => {
+    // #201 では Glyph アームで alpha_sdf / alpha_euclid と 2 回呼んでいたが、
+    // #203 では radial_alpha 1 本に統合したので Glyph 経路の呼び出しは 1 回に減る。
+    const callSites = _FS_FOR_TEST.match(/falloff_curve\(style_bit,/g) ?? [];
+    expect(callSites.length).toBe(2);
+  });
+
+  test('Circle アームの falloff_curve(style_bit, r, blur, opacity) は 1 回だけ', () => {
+    // Glyph 経路は r_euclid 引数なのでこのリテラルは Circle アームでのみ出現する。
+    const calls = _FS_FOR_TEST.match(/falloff_curve\(style_bit, r, blur, opacity\)/g) ?? [];
+    expect(calls.length).toBe(1);
   });
 
   test('GLYPH_SDF_CONTENT_SPAN の GLSL 宣言が TS 定数と整合している', () => {
@@ -52,39 +79,11 @@ describe('orberGl fragment shader (#198 / #201)', () => {
     expect(GLYPH_SDF_SIZE).toBe(256);
   });
 
-  test('shader source に #198 と #201 の履歴コメントが残っている', () => {
-    // 将来「なぜ alpha-max を取っているのか」が分からず削除される事故予防として、
-    // shader source 内に #198 (初期設計) と #201 (alpha-max 修正) の参照が
-    // 両方残っていることを担保する。
+  test('shader source に #198 / #201 / #203 の試行履歴コメントが残っている', () => {
+    // 将来「なぜ mask × profile を取っているのか」が分からず削除される事故予防として、
+    // shader source 内に試行履歴の参照が残っていることを担保する。
     expect(_FS_FOR_TEST).toMatch(/#198/);
     expect(_FS_FOR_TEST).toMatch(/#201/);
-  });
-
-  test('r_sdf へのリテラル代入は 2.0 のみ (defensive 値の逆方向改変を検出)', () => {
-    // `r_sdf = 0.0;` や `r_sdf = 0.5;` のようなリテラル代入が混入すると、
-    // UV 外で透明にならず描画されてしまう。`r_sdf = 1.0 - signed_unit;` のような
-    // 式代入はここでは拾わず、リテラル数値代入だけを検査する。
-    const literalAssignments = [..._FS_FOR_TEST.matchAll(/r_sdf\s*=\s*([0-9.]+)\s*;/g)].map(
-      (m) => m[1],
-    );
-    expect(literalAssignments.length).toBeGreaterThan(0);
-    for (const val of literalAssignments) {
-      expect(val).toBe('2.0');
-    }
-  });
-
-  test('falloff_curve(style_bit, r, blur, opacity) は Circle アームでのみ呼ばれる (旧 r-max 痕跡なし)', () => {
-    // #201 で Glyph アームは r ではなく r_sdf / r_euclid を直接 falloff_curve に渡すように
-    // 変更されたため、`falloff_curve(style_bit, r, blur, opacity)` literal は Circle アームの
-    // 1 回だけ残るのが正しい。Glyph 経路にこの literal が復活していたら r-max 退行のサイン。
-    const calls = _FS_FOR_TEST.match(/falloff_curve\(style_bit, r, blur, opacity\)/g) ?? [];
-    expect(calls.length).toBe(1);
-  });
-
-  test('Glyph + Circle 合算で falloff_curve の実呼び出しは 3 回 (Glyph=2, Circle=1)', () => {
-    // 関数定義やコメント内参照を除外するため、call site のシグネチャに直接マッチする。
-    // Glyph アーム: alpha_sdf, alpha_euclid 用に 2 回 / Circle アーム: alpha 用に 1 回。
-    const callSites = _FS_FOR_TEST.match(/falloff_curve\(style_bit,/g) ?? [];
-    expect(callSites.length).toBe(3);
+    expect(_FS_FOR_TEST).toMatch(/#203/);
   });
 });
