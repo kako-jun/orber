@@ -33,7 +33,7 @@ describe('orberGl fragment shader (#203 mask × profile)', () => {
   });
 
   test('UV 範囲外では sdf_mask = 0 で透明確定', () => {
-    // grafer 外側のテクスチャ参照を無効化するガード。
+    // glyph 外側のテクスチャ参照を無効化するガード。
     expect(_FS_FOR_TEST).toContain('sdf_mask = 0.0;');
   });
 

@@ -503,26 +503,32 @@ speed / softness without dropping to the terminal.
   profile".** The Glyph arm (`u_shape_id == 1`, which also handles uploaded
   images via the shared `jsGlyphSdf` path) originally fed only `r_sdf` into
   `falloff_curve`, so the soft falloff was confined to the SDF's UV box and
-  the result looked harder than Circle. Three rounds of revision followed:
+  the result looked harder than Circle. Three rounds of revision followed.
+
   **#198 (r-max)** tried `r = max(r_sdf, r_euclid)` fed into `falloff_curve`
   once, but outside the SDF transition `r_sdf > 1` dominated the max and the
-  halo was killed before `r_euclid` could contribute. **#201 (alpha-max)**
-  switched to computing two alpha contributions and `alpha = max(alpha_sdf,
-  alpha_euclid)`, which restored the Glyph='●' halo, but for `A` / image
-  silhouettes the saturating `alpha_euclid` core erased the inner Circle-style
-  fade and produced a circular halo around every silhouette — destroying the
-  shape's individuality. **#203 (mask × profile)** splits responsibilities:
-  the SDF becomes a pure shape mask via `sdf_mask = smoothstep(-0.05, 0.05,
-  signed_unit)` (with mask=0 for UV outside the box), and the Circle-identical
+  halo was killed before `r_euclid` could contribute.
+
+  **#201 (alpha-max)** switched to computing two alpha contributions and
+  `alpha = max(alpha_sdf, alpha_euclid)`, which restored the Glyph='●' halo,
+  but for `A` / image silhouettes the saturating `alpha_euclid` core erased
+  the inner Circle-style fade and produced a circular halo around every
+  silhouette — destroying the shape's individuality.
+
+  **#203 (mask × profile)** splits responsibilities: the SDF becomes a pure
+  shape mask via `sdf_mask = smoothstep(-0.05, 0.05, signed_unit)` (with
+  mask=0 for UV outside the box), and the Circle-identical
   `radial_alpha = falloff_curve(style_bit, r_euclid, blur, opacity)` provides
   the soft center-to-edge profile. The final alpha is the product
   `radial_alpha * sdf_mask`. For Glyph='●' the SDF is a filled disk so the
-  mask is 1 across the entire orb and alpha collapses to `falloff_curve(r_euclid)`
-  — visually indistinguishable from `shape=Circle`, which matches the
-  mathematical identity `●` = Circle. For Glyph='A' or image silhouettes the
-  mask carries the shape and the Circle profile carries the soft fade, so no
-  orb-shaped halo leaks outside the silhouette and the original individuality
-  is preserved. The Circle arm (`u_shape_id == 0`), the `falloff_curve`
+  mask is 1 inside the silhouette and alpha collapses to
+  `falloff_curve(r_euclid)` — visually very close to `shape=Circle` (the
+  outermost ~10% fade ring is omitted because the glyph's SDF radius is
+  ~0.9 × orb radius, so it is a close approximation rather than a
+  byte-identical match). For Glyph='A' or image silhouettes the mask carries
+  the shape and the Circle profile carries the soft fade, so no orb-shaped
+  halo leaks outside the silhouette and the original individuality is
+  preserved. The Circle arm (`u_shape_id == 0`), the `falloff_curve`
   function, and every uniform binding remain unchanged. This is the Web-side
   counterpart to the CLI-side bleed pass added in #195/#199: separate
   implementations, same visual goal of matching Glyph/image softness to Circle.

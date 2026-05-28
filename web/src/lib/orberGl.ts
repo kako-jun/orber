@@ -5,9 +5,15 @@
 // のコメントブロックを参照。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
-// 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
-// (`crates/core::animate::render_frame_with_params`) と同じ数式・同じ per-orb
-// パラメータを使うので、視覚パリティは「最終的な見た目が同じ」が保たれる。
+// 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。
+//
+// CPU/GPU の対応関係:
+//   - Circle アームは CPU 経路 (`crates/core::animate::render_frame_with_params`)
+//     と完全に同式・同パラメータで、視覚パリティが byte-near まで取れる
+//   - Glyph/image アームは CPU = falloff_curve(r_sdf) + 別 pass の aquarelle
+//     bleed (#195/#199)、GPU = SDF mask × Circle profile の乗算 (#203) と
+//     別実装。両者で同じ「Circle に近いソフトさ」を目指すが、合成式は別物。
+//     詳細は docs/overview.md の Phase B follow-up セクションを参照。
 //
 // shape == "glyph" のときは、`u_glyph_sdf` (256x256 SDF texture) を `(cx, cy)`
 // 中心の正方領域で sampling し、回転用 padding を残した中央帯だけを使って
@@ -36,9 +42,11 @@
 //
 // review S1: CPU 側 (crates/core::orb) は alpha を `(opacity * 255).round() as u8`
 // と `(opacity * 80).round() as u8` で 1/255 ステップに量子化してから tiny-skia
-// に渡している。本 shader は raw float のまま blend する。差分は最大 ≤ 1/255
-// (≒ 0.4% の輝度差) で肉眼識別不能。kako-jun 合意の「最終的な見た目が同じ」
-// 合格ラインを守る前提で量子化は省略している。
+// に渡している。本 shader は raw float のまま blend する。Circle アームでは
+// 差分は最大 ≤ 1/255 (≒ 0.4% の輝度差) で肉眼識別不能。kako-jun 合意の
+// 「最終的な見た目が同じ」合格ラインを守る前提で量子化は省略している。
+// Glyph/image アームは上記のとおり CPU と合成式自体が別実装なので、この
+// 「≤ 1/255」の上限は成立しない（Circle に近い見た目を目指す近似）。
 
 /// uniform 配列の上限。`crates/core::animate::MAX_ORB_COUNT = 1024` ほど大きく
 /// する必要はなく、GUI 経路では `random_batch_specs` の count_range
@@ -208,9 +216,13 @@ void main() {
     //                 produces the smooth center-to-edge fade.
     //   alpha = radial_alpha * sdf_mask
     //
-    // Glyph='●' case: the SDF is a filled circle. Inside the entire orb the mask
-    // is 1, so alpha = falloff_curve(r_euclid) — visually indistinguishable from
-    // shape=Circle.
+    // Glyph='●' case: the SDF is a filled circle. Inside the silhouette the
+    // mask is 1, so alpha = falloff_curve(r_euclid) — visually very close to
+    // shape=Circle. Note: the SDF's '●' radius is roughly 0.9 × orb radius
+    // (GLYPH_SDF_CONTENT_SPAN-derived), so the outermost ~10% fade ring that
+    // Circle would render is cut by mask=0 here. At rim/blur≈0.5, r=0.95 the
+    // omitted ring is around opacity × 0.08 alpha — close to Circle, not
+    // byte-identical to it.
     //
     // Glyph='A' / image silhouette case: sdf_mask carries the shape (A or
     // silhouette), Circle profile carries the soft inner fade. Outside the
@@ -235,6 +247,11 @@ void main() {
       // the 256x256 SDF resolution; widen for a softer outline, narrow for a
       // crisper one. UV outside the SDF box is forced to mask=0 so no
       // texture lookup leaks outside the silhouette.
+      //
+      // Screen-space transition width is roughly 0.85% of orb radius (e.g.
+      // ~1.3 px at radius=150). If GLYPH_SDF_MAX_DIST_FACTOR
+      // (crates/core/src/glyph.rs) is changed, this value shifts
+      // proportionally and the on-screen edge softness scales with it.
       float sdf_mask;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
