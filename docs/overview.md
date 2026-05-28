@@ -499,23 +499,31 @@ speed / softness without dropping to the terminal.
   then feeds the **same rim/soft falloff curve**. Because `rot_speed_signed`
   is an integer multiple of the existing `speed_mult`, glyph rotation stays
   loop-closed at `t = 0 ≡ 1`.
-- **#198 follow-up — SDF + Euclidean composite for Glyph/image.** The Glyph
-  arm (`u_shape_id == 1`, which also handles uploaded images via the shared
-  `jsGlyphSdf` path) originally fed only `r_sdf` into `falloff_curve`, so the
-  soft falloff was confined to the SDF's UV box and the result looked harder
-  than Circle. It now computes both `r_sdf` from the sampled SDF and
-  `r_euclid = distance(center, px) / radius`, then takes `r = max(r_sdf,
-  r_euclid)`. Inside the glyph both terms stay small so the opaque core is
-  preserved; near the glyph edge `r_sdf` still drives the shape falloff; and
-  outside the glyph (including outside the SDF UV box, where `r_sdf` is
-  clamped past 1) `r_euclid` takes over and produces the same full-radius
-  halo Circle has. With Glyph='●' the two terms are nearly equal, so the
-  `max` collapses to the Circle expression and the two shapes become visually
-  indistinguishable. The Circle arm (`u_shape_id == 0`), the `falloff_curve`
-  function, and every uniform binding are unchanged. This is the Web-side
-  counterpart to the CLI-side bleed pass added in #195/#199: separate
-  implementations, same visual goal of matching Glyph/image softness to
-  Circle.
+- **#198 follow-up / #201 fix — SDF + Euclidean composite for Glyph/image
+  (alpha-max).** The Glyph arm (`u_shape_id == 1`, which also handles
+  uploaded images via the shared `jsGlyphSdf` path) originally fed only
+  `r_sdf` into `falloff_curve`, so the soft falloff was confined to the SDF's
+  UV box and the result looked harder than Circle. #198 attempted to fix this
+  by taking `r = max(r_sdf, r_euclid)` and feeding the merged `r` into
+  `falloff_curve` once, but visual inspection showed Glyph='●' still had no
+  halo at all: outside the SDF transition `r_sdf > 1` dominated the max and
+  `falloff_curve` returned 0, killing the Circle-style halo before
+  `r_euclid` could contribute. #201 corrects this by computing TWO alpha
+  contributions and taking `alpha = max(alpha_sdf, alpha_euclid)` instead:
+  `alpha_sdf = falloff_curve(style_bit, r_sdf, blur, opacity)` captures the
+  glyph shape; `alpha_euclid = falloff_curve(style_bit, r_euclid, blur,
+  opacity)` captures the Circle-style halo computed exactly like the
+  `u_shape_id == 0` branch. Inside the glyph both alphas are high so the
+  opaque core is preserved; at the glyph outline `alpha_sdf` drops while
+  `alpha_euclid` carries the falloff; outside the glyph but within radius
+  `alpha_sdf = 0` and `alpha_euclid > 0`, producing the same full-radius
+  halo Circle has; outside radius both are 0. With Glyph='●' `alpha_sdf` and
+  `alpha_euclid` are nearly equal, so the max collapses to the Circle
+  formula and the two shapes become visually indistinguishable. The Circle
+  arm (`u_shape_id == 0`), the `falloff_curve` function, and every uniform
+  binding are unchanged. This is the Web-side counterpart to the CLI-side
+  bleed pass added in #195/#199: separate implementations, same visual goal
+  of matching Glyph/image softness to Circle.
 - `get_render_data`'s 16-word header schema reserves words 9 and 10 for
   `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
   per-orb 16-word slots now also use words 11 and 12 for `base_angle` and

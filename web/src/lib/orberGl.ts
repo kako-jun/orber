@@ -1,6 +1,8 @@
 // orber#112 — WebGL2 fragment shader による per-pixel orb 描画。
 // orber#55 Phase B — Glyph shape (SDF sampling) 経路と softness 軸を追加。
 // orber#198 で SDF + Euclidean を合成して Glyph/image を Circle と同レベルにソフト化。
+// orber#201: 当初 r 値で max を取っていたが、グリフ外側で r_sdf > 1 が支配して
+// halo が出ない問題があった。alpha 値で max を取るように修正。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。CPU 経路
@@ -192,10 +194,11 @@ void main() {
     float cy = ny * u_resolution.y;
 
     // alpha calculation: shape == 0 (Circle) uses Euclidean r = distance/radius
-    // unchanged from the legacy path. shape == 1 (Glyph / image) combines the
-    // SDF-derived r with the same Euclidean r via max(), so both shapes get a
-    // Circle-level soft falloff outside the glyph boundary while keeping the
-    // glyph silhouette near the boundary. See orber#198.
+    // unchanged from the legacy path. shape == 1 (Glyph / image) computes TWO
+    // alpha contributions (SDF-derived and Euclidean) via the shared
+    // falloff_curve and takes max(alpha_sdf, alpha_euclid), so the Glyph arm
+    // gains a Circle-level soft halo while keeping the glyph silhouette.
+    // See orber#198 (initial design) and orber#201 (alpha-max fix).
     float alpha = 0.0;
     if (u_shape_id == 1) {
       vec2 local = px - vec2(cx, cy);
@@ -208,29 +211,33 @@ void main() {
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
       vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
 
-      // orber#198: blend SDF and Euclidean r so Glyph/image gain a Circle-like
-      // soft halo on top of the SDF outline.
+      // orber#198 + #201: combine SDF outline and Euclidean halo as TWO alpha
+      // contributions and take the brighter one.
       //
-      //   r_sdf:    SDF-derived r. Inside the glyph it stays small, at the glyph
-      //             outline it rises to ~1 producing the existing falloff.
-      //   r_euclid: distance(center, px) / radius. Identical to the Circle arm.
+      //   alpha_sdf:    glyph shape (r_sdf goes 0..1 across the SDF transition).
+      //                 Inside the glyph it stays opaque, at the outline it falls.
+      //                 Outside the glyph (r_sdf > 1) it is zero.
+      //   alpha_euclid: Circle-style halo computed exactly like the u_shape_id == 0
+      //                 branch (r_euclid = distance / radius).
       //
-      // r = max(r_sdf, r_euclid) means:
-      //   - Inside glyph (both small): full opacity preserved.
-      //   - At glyph outline (r_sdf ≈ 1): r_sdf dominates and shapes the edge.
-      //   - Outside glyph but still within radius (r_sdf > 1, r_euclid < 1):
-      //     r_euclid wins and produces the Circle-style halo.
+      // alpha = max(alpha_sdf, alpha_euclid) means:
+      //   - Inside glyph: alpha_sdf high (and alpha_euclid also high), opaque.
+      //   - At glyph outline: alpha_sdf drops, alpha_euclid carries the falloff.
+      //   - Outside glyph but within radius: alpha_sdf = 0, alpha_euclid > 0,
+      //     giving the Circle-style halo around the glyph.
+      //   - Outside radius: both 0, transparent.
       //
-      // UV-box edge case: outside the UV box r_euclid is already greater than √2
-      // because the UV box only covers ±radius·√2 in pixel space. falloff_curve
-      // returns 0 once r >= 1, so the UV-outside region is transparent regardless
-      // of r_sdf. The r_sdf = 2.0 defensive assignment exists only to keep the
-      // max() expression semantically consistent (both operands above the cutoff)
-      // without changing the final alpha.
+      // The earlier #198 implementation took max on r values, which let r_sdf > 1
+      // outside the SDF transition dominate the result and kill the halo. Taking
+      // max on alpha instead keeps each contribution independent.
       //
-      // Glyph='●' case: the SDF is a filled circle, so r_sdf ≈ r_euclid and the
-      // max() collapses to the Circle formula — visually indistinguishable from
-      // shape=Circle. This is the perceptual goal of #198.
+      // The r_sdf = 2.0 fallback for UV-outside is still emitted defensively, but
+      // falloff_curve(r_sdf=2) returns 0 so alpha_sdf is always 0 there; the
+      // result is decided purely by alpha_euclid in that band.
+      //
+      // Glyph='●' case: the SDF is a filled circle whose r_sdf curve mirrors
+      // r_euclid, so alpha_sdf ≈ alpha_euclid everywhere and the max collapses to
+      // the Circle formula — visually indistinguishable from shape=Circle.
       //
       // The Circle arm below (u_shape_id == 0) is intentionally untouched.
       float dist = distance(px, vec2(cx, cy));
@@ -242,12 +249,13 @@ void main() {
         r_sdf = 1.0 - signed_unit;
       } else {
         // Outside the SDF UV box the texture lookup is meaningless. Push r_sdf
-        // past 1.0 so falloff_curve treats this sample as fully transparent
-        // for the SDF term, letting r_euclid drive the result via max().
+        // past 1.0 so falloff_curve treats the SDF term as fully transparent,
+        // letting alpha_euclid drive the result via max().
         r_sdf = 2.0;
       }
-      float r = max(r_sdf, r_euclid);
-      alpha = falloff_curve(style_bit, r, blur, opacity);
+      float alpha_sdf = falloff_curve(style_bit, r_sdf, blur, opacity);
+      float alpha_euclid = falloff_curve(style_bit, r_euclid, blur, opacity);
+      alpha = max(alpha_sdf, alpha_euclid);
     } else {
       float dist = distance(px, vec2(cx, cy));
       float r = dist / radius;
