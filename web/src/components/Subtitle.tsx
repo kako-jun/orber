@@ -1,39 +1,55 @@
 // orber#62 — Subtitle (Solid island)
 // index.astro 直下のサブタイトルを i18n reactive にするための薄いコンポーネント。
-// Studio と Subtitle のどちらが先に hydrate されてもよいが、lang 同期の責務は
-// こちらに集約している (Studio.tsx の onMount からは setLang を外している)。
-//
-// orber#161 — lang signal は strings.ts の hydration 後 microtask で
-// detectLang() に切り替わる (SSR は 'en' で signal init され DOM と一致 →
-// hydration mismatch を回避 → microtask で setLang を呼んで全 t() を reactive
-// 再評価)。ここでの setLang / document.documentElement.lang 更新は safety belt
-// として残す (同じ言語なら no-op、違えば再同期。Base.astro inline script との
-// 二重保険)。
+// 言語トグル (JA / EN) もここに内包する。
 
 import { onMount } from 'solid-js';
-import { t, setLang, detectLang } from '../lib/strings';
+import { t, setLang, detectLang, lang } from '../lib/strings';
 
 export default function Subtitle() {
   onMount(() => {
-    // safety belt: 通常は strings.ts の queueMicrotask が hydration 直後に
-    // setLang(detectLang()) を済ませているが、microtask キューの順序が想定と
-    // 違う環境 (将来の Solid runtime / 低速ブラウザ等) のために再同期しておく。
-    // 同じ値なら createSignal の等値ガードで no-op。
     const next = detectLang();
     setLang(next);
     if (typeof document !== 'undefined') {
       document.documentElement.lang = next;
     }
   });
-  // Solid の JSX コンパイラは {expr} を effect でラップするため、
-  // t() 内部の lang() 呼び出しで自動的に reactive 化される。
-  // 明示的なトリガ (data-lang 等) は不要。
-  // Subtitle は SSR で既に描画されており above-the-fold で常時可視のため、
-  // .fade-in は付けない (hydration で再フェードするとちらつく)。
-  // これは DESIGN.md §6 「.fade-in は新規マウント時の出現演出」の対象外。
+
+  function switchLang(l: 'ja' | 'en') {
+    setLang(l);
+    if (typeof document !== 'undefined') {
+      document.documentElement.lang = l;
+    }
+  }
+
   return (
-    <p class="font-display text-sm tracking-wide text-fgMuted text-center mt-3 mb-10">
-      {t('subtitle')}
-    </p>
+    <div class="flex flex-col items-center mt-3 mb-10 gap-1">
+      <p class="font-display text-sm tracking-wide text-fgMuted text-center">
+        {t('subtitle')}
+      </p>
+      {/* 言語トグル — 小さく、控えめに */}
+      <div class="flex items-center gap-1 text-xs text-fgSubtle">
+        <button
+          type="button"
+          onClick={() => switchLang('ja')}
+          class="rounded px-1.5 py-0.5 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
+          classList={{ 'text-fg font-semibold': lang() === 'ja', 'text-fgSubtle': lang() !== 'ja' }}
+          aria-label="日本語"
+          aria-pressed={lang() === 'ja'}
+        >
+          JA
+        </button>
+        <span class="text-fgSubtle" style={{ opacity: 0.4 }}>·</span>
+        <button
+          type="button"
+          onClick={() => switchLang('en')}
+          class="rounded px-1.5 py-0.5 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing"
+          classList={{ 'text-fg font-semibold': lang() === 'en', 'text-fgSubtle': lang() !== 'en' }}
+          aria-label="English"
+          aria-pressed={lang() === 'en'}
+        >
+          EN
+        </button>
+      </div>
+    </div>
   );
 }
