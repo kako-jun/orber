@@ -84,11 +84,11 @@ export default function AffiliateGrid() {
               {/* Caption (kako-jun 直筆の一言) と title を下に小さく */}
               <div class="mt-2 text-center">
                 {p.caption && (
-                  <div class="text-xs text-fgMuted leading-tight line-clamp-2">
+                  <div class="text-xs text-fgMuted leading-tight">
                     {p.caption}
                   </div>
                 )}
-                <div class="text-xs text-fgSubtle leading-tight truncate mt-0.5">
+                <div class="text-xs text-fgSubtle leading-tight mt-0.5">
                   {p.title}
                 </div>
               </div>

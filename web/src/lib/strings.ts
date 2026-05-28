@@ -171,6 +171,14 @@ export const STRINGS = {
     ja: '購入が orber 維持の支援になります (Amazon アソシエイト)',
     en: 'As an Amazon Associate I earn from qualifying purchases.',
   },
+  amazonButtonLabel: {
+    ja: 'Amazon で応援する',
+    en: 'Support on Amazon',
+  },
+  amazonButtonHint: {
+    ja: 'リンク先の商品でなくても、ここからお買い物するだけで応援になります',
+    en: 'Any purchase through this link helps — thanks!',
+  },
   // #146: QR の補助コピー (qrLabel / "Open on phone") は廃止。alt のみ残す。
   qrAlt: {
     ja: 'orber.llll-ll.com を開く QR コード',

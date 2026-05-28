@@ -138,6 +138,23 @@ export default function Footer() {
             他 PWA にコピペで横展開できる pattern にしている。 */}
         <AffiliateGrid />
 
+        {/* Amazon 汎用ボタン — 1つ目の商品と同じURLを使用 */}
+        <a
+          href="https://amzn.to/4nbQcSF"
+          target="_blank"
+          rel="noopener noreferrer sponsored"
+          class="
+            w-full flex flex-col items-center gap-1 px-5 py-3 text-center
+            rounded border border-glassBorder bg-glassBg
+            hover:bg-glassBgHover transition-colors duration-150
+            focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing
+            focus-visible:ring-offset-2 focus-visible:ring-offset-bg
+          "
+        >
+          <span class="text-sm text-fg">{t('amazonButtonLabel')}</span>
+          <span class="text-xs text-fgMuted">{t('amazonButtonHint')}</span>
+        </a>
+
         {/* C. QR — 別途指定する PNG (`/orber-qr.png`) を使う。補助コピーは置かない。
             PNG は事前に `magick -negate` 済みで、白モジュール + 透明背景。
             bg-bg (#040404) 上で白モジュールが見える形 (orber テーマカラーに合わせ済み)。
