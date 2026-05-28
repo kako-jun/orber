@@ -45,4 +45,29 @@ describe('orberGl fragment shader (#198)', () => {
     // GLYPH_SDF_SIZE は shader 内では使わないが export 経由で固定値を健全性確認。
     expect(GLYPH_SDF_SIZE).toBe(256);
   });
+
+  test('shader source に #198 の履歴コメントが残っている', () => {
+    // 将来「なぜ max(r_sdf, r_euclid) を取っているのか」が分からず削除される
+    // 事故予防として、shader source 内に #198 の参照が残っていることを担保する。
+    expect(_FS_FOR_TEST).toMatch(/#198/);
+  });
+
+  test('r_sdf へのリテラル代入は 2.0 のみ (defensive 値の逆方向改変を検出)', () => {
+    // `r_sdf = 0.0;` や `r_sdf = 0.5;` のようなリテラル代入が混入すると、
+    // UV 外で透明にならず描画されてしまう。`r_sdf = 1.0 - signed_unit;` のような
+    // 式代入はここでは拾わず、リテラル数値代入だけを検査する。
+    const literalAssignments = [..._FS_FOR_TEST.matchAll(/r_sdf\s*=\s*([0-9.]+)\s*;/g)].map(
+      (m) => m[1],
+    );
+    expect(literalAssignments.length).toBeGreaterThan(0);
+    for (const val of literalAssignments) {
+      expect(val).toBe('2.0');
+    }
+  });
+
+  test('falloff_curve(style_bit, r, blur, opacity) は Glyph / Circle 両アームで 1 回ずつ呼ばれる', () => {
+    // refactor で if-else どちらかから呼び出しを消してしまう事故を検出する。
+    const calls = _FS_FOR_TEST.match(/falloff_curve\(style_bit, r, blur, opacity\)/g) ?? [];
+    expect(calls.length).toBe(2);
+  });
 });
