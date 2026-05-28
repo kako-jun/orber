@@ -140,7 +140,7 @@ export default function Footer() {
 
         {/* Amazon 汎用ボタン — 1つ目の商品と同じURLを使用 */}
         <a
-          href="https://amzn.to/4nbQcSF"
+          href="https://amzn.to/4vcZqRx"
           target="_blank"
           rel="noopener noreferrer sponsored"
           class="
