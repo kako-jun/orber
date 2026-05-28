@@ -186,8 +186,8 @@ export const STRINGS = {
   },
   // #128 / #146: ja は「閲覧数: {n}」、en は「{n} views」で語順を言語ごとに分ける。
   // {n} は <nostalgic-counter> がレンダリングする数値で置換する。
-  viewsLabelPrefix: { ja: '閲覧数: ', en: '' },
-  viewsLabelSuffix: { ja: '', en: ' views' },
+  viewsLabelPrefix: { ja: '', en: '' },
+  viewsLabelSuffix: { ja: ' views', en: ' views' },
   // #146 review S2: Footer 全体の aria-label を i18n 化。
   footerAriaLabel: { ja: 'orber フッター', en: 'orber footer' },
   // Footer 末尾の小さい link 行。#174 でテキストリンクからアイコン並びに変更
