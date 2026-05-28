@@ -257,7 +257,17 @@ yields an explicit error rather than silently degrading. The default
 
 ## Relationship to aquarelle
 
-The aquarelle (watercolor bleed) shape generator will eventually be split out into its own crate, shared between `orber` (irregular orb shapes) and `blueprinter` (sumi / watercolor diagram themes). For the prototype it lives inside `orber-core` under `crates/core/src/aquarelle/` so the module boundary is already in place.
+The aquarelle (watercolor bleed) shape generator now ships as its own external
+crate at [`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is
+pulled in via `aquarelle = "0.2"` in `Cargo.toml`. `orber-core` consumes it in
+two distinct places:
+
+- **`OrbShape::Aquarelle`** uses the crate's per-orb watercolor bleed renderer
+  to paint each orb as an irregular pigment blob.
+- **`OrbShape::Glyph`** runs a single full-pixmap `render_aquarelle_bleed_pass`
+  after all glyph orbs have been drawn, so the SDF-derived outline picks up
+  the same paper-bleed softness even though each orb itself is still a glyph
+  fill. `OrbShape::Circle` does not invoke either path.
 
 ## Workspace layout
 
@@ -434,6 +444,16 @@ color. The pipeline:
 4. The outline is converted to a cached SDF, so **`--blur` and `--softness`
    both affect Glyph mode** with the same edge-falloff meaning as circle
    orbs rather than a hard text fill.
+5. After every glyph orb has been painted into the pixmap, Glyph mode runs a
+   single `aquarelle::render_aquarelle_bleed_pass` over the whole image (with
+   `AquarelleBleedParams::default()` and a fixed seed). This adds a
+   paper-bleed-style softening to the SDF-derived outline so the Glyph result
+   sits closer to the Circle and Aquarelle shapes in overall feel. The bleed
+   pass runs **only for `OrbShape::Glyph`** — Circle and Aquarelle renders are
+   bit-identical to before this pass was added. The animated Glyph path
+   (`render_frame_with_params`) applies the same single `render_aquarelle_bleed_pass`
+   per frame with a fixed seed of `0`, so the bleed pattern stays stable
+   across frames instead of flickering frame to frame.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
