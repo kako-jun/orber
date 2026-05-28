@@ -18,7 +18,9 @@
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
 use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
-use aquarelle::{render_aquarelle_orb, AquarelleParams};
+use aquarelle::{
+    render_aquarelle_bleed_pass, render_aquarelle_orb, AquarelleBleedParams, AquarelleParams,
+};
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
@@ -190,6 +192,13 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
                 );
             }
         }
+    }
+
+    // Glyph shape のときだけ、全 orb 描画後に aquarelle v0.2 の bleed pass を 1 回かける。
+    // per-orb ではなく全体 1 回にすることで、グリフ群が水彩のにじみで馴染むようにする (#195)。
+    // seed は決定論性のため固定 0。AquarelleBleedParams::default() = radius=3, intensity=0.5, halo=0.3。
+    if let OrbShape::Glyph { .. } = opts.shape {
+        render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
     }
 
     // tiny-skia の Pixmap は premultiplied alpha なので un-premultiply して straight に戻す。
