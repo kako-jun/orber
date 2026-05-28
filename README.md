@@ -186,7 +186,11 @@ The GUI runs entirely client-side. The `orber-wasm` crate handles rendering
 via the WebCodecs API (Chrome 94+ / Safari 16.4+ / Firefox 130+). The encoder
 probes H.264 → VP9 → AV1 and falls back automatically, so browsers without an
 H.264 encoder (Linux Chrome / Edge / Firefox) still produce mp4 loops via VP9
-or AV1. On older browsers with no WebCodecs support at all, the video tiles
+or AV1. Generation and playback happen in the same browser session (a freshly
+encoded video Blob is rendered as an inline `<video>`), so codec compatibility
+with other browsers is not a concern — Safari users always get H.264 because
+their browser has it, Linux Chrome users get VP9 / AV1 and play it back
+themselves. On older browsers with no WebCodecs support at all, the video tiles
 fall back to the static PNG. Source: `web/` (Astro + Solid +
 Tailwind). The visual language and component conventions are documented in
 [`DESIGN.md`](./DESIGN.md). UI text is auto-localized: Japanese for `ja-*`

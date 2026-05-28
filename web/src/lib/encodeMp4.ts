@@ -88,6 +88,10 @@ export async function pickSupportedVideoCodec(
   for (const hardwareAcceleration of accelHints) {
     for (const cand of candidates) {
       try {
+        // probe 時の bitrate / framerate / 解像度は実際の encoder.configure と
+        // 完全一致させる方針。probe で OK と判定された組み合わせをそのまま
+        // configure に渡すことで、isConfigSupported: true だったのに configure
+        // で失敗するケースを最小化する。
         const result = await VideoEncoder.isConfigSupported({
           codec: cand.codec,
           width,

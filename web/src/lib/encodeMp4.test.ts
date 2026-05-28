@@ -119,13 +119,8 @@ describe('pickSupportedVideoCodec - 異常系', () => {
   it('B6: VideoEncoder が undefined なら null（isConfigSupported は呼ばれない）', async () => {
     vi.unstubAllGlobals();
     vi.stubGlobal('VideoEncoder', undefined);
-    // ローカルの spy を新たに置いて 0 回呼ばれた事を確認
-    const spy = vi.fn();
-    // VideoEncoder 自体が undefined なのでこの spy は呼ばれ得ないが
-    // 念のため別経路として用意（実行時アクセスを検知する目的ではない）
     const picked = await pickSupportedVideoCodec(1280, 720);
     expect(picked).toBeNull();
-    expect(spy).not.toHaveBeenCalled();
   });
 
   it('B7: VideoEncoder.isConfigSupported が関数でない場合 null', async () => {
@@ -263,7 +258,7 @@ describe('pickSupportedVideoCodec - 事故パターン予防', () => {
     expect(picked?.codec).toBe('vp09.00.41.08');
   });
 
-  it('E20: 連続 2 回呼んでも同じ結果（純関数性、呼び出し回数も 2 倍）', async () => {
+  it('E20: 連続 2 回呼んでも同じ結果（内部キャッシュ無し / no internal caching、呼び出し回数も 2 倍）', async () => {
     isConfigSupported.mockResolvedValue({ supported: false, config: {} });
     const a = await pickSupportedVideoCodec(1280, 720);
     const b = await pickSupportedVideoCodec(1280, 720);
@@ -273,6 +268,9 @@ describe('pickSupportedVideoCodec - 事故パターン予防', () => {
   });
 
   it('E21: throw catch 時に console.error / console.warn を呼ばない', async () => {
+    // probe 失敗時に console を汚さない方針。ユーザー環境で「正常な fallback
+    // 経路」として warn が大量に出ないようにするための固定。将来ログを出す
+    // べきと判断した時にこのテストが先に落ちる前提で固定。
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     isConfigSupported.mockRejectedValue(new Error('probe failed'));
