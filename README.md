@@ -136,13 +136,21 @@ that base angle.
 ### Softness
 
 `--softness low|mid|high` (default `mid`) is a single axis that bundles alpha,
-blur, and edge softness:
+blur offset, and glyph/image edge softness.
 
-- `low` — default alpha + weak blur + sharper edges. Tuned for a crisper plate
-  or wallpaper look.
-- `mid` — identical to the previous default. Existing renders are unchanged.
-- `high` — weaker alpha + stronger blur + softer edges. Tuned for sitting
-  **underneath text overlays** so the orbs read as ambient color.
+- `low` — alpha=1.0 + blur+0.0 + crisper glyph/image silhouettes. The
+  crisp baseline (this used to be the default before #205).
+- `mid` — alpha=0.55 + blur+0.25 + medium silhouette softness. **Default
+  since #205**, tuned so every shape reads close to the orb softness on
+  first glance.
+- `high` — alpha=0.35 + blur+0.5 + maximum silhouette softness. Tuned for
+  sitting **underneath text overlays** so the orbs read as ambient color,
+  or for a cinematic mood plate.
+
+> The original Phase A scale had a sharper `low` (`blur_offset = -0.25`)
+> and put `mid` at the legacy default. #205 shifted the whole scale toward
+> blurry — the old sharp `low` is retired since nothing in the GUI relied
+> on the extra sharpness it provided.
 
 ```bash
 orber --input photo.jpg --output wallpaper.png --softness low
