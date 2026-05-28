@@ -461,19 +461,48 @@ dependency itself is small and pure-Rust (no shaping, no FreeType).
 ## Softness axis
 
 `--softness {low, mid, high}` is a **single user-facing axis** that bundles
-three internal knobs (alpha, blur strength, edge softness) into a 3-stop
-preset.
+three internal knobs (alpha, blur offset, glyph/image edge softness) into a
+3-stop preset.
 
-| preset | alpha | blur | edge | use case |
+| preset | alpha | blur | edge softness | use case |
 |---|---|---|---|---|
-| `low`  | default | weak   | sharp | crisp plate / wallpaper |
-| `mid`  | default | default | default | legacy default |
-| `high` | weak    | strong | soft  | sit underneath text overlay |
+| `low` | 1.0 | 0.0 | 0.3 | crisper baseline (was the legacy default before #205) |
+| `mid` (default) | 0.55 | +0.25 | 0.6 | new default — orb-like softness across all shapes |
+| `high` | 0.35 | +0.5 | 1.0 | maximum blur (sit underneath text overlay or for cinematic mood) |
 
-`mid` is the **identity preset** — its alpha / blur / edge values are exactly
-the existing defaults, so passing `--softness mid` (or omitting the flag) is
-guaranteed to match the pre-preset render bit-for-bit. The preset is
-implemented as `SoftnessPreset { Low, Mid, High }` in `crates/core/src/style.rs`.
+**#205 — Scale shifted toward blurry.** The original Phase A preset put
+`mid` at the legacy default (alpha=1.0 / blur+0.0) and `low` at a sharper
+extreme (blur-0.25). After comparing the Web GUI Glyph / image arm against
+the Circle arm we settled on "orb-like softness as the new baseline", so
+the whole table shifts upward: the old `mid` becomes the new `low`, the old
+`high` becomes the new `mid` (default), and a brand-new `high` extends the
+soft end. The old sharp `low` (`blur_offset = -0.25`) is **retired** —
+nothing in the GUI used the extra sharpness it provided.
+
+The `edge softness` column drives the Glyph / image arm's smoothstep mask
+(`smoothstep(-edge_softness, edge_softness * 0.5, signed_unit)`) in the
+fragment shader. The Circle arm uses Euclidean distance + `falloff_curve`,
+so it is unaffected by this column. Higher values produce a softer
+silhouette outline. The full transition width in `signed_unit` space is
+`1.5 * edge_softness` (from `-edge_softness` to `0.5 * edge_softness`),
+which projects to roughly the following fraction of orb radius:
+
+| preset | edge_softness | full transition width | half-width |
+|---|---|---|---|
+| `low` | 0.3 | ~7.5% of orb radius | ~3.75% |
+| `mid` | 0.6 | ~15% of orb radius | ~7.5% |
+| `high` | 1.0 | ~25% of orb radius | ~12.5% |
+
+Note: edge_softness is consumed only by the WebGL2 fragment shader
+(Glyph/image arm). The CPU path (`render_static` / `animate.rs`) achieves
+the analogous softness via `blur_offset` and the post-render
+`aquarelle bleed pass` (#195/#199). The two implementations differ but
+target the same visual goal.
+
+The preset is implemented as `SoftnessPreset { Low, Mid, High }` in
+`crates/core/src/style.rs`. The values flow into the WebGL2 path via
+`pack_render_data_for_webgl` header slots 9 (`alpha_mul`), 5 (base blur after
+`+ blur_offset`), and 12 (`edge_softness`, #205).
 
 ## Phase B — Web GUI parity (#55)
 
@@ -516,11 +545,17 @@ speed / softness without dropping to the terminal.
   silhouette — destroying the shape's individuality.
 
   **#203 (mask × profile)** splits responsibilities: the SDF becomes a pure
-  shape mask via `sdf_mask = smoothstep(-0.05, 0.05, signed_unit)` (with
-  mask=0 for UV outside the box), and the Circle-identical
-  `radial_alpha = falloff_curve(style_bit, r_euclid, blur, opacity)` provides
-  the soft center-to-edge profile. The final alpha is the product
-  `radial_alpha * sdf_mask`. For Glyph='●' the SDF is a filled disk so the
+  shape mask via `sdf_mask = smoothstep(-edge_softness, edge_softness * 0.5,
+  signed_unit)` (with mask=0 for UV outside the box), and the
+  Circle-identical `radial_alpha = falloff_curve(style_bit, r_euclid, blur,
+  opacity)` provides the soft center-to-edge profile. The final alpha is the
+  product `radial_alpha * sdf_mask`. The smoothstep half-width was originally
+  hard-coded at ±0.05; **#205** replaced it with the
+  `u_glyph_edge_softness` uniform driven by `SoftnessPreset::edge_softness()`
+  (Low=0.3 / Mid=0.6 / High=1.0). The lower bound is wide, the upper bound is
+  pulled back to half that value so the mask still pinches off inside the
+  SDF box (no mask=1 leaking far past the silhouette) while the outer
+  fall-off broadens proportionally with softness. For Glyph='●' the SDF is a filled disk so the
   mask is 1 inside the silhouette and alpha collapses to
   `falloff_curve(r_euclid)` — visually very close to `shape=Circle` (the
   outermost ~10% fade ring is omitted because the glyph's SDF radius is
@@ -533,9 +568,11 @@ speed / softness without dropping to the terminal.
   counterpart to the CLI-side bleed pass added in #195/#199: separate
   implementations, same visual goal of matching Glyph/image softness to Circle.
 - `get_render_data`'s 16-word header schema reserves words 9 and 10 for
-  `alpha_mul` and `shape_id` (previously zero-filled reserved words). The
-  per-orb 16-word slots now also use words 11 and 12 for `base_angle` and
-  `rot_speed_signed` (the remaining tail words stay reserved).
+  `alpha_mul` and `shape_id` (previously zero-filled reserved words), word 11
+  for `glyph_rotate` (#136), and word 12 for `edge_softness` (#205, drives
+  the Glyph/image smoothstep). The per-orb 16-word slots use words 11 and 12
+  for `base_angle` and `rot_speed_signed` (the remaining tail words stay
+  reserved).
 - Studio UI (#131): the collapsible Advanced section is gone. Instead, the
   four axes are always visible as flat control rows directly under the aspect
   toggles. Every control immediately re-runs the batch:

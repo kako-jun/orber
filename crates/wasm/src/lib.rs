@@ -535,9 +535,11 @@ pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsErr
 /// - `[6]`: direction_id (0=LR, 1=RL, 2=TB, 3=BT)
 /// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow, 3 = Mid, 4 = Fast)
 /// - `[8]`: n_orbs (整数を f32 として)
-/// - `[9]`: softness_alpha_mul (0..1) — Phase B (#55)。Mid なら 1.0
+/// - `[9]`: softness_alpha_mul (0..1) — Phase B (#55)。Mid なら 0.55 (#205 後)
 /// - `[10]`: shape_id (0=Circle, 1=Glyph) — Phase B (#55)
-/// - `[11..16]`: 予約（0 詰め）
+/// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
+/// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
+/// - `[13..16]`: 予約（0 詰め）
 ///
 /// `[16 + 16*i ..]` per orb i:
 /// - `[+0..+3]`: color_rgb (0..1)
@@ -618,9 +620,11 @@ pub fn get_render_data(
 
     let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
     // Phase B (#55): softness.blur_offset() を base_blur に積算（core/animate と同式）。
-    // Mid なら +0.0 で既存挙動と完全同値。
+    // #205 以降 Mid は +0.25 で blurry 寄りの新 default。
     let base_blur = (spec.blur + softness.blur_offset()).clamp(0.0, 1.0);
     let alpha_mul = softness.alpha_mul().clamp(0.0, 1.0);
+    // #205: Glyph/image アーム smoothstep 幅を softness 連動。Circle は参照しない。
+    let edge_softness = softness.edge_softness();
     let shape_id: f32 = match shape {
         OrbShape::Circle => 0.0,
         OrbShape::Glyph { .. } => 1.0,
@@ -641,6 +645,7 @@ pub fn get_render_data(
         alpha_mul,
         shape_id,
         p.glyph_rotate,
+        edge_softness,
     );
 
     Ok(js_sys::Float32Array::from(buf.as_slice()))
@@ -651,8 +656,8 @@ pub fn get_render_data(
 ///
 /// WebGL path が core のアニメーションと別 RNG 列を持たないよう、乱数列は
 /// ここで再実装せず `orber_core::animate::generate_orb_params` に委譲する。
-// TODO(orber#future): pack_render_data の引数が 11 個に達した。Phase C で
-// orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
+// TODO(orber#future): pack_render_data の引数が 12 個に達した (#205 で edge_softness 追加)。
+// Phase C で orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
 #[allow(clippy::too_many_arguments)]
 fn pack_render_data(
     clusters: &[Cluster],
@@ -666,6 +671,7 @@ fn pack_render_data(
     alpha_mul: f32,
     shape_id: f32,
     glyph_rotate: bool,
+    edge_softness: f32,
 ) -> Vec<f32> {
     pack_render_data_for_webgl(
         clusters,
@@ -679,6 +685,7 @@ fn pack_render_data(
         alpha_mul,
         shape_id,
         glyph_rotate,
+        edge_softness,
     )
 }
 
@@ -1148,6 +1155,7 @@ mod tests {
             softness.alpha_mul().clamp(0.0, 1.0),
             1.0,
             true,
+            softness.edge_softness(),
         );
         let expected = pack_render_data_for_webgl(
             &clusters,
@@ -1161,7 +1169,52 @@ mod tests {
             softness.alpha_mul().clamp(0.0, 1.0),
             1.0,
             true,
+            softness.edge_softness(),
         );
         assert_eq!(buf, expected);
+    }
+
+    /// #205: get_render_data の header[12] に softness.edge_softness() がそのまま
+    /// 入っていることを担保する。
+    #[test]
+    fn pack_render_data_header_includes_edge_softness() {
+        let mut p = base_params();
+        p.k = 2;
+        p.source_width = 2;
+        p.source_height = 2;
+        p.source_rgb = vec![
+            255, 0, 0, 255, 0, 0, //
+            0, 0, 255, 0, 0, 255,
+        ];
+        let total = 12usize;
+        let spec_idx = 0usize;
+        let still_count = total - GUI_VIDEO_COUNT_DEFAULT;
+        let (_, bg, clusters) = get_or_build_clusters(&mut p).expect("clusters should build");
+        let specs = random_batch_specs(42, total, still_count);
+        let spec = specs[spec_idx];
+        let speed = speed_for_spec_idx(spec_idx, still_count, &spec);
+        // Low / Mid / High それぞれで header[12] が edge_softness() と一致すること。
+        for preset in [
+            SoftnessPreset::Low,
+            SoftnessPreset::Mid,
+            SoftnessPreset::High,
+        ] {
+            let n_orbs = spec.count.clamp(1, MAX_ORB_COUNT);
+            let buf = pack_render_data(
+                &clusters,
+                bg,
+                (64f32) * 0.25 * spec.orb_size.max(0.0),
+                (spec.blur + preset.blur_offset()).clamp(0.0, 1.0),
+                0.0,
+                speed.cycle_count() as f32,
+                spec.seed,
+                n_orbs,
+                preset.alpha_mul().clamp(0.0, 1.0),
+                1.0,
+                true,
+                preset.edge_softness(),
+            );
+            assert!((buf[12] - preset.edge_softness()).abs() < 1e-6);
+        }
     }
 }

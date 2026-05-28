@@ -3,6 +3,12 @@
 // orber#198 → #201 → #203 で Glyph/image アームの softening 合成を最終的に
 // 「SDF マスク × Circle profile」の乗算形に確定。過去の試行履歴は shader 本体
 // のコメントブロックを参照。
+// orber#205 — Glyph/image アームの smoothstep 幅を softness 連動に変更。
+// u_glyph_edge_softness uniform (header[12] 経由) を softness preset の
+// edge_softness() (Low=0.3 / Mid=0.6 / High=1.0) で駆動し、ハードコード ±0.05 を
+// `smoothstep(-u_glyph_edge_softness, u_glyph_edge_softness * 0.5, signed_unit)`
+// に置き換える。下限を広く・上限を控えめにすることで、SDF を「形状ゲート」として
+// 残しつつ縁を blurry にする。
 //
 // `orber-wasm` の `get_render_data` で得た Float32Array をそのまま uniform に
 // 流し、fragment shader 1 pass で全 orb の Source-Over 合成を行う。
@@ -93,12 +99,16 @@ uniform float u_direction;     // 0=LR, 1=RL, 2=TB, 3=BT
 uniform float u_cycle;         // 1=VerySlow, 2=Slow, 3=Mid, 4=Fast
 uniform int u_n_orbs;
 // Phase B (#55):
-uniform float u_alpha_mul;     // softness.alpha_mul (Mid=1.0)
+uniform float u_alpha_mul;     // softness.alpha_mul (Mid=0.55 after #205)
 uniform int u_shape_id;        // 0=Circle, 1=Glyph
 uniform sampler2D u_glyph_sdf;
 // #136: glyph 回転 ON/OFF。1.0 = ON (legacy), 0.0 = OFF (静止)。
 // OFF でも base_angle は乗るので glyph 文字の初期向きは保たれる。
 uniform float u_glyph_rotate;
+// #205: Glyph/image アーム smoothstep 幅 (softness 連動)。Low=0.3 / Mid=0.6 / High=1.0。
+// smoothstep(-u_glyph_edge_softness, u_glyph_edge_softness * 0.5, signed_unit) で SDF を
+// 形状ゲートに変換する。Circle アームは Euclidean distance + falloff_curve なので参照しない。
+uniform float u_glyph_edge_softness;
 
 // per-orb uniforms (length MAX_ORBS = 64). Float で詰める。
 uniform vec4 u_orb_color[${MAX_ORBS}];     // (r, g, b, weight)
@@ -243,20 +253,26 @@ void main() {
       vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
 
       // SDF -> smooth shape mask. signed_unit > 0 inside, < 0 outside.
-      // The 0.05 half-width is an empirical edge-softness tuning constant for
-      // the 256x256 SDF resolution; widen for a softer outline, narrow for a
-      // crisper one. UV outside the SDF box is forced to mask=0 so no
-      // texture lookup leaks outside the silhouette.
+      // #205: the smoothstep half-width is now driven by u_glyph_edge_softness
+      // (softness preset edge_softness(), 0.3..=1.0). The lower bound is wide
+      // and the upper bound is held back at u_glyph_edge_softness * 0.5 so
+      // the mask still pinches off well inside the SDF box (avoiding mask=1
+      // far beyond the silhouette) while the outer fall-off broadens
+      // proportionally with softness. UV outside the SDF box is forced to
+      // mask=0 so no texture lookup leaks beyond the silhouette.
       //
-      // Screen-space transition width is roughly 0.85% of orb radius (e.g.
-      // ~1.3 px at radius=150). If GLYPH_SDF_MAX_DIST_FACTOR
-      // (crates/core/src/glyph.rs) is changed, this value shifts
-      // proportionally and the on-screen edge softness scales with it.
+      // Screen-space full transition width is 1.5 * edge_softness in
+      // signed_unit space, which projects to roughly:
+      //   Low  (edge_softness=0.3) — full ~7.5% / half ~3.75% of orb radius
+      //   Mid  (edge_softness=0.6) — full ~15%  / half ~7.5%  of orb radius
+      //   High (edge_softness=1.0) — full ~25%  / half ~12.5% of orb radius
+      // Visibly orb-like at Mid/High; Low stays close to the legacy
+      // +/-0.05 half-width baseline. Previously a hard-coded 0.05 half-width.
       float sdf_mask;
       if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
         float sdf01 = texture(u_glyph_sdf, uv).r;
         float signed_unit = sdf01 * 2.0 - 1.0;
-        sdf_mask = smoothstep(-0.05, 0.05, signed_unit);
+        sdf_mask = smoothstep(-u_glyph_edge_softness, u_glyph_edge_softness * 0.5, signed_unit);
       } else {
         sdf_mask = 0.0;
       }
@@ -385,6 +401,8 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     shapeId: gl.getUniformLocation(prog, 'u_shape_id'),
     glyphMask: gl.getUniformLocation(prog, 'u_glyph_sdf'),
     glyphRotate: gl.getUniformLocation(prog, 'u_glyph_rotate'),
+    // #205: softness 連動の Glyph/image smoothstep 幅。
+    glyphEdgeSoftness: gl.getUniformLocation(prog, 'u_glyph_edge_softness'),
     orbColor: gl.getUniformLocation(prog, 'u_orb_color'),
     orbPhase: gl.getUniformLocation(prog, 'u_orb_phase'),
     orbMisc: gl.getUniformLocation(prog, 'u_orb_misc'),
@@ -455,9 +473,14 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     const nOrbs = data[8] | 0;
     // Phase B (#55): header[9] = alpha_mul, header[10] = shape_id (0=Circle, 1=Glyph)。
     // #136: header[11] = glyph_rotate (1.0=ON / 既定, 0.0=OFF)。
+    // #205: header[12] = edge_softness (Glyph/image smoothstep 幅、0.3..=1.0)。
+    // 旧 wasm から呼ばれた場合は header[12] = 0 になりうるが、その場合 smoothstep
+    // 幅が 0 に縮退して mask が hard-edge になるだけで shader compile は通る。
+    // 現行 wasm は必ず edge_softness を詰めるので実害なし。
     const alphaMul = data[9];
     const shapeId = data[10] | 0;
     const glyphRotate = data[11];
+    const glyphEdgeSoftness = data[12];
 
     if (nOrbs > MAX_ORBS) {
       throw new Error(`n_orbs ${nOrbs} exceeds MAX_ORBS=${MAX_ORBS}`);
@@ -478,6 +501,9 @@ export function createGlRenderer(canvas: AnyCanvas): GlRenderer {
     gl!.uniform1f(uLoc.alphaMul, alphaMul);
     gl!.uniform1i(uLoc.shapeId, shapeId);
     gl!.uniform1f(uLoc.glyphRotate, glyphRotate);
+    // #205: softness 連動 smoothstep 幅。Circle 経路では参照されない uniform だが
+    // 毎フレーム書く必要は無く、setRenderData が呼ばれたタイミングで一度書けば足りる。
+    gl!.uniform1f(uLoc.glyphEdgeSoftness, glyphEdgeSoftness);
 
     // per-orb を 3 本の vec4 配列に詰め直す。余り (i >= nOrbs) は 0 詰め
     // のままで shader 側で `i >= u_n_orbs` ガードしているので使われない。

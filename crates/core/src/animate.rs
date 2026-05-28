@@ -319,6 +319,11 @@ fn unit_from_hash(x: u64) -> f32 {
 ///
 /// `glyph_rotate` (#136): `false` を渡すと shader 側で per-orb 回転を抑止し、
 /// 全 t で `base_angle` のまま描く。Circle 経路には影響しない。
+///
+/// `edge_softness` (#205): Glyph / image アームの smoothstep 幅を softness preset と
+/// 連動させるため、`SoftnessPreset::edge_softness()` の値 (0.3 / 0.6 / 1.0) を
+/// shader に流す。Circle アームは Euclidean distance + falloff_curve なので影響を
+/// 受けない。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data_for_webgl(
@@ -333,6 +338,7 @@ pub fn pack_render_data_for_webgl(
     alpha_mul: f32,
     shape_id: f32,
     glyph_rotate: bool,
+    edge_softness: f32,
 ) -> Vec<f32> {
     let header_words = 16usize;
     let per_orb_words = 16usize;
@@ -351,6 +357,9 @@ pub fn pack_render_data_for_webgl(
     buf[10] = shape_id;
     // #136: header[11] = glyph_rotate (1.0 = ON / 既定, 0.0 = OFF)。既存ヘッダ予約域に追加。
     buf[11] = if glyph_rotate { 1.0 } else { 0.0 };
+    // #205: header[12] = edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0)。
+    // Circle アームは参照しない。残り header[13..16] は今後の拡張用に予約。
+    buf[12] = edge_softness;
 
     if n_orbs == 0 || clusters.is_empty() {
         return buf;

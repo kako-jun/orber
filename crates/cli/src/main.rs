@@ -64,13 +64,15 @@ impl From<CliSpeed> for MotionSpeed {
 }
 
 /// Visual softness preset (`--softness`). Single axis, three steps (#55).
+/// #205 で全体が blurry 方向にシフトされた。旧 Low は廃止、旧 Mid→新 Low、
+/// 旧 High→新 Mid (default)、新 High が追加された。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliSoftness {
-    /// Low softness: less blur, sharper edges.
+    /// Crisper baseline (was the legacy default before #205): less blur, sharper edges.
     Low,
-    /// Same look as before (default; no regression).
+    /// Orb-like softness (new default; same look as the previous "high" preset).
     Mid,
-    /// High softness: more blur, softer edges, slightly fainter center.
+    /// Maximum blur — use under text overlays or for cinematic mood.
     High,
 }
 
@@ -303,8 +305,10 @@ struct Cli {
     #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
     glyph_char: char,
 
-    /// Visual softness preset (#55): low / mid / high.
-    /// Low = sharper / less blur, Mid = legacy default, High = softer / more blur.
+    /// Visual softness preset (#55, #205): low / mid / high.
+    /// Low = crisper baseline (was the legacy default before #205),
+    /// Mid = orb-like softness (new default; same look as the previous "high" preset),
+    /// High = maximum blur (use under text overlays or for cinematic mood).
     #[arg(long, value_enum, default_value_t = CliSoftness::Mid)]
     softness: CliSoftness,
 
