@@ -15,10 +15,10 @@
 //!   blur=1 → 中心の不透明領域が点に近く、緩やかに減衰
 //! - 彩度調整は palette の HSL 経由
 
-use aquarelle::{render_aquarelle_orb, AquarelleParams};
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, GlyphFontId};
 use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
+use aquarelle::{render_aquarelle_orb, AquarelleParams};
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use tiny_skia::{
