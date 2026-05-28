@@ -218,8 +218,18 @@ export function detectLang(): Lang {
   // が誤った言語で出力される事故が起きる)。window は SSR 環境では未定義。
   if (typeof window === 'undefined') return 'en';
   const nav = window.navigator;
-  if (!nav || typeof nav.language !== 'string') return 'en';
-  return nav.language.toLowerCase().startsWith('ja') ? 'ja' : 'en';
+  if (!nav) return 'en';
+  // navigator.languages (優先言語リスト全体) を見る。
+  // Android Chrome では navigator.language がブラウザUI言語を返すため、
+  // システム言語が ja でもブラウザが en 設定だと 'en' になってしまう。
+  // リスト全体に 'ja' が含まれていれば日本語ユーザーと判定する。
+  const langs: readonly string[] =
+    Array.isArray(nav.languages) && nav.languages.length > 0
+      ? nav.languages
+      : typeof nav.language === 'string'
+        ? [nav.language]
+        : [];
+  return langs.some((l) => l.toLowerCase().startsWith('ja')) ? 'ja' : 'en';
 }
 
 // orber#161 — Solid hydration mismatch 対策。
