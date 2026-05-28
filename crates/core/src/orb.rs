@@ -660,4 +660,356 @@ mod tests {
             "OrbShape::Glyph via render_static should paint visible pixels, lit={lit}"
         );
     }
+
+    // ===== #195: 3 shape の決定論性と Glyph bleed pass の効果検証テスト群 =====
+
+    #[test]
+    fn circle_render_static_is_deterministic_after_refactor() {
+        // Circle の render_static は同じ入力で 2 回呼ぶと完全に byte-equal を保つ。
+        // #195 で 3 shape を対等な match 分岐に整理したが、Circle 経路は退化していない。
+        let clusters = [
+            cluster([200, 100, 50], 0.3, 0.4, 1.0),
+            cluster([50, 200, 100], 0.7, 0.6, 0.8),
+            cluster([100, 50, 200], 0.5, 0.5, 0.5),
+        ];
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Circle,
+            ..Default::default()
+        };
+        let a = render_static(&clusters, &opts);
+        let b = render_static(&clusters, &opts);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "Circle render_static must be byte-equal on repeated calls (determinism)"
+        );
+    }
+
+    #[test]
+    fn circle_multi_cluster_premul_invariant() {
+        // un-premultiply 後の不変条件: alpha==0 のとき rgb は (0,0,0) に正規化される。
+        // また、各チャネルは u8 として 0..=255 の範囲に収まる（型として保証されるが念のため）。
+        let clusters = [
+            cluster([200, 100, 50], 0.3, 0.4, 1.0),
+            cluster([50, 200, 100], 0.7, 0.6, 0.8),
+            cluster([100, 50, 200], 0.5, 0.5, 0.5),
+        ];
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Circle,
+            ..Default::default()
+        };
+        let img = render_static(&clusters, &opts);
+        for px in img.pixels() {
+            if px[3] == 0 {
+                assert_eq!(
+                    [px[0], px[1], px[2]],
+                    [0, 0, 0],
+                    "alpha=0 pixel must have RGB normalized to 0"
+                );
+            }
+            // u8 の range は型で保証されるが、明示的にチェックして不変条件を残す。
+            assert!(px[0] <= 255 && px[1] <= 255 && px[2] <= 255);
+        }
+    }
+
+    #[test]
+    fn aquarelle_render_static_is_deterministic() {
+        // Aquarelle 経路の render_static は同じ入力で byte-equal を保つ。
+        // 内部 seed は cluster index 由来で決定論的なので、2 回描画して一致するはず。
+        let c = cluster([200, 100, 50], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Aquarelle(AquarelleParams::default()),
+            ..Default::default()
+        };
+        let a = render_static(std::slice::from_ref(&c), &opts);
+        let b = render_static(std::slice::from_ref(&c), &opts);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "Aquarelle render_static must be byte-equal on repeated calls (determinism)"
+        );
+    }
+
+    #[test]
+    fn aquarelle_differs_from_circle_for_same_cluster() {
+        // 同じ cluster / opts を Circle と Aquarelle で描画したとき、出力は別物になる。
+        // 一致してしまうと Aquarelle 経路が事実上 Circle と同じ絵を出す退化に気付けない。
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let base = RenderOptions {
+            width: 96,
+            height: 96,
+            ..Default::default()
+        };
+        let circle_opts = RenderOptions {
+            shape: OrbShape::Circle,
+            ..base.clone()
+        };
+        let aquarelle_opts = RenderOptions {
+            shape: OrbShape::Aquarelle(AquarelleParams::default()),
+            ..base
+        };
+        let img_circle = render_static(std::slice::from_ref(&c), &circle_opts);
+        let img_aquarelle = render_static(std::slice::from_ref(&c), &aquarelle_opts);
+        assert_ne!(
+            img_circle.as_raw(),
+            img_aquarelle.as_raw(),
+            "Aquarelle rendering must produce a different pixmap than Circle for the same cluster"
+        );
+    }
+
+    #[test]
+    fn glyph_bleed_pass_is_deterministic() {
+        // Glyph + bleed pass (seed=0 固定) は同じ入力で 2 回描画して byte-equal を保つ。
+        // bleed pass が非決定論的な乱数を引き始めたらこのテストが破綻して警告となる。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let a = render_static(std::slice::from_ref(&c), &opts);
+        let b = render_static(std::slice::from_ref(&c), &opts);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "Glyph render_static (with bleed pass seed=0) must be byte-equal on repeated calls"
+        );
+    }
+
+    #[test]
+    fn glyph_lit_pixels_remain_visible_after_bleed() {
+        // bleed pass を通してもグリフの白塗りピクセルが極端に薄まって消えていないこと。
+        // 既存 glyph_shape_renders_via_render_static と同じ閾値 (lit > 32) で担保する。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 100,
+            height: 100,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[c], &opts);
+        let lit = img.pixels().filter(|p| p[0] > 32).count();
+        assert!(
+            lit > 32,
+            "Glyph lit pixels must survive the bleed pass (lit > 32), got lit={lit}"
+        );
+    }
+
+    #[test]
+    fn glyph_bleed_produces_halo_around_lit_pixel_cluster() {
+        // bleed pass の直接の証拠: グリフ本体の境界から外側に halo が漏れる。
+        // 3-pass box blur (radius=3) の到達距離は概ね 9px。
+        //
+        // アプローチ: 同じグリフを 2 通りで描画し halo 領域の brightness 合計を比較する。
+        // - reference: 通常の Glyph render_static (= bleed pass あり)
+        // - control:  Circle render_static (= bleed pass なし) を「同じ位置に絶対に lit pixel が
+        //              ない領域」の参照背景として使い、その領域の R 合計 (= 0) と比較
+        //
+        // ……ではなく、より単純に「Glyph 出力の中で『中心から十分離れた / 黒背景の領域』に
+        // R > 0 の pixel が一定数以上ある」を確認する。bleed が無ければ glyph SDF 範囲外の
+        // pixel は完全な黒 (R=0) であるはず。
+        //
+        // 判断ポイント: 64x64 に default orb_size=1.0 で描画 → 半径 = 16px。グリフ中心は
+        // (32, 32)。「中心から距離 >= 22px」の pixel (= 半径より 6px 外側) を halo 候補領域
+        // とし、その中に R > 0 pixel が少なくとも 8 個あれば bleed pass が halo を出している。
+        // bleed radius は box-blur*3 で実効 ~9px のため、中心から 22..=25px の範囲には
+        // halo がしっかり届く。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[c], &opts);
+        let cx = 32.0f32;
+        let cy = 32.0f32;
+        // 半径 18..=20 のリング: ☆ グリフ本体は r<=16 でほぼ完結し (max R ~30+)、
+        // r=17 以降は max R が <= 2 まで急落する = 本体ピクセルは無くなる領域。
+        // ここで lit pixel (R>0) が複数残っていれば、それは bleed pass が外側に
+        // にじみを広げた halo の直接の証拠。
+        // 経験的に r=18 で ~29px, r=19 で ~15px, r=20 で ~3px の halo が観測される。
+        let mut halo_count = 0;
+        let mut halo_max_r = 0u8;
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let d = (dx * dx + dy * dy).sqrt();
+                if (18.0..21.0).contains(&d) {
+                    let px = img.get_pixel(x, y);
+                    if px[0] > 0 {
+                        halo_count += 1;
+                        halo_max_r = halo_max_r.max(px[0]);
+                    }
+                }
+            }
+        }
+        // halo の R 値は薄いがゼロではない (typical max_R ~= 1)。
+        // pixel 数のみで判定する。
+        assert!(
+            halo_count >= 10,
+            "bleed pass must leak halo (R>0) into the ring 18..=20px from glyph center; \
+             found {halo_count} halo pixels (max R = {halo_max_r}). \
+             expected ~30+ halo pixels."
+        );
+    }
+
+    #[test]
+    fn glyph_with_empty_clusters_stays_black_after_bleed() {
+        // clusters=&[] で Glyph 経路に入っても bleed pass で偽 pixel が生まれず、
+        // 全画面が背景の黒 (0,0,0,255) のままになる。
+        use crate::glyph::GlyphFontId;
+        let opts = RenderOptions {
+            width: 32,
+            height: 32,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[], &opts);
+        for px in img.pixels() {
+            assert_eq!(
+                [px[0], px[1], px[2], px[3]],
+                [0, 0, 0, 255],
+                "empty clusters + Glyph (with bleed) must stay solid black"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_zero_weight_cluster_stays_black_after_bleed() {
+        // weight=0 の cluster は半径 0 でスキップされ、Glyph 描画自体が走らない。
+        // 残った真っ黒 Pixmap に bleed pass をかけても黒のまま。
+        use crate::glyph::GlyphFontId;
+        let opts = RenderOptions {
+            width: 32,
+            height: 32,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..Default::default()
+        };
+        let img = render_static(&[cluster([255, 255, 255], 0.5, 0.5, 0.0)], &opts);
+        for px in img.pixels() {
+            assert_eq!(
+                [px[0], px[1], px[2], px[3]],
+                [0, 0, 0, 255],
+                "weight=0 + Glyph (with bleed) must stay solid black"
+            );
+        }
+    }
+
+    #[test]
+    fn all_shapes_produce_valid_premultiplied_inverted_rgba() {
+        // 3 shape どの経路でも、un-premultiply 後の出力は不変条件
+        // 「alpha==0 なら rgb==(0,0,0)」を満たす。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([200, 100, 50], 0.5, 0.5, 1.0);
+        let shapes = [
+            OrbShape::Circle,
+            OrbShape::Aquarelle(AquarelleParams::default()),
+            OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+        ];
+        for shape in shapes {
+            let opts = RenderOptions {
+                width: 48,
+                height: 48,
+                shape,
+                ..Default::default()
+            };
+            let img = render_static(std::slice::from_ref(&c), &opts);
+            for px in img.pixels() {
+                if px[3] == 0 {
+                    assert_eq!(
+                        [px[0], px[1], px[2]],
+                        [0, 0, 0],
+                        "alpha=0 pixel must have RGB=0 for shape={:?}",
+                        shape
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_shapes_produce_buffer_of_correct_size() {
+        // 3 shape どの経路でも、出力バッファ長は width*height*4 と一致する。
+        // RgbaImage::from_raw の expect で守られているが、明示的に契約として残す。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([200, 100, 50], 0.5, 0.5, 1.0);
+        let shapes = [
+            OrbShape::Circle,
+            OrbShape::Aquarelle(AquarelleParams::default()),
+            OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+        ];
+        for shape in shapes {
+            let opts = RenderOptions {
+                width: 40,
+                height: 56,
+                shape,
+                ..Default::default()
+            };
+            let img = render_static(std::slice::from_ref(&c), &opts);
+            assert_eq!(
+                img.as_raw().len(),
+                (opts.width * opts.height * 4) as usize,
+                "buffer length must be width*height*4 for shape={:?}",
+                shape
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_bleed_with_softness_high_still_deterministic() {
+        // softness=High でも Glyph + bleed pass の決定論性が保たれる。
+        // softness が blur/alpha に積算される経路でも乱数化されていないことを担保。
+        use crate::glyph::GlyphFontId;
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            softness: SoftnessPreset::High,
+            ..Default::default()
+        };
+        let a = render_static(std::slice::from_ref(&c), &opts);
+        let b = render_static(std::slice::from_ref(&c), &opts);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "Glyph + softness=High must remain byte-equal on repeated calls"
+        );
+    }
 }
