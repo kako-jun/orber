@@ -1,9 +1,7 @@
 # orber
 
-<p align="center">
-  <a href="https://nostalgic.llll-ll.com"><img src="https://api.nostalgic.llll-ll.com/visit?action=get&id=github-20b16cd9&format=image" alt="Visitors"></a>
-  <a href="https://nostalgic.llll-ll.com/yokoso"><img src="https://api.nostalgic.llll-ll.com/yokoso?action=get&id=github-20b16cd9&format=image" alt="Welcome"></a>
-</p>
+<a href="https://nostalgic.llll-ll.com"><img src="https://api.nostalgic.llll-ll.com/visit?action=get&id=github-20b16cd9&format=image" alt="Visitors" align="middle"></a>
+<a href="https://nostalgic.llll-ll.com/yokoso"><img src="https://api.nostalgic.llll-ll.com/yokoso?action=get&id=github-20b16cd9&format=image" alt="Welcome" align="middle"></a>
 
 Turn photos and videos into abstract **orb mood** output — colorful, blurry light spheres drifting slowly. Useful as video backgrounds, streaming wait screens, social story backgrounds, wallpapers, or just to obfuscate a personal photo into a vibe.
 
