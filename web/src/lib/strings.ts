@@ -232,27 +232,11 @@ export function detectLang(): Lang {
   return langs.some((l) => l.toLowerCase().startsWith('ja')) ? 'ja' : 'en';
 }
 
-// orber#161 — Solid hydration mismatch 対策。
-// 以前はモジュール init 時に detectLang() を呼んで signal を初期化していたが、
-// それだと SSR 評価値 ('en') と client 評価値 ('ja') が食い違い、Solid の
-// hydration が「DOM 既存 → 再レンダリングしない」最適化に引っかかって
-// SSR の EN テキストが残留する島が発生していた (一部だけ JP、他は EN という
-// 混在状態)。
-//
-// 対策: signal は SSR と同じ 'en' で初期化し、hydration 完了後の microtask で
-// setLang(detectLang()) を呼んで reactive 再評価をトリガする。これにより
-// 全 t() 呼び出しが (各島で) 同時に再評価され、言語が確実に揃う。
-//
-// 各 Solid island が同一モジュールチャンクを共有するか別かは Vite の chunk
-// 分割に依る。共有なら 1 度の setLang で全島更新、別なら各島の microtask が
-// それぞれ自島の signal を更新するため、どちらの構成でも結果は同じ。
-const [lang, setLang] = createSignal<Lang>('en');
-if (typeof window !== 'undefined') {
-  // microtask は hydration 用 top-level コードの直後・Subtitle.tsx の onMount より
-  // 前に走ることを期待。`createSignal` はデフォルトで `===` 等値ガード付きなので
-  // en ブラウザで `setLang('en')` を呼んでも no-op (購読側 effect は再走しない)。
-  queueMicrotask(() => setLang(detectLang()));
-}
+// client:only により SSR されないため、detectLang() を直接初期値として使える。
+// hydration mismatch は発生しない。
+const [lang, setLang] = createSignal<Lang>(
+  typeof window !== 'undefined' ? detectLang() : 'en'
+);
 export { lang, setLang };
 
 export type StringKey = keyof typeof STRINGS;

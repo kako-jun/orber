@@ -7,13 +7,13 @@ import PwaInstallPrompt from '../components/PwaInstallPrompt';
 ---
 <Base title="orber">
   <h1 class="font-display text-5xl font-light tracking-logo lowercase text-fg text-center pl-[0.4em]">orber</h1>
-  <Subtitle client:load />
-  <Studio client:load />
+  <Subtitle client:only="solid-js" />
+  <Studio client:only="solid-js" />
   {/* #128: Footer は Studio の自然なスクロール末尾に着地。client:visible で
       初期描画コストを下げる (画面に入った時点でだけ hydrate)。 */}
-  <Footer client:visible />
+  <Footer client:only="solid-js" />
   {/* #148: PWA install prompt は beforeinstallprompt を捕まえる必要があるので
       client:load で早めに hydrate する。普段は不可視で、browser がインストール
       可能と判定したときだけ画面下のトーストとして visible になる。 */}
-  <PwaInstallPrompt client:load />
+  <PwaInstallPrompt client:only="solid-js" />
 </Base>
