@@ -208,26 +208,29 @@ void main() {
       vec2 rotated = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
       vec2 uv = rotated / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
 
-      // orber#198: blend SDF and Euclidean r so Glyph / image get the same
-      // softness as Circle.
+      // orber#198: blend SDF and Euclidean r so Glyph/image gain a Circle-like
+      // soft halo on top of the SDF outline.
       //
-      //   r_sdf    — shape-derived r from the SDF signed distance.
-      //              Only meaningful while the rotated sample lands inside
-      //              the SDF texture UV box; otherwise we force it large so
-      //              the Euclidean term dominates.
-      //   r_euclid — Circle-style r = distance / radius. Defined everywhere.
+      //   r_sdf:    SDF-derived r. Inside the glyph it stays small, at the glyph
+      //             outline it rises to ~1 producing the existing falloff.
+      //   r_euclid: distance(center, px) / radius. Identical to the Circle arm.
       //
-      // Effective r = max(r_sdf, r_euclid):
-      //   - Inside the glyph: both small  → opaque core preserved.
-      //   - Near the glyph edge: r_sdf ≈ 1 drives falloff_curve into the
-      //                          rim/soft transition.
-      //   - Outside the glyph (and outside UV box): r_sdf is forced large,
-      //                          r_euclid takes over and produces the same
-      //                          Circle-style halo all the way out to
-      //                          r_euclid = 1.
+      // r = max(r_sdf, r_euclid) means:
+      //   - Inside glyph (both small): full opacity preserved.
+      //   - At glyph outline (r_sdf ≈ 1): r_sdf dominates and shapes the edge.
+      //   - Outside glyph but still within radius (r_sdf > 1, r_euclid < 1):
+      //     r_euclid wins and produces the Circle-style halo.
       //
-      // For Glyph='●' (filled circle SDF), r_sdf ≈ r_euclid, so max() collapses
-      // back to the Circle path and the two shapes become visually indistinct.
+      // UV-box edge case: outside the UV box r_euclid is already greater than √2
+      // because the UV box only covers ±radius·√2 in pixel space. falloff_curve
+      // returns 0 once r >= 1, so the UV-outside region is transparent regardless
+      // of r_sdf. The r_sdf = 2.0 defensive assignment exists only to keep the
+      // max() expression semantically consistent (both operands above the cutoff)
+      // without changing the final alpha.
+      //
+      // Glyph='●' case: the SDF is a filled circle, so r_sdf ≈ r_euclid and the
+      // max() collapses to the Circle formula — visually indistinguishable from
+      // shape=Circle. This is the perceptual goal of #198.
       //
       // The Circle arm below (u_shape_id == 0) is intentionally untouched.
       float dist = distance(px, vec2(cx, cy));

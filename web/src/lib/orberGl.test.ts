@@ -27,10 +27,10 @@ describe('orberGl fragment shader (#198)', () => {
   });
 
   test('Circle アーム (u_shape_id == 0) は従来式 r = dist / radius のまま', () => {
-    // else ブロックに dist/radius の Circle 計算が残っていること。
-    // Glyph 側の r_euclid も同じ式だが、Circle 側は `float r = dist / radius;` の
-    // 形のままなのでこちらで識別できる。
-    expect(_FS_FOR_TEST).toContain('float r = dist / radius;');
+    // else ブロック内に Circle 固有の dist 宣言 + r = dist / radius シーケンスが残っていること。
+    // Glyph アームの r_euclid と同じ式だが、Circle 側はローカル変数名 `dist` を経由した
+    // この 2 行シーケンスが識別子になる。
+    expect(_FS_FOR_TEST).toMatch(/float dist = distance\(px, vec2\(cx, cy\)\);\s*\n\s*float r = dist \/ radius;/);
   });
 
   test('Circle 経路の falloff_curve 呼び出しは Glyph 経路と同じ関数を共有している', () => {
