@@ -96,9 +96,6 @@ export default function AffiliateGrid() {
           </li>
         ))}
       </ul>
-      <p class="text-xs text-fgSubtle mt-3 text-center">
-        {t('affiliateDisclosure')}
-      </p>
     </section>
   );
 }

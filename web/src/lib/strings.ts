@@ -167,10 +167,6 @@ export const STRINGS = {
     ja: 'おすすめ',
     en: 'Picks',
   },
-  affiliateDisclosure: {
-    ja: '購入が orber 維持の支援になります (Amazon アソシエイト)',
-    en: 'As an Amazon Associate I earn from qualifying purchases.',
-  },
   amazonButtonLabel: {
     ja: 'Amazon で応援する',
     en: 'Support on Amazon',

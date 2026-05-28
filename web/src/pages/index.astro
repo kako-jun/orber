@@ -2,10 +2,12 @@
 import Base from '../layouts/Base.astro';
 import Studio from '../components/Studio';
 import Subtitle from '../components/Subtitle';
+import LangToggle from '../components/LangToggle';
 import Footer from '../components/Footer';
 import PwaInstallPrompt from '../components/PwaInstallPrompt';
 ---
 <Base title="orber">
+  <LangToggle client:only="solid-js" />
   <h1 class="font-display text-5xl font-light tracking-logo lowercase text-fg text-center pl-[0.4em]">orber</h1>
   <Subtitle client:only="solid-js" />
   <Studio client:only="solid-js" />

@@ -1277,6 +1277,11 @@ export default function Studio() {
           )}
         </Show>
       </label>
+      {/* Privacy note — Footer から移設 (session536)。ドロップ即座に
+          「サーバーへ送られない」境界条件を伝える方が安心感が出る。 */}
+      <p class="text-xs text-fgMuted leading-relaxed text-center max-w-md mx-auto">
+        {t('privacyNote')}
+      </p>
 
       {/* #133: aspect / shape / count / speed / softness すべてを 1 つの grid に
           載せて、各 row の左右端が完全に揃うようにする。

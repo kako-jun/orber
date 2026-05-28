@@ -168,10 +168,7 @@ export default function Footer() {
           class="block"
         />
 
-        {/* Privacy — orber の境界条件 (画像はブラウザ内処理) はここに残す。 */}
-        <p class="text-xs text-fgMuted leading-relaxed max-w-md">
-          {t('privacyNote')}
-        </p>
+        {/* Privacy note は #(session536) でドロップエリア直下に移動済み。 */}
 
         {/* Counter + version (1 行、tabular-nums)。
             #146 review S1: Counter 非表示時に version 単独になるため justify-center で
@@ -188,6 +185,7 @@ export default function Footer() {
                 id={NOSTALGIC_COUNTER_ID}
                 type="total"
                 format="text"
+                style="font-family: inherit;"
               />
               <span>{t('viewsLabelSuffix')}</span>
             </span>
