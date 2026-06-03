@@ -116,4 +116,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --features gpu -- -D warnings
 
       - name: Run GPU parity tests (lavapipe, must not skip)
-        run: cargo test -p orber-core --features gpu -- --nocapture
+        # --test-threads=1 belt-and-suspenders: the parity tests share one wgpu
+        # context via OnceLock so they no longer race on adapter/device bring-up,
+        # but serializing them removes any remaining contention on lavapipe.
+        run: cargo test -p orber-core --features gpu -- --nocapture --test-threads=1

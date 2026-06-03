@@ -325,7 +325,18 @@ struct Cli {
     /// cpu goes to 1024), or when built without the `gpu` feature. On the covered
     /// path (Circle, saturation applied, count <= 64) the two match within
     /// +/-2/channel; video and color/keyframe tracks are cpu-only.
+    /// Default depends on the build: the `gpu` feature builds default to `gpu`,
+    /// plain (CPU-only) builds default to `cpu` — so a stock `cargo install orber`
+    /// renders silently on the CPU instead of emitting a "no gpu feature, falling
+    /// back" warning on every run. Passing `--renderer gpu` to a CPU-only build
+    /// still warns (the user asked for something this build can't do).
+    #[cfg(feature = "gpu")]
     #[arg(long, value_enum, default_value_t = Renderer::Gpu)]
+    renderer: Renderer,
+
+    /// See the `gpu`-build variant above; CPU-only builds default to `cpu`.
+    #[cfg(not(feature = "gpu"))]
+    #[arg(long, value_enum, default_value_t = Renderer::Cpu)]
     renderer: Renderer,
 
     /// Glyph character used when --shape glyph (#55). Must be a single character.

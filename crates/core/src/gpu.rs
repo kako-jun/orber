@@ -51,7 +51,6 @@
 //! Phase 0 covers **Circle orbs only**. Glyph / image shapes / aquarelle are
 //! Phase 1; the CLI falls back to the CPU renderer for non-Circle shapes.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use image::RgbaImage;
@@ -78,8 +77,20 @@ pub const MAX_ORBS: usize = 64;
 const HEADER_WORDS: usize = 16;
 const PER_ORB_WORDS: usize = 16;
 
-/// The Circle orb WGSL (translation of `orberGl.ts` Circle arm).
-const ORB_CIRCLE_WGSL: &str = include_str!("orb_circle.wgsl");
+/// The Circle orb WGSL template (translation of `orberGl.ts` Circle arm). The
+/// `{{MAX_ORBS}}` placeholders are filled from [`MAX_ORBS`] at first use by
+/// [`orb_circle_wgsl`], so the shader's orb-array length / `MAX_ORBS` const is
+/// single-sourced from Rust instead of a hand-kept `64` literal.
+const ORB_CIRCLE_WGSL_TEMPLATE: &str = include_str!("orb_circle.wgsl");
+
+/// The resolved Circle WGSL, with `{{MAX_ORBS}}` substituted from [`MAX_ORBS`].
+/// Resolved once (the result is `&'static`) so it doubles as a stable cache key
+/// for the pipeline cache.
+fn orb_circle_wgsl() -> &'static str {
+    use std::sync::OnceLock;
+    static RESOLVED: OnceLock<String> = OnceLock::new();
+    RESOLVED.get_or_init(|| ORB_CIRCLE_WGSL_TEMPLATE.replace("{{MAX_ORBS}}", &MAX_ORBS.to_string()))
+}
 
 /// Header uniform block handed to the Circle shader. Mirrors `struct Params` in
 /// `orb_circle.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
@@ -155,10 +166,16 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter_name: String,
+    // Caches use `Mutex` (not `RefCell`) so `GpuRenderer` is `Sync`: the parity
+    // tests share one `&'static GpuRenderer` across threads (built once via
+    // `OnceLock`) to stop several `wgpu::Instance`/adapter/device bring-ups from
+    // racing under the default multi-threaded `cargo test`. wgpu's `Device`/`Queue`
+    // are already `Send + Sync`; only these interior-mutable caches needed locking.
+    // The CLI uses one renderer single-threaded, so the lock is uncontended there.
     /// Circle pipelines, keyed by shader source.
-    pipeline_cache: RefCell<HashMap<String, CachedPipeline>>,
+    pipeline_cache: std::sync::Mutex<HashMap<String, CachedPipeline>>,
     /// Per-size resources, keyed by `(width, height)`.
-    sized_cache: RefCell<HashMap<(u32, u32), SizedResources>>,
+    sized_cache: std::sync::Mutex<HashMap<(u32, u32), SizedResources>>,
 }
 
 impl GpuRenderer {
@@ -189,8 +206,8 @@ impl GpuRenderer {
             device,
             queue,
             adapter_name,
-            pipeline_cache: RefCell::new(HashMap::new()),
-            sized_cache: RefCell::new(HashMap::new()),
+            pipeline_cache: std::sync::Mutex::new(HashMap::new()),
+            sized_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -205,8 +222,8 @@ impl GpuRenderer {
     #[cfg(test)]
     fn cache_sizes(&self) -> (usize, usize) {
         (
-            self.pipeline_cache.borrow().len(),
-            self.sized_cache.borrow().len(),
+            self.pipeline_cache.lock().unwrap().len(),
+            self.sized_cache.lock().unwrap().len(),
         )
     }
 
@@ -214,7 +231,7 @@ impl GpuRenderer {
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
     fn pipeline<R>(&self, shader_wgsl: &str, f: impl FnOnce(&CachedPipeline) -> R) -> R {
-        let mut cache = self.pipeline_cache.borrow_mut();
+        let mut cache = self.pipeline_cache.lock().unwrap();
         let entry = cache
             .entry(shader_wgsl.to_owned())
             .or_insert_with(|| self.build_pipeline(shader_wgsl));
@@ -284,7 +301,7 @@ impl GpuRenderer {
         height: u32,
         f: impl FnOnce(&SizedResources) -> R,
     ) -> R {
-        let mut map = self.sized_cache.borrow_mut();
+        let mut map = self.sized_cache.lock().unwrap();
         let entry = map
             .entry((width, height))
             .or_insert_with(|| Self::build_sized_resources(&self.device, width, height));
@@ -338,6 +355,16 @@ impl GpuRenderer {
     /// within ±2/channel. `opts.width` / `opts.height` give the output size; `t`
     /// is clamped to `0.0..=1.0`.
     ///
+    /// # Clamping (caller's responsibility)
+    ///
+    /// The resolved orb count is **silently clamped to [`MAX_ORBS`] (64)** — the
+    /// orb-array uniform is fixed at 64 entries. Beyond that the GPU renders only
+    /// the first 64 orbs, which is a *different image* than the CPU oracle (which
+    /// scales to [`MAX_ORB_COUNT`]). The caller therefore owns routing `count > 64`
+    /// to the CPU renderer so the two never diverge for the same flags; the CLI's
+    /// `FrameRenderer::select` does this. A `debug_assert!` here trips in debug
+    /// builds if a future caller forgets and feeds `count > MAX_ORBS` directly.
+    ///
     /// # Panics / scope
     ///
     /// This is the **Circle** path only. The shape in `opts.shape` is ignored
@@ -363,12 +390,21 @@ impl GpuRenderer {
         let cycle = opts.speed.cycle_count() as f32;
         // n_orbs mirrors `precompute_orb_params`: count.unwrap_or(clusters.len())
         // clamped to MAX_ORB_COUNT, at least 1 if there are clusters.
-        let n_orbs = opts
+        let n_orbs_resolved = opts
             .count
             .unwrap_or(clusters.len())
             .min(MAX_ORB_COUNT)
-            .max(if clusters.is_empty() { 0 } else { 1 })
-            .min(MAX_ORBS);
+            .max(if clusters.is_empty() { 0 } else { 1 });
+        // count > MAX_ORBS is the caller's responsibility to route to the CPU
+        // renderer (see the doc-comment above). Trip in debug builds if a caller
+        // forgot; release silently clamps so the GPU never reads past the uniform.
+        debug_assert!(
+            n_orbs_resolved <= MAX_ORBS,
+            "render_frame: resolved orb count {n_orbs_resolved} exceeds MAX_ORBS ({MAX_ORBS}); \
+             the caller must route count > {MAX_ORBS} to the CPU renderer (it would otherwise \
+             silently clamp and diverge from the CPU oracle)"
+        );
+        let n_orbs = n_orbs_resolved.min(MAX_ORBS);
         // shape_id / glyph_rotate / edge_softness are Phase-1 (Glyph) inputs; the
         // Circle shader ignores them. Pass Circle defaults.
         let mut pack = pack_render_data_for_webgl(
@@ -478,7 +514,7 @@ impl GpuRenderer {
         // Pipeline (shader compile) cached per shader source; target / read-back
         // cached per size. Only the small uniforms / bind group are rebuilt per
         // frame.
-        self.pipeline(ORB_CIRCLE_WGSL, |cached| {
+        self.pipeline(orb_circle_wgsl(), |cached| {
             self.sized_resources(width, height, |res| {
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("orber-circle-bg"),
@@ -644,34 +680,96 @@ mod tests {
         }
     }
 
-    /// Get a renderer for a parity test, or decide what to do when no adapter is
-    /// available.
+    /// Turn a missing adapter into the right outcome for `what`:
     ///
     /// - **`ORBER_REQUIRE_GPU=1`** (CI / any environment that must actually verify
     ///   parity): a missing adapter is a hard **`panic!`** — the test fails loudly
     ///   instead of silently passing. This is what stops the "no GPU ⇒ green
     ///   without checking anything" false-positive.
-    /// - **unset** (developer machine without a GPU): returns `None` so the caller
-    ///   can `return` early and skip. This keeps the suite convenient locally
-    ///   while making "skipped" and "really verified" distinguishable.
+    /// - **unset** (developer machine without a GPU): the caller skips, so a
+    ///   missing adapter just prints a SKIP line. This keeps the suite convenient
+    ///   locally while making "skipped" and "really verified" distinguishable.
     ///
-    /// `what` names the test for the panic / skip message.
-    fn require_or_skip_renderer(what: &str) -> Option<GpuRenderer> {
-        match GpuRenderer::new() {
+    /// Under `ORBER_REQUIRE_GPU=1` this `panic!`s and never returns; otherwise it
+    /// prints the SKIP line and returns, leaving the caller to skip. `what` names
+    /// the test for the message.
+    fn require_gpu_or_panic(what: &str) {
+        if std::env::var("ORBER_REQUIRE_GPU").as_deref() == Ok("1") {
+            panic!(
+                "{what}: ORBER_REQUIRE_GPU=1 but no GPU adapter is available; \
+                 parity could not be verified (install a Vulkan ICD, e.g. \
+                 mesa-vulkan-drivers + VK_ICD_FILENAMES=lvp_icd, or unset \
+                 ORBER_REQUIRE_GPU to allow skipping)"
+            );
+        }
+        eprintln!(
+            "SKIP {what}: no GPU adapter available (set ORBER_REQUIRE_GPU=1 to fail instead)"
+        );
+    }
+
+    /// A single `GpuRenderer` shared by the whole parity-test group.
+    ///
+    /// `cargo test` is multi-threaded by default, and each parity test used to
+    /// build its own `wgpu::Instance` + adapter + device. On a real GPU, several
+    /// `request_adapter` / `request_device` calls racing at once would transiently
+    /// return `None` (~1 run in 8), which `ORBER_REQUIRE_GPU=1` then turned into a
+    /// hard, *spurious* failure. Bringing the context up exactly once removes that
+    /// contention: wgpu's `Device` / `Queue` are `Send + Sync`, so a
+    /// `&'static GpuRenderer` is safe to borrow concurrently from every test.
+    static SHARED_TEST_GPU: std::sync::OnceLock<Option<GpuRenderer>> = std::sync::OnceLock::new();
+
+    /// Get the shared parity renderer, or decide what to do when no adapter is
+    /// available (panic under `ORBER_REQUIRE_GPU=1`, skip otherwise). The context
+    /// is built at most once for the whole test binary, regardless of how many
+    /// threads call this. `what` names the test for the panic / skip message.
+    fn require_or_skip_renderer(what: &str) -> Option<&'static GpuRenderer> {
+        let shared = SHARED_TEST_GPU.get_or_init(GpuRenderer::new);
+        match shared {
             Some(r) => Some(r),
             None => {
-                if std::env::var("ORBER_REQUIRE_GPU").as_deref() == Ok("1") {
-                    panic!(
-                        "{what}: ORBER_REQUIRE_GPU=1 but no GPU adapter is available; \
-                         parity could not be verified (install a Vulkan ICD, e.g. \
-                         mesa-vulkan-drivers + VK_ICD_FILENAMES=lvp_icd, or unset \
-                         ORBER_REQUIRE_GPU to allow skipping)"
-                    );
-                }
-                eprintln!("SKIP {what}: no GPU adapter available (set ORBER_REQUIRE_GPU=1 to fail instead)");
+                require_gpu_or_panic(what);
                 None
             }
         }
+    }
+
+    /// Build a *fresh, independent* renderer for tests that need a second context
+    /// (e.g. the cache-leak oracle leg). Because this is the rare single-instance
+    /// path it can still race transiently with the shared context's bring-up, so
+    /// retry the bring-up a few times before falling back to require/skip.
+    fn require_or_skip_fresh_renderer(what: &str) -> Option<GpuRenderer> {
+        for _ in 0..3 {
+            if let Some(r) = GpuRenderer::new() {
+                return Some(r);
+            }
+        }
+        require_gpu_or_panic(what);
+        None
+    }
+
+    /// The WGSL must be single-sourced from `gpu::MAX_ORBS`: every `{{MAX_ORBS}}`
+    /// placeholder is substituted, none survive, and the resolved orb-array length
+    /// / `MAX_ORBS` const carry the Rust value. This catches a future bump of
+    /// `MAX_ORBS` (e.g. to 128) silently leaving a stale `64` in the shader.
+    #[test]
+    fn wgsl_max_orbs_is_synced_with_rust() {
+        let resolved = orb_circle_wgsl();
+        assert!(
+            !resolved.contains("{{MAX_ORBS}}"),
+            "unsubstituted {{{{MAX_ORBS}}}} placeholder left in resolved WGSL"
+        );
+        assert!(
+            ORB_CIRCLE_WGSL_TEMPLATE.contains("{{MAX_ORBS}}"),
+            "template lost its {{{{MAX_ORBS}}}} placeholder — the literal would no longer be single-sourced"
+        );
+        assert!(
+            resolved.contains(&format!("const MAX_ORBS: u32 = {MAX_ORBS}u;")),
+            "resolved WGSL MAX_ORBS const does not carry gpu::MAX_ORBS ({MAX_ORBS})"
+        );
+        assert!(
+            resolved.contains(&format!("array<Orb, {MAX_ORBS}>")),
+            "resolved WGSL orb-array length does not carry gpu::MAX_ORBS ({MAX_ORBS})"
+        );
     }
 
     /// A small varied palette so per-pixel parity isn't trivially satisfied by a
@@ -862,9 +960,14 @@ mod tests {
 
     /// Pipeline + sized caches must each hold exactly one entry after a clip of
     /// many same-size frames, and a second size must grow only the sized cache.
+    ///
+    /// Uses a *private* renderer (not the shared one): it asserts exact cache
+    /// entry counts, which the shared renderer would violate because the other
+    /// parity tests render it at many different sizes.
     #[test]
     fn caches_resources_across_a_clip() {
-        let Some(renderer) = require_or_skip_renderer("caches_resources_across_a_clip") else {
+        let Some(renderer) = require_or_skip_fresh_renderer("caches_resources_across_a_clip")
+        else {
             return;
         };
         let clusters = sample_clusters();
@@ -887,10 +990,13 @@ mod tests {
     /// Reused per-size resources must not leak the previous frame's bytes: a
     /// second frame with different inputs at the same size (hitting the cache)
     /// must equal a fresh renderer's single render of those inputs.
+    ///
+    /// Uses a *private* renderer (not the shared one) so the `sizes == 1`
+    /// assertion holds — the shared renderer accumulates sizes from other tests.
     #[test]
     fn cached_resources_do_not_leak_previous_frame() {
         let Some(renderer) =
-            require_or_skip_renderer("cached_resources_do_not_leak_previous_frame")
+            require_or_skip_fresh_renderer("cached_resources_do_not_leak_previous_frame")
         else {
             return;
         };
@@ -906,11 +1012,14 @@ mod tests {
         let (_, sizes) = renderer.cache_sizes();
         assert_eq!(sizes, 1, "both frames must share one cached size");
 
-        // The first adapter already came up, so a second must too under
-        // ORBER_REQUIRE_GPU=1; treat a failure here as a real failure, not a skip.
-        let Some(fresh) =
-            require_or_skip_renderer("cached_resources_do_not_leak_previous_frame (oracle leg)")
-        else {
+        // This leg needs a *second, independent* renderer (a fresh per-size cache)
+        // to prove the shared one didn't leak frame A's bytes. The shared context
+        // already came up, so a second must too under ORBER_REQUIRE_GPU=1; the
+        // helper retries the bring-up to absorb any transient adapter race before
+        // treating a failure as real (not a skip).
+        let Some(fresh) = require_or_skip_fresh_renderer(
+            "cached_resources_do_not_leak_previous_frame (oracle leg)",
+        ) else {
             return;
         };
         let b_fresh = fresh.render_frame(&clusters, &opts_b, 0.7);

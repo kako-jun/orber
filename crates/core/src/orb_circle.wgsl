@@ -37,10 +37,11 @@
 const TAU: f32 = 6.28318530718;
 const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
 
-// per-orb uniform array の上限。orberGl.ts の MAX_ORBS / wasm の
-// GL_RENDERER_MAX_ORBS と同期させる。
+// per-orb uniform array の上限。`{{MAX_ORBS}}` は gpu.rs が include_str! 後に
+// Rust 側 `gpu::MAX_ORBS` で置換する単一ソース（リテラル二重定義を避ける）。
+// orberGl.ts の MAX_ORBS / wasm の GL_RENDERER_MAX_ORBS とも同期させること。
 // SYNC WITH web/src/lib/orberGl.ts::MAX_ORBS と crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS
-const MAX_ORBS: u32 = 64u;
+const MAX_ORBS: u32 = {{MAX_ORBS}}u;
 
 struct Params {
     resolution: vec2<f32>, // (width, height) px
@@ -68,9 +69,9 @@ struct Orb {
 };
 
 struct Orbs {
-    // WGSL は配列長にリテラルを要求するため MAX_ORBS const を参照できない。
-    // 64 は上の MAX_ORBS と一致させること。
-    orbs: array<Orb, 64>,
+    // WGSL は配列長に const 式を要求し、上の MAX_ORBS const は配列長に使えないため
+    // `{{MAX_ORBS}}` を gpu.rs が同じ値で置換する（const と配列長が必ず一致する）。
+    orbs: array<Orb, {{MAX_ORBS}}>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
