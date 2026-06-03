@@ -7,6 +7,29 @@
 //! matches the CPU (tiny-skia) oracle ([`crate::animate::render_frame`]) within
 //! ±2/channel.
 //!
+//! ## Parity scope (narrow — do not over-claim)
+//!
+//! Parity with the CPU oracle holds **only** on this exact path:
+//!
+//! - **shape = Circle** (Glyph / image / aquarelle are Phase 1; the CLI routes
+//!   those to the CPU renderer);
+//! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
+//!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
+//!   `opts.saturation` to each packed orb color after
+//!   [`pack_render_data_for_webgl`] (which itself never applies saturation,
+//!   because it is shared with the WebGL path). Without that step the GPU and CPU
+//!   would diverge for `--saturation != 1.0`;
+//! - **count ≤ [`MAX_ORBS`] (64)**: the orb-array uniform is fixed at 64 entries,
+//!   so the GPU silently clamps beyond that. The CPU path scales to
+//!   [`MAX_ORB_COUNT`] (1024). The CLI therefore falls back to CPU when the
+//!   resolved count exceeds [`MAX_ORBS`] (see `FrameRenderer::select` in the CLI)
+//!   so the two never produce different images for the same flags.
+//!
+//! Outside that path the GPU is **not** a drop-in for the CPU oracle: video is
+//! rendered on the CPU, and the per-orb `color_tracks` / `keyframe_tracks` (#7 /
+//! #33) are not yet folded into the GPU pack, so animated color/position tracks
+//! are CPU-only for now.
+//!
 //! ## Parity contract (must match [`crate::animate::render_frame`] for Circle)
 //!
 //! The CPU oracle composites orbs in **straight sRGB byte space** (tiny-skia
@@ -36,6 +59,7 @@ use wgpu::util::DeviceExt;
 
 use crate::animate::{pack_render_data_for_webgl, AnimateOptions, MotionDirection, MAX_ORB_COUNT};
 use crate::cluster::Cluster;
+use crate::orb::adjust_saturation_pub;
 
 /// Bytes per pixel for `Rgba8Unorm`.
 const BYTES_PER_PIXEL: u32 = 4;
@@ -347,7 +371,7 @@ impl GpuRenderer {
             .min(MAX_ORBS);
         // shape_id / glyph_rotate / edge_softness are Phase-1 (Glyph) inputs; the
         // Circle shader ignores them. Pass Circle defaults.
-        let pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data_for_webgl(
             clusters,
             opts.background,
             base_radius_unit,
@@ -361,6 +385,17 @@ impl GpuRenderer {
             true, // glyph_rotate (unused by Circle)
             opts.softness.edge_softness(),
         );
+
+        // `pack_render_data_for_webgl` is shared with the WebGL path and must NOT
+        // bake in saturation (the web side has its own knob). The CPU oracle,
+        // however, applies `adjust_saturation_pub(color_at_t, saturation)` per orb
+        // (`animate::render_frame`). To stay bit-exact we re-apply the *same*
+        // function here, in native GPU land only, over the packed color words.
+        //
+        // Each color word triple is `c.color[i] as f32 / 255.0`, so `round(w*255)`
+        // recovers the exact u8 the CPU fed to `adjust_saturation_pub`; we run the
+        // identical HSL transform and write the result back as `u8 / 255.0`.
+        apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         self.render_packed(&pack, width, height, t)
     }
@@ -419,7 +454,11 @@ impl GpuRenderer {
         };
         for i in 0..n_orbs {
             let off = HEADER_WORDS + PER_ORB_WORDS * i;
-            if off + 11 >= pack.len() {
+            // Max word read below is `pack[off + 10]`, so the guard must allow
+            // `off + 10 == len - 1`, i.e. `off + 11 == len`. Using `>=` here would
+            // wrongly break one orb early when an externally hand-built buffer is
+            // sized to exactly `off + 11`; the correct cut-off is `off + 11 > len`.
+            if off + 11 > pack.len() {
                 break;
             }
             orb_array.orbs[i] = GpuOrb {
@@ -546,6 +585,35 @@ fn align_up(value: u32, align: u32) -> u32 {
     value.div_ceil(align) * align
 }
 
+/// Apply `adjust_saturation_pub` to the per-orb color words of a
+/// `pack_render_data_for_webgl` buffer, in place (native GPU path only).
+///
+/// `pack_render_data_for_webgl` is shared with the WebGL path and intentionally
+/// leaves saturation out, but the CPU oracle applies it per orb, so the native
+/// GPU path re-applies the identical transform here to keep bit-exact parity.
+/// Color words live at `[off .. off+3]` per orb as `u8 / 255.0`; we round back to
+/// the original u8, run the same HSL adjust, and write the result back the same
+/// way. A factor of `1.0` is the `adjust_saturation_pub` fast-path (no change).
+fn apply_saturation_to_pack(pack: &mut [f32], saturation: f32, n_orbs: usize) {
+    for i in 0..n_orbs {
+        let off = HEADER_WORDS + PER_ORB_WORDS * i;
+        // Bounds: we touch [off, off+2]. `off + 3 > len` means the color triple
+        // does not fit, so stop.
+        if off + 3 > pack.len() {
+            break;
+        }
+        let rgb = [
+            (pack[off] * 255.0).round() as u8,
+            (pack[off + 1] * 255.0).round() as u8,
+            (pack[off + 2] * 255.0).round() as u8,
+        ];
+        let out = adjust_saturation_pub(rgb, saturation);
+        pack[off] = out[0] as f32 / 255.0;
+        pack[off + 1] = out[1] as f32 / 255.0;
+        pack[off + 2] = out[2] as f32 / 255.0;
+    }
+}
+
 /// A fragment-visible uniform-buffer bind-group-layout entry.
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -573,6 +641,36 @@ mod tests {
             color,
             centroid: Centroid { x: cx, y: cy },
             weight,
+        }
+    }
+
+    /// Get a renderer for a parity test, or decide what to do when no adapter is
+    /// available.
+    ///
+    /// - **`ORBER_REQUIRE_GPU=1`** (CI / any environment that must actually verify
+    ///   parity): a missing adapter is a hard **`panic!`** — the test fails loudly
+    ///   instead of silently passing. This is what stops the "no GPU ⇒ green
+    ///   without checking anything" false-positive.
+    /// - **unset** (developer machine without a GPU): returns `None` so the caller
+    ///   can `return` early and skip. This keeps the suite convenient locally
+    ///   while making "skipped" and "really verified" distinguishable.
+    ///
+    /// `what` names the test for the panic / skip message.
+    fn require_or_skip_renderer(what: &str) -> Option<GpuRenderer> {
+        match GpuRenderer::new() {
+            Some(r) => Some(r),
+            None => {
+                if std::env::var("ORBER_REQUIRE_GPU").as_deref() == Ok("1") {
+                    panic!(
+                        "{what}: ORBER_REQUIRE_GPU=1 but no GPU adapter is available; \
+                         parity could not be verified (install a Vulkan ICD, e.g. \
+                         mesa-vulkan-drivers + VK_ICD_FILENAMES=lvp_icd, or unset \
+                         ORBER_REQUIRE_GPU to allow skipping)"
+                    );
+                }
+                eprintln!("SKIP {what}: no GPU adapter available (set ORBER_REQUIRE_GPU=1 to fail instead)");
+                None
+            }
         }
     }
 
@@ -641,8 +739,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_within_tolerance() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP gpu_matches_cpu_within_tolerance: no GPU adapter available");
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_within_tolerance") else {
             return;
         };
         eprintln!(
@@ -677,6 +774,35 @@ mod tests {
         eprintln!("overall max per-channel diff across all cases = {overall_max}");
     }
 
+    /// `--saturation != 1.0` must hold parity: the native GPU path re-applies
+    /// `adjust_saturation_pub` (the CPU oracle's own per-orb saturation) after the
+    /// shared `pack_render_data_for_webgl`. Without that step desaturated (0.5) and
+    /// boosted (2.0) frames would diverge from the CPU. Covers a couple of sizes /
+    /// times so the orb colors actually change between frames.
+    #[test]
+    fn gpu_matches_cpu_with_saturation() {
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_with_saturation") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        for &saturation in &[0.5_f32, 2.0] {
+            for &(w, h) in &[(37u32, 23u32), (40, 28)] {
+                let mut opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+                opts.saturation = saturation;
+                for &t in &[0.0_f32, 0.5, 1.0] {
+                    let cpu = render_frame(&clusters, &opts, t);
+                    let gpu = renderer.render_frame(&clusters, &opts, t);
+                    let max_diff = assert_within_tolerance(
+                        &cpu,
+                        &gpu,
+                        &format!("sat={saturation} {w}x{h} t={t}"),
+                    );
+                    eprintln!("sat={saturation} {w}x{h} t={t}: max per-channel diff = {max_diff}");
+                }
+            }
+        }
+    }
+
     /// 1x1 read-back boundary: width*4 = 4 bytes/row is padded to 256, so this
     /// exercises the most extreme row-padding strip. Use a background-only frame
     /// (no clusters) so the assertion is about read-back geometry, not the
@@ -684,8 +810,7 @@ mod tests {
     /// tiny-skia's analytic path coverage. Also checks 1x3 / 3x1 strips.
     #[test]
     fn gpu_matches_cpu_1x1_readback() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP gpu_matches_cpu_1x1_readback: no GPU adapter available");
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_1x1_readback") else {
             return;
         };
         for &(w, h) in &[(1u32, 1u32), (1, 3), (3, 1), (5, 1)] {
@@ -704,8 +829,7 @@ mod tests {
     /// All four flow directions must hold parity at a single non-trivial size/t.
     #[test]
     fn gpu_matches_cpu_all_directions() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP gpu_matches_cpu_all_directions: no GPU adapter available");
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_all_directions") else {
             return;
         };
         let clusters = sample_clusters();
@@ -726,8 +850,7 @@ mod tests {
     /// Empty clusters → background-only frame must still match (bg fill path).
     #[test]
     fn gpu_matches_cpu_empty_clusters() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP gpu_matches_cpu_empty_clusters: no GPU adapter available");
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_empty_clusters") else {
             return;
         };
         let opts = circle_opts(32, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
@@ -741,8 +864,7 @@ mod tests {
     /// many same-size frames, and a second size must grow only the sized cache.
     #[test]
     fn caches_resources_across_a_clip() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP caches_resources_across_a_clip: no GPU adapter available");
+        let Some(renderer) = require_or_skip_renderer("caches_resources_across_a_clip") else {
             return;
         };
         let clusters = sample_clusters();
@@ -767,8 +889,9 @@ mod tests {
     /// must equal a fresh renderer's single render of those inputs.
     #[test]
     fn cached_resources_do_not_leak_previous_frame() {
-        let Some(renderer) = GpuRenderer::new() else {
-            eprintln!("SKIP cached_resources_do_not_leak_previous_frame: no GPU adapter available");
+        let Some(renderer) =
+            require_or_skip_renderer("cached_resources_do_not_leak_previous_frame")
+        else {
             return;
         };
         let clusters = sample_clusters();
@@ -783,8 +906,11 @@ mod tests {
         let (_, sizes) = renderer.cache_sizes();
         assert_eq!(sizes, 1, "both frames must share one cached size");
 
-        let Some(fresh) = GpuRenderer::new() else {
-            eprintln!("SKIP oracle leg: no second GPU adapter available");
+        // The first adapter already came up, so a second must too under
+        // ORBER_REQUIRE_GPU=1; treat a failure here as a real failure, not a skip.
+        let Some(fresh) =
+            require_or_skip_renderer("cached_resources_do_not_leak_previous_frame (oracle leg)")
+        else {
             return;
         };
         let b_fresh = fresh.render_frame(&clusters, &opts_b, 0.7);

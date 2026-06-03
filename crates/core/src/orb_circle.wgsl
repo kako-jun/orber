@@ -5,10 +5,15 @@
 // header(16 words) + per-orb(16 words × n_orbs) をそのまま GPU バッファに流す。
 // パラメータ算術は再実装せず、`gpu.rs` 側で pack 出力を vec4 にほどいて渡す。
 //
-// CPU(tiny-skia) との対応:
-//   - Circle アームは CPU 経路（animate::render_frame）と同式・同パラメータで、
-//     GLSL 実装が本番で byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を
-//     忠実に写経しているので、同じ ±2/channel の許容内で一致する。
+// CPU(tiny-skia) との対応（パリティ範囲は狭い。過大主張しない）:
+//   - パリティが成り立つのは **Circle ∧ saturation 反映済 ∧ count ≤ MAX_ORBS(64)**
+//     の経路に限る。saturation は pack_render_data_for_webgl では掛けず（WebGL と共有
+//     のため）、native GPU 側 gpu.rs::render_frame が adjust_saturation_pub を後段適用
+//     して CPU と揃える。count > 64 は CLI が CPU にフォールバックする（このシェーダは
+//     64 で clamp）。video は CPU 経路、color/keyframe tracks は GPU pack 未対応。
+//   - その経路では Circle アームは CPU 経路（animate::render_frame）と同式・同パラメータ
+//     で、GLSL 実装が本番で byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を
+//     忠実に写経しているので、同じ ±2/channel の許容内で一致する（実 GPU では 0）。
 //   - falloff_curve は raw float のまま blend する（CPU 側は alpha を 1/255 に
 //     量子化してから tiny-skia に渡すが、その差は Circle で ≤1/255）。
 //
