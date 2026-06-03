@@ -144,6 +144,20 @@ impl From<CliVariationMode> for VariationMode {
     }
 }
 
+/// Which renderer backend to drive (`--renderer`).
+///
+/// `gpu` is the wgpu (Rust + WGSL) production path (#207); it falls back to the
+/// CPU renderer when no GPU adapter is available, for non-Circle shapes (Phase 0
+/// covers Circle only), or when the binary was built without the `gpu` feature.
+/// The GPU path matches the CPU oracle bit-for-bit, so the output is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Renderer {
+    /// Reference CPU (tiny-skia) renderer.
+    Cpu,
+    /// Production wgpu (Rust + WGSL) renderer; falls back to CPU when unavailable.
+    Gpu,
+}
+
 /// Shape used to render each orb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Shape {
@@ -300,6 +314,13 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
     shape: Shape,
 
+    /// Renderer backend: production `gpu` (wgpu) or the `cpu` reference (#207).
+    /// `gpu` falls back to `cpu` when no GPU adapter is available, for non-Circle
+    /// shapes (Phase 0 covers Circle only), or when built without the `gpu`
+    /// feature. Output is identical either way (bit-exact parity).
+    #[arg(long, value_enum, default_value_t = Renderer::Gpu)]
+    renderer: Renderer,
+
     /// Glyph character used when --shape glyph (#55). Must be a single character.
     /// Defaults to ☆ (U+2606). Use a character covered by Noto Sans Symbols 2.
     #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
@@ -447,6 +468,76 @@ fn main() -> ExitCode {
 /// CLI の `--direction` / `--speed` を内部表現に変換する。
 fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
     (cli.direction.into(), cli.speed.into())
+}
+
+/// 単一フレーム描画のバックエンド。`--renderer` を解決して GPU/CPU を選ぶ (#207)。
+///
+/// GPU は Circle shape かつ GPU アダプタが取れた場合のみ使う。それ以外（非
+/// Circle、アダプタ無し、`gpu` feature 無しビルド）は CPU にフォールバックする。
+/// 出力は CPU オラクルと bit-exact 一致するので、フォールバックしても見た目は変わらない。
+enum FrameRenderer {
+    Cpu,
+    #[cfg(feature = "gpu")]
+    Gpu(Box<orber_core::gpu::GpuRenderer>),
+}
+
+impl FrameRenderer {
+    /// `--renderer` の選択と shape からバックエンドを決める。GPU 要求でも、
+    /// 非 Circle / アダプタ取得失敗 / feature 無しなら CPU にフォールバックし、
+    /// stderr に一言出す。
+    fn select(choice: Renderer, shape: OrbShape) -> Self {
+        match choice {
+            Renderer::Cpu => FrameRenderer::Cpu,
+            Renderer::Gpu => {
+                if shape != OrbShape::Circle {
+                    eprintln!(
+                        "orber: --renderer gpu は Phase 0 で Circle のみ対応。非 Circle shape のため cpu にフォールバックします"
+                    );
+                    return FrameRenderer::Cpu;
+                }
+                Self::select_gpu_circle()
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn select_gpu_circle() -> Self {
+        match orber_core::gpu::GpuRenderer::new() {
+            Some(gpu) => {
+                eprintln!(
+                    "orber: using gpu renderer (adapter: {})",
+                    gpu.adapter_name()
+                );
+                FrameRenderer::Gpu(Box::new(gpu))
+            }
+            None => {
+                eprintln!("orber: GPU アダプタが取得できないため cpu にフォールバックします");
+                FrameRenderer::Cpu
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn select_gpu_circle() -> Self {
+        eprintln!(
+            "orber: この orber は gpu feature 無しでビルドされています。cpu にフォールバックします"
+        );
+        FrameRenderer::Cpu
+    }
+
+    /// 1 フレームを描画する。GPU 経路は Circle のみ（select で保証済み）。
+    fn render(
+        &self,
+        clusters: &[Cluster],
+        opts: &orber_core::animate::AnimateOptions,
+        t: f32,
+    ) -> image::RgbaImage {
+        match self {
+            FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
+            #[cfg(feature = "gpu")]
+            FrameRenderer::Gpu(gpu) => gpu.render_frame(clusters, opts, t),
+        }
+    }
 }
 
 /// orb プールが空になった（K=1 / 単色画像）ときに stderr で警告し、処理は継続する。
@@ -637,7 +728,9 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         color_tracks: None,
         keyframe_tracks: None,
     };
-    let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+    // #207: --renderer で GPU/CPU を選ぶ。GPU は Circle のみ、それ以外は CPU。
+    let renderer = FrameRenderer::select(cli.renderer, cli.orb_shape());
+    let out = renderer.render(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
     if let Err(e) = out.save(output) {

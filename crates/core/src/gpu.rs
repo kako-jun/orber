@@ -1,0 +1,795 @@
+//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0.
+//!
+//! [`GpuRenderer`] is the headless, native side of the renderer. It runs the
+//! **Circle** orb WGSL ([`orb_circle.wgsl`](../src/orb_circle.wgsl)) that is a
+//! faithful translation of the browser's `web/src/lib/orberGl.ts` Circle arm, so
+//! the native CLI and the web produce matching Circle frames, and so the GPU path
+//! matches the CPU (tiny-skia) oracle ([`crate::animate::render_frame`]) within
+//! ±2/channel.
+//!
+//! ## Parity contract (must match [`crate::animate::render_frame`] for Circle)
+//!
+//! The CPU oracle composites orbs in **straight sRGB byte space** (tiny-skia
+//! premultiplied internally, then un-premultiplied back to straight on output).
+//! To match it the GPU path:
+//!
+//! - renders into an [`wgpu::TextureFormat::Rgba8Unorm`] target (NOT `*Srgb`), so
+//!   no sRGB↔linear conversion happens — the shader's float blend maps to bytes
+//!   by `round(value * 255)`, the same arithmetic as the CPU loop;
+//! - feeds the shader the **exact same per-orb data** the WebGL path uses
+//!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
+//!   reused, never reimplemented, so the orb positions / radii / alphas are
+//!   identical to the proven web/CPU result;
+//! - reads the result back accounting for wgpu's 256-byte row-alignment
+//!   requirement on `copy_texture_to_buffer`.
+//!
+//! ## Scope
+//!
+//! Phase 0 covers **Circle orbs only**. Glyph / image shapes / aquarelle are
+//! Phase 1; the CLI falls back to the CPU renderer for non-Circle shapes.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use image::RgbaImage;
+use wgpu::util::DeviceExt;
+
+use crate::animate::{pack_render_data_for_webgl, AnimateOptions, MotionDirection, MAX_ORB_COUNT};
+use crate::cluster::Cluster;
+
+/// Bytes per pixel for `Rgba8Unorm`.
+const BYTES_PER_PIXEL: u32 = 4;
+/// wgpu requires `bytes_per_row` of a texture→buffer copy to be a multiple of
+/// this (`COPY_BYTES_PER_ROW_ALIGNMENT`).
+const ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+/// Maximum orbs the Circle shader iterates. Must match `MAX_ORBS` in
+/// `orb_circle.wgsl`, `web/src/lib/orberGl.ts::MAX_ORBS`, and
+/// `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`.
+// SYNC WITH orb_circle.wgsl::MAX_ORBS
+pub const MAX_ORBS: usize = 64;
+
+/// Header words / per-orb words in the `pack_render_data_for_webgl` layout.
+/// Kept in sync with that function (header 16 words, per-orb 16 words).
+const HEADER_WORDS: usize = 16;
+const PER_ORB_WORDS: usize = 16;
+
+/// The Circle orb WGSL (translation of `orberGl.ts` Circle arm).
+const ORB_CIRCLE_WGSL: &str = include_str!("orb_circle.wgsl");
+
+/// Header uniform block handed to the Circle shader. Mirrors `struct Params` in
+/// `orb_circle.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
+/// uniform layout (vec2 then scalars packed into 16-byte rows).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Params {
+    // row 0: resolution.xy, t, base_radius
+    resolution: [f32; 2],
+    t: f32,
+    base_radius: f32,
+    // row 1: bg.rgba
+    bg: [f32; 4],
+    // row 2: base_blur, direction, cycle, n_orbs
+    base_blur: f32,
+    direction: f32,
+    cycle: f32,
+    n_orbs: f32,
+    // row 3: alpha_mul + padding
+    alpha_mul: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+/// One orb as the Circle shader sees it: three vec4s mirroring `struct Orb` in
+/// `orb_circle.wgsl` (color+weight, phase quartet, misc). Filled from the
+/// `pack_render_data_for_webgl` per-orb words.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuOrb {
+    color: [f32; 4], // r, g, b, weight
+    phase: [f32; 4], // phase, phi_radius, phi_blur, phi_opacity
+    misc: [f32; 4],  // cross_axis, style_bit, speed_mult, _
+}
+
+/// The orb-array uniform: a fixed-size `[GpuOrb; MAX_ORBS]` (unused tail zeroed).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OrbArray {
+    orbs: [GpuOrb; MAX_ORBS],
+}
+
+/// A render pipeline plus its bind-group layout, compiled once per distinct
+/// shader source. Caching keeps shader compilation / pipeline creation off the
+/// per-frame path: a long video renders the same shader for every frame.
+struct CachedPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// Per-dimension GPU resources reused across same-sized frames: the render
+/// target and the padded read-back buffer. Reallocating these every frame is the
+/// other half of the per-frame cost the cache removes.
+struct SizedResources {
+    width: u32,
+    height: u32,
+    target: wgpu::Texture,
+    target_view: wgpu::TextureView,
+    output_buffer: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+}
+
+/// Headless wgpu renderer for the Circle orb path. Holds a device/queue plus a
+/// per-shader pipeline cache and a per-size resource cache, so a multi-frame
+/// render (a long `--duration-ms` video) compiles the shader and allocates the
+/// target/read-back buffer only once instead of every frame.
+///
+/// The caches are unbounded and never evict; for the single-resolution clip use
+/// case this is intentional. A caller streaming arbitrarily many sizes through
+/// one long-lived renderer should drop and rebuild it to release memory.
+pub struct GpuRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter_name: String,
+    /// Circle pipelines, keyed by shader source.
+    pipeline_cache: RefCell<HashMap<String, CachedPipeline>>,
+    /// Per-size resources, keyed by `(width, height)`.
+    sized_cache: RefCell<HashMap<(u32, u32), SizedResources>>,
+}
+
+impl GpuRenderer {
+    /// Bring up a headless GPU context (no surface). Returns `None` when no
+    /// adapter is available (e.g. CI without a GPU / software rasterizer), so
+    /// callers can fall back to the CPU path instead of hard-failing.
+    pub fn new() -> Option<Self> {
+        pollster::block_on(Self::new_async())
+    }
+
+    async fn new_async() -> Option<Self> {
+        // Headless: no window/display handle is needed (backends still come from env).
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+        let adapter_name = adapter.get_info().name;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("orber-gpu-device"),
+                ..Default::default()
+            })
+            .await
+            .ok()?;
+        Some(Self {
+            device,
+            queue,
+            adapter_name,
+            pipeline_cache: RefCell::new(HashMap::new()),
+            sized_cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Name of the underlying adapter (for diagnostics / proving the GPU path ran).
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// Live entry counts of the two caches, `(pipelines, sizes)`. Exposed for the
+    /// cache-effectiveness test: rendering a clip of many frames at one size with
+    /// one shader must leave exactly one pipeline and one sized entry.
+    #[cfg(test)]
+    fn cache_sizes(&self) -> (usize, usize) {
+        (
+            self.pipeline_cache.borrow().len(),
+            self.sized_cache.borrow().len(),
+        )
+    }
+
+    /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
+    /// pipeline only on first use. The closure runs at most once per distinct
+    /// shader source for the life of the renderer.
+    fn pipeline<R>(&self, shader_wgsl: &str, f: impl FnOnce(&CachedPipeline) -> R) -> R {
+        let mut cache = self.pipeline_cache.borrow_mut();
+        let entry = cache
+            .entry(shader_wgsl.to_owned())
+            .or_insert_with(|| self.build_pipeline(shader_wgsl));
+        f(entry)
+    }
+
+    /// Compile the Circle pipeline (binding 0 = `Params`, binding 1 = `OrbArray`).
+    fn build_pipeline(&self, shader_wgsl: &str) -> CachedPipeline {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("orber-circle-bgl"),
+                    entries: &[uniform_entry(0), uniform_entry(1)],
+                });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("orber-circle-shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_wgsl.into()),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orber-circle-pl"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("orber-circle-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        CachedPipeline {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Get-or-build the per-size resources, allocating the target texture and
+    /// read-back buffer only on first use of a `(width, height)`.
+    fn sized_resources<R>(
+        &self,
+        width: u32,
+        height: u32,
+        f: impl FnOnce(&SizedResources) -> R,
+    ) -> R {
+        let mut map = self.sized_cache.borrow_mut();
+        let entry = map
+            .entry((width, height))
+            .or_insert_with(|| Self::build_sized_resources(&self.device, width, height));
+        f(entry)
+    }
+
+    /// Allocate the target texture and the padded read-back buffer for a size.
+    fn build_sized_resources(device: &wgpu::Device, width: u32, height: u32) -> SizedResources {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("orber-circle-target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let unpadded_bytes_per_row = width * BYTES_PER_PIXEL;
+        let padded_bytes_per_row = align_up(unpadded_bytes_per_row, ROW_ALIGNMENT);
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orber-circle-readback"),
+            size: (padded_bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        SizedResources {
+            width,
+            height,
+            target,
+            target_view,
+            output_buffer,
+            padded_bytes_per_row,
+        }
+    }
+
+    /// Render one Circle frame at time `t` from `clusters` + `opts`, matching
+    /// [`crate::animate::render_frame`].
+    ///
+    /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
+    /// arithmetic the WebGL path uses — so the GPU output matches the CPU oracle
+    /// within ±2/channel. `opts.width` / `opts.height` give the output size; `t`
+    /// is clamped to `0.0..=1.0`.
+    ///
+    /// # Panics / scope
+    ///
+    /// This is the **Circle** path only. The shape in `opts.shape` is ignored
+    /// here (the caller is responsible for routing non-Circle shapes to the CPU
+    /// renderer); see the module docs.
+    pub fn render_frame(&self, clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
+        let width = opts.width.max(1);
+        let height = opts.height.max(1);
+        let t = t.clamp(0.0, 1.0);
+
+        // Derive the WebGL pack-buffer scalars exactly as the CPU oracle /
+        // `get_render_data` do, then reuse `pack_render_data_for_webgl` so the
+        // per-orb arithmetic is never reimplemented.
+        let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
+        let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
+        let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
+        let direction_id: f32 = match opts.direction {
+            MotionDirection::LeftToRight => 0.0,
+            MotionDirection::RightToLeft => 1.0,
+            MotionDirection::TopToBottom => 2.0,
+            MotionDirection::BottomToTop => 3.0,
+        };
+        let cycle = opts.speed.cycle_count() as f32;
+        // n_orbs mirrors `precompute_orb_params`: count.unwrap_or(clusters.len())
+        // clamped to MAX_ORB_COUNT, at least 1 if there are clusters.
+        let n_orbs = opts
+            .count
+            .unwrap_or(clusters.len())
+            .min(MAX_ORB_COUNT)
+            .max(if clusters.is_empty() { 0 } else { 1 })
+            .min(MAX_ORBS);
+        // shape_id / glyph_rotate / edge_softness are Phase-1 (Glyph) inputs; the
+        // Circle shader ignores them. Pass Circle defaults.
+        let pack = pack_render_data_for_webgl(
+            clusters,
+            opts.background,
+            base_radius_unit,
+            base_blur,
+            direction_id,
+            cycle,
+            opts.seed,
+            n_orbs,
+            alpha_mul,
+            0.0,  // shape_id = Circle
+            true, // glyph_rotate (unused by Circle)
+            opts.softness.edge_softness(),
+        );
+
+        self.render_packed(&pack, width, height, t)
+    }
+
+    /// Render one Circle frame from a raw `pack_render_data_for_webgl` buffer.
+    ///
+    /// `pack` must be the header(16) + per-orb(16 × n_orbs) layout produced by
+    /// [`pack_render_data_for_webgl`]. `t` is the normalized time written into the
+    /// shader's `u_t`; it is clamped to `0.0..=1.0`. This is the seam the WebGL
+    /// path will also share (Phase 2).
+    pub fn render_packed(&self, pack: &[f32], width: u32, height: u32, t: f32) -> RgbaImage {
+        let width = width.max(1);
+        let height = height.max(1);
+        let t = t.clamp(0.0, 1.0);
+
+        assert!(
+            pack.len() >= HEADER_WORDS,
+            "pack buffer too short: {} < {HEADER_WORDS}",
+            pack.len()
+        );
+
+        // Header → Params. Layout per `pack_render_data_for_webgl` doc-comment.
+        let n_orbs_packed = pack[8].max(0.0) as usize;
+        let n_orbs = n_orbs_packed.min(MAX_ORBS);
+        let params = Params {
+            resolution: [width as f32, height as f32],
+            t,
+            base_radius: pack[4],
+            bg: [pack[0], pack[1], pack[2], pack[3]],
+            base_blur: pack[5],
+            direction: pack[6],
+            cycle: pack[7],
+            n_orbs: n_orbs as f32,
+            alpha_mul: pack[9],
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("orber-circle-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        // Per-orb words → fixed-size array (unused tail zeroed). Only the words
+        // the Circle shader reads are unpacked (color+weight, phase quartet,
+        // cross_axis/style/speed); rotation words are skipped.
+        let mut orb_array = OrbArray {
+            orbs: [GpuOrb {
+                color: [0.0; 4],
+                phase: [0.0; 4],
+                misc: [0.0; 4],
+            }; MAX_ORBS],
+        };
+        for i in 0..n_orbs {
+            let off = HEADER_WORDS + PER_ORB_WORDS * i;
+            if off + 11 >= pack.len() {
+                break;
+            }
+            orb_array.orbs[i] = GpuOrb {
+                color: [pack[off], pack[off + 1], pack[off + 2], pack[off + 3]],
+                phase: [pack[off + 4], pack[off + 5], pack[off + 6], pack[off + 7]],
+                misc: [pack[off + 8], pack[off + 9], pack[off + 10], 0.0],
+            };
+        }
+        let orb_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("orber-circle-orbs"),
+                contents: bytemuck::bytes_of(&orb_array),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        // Pipeline (shader compile) cached per shader source; target / read-back
+        // cached per size. Only the small uniforms / bind group are rebuilt per
+        // frame.
+        self.pipeline(ORB_CIRCLE_WGSL, |cached| {
+            self.sized_resources(width, height, |res| {
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("orber-circle-bg"),
+                    layout: &cached.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: orb_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
+            })
+        })
+    }
+
+    /// Render one full-screen pass into `res.target`, copy it into the read-back
+    /// buffer, map it, and strip wgpu's row padding into a tight `RgbaImage`.
+    fn run_pass_and_readback(
+        &self,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        res: &SizedResources,
+    ) -> RgbaImage {
+        let (width, height) = (res.width, res.height);
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orber-circle-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("orber-circle-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &res.target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &res.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &res.output_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(res.padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            extent,
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = res.output_buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("device poll failed");
+
+        let unpadded_bytes_per_row = width * BYTES_PER_PIXEL;
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        for row in 0..height {
+            let start = (row * res.padded_bytes_per_row) as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            pixels.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        res.output_buffer.unmap();
+
+        RgbaImage::from_raw(width, height, pixels)
+            .expect("read-back buffer matches image dimensions")
+    }
+}
+
+/// Round `value` up to the next multiple of `align` (a power of two).
+fn align_up(value: u32, align: u32) -> u32 {
+    value.div_ceil(align) * align
+}
+
+/// A fragment-visible uniform-buffer bind-group-layout entry.
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+    use crate::cluster::{Centroid, Cluster};
+    use crate::orb::OrbShape;
+    use crate::style::SoftnessPreset;
+
+    fn cluster(color: [u8; 3], cx: f32, cy: f32, weight: f32) -> Cluster {
+        Cluster {
+            color,
+            centroid: Centroid { x: cx, y: cy },
+            weight,
+        }
+    }
+
+    /// A small varied palette so per-pixel parity isn't trivially satisfied by a
+    /// flat color: several colors / weights scattered around the frame.
+    fn sample_clusters() -> Vec<Cluster> {
+        vec![
+            cluster([220, 60, 60], 0.3, 0.4, 0.5),
+            cluster([60, 120, 220], 0.7, 0.6, 0.3),
+            cluster([200, 200, 80], 0.5, 0.2, 0.2),
+            cluster([90, 220, 140], 0.2, 0.8, 0.25),
+        ]
+    }
+
+    fn circle_opts(
+        w: u32,
+        h: u32,
+        direction: MotionDirection,
+        speed: MotionSpeed,
+    ) -> AnimateOptions {
+        AnimateOptions {
+            width: w,
+            height: h,
+            orb_size: 1.0,
+            blur: 0.5,
+            saturation: 1.0,
+            direction,
+            speed,
+            seed: 12345,
+            count: Some(12),
+            background: [12, 18, 28, 255],
+            shape: OrbShape::Circle,
+            softness: SoftnessPreset::Mid,
+            glyph_rotate: true,
+            color_tracks: None,
+            keyframe_tracks: None,
+        }
+    }
+
+    /// Assert every channel of `a`/`b` agrees within `±2`, returning the max diff.
+    fn assert_within_tolerance(a: &RgbaImage, b: &RgbaImage, ctx: &str) -> u8 {
+        assert_eq!(a.dimensions(), b.dimensions(), "{ctx}: dimension mismatch");
+        let mut max_diff = 0u8;
+        let mut worst = (0u32, 0u32, 0usize, [0u8; 4], [0u8; 4]);
+        for (x, y, ap) in a.enumerate_pixels() {
+            let bp = b.get_pixel(x, y);
+            for ch in 0..4 {
+                let d = ap.0[ch].abs_diff(bp.0[ch]);
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (x, y, ch, ap.0, bp.0);
+                }
+            }
+        }
+        assert!(
+            max_diff <= 2,
+            "{ctx}: max per-channel diff {max_diff} at pixel ({},{}) channel {} (cpu={:?} gpu={:?})",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.4,
+        );
+        max_diff
+    }
+
+    #[test]
+    fn gpu_matches_cpu_within_tolerance() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP gpu_matches_cpu_within_tolerance: no GPU adapter available");
+            return;
+        };
+        eprintln!(
+            "GPU Circle parity test running on adapter: {}",
+            renderer.adapter_name()
+        );
+
+        let clusters = sample_clusters();
+        // Cover the read-back strip boundary both ways with orb-bearing frames:
+        //   - 37x23: width*4 = 148, not a multiple of 256, so rows ARE padded;
+        //   - 64x16: width*4 = 256 is already row-aligned, so NO padding.
+        // (1x1 is exercised separately by `gpu_matches_cpu_1x1_readback`: at a
+        // sub-pixel orb radius tiny-skia's analytic path-coverage AA diverges from
+        // a point-sampled shader — a degenerate case orber never renders — so the
+        // 1x1 row-padding readback is checked background-only instead.)
+        let mut overall_max = 0u8;
+        for &(w, h) in &[(37u32, 23u32), (64, 16)] {
+            let dir = match (w, h) {
+                (37, 23) => MotionDirection::LeftToRight,
+                _ => MotionDirection::TopToBottom,
+            };
+            let opts = circle_opts(w, h, dir, MotionSpeed::Slow);
+            for &t in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+                let cpu = render_frame(&clusters, &opts, t);
+                let gpu = renderer.render_frame(&clusters, &opts, t);
+                let max_diff =
+                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} {dir:?} t={t}"));
+                overall_max = overall_max.max(max_diff);
+                eprintln!("{w}x{h} {dir:?} t={t}: max per-channel diff = {max_diff}");
+            }
+        }
+        eprintln!("overall max per-channel diff across all cases = {overall_max}");
+    }
+
+    /// 1x1 read-back boundary: width*4 = 4 bytes/row is padded to 256, so this
+    /// exercises the most extreme row-padding strip. Use a background-only frame
+    /// (no clusters) so the assertion is about read-back geometry, not the
+    /// degenerate sub-pixel-orb AA where a point-sampled shader cannot match
+    /// tiny-skia's analytic path coverage. Also checks 1x3 / 3x1 strips.
+    #[test]
+    fn gpu_matches_cpu_1x1_readback() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP gpu_matches_cpu_1x1_readback: no GPU adapter available");
+            return;
+        };
+        for &(w, h) in &[(1u32, 1u32), (1, 3), (3, 1), (5, 1)] {
+            let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+            for &t in &[0.0_f32, 0.5, 1.0] {
+                // Background-only frame on both paths.
+                let cpu = render_frame(&[], &opts, t);
+                let gpu = renderer.render_frame(&[], &opts, t);
+                let max_diff =
+                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} bg-only t={t}"));
+                eprintln!("{w}x{h} bg-only t={t}: max per-channel diff = {max_diff}");
+            }
+        }
+    }
+
+    /// All four flow directions must hold parity at a single non-trivial size/t.
+    #[test]
+    fn gpu_matches_cpu_all_directions() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP gpu_matches_cpu_all_directions: no GPU adapter available");
+            return;
+        };
+        let clusters = sample_clusters();
+        for dir in [
+            MotionDirection::LeftToRight,
+            MotionDirection::RightToLeft,
+            MotionDirection::TopToBottom,
+            MotionDirection::BottomToTop,
+        ] {
+            let opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
+            let cpu = render_frame(&clusters, &opts, 0.37);
+            let gpu = renderer.render_frame(&clusters, &opts, 0.37);
+            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("dir {dir:?}"));
+            eprintln!("dir {dir:?}: max per-channel diff = {max_diff}");
+        }
+    }
+
+    /// Empty clusters → background-only frame must still match (bg fill path).
+    #[test]
+    fn gpu_matches_cpu_empty_clusters() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP gpu_matches_cpu_empty_clusters: no GPU adapter available");
+            return;
+        };
+        let opts = circle_opts(32, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let cpu = render_frame(&[], &opts, 0.5);
+        let gpu = renderer.render_frame(&[], &opts, 0.5);
+        let max_diff = assert_within_tolerance(&cpu, &gpu, "empty clusters");
+        eprintln!("empty clusters: max per-channel diff = {max_diff}");
+    }
+
+    /// Pipeline + sized caches must each hold exactly one entry after a clip of
+    /// many same-size frames, and a second size must grow only the sized cache.
+    #[test]
+    fn caches_resources_across_a_clip() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP caches_resources_across_a_clip: no GPU adapter available");
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        for k in 0..16 {
+            let t = k as f32 / 15.0;
+            let _ = renderer.render_frame(&clusters, &opts, t);
+        }
+        let (pipes, sizes) = renderer.cache_sizes();
+        assert_eq!(pipes, 1, "shader must compile exactly once");
+        assert_eq!(sizes, 1, "size must allocate exactly once");
+
+        let opts2 = circle_opts(24, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let _ = renderer.render_frame(&clusters, &opts2, 0.5);
+        let (pipes, sizes) = renderer.cache_sizes();
+        assert_eq!(pipes, 1, "second size must not recompile the shader");
+        assert_eq!(sizes, 2, "second size must add one sized entry");
+    }
+
+    /// Reused per-size resources must not leak the previous frame's bytes: a
+    /// second frame with different inputs at the same size (hitting the cache)
+    /// must equal a fresh renderer's single render of those inputs.
+    #[test]
+    fn cached_resources_do_not_leak_previous_frame() {
+        let Some(renderer) = GpuRenderer::new() else {
+            eprintln!("SKIP cached_resources_do_not_leak_previous_frame: no GPU adapter available");
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts_a = circle_opts(40, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut opts_b = circle_opts(40, 24, MotionDirection::TopToBottom, MotionSpeed::Mid);
+        opts_b.seed = 999;
+        opts_b.background = [40, 5, 50, 255];
+
+        let _a = renderer.render_frame(&clusters, &opts_a, 0.3);
+        let b_cached = renderer.render_frame(&clusters, &opts_b, 0.7);
+
+        let (_, sizes) = renderer.cache_sizes();
+        assert_eq!(sizes, 1, "both frames must share one cached size");
+
+        let Some(fresh) = GpuRenderer::new() else {
+            eprintln!("SKIP oracle leg: no second GPU adapter available");
+            return;
+        };
+        let b_fresh = fresh.render_frame(&clusters, &opts_b, 0.7);
+        let max_diff =
+            assert_within_tolerance(&b_fresh, &b_cached, "reused frame B vs fresh render");
+        eprintln!("reuse-vs-fresh frame B: max per-channel diff = {max_diff}");
+    }
+}

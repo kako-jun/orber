@@ -18,6 +18,12 @@ exclude = [".github/", "target/"]
 name = "orber"
 path = "src/main.rs"
 
+[features]
+# OFF (default): CPU (tiny-skia) renderer のみ。
+# ON: wgpu (Rust + WGSL) renderer を足し、--renderer gpu を有効化する (#207)。
+default = []
+gpu = ["orber-core/gpu"]
+
 [dependencies]
 orber-core = { path = "../core", version = "0.3.0" }
 clap = { workspace = true }
