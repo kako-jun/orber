@@ -222,7 +222,8 @@ pub fn render_video(
         seed: opts.seed,
         count: opts.count,
         background: opts.background,
-        shape: opts.shape,
+        // OrbShape は Copy ではなくなった（Image が Arc<[u8]> を持つ）ので clone する。
+        shape: opts.shape.clone(),
         softness: opts.softness,
         glyph_rotate: true,
         color_tracks: opts.color_tracks.clone(),

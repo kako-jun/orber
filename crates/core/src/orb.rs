@@ -17,13 +17,13 @@
 
 use crate::cluster::Cluster;
 use crate::glyph::{render_glyph_orb, render_sdf_orb, GlyphFontId};
-use std::sync::Arc;
 use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
 use aquarelle::{
     render_aquarelle_bleed_pass, render_aquarelle_orb, AquarelleBleedParams, AquarelleParams,
 };
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
+use std::sync::Arc;
 use tiny_skia::{
     Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode,
     Transform,

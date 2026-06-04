@@ -38,8 +38,9 @@ const GLYPH_SDF_MAX_DIST_FACTOR: f32 = 0.06;
 /// orber-core が同梱するフォント識別子。
 ///
 /// 将来的に複数フォントを同梱する余地を残すため `enum` にしている。Phase A では
-/// `NotoSymbols2` の 1 種類のみ。`Copy + Eq` を保つことで [`crate::orb::OrbShape`]
-/// が引き続き `Copy` でいられる。
+/// `NotoSymbols2` の 1 種類のみ。`Copy + Eq` の軽量 enum なので、[`crate::orb::OrbShape`]
+/// の `Glyph` アームを安価に複製できる（#217 で `OrbShape` 自体は `Image` の
+/// `Arc<[u8]>` のため `Copy` ではなく `Clone` になった）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GlyphFontId {
     /// Noto Sans Symbols 2 (記号類専用 subset)。`☆ ♪ ♥ ✿` 等が含まれる。
@@ -351,8 +352,7 @@ pub fn image_rgba_to_sdf(rgba: &image::RgbaImage, size: u32) -> Option<Vec<u8>> 
 
     // 透明キャンバス (alpha=0) に bilinear リサンプル結果をレターボックス配置する。
     // Canvas の clearRect + drawImage と同じ「描画矩形の外は alpha=0 のまま」を再現。
-    let resized =
-        image::imageops::resize(rgba, dw, dh, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(rgba, dw, dh, image::imageops::FilterType::Triangle);
     let mut canvas = image::RgbaImage::from_pixel(s as u32, s as u32, image::Rgba([0, 0, 0, 0]));
     image::imageops::replace(&mut canvas, &resized, dx as i64, dy as i64);
 
@@ -850,7 +850,10 @@ mod tests {
         }
         let sdf = mask_to_sdf(&mask, size);
         assert_eq!(sdf.len(), s * s);
-        assert!(sdf[16 * s + 16] > 128, "center of inside block must be inside (>128)");
+        assert!(
+            sdf[16 * s + 16] > 128,
+            "center of inside block must be inside (>128)"
+        );
         assert!(sdf[0] < 128, "far corner must be outside (<128)");
     }
 
@@ -906,7 +909,10 @@ mod tests {
             sdf.iter().any(|&b| b > 128),
             "luma auto-polarity must produce inside region for the minority (dark) subject"
         );
-        assert!(sdf.iter().any(|&b| b < 128), "must produce outside region too");
+        assert!(
+            sdf.iter().any(|&b| b < 128),
+            "must produce outside region too"
+        );
     }
 
     /// 不透明・少数派が明るい被写体でも auto-polarity が拾う（黒背景に白い小四角）。

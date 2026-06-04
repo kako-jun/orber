@@ -173,19 +173,9 @@ enum Shape {
     Aquarelle,
     /// One bundled-font glyph filled per orb (#55). Pick the glyph with --glyph-char.
     Glyph,
-}
-
-impl Shape {
-    fn to_orb_shape(self, params: AquarelleParams, glyph_char: char) -> OrbShape {
-        match self {
-            Shape::Circle => OrbShape::Circle,
-            Shape::Aquarelle => OrbShape::Aquarelle(params),
-            Shape::Glyph => OrbShape::Glyph {
-                ch: glyph_char,
-                font: GlyphFontId::NotoSymbols2,
-            },
-        }
-    }
+    /// Image silhouette filled per orb (#217). Provide the silhouette with
+    /// --image-mask (a raster PNG/JPG/...; SVG is web-only, image crate is raster).
+    Image,
 }
 
 /// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
@@ -347,6 +337,15 @@ struct Cli {
     #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
     glyph_char: char,
 
+    /// Silhouette image used when --shape image (#217). A raster image (PNG / JPG /
+    /// etc.; SVG is web-only since the image crate decodes raster only). This is the
+    /// SHAPE source and is separate from --input (the COLOR source). The silhouette
+    /// is auto-detected: transparent images use alpha, opaque images use luminance
+    /// with auto-polarity (minority = subject). A flat / contrast-free mask is
+    /// rejected with an explicit error. Required when --shape image.
+    #[arg(long)]
+    image_mask: Option<PathBuf>,
+
     /// Visual softness preset (#55, #205): low / mid / high.
     /// Low = crisper baseline (was the legacy default before #205),
     /// Mid = orb-like softness (new default; same look as the previous "high" preset),
@@ -402,9 +401,51 @@ impl Cli {
         }
     }
 
-    fn orb_shape(&self) -> OrbShape {
-        self.shape
-            .to_orb_shape(self.aquarelle_params(), self.glyph_char)
+    /// Resolve the `OrbShape` for this run. For `--shape image` this performs I/O:
+    /// it decodes `--image-mask` (CLI-side, default image features) and runs the
+    /// silhouette → SDF heuristic ([`orber_core::glyph::image_rgba_to_sdf`]). Returns
+    /// `Err(message)` — never panics — when `--image-mask` is missing, unreadable, or
+    /// has no usable contrast, so callers can `eprintln!` and exit cleanly.
+    fn orb_shape(&self) -> Result<OrbShape, String> {
+        match self.shape {
+            Shape::Circle => Ok(OrbShape::Circle),
+            Shape::Aquarelle => Ok(OrbShape::Aquarelle(self.aquarelle_params())),
+            Shape::Glyph => Ok(OrbShape::Glyph {
+                ch: self.glyph_char,
+                font: GlyphFontId::NotoSymbols2,
+            }),
+            Shape::Image => self.resolve_image_shape(),
+        }
+    }
+
+    /// `--shape image` の解決: `--image-mask` をデコードして画像シルエット SDF を作る。
+    fn resolve_image_shape(&self) -> Result<OrbShape, String> {
+        let path = self.image_mask.as_ref().ok_or_else(|| {
+            "--shape image requires --image-mask PATH (the silhouette image; \
+             --input is the color source, --image-mask is the shape source)"
+                .to_string()
+        })?;
+        // CLI 側は default features の image crate でデコード（PNG/JPG/WebP 等のラスタ）。
+        // SVG はラスタデコーダに無いので非対応（web のみ）。
+        let img = image::open(path).map_err(|e| {
+            format!(
+                "failed to read --image-mask {}: {e} (raster images only; SVG is web-only)",
+                path.display()
+            )
+        })?;
+        let rgba = img.to_rgba8();
+        let size = orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE;
+        let sdf = orber_core::glyph::image_rgba_to_sdf(&rgba, size).ok_or_else(|| {
+            format!(
+                "--image-mask {} has no usable silhouette contrast (it is blank or a single flat \
+                 color); provide an image with a distinct subject vs. background",
+                path.display()
+            )
+        })?;
+        Ok(OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size,
+        })
     }
 
     /// Resolved orb count. `--count-preset` wins over `--count` when both are present
@@ -527,7 +568,7 @@ impl FrameRenderer {
     /// 同じ枚数だけ直接描く（#210 Phase 1a で旧 64 制限・CPU フォールバックを撤去）。
     /// storage buffer は wgpu の WebGL2 backend では非対応のため使わず、data-texture
     /// で portable にしている（Phase 2 のブラウザ fallback を壊さない）。
-    fn select(choice: Renderer, shape: OrbShape) -> Self {
+    fn select(choice: Renderer, shape: &OrbShape) -> Self {
         match Self::route(choice, shape) {
             // 現状 route は全 shape を Gpu に振るため、この arm は到達しない。将来 GPU
             // 非対応 shape を足したときに stderr 文言を出すための防御として残す。
@@ -548,19 +589,20 @@ impl FrameRenderer {
     /// `Cpu(None)`（文言なし）。GPU を選んでも、最終的にアダプタが取れなければ
     /// `select_gpu` がさらに CPU に落とす。アダプタに依存しないので、ルーティング
     /// 判定をそのままユニットテストできる。
-    fn route(choice: Renderer, shape: OrbShape) -> RenderRoute {
+    fn route(choice: Renderer, shape: &OrbShape) -> RenderRoute {
         match choice {
             Renderer::Cpu => RenderRoute::Cpu(None),
             Renderer::Gpu => {
-                // Circle (#210), Glyph (#212 Phase 1b) and Aquarelle (#216 Phase 1c)
-                // render in WGSL. Glyph matches the CPU pre-bleed fill (its own
-                // per-frame bleed pass is CPU-only for now, a known visual difference).
-                // Aquarelle reproduces the crate's four layers analytically (structural
-                // parity, AA-only residual). All three shapes route to the GPU.
+                // Circle (#210), Glyph (#212 Phase 1b), Aquarelle (#216 Phase 1c) and
+                // Image (#217) all render in WGSL. Glyph / Image share the SDF shader
+                // path (their per-frame bleed pass is reproduced as a 2nd pass).
+                // Aquarelle reproduces the crate's four layers analytically. All
+                // shapes route to the GPU.
                 match shape {
-                    OrbShape::Circle | OrbShape::Glyph { .. } | OrbShape::Aquarelle(_) => {
-                        RenderRoute::Gpu
-                    }
+                    OrbShape::Circle
+                    | OrbShape::Glyph { .. }
+                    | OrbShape::Aquarelle(_)
+                    | OrbShape::Image { .. } => RenderRoute::Gpu,
                 }
             }
         }
@@ -591,7 +633,8 @@ impl FrameRenderer {
         FrameRenderer::Cpu
     }
 
-    /// 1 フレームを描画する。GPU 経路は Circle / Glyph（select / route で保証済み）。
+    /// 1 フレームを描画する。GPU 経路は Circle / Glyph / Aquarelle / Image（select /
+    /// route で保証済み）。
     fn render(
         &self,
         clusters: &[Cluster],
@@ -601,10 +644,12 @@ impl FrameRenderer {
         match self {
             FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
             #[cfg(feature = "gpu")]
-            FrameRenderer::Gpu(gpu) => match opts.shape {
-                // Glyph uses the dedicated WGSL glyph path (#212); Aquarelle the
-                // dedicated WGSL four-layer path (#216); Circle the default.
+            FrameRenderer::Gpu(gpu) => match &opts.shape {
+                // Glyph uses the dedicated WGSL glyph path (#212); Image the same SDF
+                // path with a supplied texture (#217); Aquarelle the dedicated WGSL
+                // four-layer path (#216); Circle the default.
                 OrbShape::Glyph { .. } => gpu.render_frame_glyph(clusters, opts, t),
+                OrbShape::Image { .. } => gpu.render_frame_image(clusters, opts, t),
                 OrbShape::Aquarelle(_) => gpu.render_frame_aquarelle(clusters, opts, t),
                 _ => gpu.render_frame(clusters, opts, t),
             },
@@ -652,6 +697,16 @@ fn warn_if_aquarelle_count_ignored(cli: &Cli) {
             "orber: warning: aquarelle shape ignores --count (rendering one orb per k-means cluster from the palette)"
         );
     }
+}
+
+/// `cli.orb_shape()` を解決し、エラー（`--shape image` の mask 欠如 / 読込失敗 /
+/// コントラスト無し等）なら stderr に出して `Err(ExitCode)` を返す。各 render 経路の
+/// 先頭で 1 度だけ呼び、Image の I/O デコードを多重に走らせない。panic はしない。
+fn resolve_orb_shape(cli: &Cli) -> Result<OrbShape, ExitCode> {
+    cli.orb_shape().map_err(|msg| {
+        eprintln!("orber: {msg}");
+        ExitCode::from(2)
+    })
 }
 
 fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
@@ -727,6 +782,12 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
 
+    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
+    let orb_shape = match resolve_orb_shape(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
     // 4. ビデオオプション構築。解像度は固定。
     let (direction, speed) = resolve_motion(cli);
     let opts = VideoOptions {
@@ -738,7 +799,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         seed: cli.seed,
         count: Some(cli.resolved_count()),
         background,
-        shape: cli.orb_shape(),
+        shape: orb_shape,
         softness: cli.resolved_softness(),
         color_tracks: None,
         keyframe_tracks: None,
@@ -778,6 +839,12 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
 
+    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
+    let orb_shape = match resolve_orb_shape(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
     // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
     //    描画する。これで --count による orb 数の展開が単発出力でも効く。
     //    （render_static は count を解釈しないので、count=clusters.len() に固定された
@@ -794,15 +861,15 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         seed: cli.seed,
         count: Some(cli.resolved_count()),
         background,
-        shape: cli.orb_shape(),
+        shape: orb_shape.clone(),
         softness: cli.resolved_softness(),
         glyph_rotate: true,
         color_tracks: None,
         keyframe_tracks: None,
     };
-    // #207/#210: --renderer で GPU/CPU を選ぶ。GPU は Circle のみ（count は 1024 まで
-    // data-texture 経路で GPU が直接描く）。
-    let renderer = FrameRenderer::select(cli.renderer, cli.orb_shape());
+    // #207/#210: --renderer で GPU/CPU を選ぶ。GPU は全 shape（Circle/Glyph/Aquarelle/
+    // Image）に対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
+    let renderer = FrameRenderer::select(cli.renderer, &orb_shape);
     let out = renderer.render(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
@@ -891,6 +958,12 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
 
+    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
+    let orb_shape = match resolve_orb_shape(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         let (direction, speed) = resolve_motion(cli);
@@ -903,7 +976,7 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
             seed: cli.seed,
             count: Some(cli.resolved_count()),
             background,
-            shape: cli.orb_shape(),
+            shape: orb_shape,
             softness: cli.resolved_softness(),
             color_tracks: Some(orb_tracks),
             keyframe_tracks: None,
@@ -931,7 +1004,7 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
                 seed: cli.seed,
                 count: Some(cli.resolved_count()),
                 background,
-                shape: cli.orb_shape(),
+                shape: orb_shape,
                 softness: cli.resolved_softness(),
                 glyph_rotate: true,
                 color_tracks: Some(orb_tracks),
@@ -1016,6 +1089,12 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
 
+    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
+    let orb_shape = match resolve_orb_shape(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         let (direction, speed) = resolve_motion(cli);
@@ -1028,7 +1107,7 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
             seed: cli.seed,
             count: Some(cli.resolved_count()),
             background,
-            shape: cli.orb_shape(),
+            shape: orb_shape,
             softness: cli.resolved_softness(),
             color_tracks: None,
             keyframe_tracks: Some(orb_kf_tracks),
@@ -1057,7 +1136,7 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
                 seed: cli.seed,
                 count: Some(cli.resolved_count()),
                 background,
-                shape: cli.orb_shape(),
+                shape: orb_shape,
                 softness: cli.resolved_softness(),
                 glyph_rotate: true,
                 color_tracks: None,
@@ -1120,7 +1199,12 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
         );
     }
 
-    let orb_shape = cli.orb_shape();
+    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。各 spec
+    // で同じ shape を使い回すので、ループ前に 1 回だけ作る。
+    let orb_shape = match resolve_orb_shape(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let softness = cli.resolved_softness();
     // クラスタ抽出は preset 全 spec で 1 回だけ（K は VARIATIONS_KMEANS_K で固定）。
     // パレットを spec ごとに変えると入力画像の色が崩れるので、ここはキャッシュではなく
@@ -1151,7 +1235,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
             spec,
             &out_path,
             background,
-            orb_shape,
+            &orb_shape,
             softness,
         );
         if let Err(msg) = result {
@@ -1173,7 +1257,7 @@ fn render_one_variation(
     spec: &VariationSpec,
     out_path: &std::path::Path,
     bg_rgba: [u8; 4],
-    orb_shape: OrbShape,
+    orb_shape: &OrbShape,
     softness: SoftnessPreset,
 ) -> Result<(), String> {
     // saturation は preset で揺らさない（同一画像から作る複数バリエーションでは
@@ -1193,7 +1277,7 @@ fn render_one_variation(
                 seed: spec.seed,
                 count: Some(spec.count),
                 background: bg_rgba,
-                shape: orb_shape,
+                shape: orb_shape.clone(),
                 softness,
                 glyph_rotate: true,
                 color_tracks: None,
@@ -1212,7 +1296,7 @@ fn render_one_variation(
                 seed: spec.seed,
                 count: Some(spec.count),
                 background: bg_rgba,
-                shape: orb_shape,
+                shape: orb_shape.clone(),
                 softness,
                 color_tracks: None,
                 keyframe_tracks: None,
@@ -1353,7 +1437,7 @@ mod tests {
         // count 引数も失ったので、もはや count に依らず route(Gpu, Circle) は `Gpu`
         // 一択。回帰意図（旧 64/1024 境界）はテスト名・コメントで残し、判定は count に
         // 依存しない単一呼び出しで行う。アダプタ非依存のルーティング判定のみ。
-        let route = FrameRenderer::route(Renderer::Gpu, OrbShape::Circle);
+        let route = FrameRenderer::route(Renderer::Gpu, &OrbShape::Circle);
         assert_eq!(
             route,
             RenderRoute::Gpu,
@@ -1366,16 +1450,17 @@ mod tests {
         );
     }
 
-    /// C2 (#210 → #212 → #216): GPU 要求時、Circle / Glyph / Aquarelle の全 shape が
-    /// `Gpu` に乗る（#216 Phase 1c で aquarelle も WGSL 化され、理由つき CPU フォール
-    /// バックは無くなった）。--renderer cpu は理由なし `Cpu(None)` のまま。
+    /// C2 (#210 → #212 → #216 → #217): GPU 要求時、Circle / Glyph / Aquarelle / Image
+    /// の全 shape が `Gpu` に乗る（#216 Phase 1c で aquarelle も WGSL 化、#217 で image
+    /// も glyph SDF 経路に乗り、理由つき CPU フォールバックは無くなった）。
+    /// --renderer cpu は理由なし `Cpu(None)` のまま。
     #[test]
     fn gpu_route_covers_circle_glyph_and_aquarelle() {
         // Aquarelle (#216) は GPU 経路に乗る（フォールバック文言なし）。
         assert_eq!(
             FrameRenderer::route(
                 Renderer::Gpu,
-                OrbShape::Aquarelle(AquarelleParams {
+                &OrbShape::Aquarelle(AquarelleParams {
                     bleed: 0.5,
                     bloom: 0.5,
                     offset: 0.5,
@@ -1390,7 +1475,7 @@ mod tests {
         assert_eq!(
             FrameRenderer::route(
                 Renderer::Gpu,
-                OrbShape::Glyph {
+                &OrbShape::Glyph {
                     ch: '☆',
                     font: GlyphFontId::NotoSymbols2,
                 },
@@ -1399,16 +1484,29 @@ mod tests {
             "glyph + gpu must route to the gpu path (#212)"
         );
 
+        // Image (#217) も GPU 経路（glyph SDF 経路を共有）。
+        assert_eq!(
+            FrameRenderer::route(
+                Renderer::Gpu,
+                &OrbShape::Image {
+                    sdf: std::sync::Arc::from(vec![0u8; 4]),
+                    size: 2,
+                },
+            ),
+            RenderRoute::Gpu,
+            "image + gpu must route to the gpu path (#217)"
+        );
+
         // Circle (#210) も GPU 経路。
         assert_eq!(
-            FrameRenderer::route(Renderer::Gpu, OrbShape::Circle),
+            FrameRenderer::route(Renderer::Gpu, &OrbShape::Circle),
             RenderRoute::Gpu,
             "circle + gpu must route to the gpu path (#210)"
         );
 
         // --renderer cpu は理由なしで CPU（明示指定なので警告は出さない）。
         assert_eq!(
-            FrameRenderer::route(Renderer::Cpu, OrbShape::Circle),
+            FrameRenderer::route(Renderer::Cpu, &OrbShape::Circle),
             RenderRoute::Cpu(None),
             "explicit cpu must route to Cpu(None) with no warning"
         );
@@ -1423,9 +1521,105 @@ mod tests {
         .expect("--shape glyph should parse");
         assert_eq!(cli.glyph_char, '☆');
         match cli.orb_shape() {
-            OrbShape::Glyph { ch, .. } => assert_eq!(ch, '☆'),
-            other => panic!("expected OrbShape::Glyph, got {other:?}"),
+            Ok(OrbShape::Glyph { ch, .. }) => assert_eq!(ch, '☆'),
+            other => panic!("expected Ok(OrbShape::Glyph), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shape_image_without_mask_errors_not_panics() {
+        // #217: --shape image で --image-mask 無し → orb_shape() が Err（panic しない）。
+        let cli = Cli::try_parse_from([
+            "orber", "--input", "x", "--output", "x.png", "--shape", "image",
+        ])
+        .expect("--shape image should parse (clap level)");
+        let result = cli.orb_shape();
+        assert!(
+            result.is_err(),
+            "--shape image without --image-mask must be an explicit Err, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn shape_image_with_unreadable_mask_errors_not_panics() {
+        // #217: --image-mask が存在しないファイル → Err（panic しない）。
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "image",
+            "--image-mask",
+            "/nonexistent/definitely/not/here.png",
+        ])
+        .expect("clap should parse");
+        assert!(
+            cli.orb_shape().is_err(),
+            "unreadable --image-mask must be an explicit Err"
+        );
+    }
+
+    #[test]
+    fn shape_image_with_valid_mask_resolves_to_image() {
+        // #217: 有効なシルエット PNG を書き出して --image-mask に渡すと
+        // OrbShape::Image に解決される（size は DEFAULT_GLYPH_SDF_SIZE = 256）。
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mask_path = dir.path().join("silhouette.png");
+        // 透明背景に中央不透明ブロックの 64x64 PNG を作る。
+        let mut img = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        img.save(&mask_path).expect("write mask png");
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "image",
+            "--image-mask",
+            mask_path.to_str().unwrap(),
+        ])
+        .expect("clap should parse");
+        match cli.orb_shape() {
+            Ok(OrbShape::Image { size, sdf }) => {
+                assert_eq!(size, orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE);
+                assert_eq!(sdf.len(), (size as usize) * (size as usize));
+            }
+            other => panic!("expected Ok(OrbShape::Image), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_image_with_no_contrast_mask_errors() {
+        // #217: フラットな単色 PNG → コントラスト無しで Err（panic しない）。
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mask_path = dir.path().join("flat.png");
+        let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([100, 100, 100, 255]));
+        img.save(&mask_path).expect("write flat png");
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "image",
+            "--image-mask",
+            mask_path.to_str().unwrap(),
+        ])
+        .expect("clap should parse");
+        assert!(
+            cli.orb_shape().is_err(),
+            "flat single-color mask has no contrast → Err"
+        );
     }
 
     #[test]
