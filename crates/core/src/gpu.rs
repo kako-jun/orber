@@ -247,8 +247,14 @@ impl GpuRenderer {
     #[cfg(test)]
     fn cache_sizes(&self) -> (usize, usize) {
         (
-            self.pipeline_cache.lock().unwrap().len(),
-            self.sized_cache.lock().unwrap().len(),
+            self.pipeline_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            self.sized_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
         )
     }
 
@@ -260,7 +266,7 @@ impl GpuRenderer {
     fn orb_capacity(&self) -> u32 {
         self.orb_texture
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, |tex| tex.capacity)
     }
@@ -269,7 +275,10 @@ impl GpuRenderer {
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
     fn pipeline<R>(&self, shader_wgsl: &str, f: impl FnOnce(&CachedPipeline) -> R) -> R {
-        let mut cache = self.pipeline_cache.lock().unwrap();
+        let mut cache = self
+            .pipeline_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = cache
             .entry(shader_wgsl.to_owned())
             .or_insert_with(|| self.build_pipeline(shader_wgsl));
@@ -342,7 +351,10 @@ impl GpuRenderer {
         height: u32,
         f: impl FnOnce(&SizedResources) -> R,
     ) -> R {
-        let mut map = self.sized_cache.lock().unwrap();
+        let mut map = self
+            .sized_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map
             .entry((width, height))
             .or_insert_with(|| Self::build_sized_resources(&self.device, width, height));
@@ -397,7 +409,10 @@ impl GpuRenderer {
     /// buffer→texture copies), so the tight `ORB_TEX_BYTES_PER_ROW` (48) is used.
     fn upload_orb_texture(&self, orbs: &[GpuOrb]) -> wgpu::TextureView {
         let rows = orbs.len().max(1) as u32;
-        let mut guard = self.orb_texture.lock().unwrap();
+        let mut guard = self
+            .orb_texture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let needs_realloc = match guard.as_ref() {
             Some(tex) => tex.capacity < rows,
             None => true,
