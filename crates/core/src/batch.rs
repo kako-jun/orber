@@ -73,7 +73,8 @@ pub fn generate_batch(input: BatchInput) -> Result<Vec<Vec<u8>>, BatchError> {
                 blur: spec.blur,
                 saturation: 1.0,
                 background: bg,
-                shape: input.shape,
+                // OrbShape は Copy ではなくなった（Image が Arc<[u8]> を持つ）ので clone する。
+                shape: input.shape.clone(),
                 softness: crate::style::SoftnessPreset::Mid,
                 glyph_rotate: true,
                 color_tracks: None,

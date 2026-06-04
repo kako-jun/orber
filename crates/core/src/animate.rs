@@ -655,8 +655,14 @@ pub fn render_frame_with_params(
 
         // shape による分岐:
         // - Glyph: 1 文字の SDF を回転サンプリングし、blur + Rim/Soft falloff を共有
+        // - Image (#217): 与えられた画像シルエット SDF を同じ共有描画に流す
         // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
-        match opts.shape {
+        // Image の SDF は Arc なので move しないよう `&opts.shape` を借用で分岐する。
+        let profile = match p.style {
+            OrbStyle::Rim => FalloffProfile::Rim,
+            OrbStyle::Soft => FalloffProfile::Soft,
+        };
+        match &opts.shape {
             OrbShape::Glyph { ch, font } => {
                 // Glyph でも style / blur は Circle と同じ falloff カーブに流し込む。
                 // RNG の `style` 引きは Circle/Glyph 切替時の seed 列互換にも使われる。
@@ -667,12 +673,31 @@ pub fn render_frame_with_params(
                     rgb,
                     blur,
                     opacity,
-                    match p.style {
-                        OrbStyle::Rim => FalloffProfile::Rim,
-                        OrbStyle::Soft => FalloffProfile::Soft,
-                    },
-                    font,
-                    ch,
+                    profile,
+                    *font,
+                    *ch,
+                    glyph_rotation_angle(
+                        cycle,
+                        t,
+                        p.base_angle,
+                        p.rot_speed_signed,
+                        opts.glyph_rotate,
+                    ),
+                );
+            }
+            OrbShape::Image { sdf, size } => {
+                // Image: glyph と同じ共有 SDF 描画 render_sdf_orb に乗せる。回転も Web の
+                // image アーム（glyph と同 shape_id）と揃え、glyph_rotation_angle を使う。
+                crate::glyph::render_sdf_orb(
+                    &mut pixmap,
+                    (cx, cy),
+                    radius,
+                    rgb,
+                    blur,
+                    opacity,
+                    profile,
+                    sdf,
+                    *size as usize,
                     glyph_rotation_angle(
                         cycle,
                         t,
@@ -688,13 +713,12 @@ pub fn render_frame_with_params(
         }
     }
 
-    // Glyph shape のときだけ、全 orb 描画後に aquarelle v0.2 の bleed pass を 1 回かける。
-    // per-orb ではなく per-frame で 1 回にすることで、static 経路 (orb.rs の render_static)
-    // と同じ paper-bleed 質感を animation でも維持する (#195)。
-    // seed=0 固定。RenderOptions / AnimateOptions に seed フィールドが入った時は
-    // そちらと連動させて再現性をユーザーから制御できるようにする。
-    // seed をフレーム間で固定することで、bleed パターンが t に対してチラつかない。
-    if let OrbShape::Glyph { .. } = opts.shape {
+    // SDF 系 shape（Glyph / Image）のときだけ、全 orb 描画後に aquarelle v0.2 の
+    // bleed pass を 1 回かける。per-orb ではなく per-frame で 1 回にすることで、static
+    // 経路 (orb.rs の render_static) と同じ paper-bleed 質感を animation でも維持する (#195)。
+    // Image (#217) も Web の image アームと揃えて Glyph 同様 bleed を掛ける。
+    // seed=0 固定でフレーム間の bleed パターンが t に対してチラつかない。
+    if matches!(opts.shape, OrbShape::Glyph { .. } | OrbShape::Image { .. }) {
         render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
     }
 
@@ -796,7 +820,8 @@ fn render_frame_aquarelle(
         blur: opts.blur,
         saturation: opts.saturation,
         background: opts.background,
-        shape: opts.shape,
+        // OrbShape は Copy ではなくなった（Image が Arc<[u8]> を持つ）ので clone する。
+        shape: opts.shape.clone(),
         softness: opts.softness,
     };
     render_static(&modulated, &render_opts)

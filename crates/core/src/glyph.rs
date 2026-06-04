@@ -557,12 +557,15 @@ fn blend_source_over(pixmap: &mut Pixmap, x: u32, y: u32, rgb: [u8; 3], alpha: f
         .clamp(0.0, 255.0) as u8;
 }
 
-/// 単一の Glyph orb を pixmap に SourceOver で重ねる。
+/// 与えられた SDF テクスチャ (`size × size`、128≈edge) を 1 orb として pixmap に
+/// SourceOver で重ねる、shape 非依存の共有描画関数。
 ///
-/// Circle と同じ `falloff_curve` を使うため、入力は `blur` / `style` / `opacity`
-/// をそのまま受ける。`rotation` は glyph テクスチャ空間に対する回転角 (rad)。
+/// Glyph ([`render_glyph_orb`]) と Image (#217、`OrbShape::Image`) が **SDF の
+/// 出どころだけ変えて同じこの描画に乗る**。`u`/`v` の content-span マッピング・
+/// bilinear サンプル・`falloff_curve` は両者で完全共通。`rotation` は SDF テクスチャ
+/// 空間に対する回転角 (rad)。`sdf` が全 0（描画なし）なら何もしない。
 #[allow(clippy::too_many_arguments)]
-pub fn render_glyph_orb(
+pub fn render_sdf_orb(
     pixmap: &mut Pixmap,
     center: (f32, f32),
     radius: f32,
@@ -570,8 +573,8 @@ pub fn render_glyph_orb(
     blur: f32,
     opacity: f32,
     profile: FalloffProfile,
-    font: GlyphFontId,
-    ch: char,
+    sdf: &[u8],
+    size: usize,
     rotation: f32,
 ) {
     if radius <= 0.0 {
@@ -581,12 +584,9 @@ pub fn render_glyph_orb(
     if opacity <= 0.0 {
         return;
     }
-    let sdf_size = glyph_sdf_size_for_radius(radius);
-    let sdf = cached_glyph_sdf(font, ch, sdf_size);
-    if sdf.iter().all(|&b| b == 0) {
+    if size == 0 || sdf.len() < size * size || sdf.iter().all(|&b| b == 0) {
         return;
     }
-    let size = sdf_size as usize;
     let (cx, cy) = center;
     let cos_a = rotation.cos();
     let sin_a = rotation.sin();
@@ -609,13 +609,50 @@ pub fn render_glyph_orb(
             if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                 continue;
             }
-            let sdf01 = sample_sdf_bilinear(&sdf, size, u, v);
+            let sdf01 = sample_sdf_bilinear(sdf, size, u, v);
             let signed_unit = sdf01 * 2.0 - 1.0;
             let r = 1.0 - signed_unit;
             let alpha = falloff_curve(profile, r, blur, opacity);
             blend_source_over(pixmap, x, y, rgb, alpha);
         }
     }
+}
+
+/// 単一の Glyph orb を pixmap に SourceOver で重ねる。
+///
+/// Circle と同じ `falloff_curve` を使うため、入力は `blur` / `style` / `opacity`
+/// をそのまま受ける。`rotation` は glyph テクスチャ空間に対する回転角 (rad)。
+/// radius からキャッシュ済み glyph SDF を引き、共有の [`render_sdf_orb`] に流すだけ。
+#[allow(clippy::too_many_arguments)]
+pub fn render_glyph_orb(
+    pixmap: &mut Pixmap,
+    center: (f32, f32),
+    radius: f32,
+    rgb: [u8; 3],
+    blur: f32,
+    opacity: f32,
+    profile: FalloffProfile,
+    font: GlyphFontId,
+    ch: char,
+    rotation: f32,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+    let sdf_size = glyph_sdf_size_for_radius(radius);
+    let sdf = cached_glyph_sdf(font, ch, sdf_size);
+    render_sdf_orb(
+        pixmap,
+        center,
+        radius,
+        rgb,
+        blur,
+        opacity,
+        profile,
+        &sdf,
+        sdf_size as usize,
+        rotation,
+    );
 }
 
 #[cfg(test)]
