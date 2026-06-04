@@ -146,15 +146,16 @@ impl From<CliVariationMode> for VariationMode {
 
 /// Which renderer backend to drive (`--renderer`).
 ///
-/// `gpu` is the wgpu (Rust + WGSL) production path (#207). It falls back to the
-/// CPU renderer when no GPU adapter is available, for non-Circle shapes (Phase 0
-/// covers Circle only), or when the binary was built without the `gpu` feature.
-/// Orb count no longer forces a fallback: per-orb data is a data-texture, so the
-/// GPU renders any count up to 1024 directly (#210 Phase 1a). On the path it
-/// covers — Circle, saturation reflected — the GPU output matches the CPU oracle
-/// within ±2/channel (bit-exact on real GPUs), so those flags give the same image
-/// either backend. Video frames are always rendered on the CPU; color/keyframe
-/// tracks are not yet folded into the GPU pack.
+/// `gpu` is the wgpu (Rust + WGSL) production path (#207). Circle, Glyph (#212)
+/// and Aquarelle (#216) all render on the GPU; the only fallback to the CPU
+/// renderer is when no GPU adapter is available, or when the binary was built
+/// without the `gpu` feature. The `image` shape is web-only. Orb count never
+/// forces a fallback: per-orb data is a data-texture, so the GPU renders any
+/// count up to 1024 directly (#210 Phase 1a). Circle matches the CPU oracle
+/// within ±2/channel (bit-exact on real GPUs); Glyph and Aquarelle match
+/// structurally (float SDF / AA differences only). Video frames are always
+/// rendered on the CPU; color/keyframe tracks are not yet folded into the GPU
+/// pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Renderer {
     /// Reference CPU (tiny-skia) renderer.
@@ -320,12 +321,13 @@ struct Cli {
     shape: Shape,
 
     /// Renderer backend: production `gpu` (wgpu) or the `cpu` reference (#207).
-    /// `gpu` falls back to `cpu` when no GPU adapter is available, for non-Circle
-    /// shapes (Phase 0 covers Circle only), or when built without the `gpu`
-    /// feature. --count no longer triggers a fallback (the GPU renders up to 1024
-    /// orbs via a data-texture, #210). On the covered path (Circle, saturation
-    /// applied) the two match within +/-2/channel; video and color/keyframe tracks
-    /// are cpu-only.
+    /// Circle, Glyph (#212) and Aquarelle (#216) all render on the GPU; `gpu`
+    /// only falls back to `cpu` when no GPU adapter is available or when built
+    /// without the `gpu` feature. The `image` shape is web-only. --count never
+    /// triggers a fallback (the GPU renders up to 1024 orbs via a data-texture,
+    /// #210). Circle matches the CPU oracle within +/-2/channel (bit-exact on
+    /// real GPUs); Glyph and Aquarelle match structurally (float SDF / AA
+    /// differences). Video and color/keyframe tracks are cpu-only.
     /// Default depends on the build: the `gpu` feature builds default to `gpu`,
     /// plain (CPU-only) builds default to `cpu` — so a stock `cargo install orber`
     /// renders silently on the CPU instead of emitting a "no gpu feature, falling
@@ -496,10 +498,10 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
 /// #212 Phase 1b で WGSL 化（SDF fill + 回転）。Aquarelle は #216 Phase 1c で WGSL 化
 /// （4 層を解析 radial で評価、RNG/色は CPU pack で算出）。アダプタ無し・`gpu` feature
 /// 無しビルドは CPU にフォールバックする。Circle 経路は CPU オラクルと ±2/channel
-/// （実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、per-frame の
-/// aquarelle bleed pass は当面 CPU 専用（既知の見た目差）。Aquarelle は 4 層が構造一致し
-/// RNG/色は bit-identical、残差は tiny-skia の AA 塗りとの差のみ。video や
-/// color/keyframe tracks も GPU pack 未対応で CPU 専用。
+/// （実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、Glyph 専用の
+/// per-frame bleed pass は当面 CPU 専用（既知の見た目差）。Aquarelle は 4 層が構造一致し
+/// RNG/色は bit-identical、post-blur 無しで完全 parity（残差は tiny-skia の AA 塗りとの差
+/// のみ）。video や color/keyframe tracks も GPU pack 未対応で CPU 専用。
 enum FrameRenderer {
     Cpu,
     #[cfg(feature = "gpu")]
@@ -508,6 +510,8 @@ enum FrameRenderer {
 
 /// アダプタ取得前のルーティング判定（`FrameRenderer::route` の戻り値）。`Cpu` の
 /// `Option<String>` は「GPU を諦めた理由」の stderr 文言（CPU 明示指定なら `None`）。
+/// 現状は全 shape が GPU に乗るため `Cpu(Some(_))` は route から返らない（将来 GPU
+/// 非対応 shape を足したときの防御用に残す variant）。
 #[derive(Debug, PartialEq, Eq)]
 enum RenderRoute {
     Cpu(Option<String>),
@@ -515,8 +519,8 @@ enum RenderRoute {
 }
 
 impl FrameRenderer {
-    /// `--renderer` の選択と shape からバックエンドを決める。GPU 要求でも、非 Circle /
-    /// アダプタ取得失敗 / feature 無しなら CPU にフォールバックし、stderr に一言出す。
+    /// `--renderer` の選択と shape からバックエンドを決める。現状は全 shape が GPU に
+    /// 乗るため、GPU 要求が CPU に落ちるのはアダプタ取得失敗 / feature 無しのときだけ。
     ///
     /// orb 数による分岐は無い: GPU は per-orb データを data-texture に積んで
     /// fragment shader で `textureLoad` し、count を `MAX_ORB_COUNT` (1024) まで CPU と
@@ -525,6 +529,8 @@ impl FrameRenderer {
     /// で portable にしている（Phase 2 のブラウザ fallback を壊さない）。
     fn select(choice: Renderer, shape: OrbShape) -> Self {
         match Self::route(choice, shape) {
+            // 現状 route は全 shape を Gpu に振るため、この arm は到達しない。将来 GPU
+            // 非対応 shape を足したときに stderr 文言を出すための防御として残す。
             RenderRoute::Cpu(Some(reason)) => {
                 eprintln!("{reason}");
                 FrameRenderer::Cpu
@@ -535,17 +541,20 @@ impl FrameRenderer {
         }
     }
 
-    /// アダプタ取得より前の「どのバックエンドに振るか」だけを決める純関数。GPU を
-    /// 諦めるときは stderr 文言を `Cpu(Some(_))` に載せる。GPU を選んでも、最終的に
-    /// アダプタが取れなければ `select_gpu_circle` がさらに CPU に落とす。アダプタに
-    /// 依存しないので、ルーティング判定をそのままユニットテストできる。
+    /// アダプタ取得より前の「どのバックエンドに振るか」だけを決める純関数。現状は
+    /// 全 shape（Circle / Glyph / Aquarelle）を `Gpu` に振るため `Cpu(Some(_))` は
+    /// 発生しない。`Cpu(Some(_))` アームは将来 GPU 非対応 shape を足したときの防御
+    /// として残してあり、その場合だけ stderr 文言を載せる。`--renderer cpu` 明示は
+    /// `Cpu(None)`（文言なし）。GPU を選んでも、最終的にアダプタが取れなければ
+    /// `select_gpu` がさらに CPU に落とす。アダプタに依存しないので、ルーティング
+    /// 判定をそのままユニットテストできる。
     fn route(choice: Renderer, shape: OrbShape) -> RenderRoute {
         match choice {
             Renderer::Cpu => RenderRoute::Cpu(None),
             Renderer::Gpu => {
                 // Circle (#210), Glyph (#212 Phase 1b) and Aquarelle (#216 Phase 1c)
-                // render in WGSL. Glyph matches the CPU pre-bleed fill (the per-frame
-                // aquarelle bleed pass is CPU-only for now, a known visual difference).
+                // render in WGSL. Glyph matches the CPU pre-bleed fill (its own
+                // per-frame bleed pass is CPU-only for now, a known visual difference).
                 // Aquarelle reproduces the crate's four layers analytically (structural
                 // parity, AA-only residual). All three shapes route to the GPU.
                 match shape {
