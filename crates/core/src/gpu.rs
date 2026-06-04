@@ -111,6 +111,33 @@ fn orb_glyph_wgsl() -> &'static str {
     include_str!("orb_glyph.wgsl")
 }
 
+/// The Glyph **bleed/halo** WGSL (#214 Phase 1b.5). The 2nd-pass group that writes
+/// the aquarelle paper-bleed over the glyph fill: premultiply + separable box-blur
+/// (H/V), halo saturation boost, and the intensity compose + finalize. Translated
+/// from `aquarelle::render_aquarelle_bleed_pass` (default params, seed=0); see the
+/// shader header and [`BLEED_BOX_RADIUS`] / [`BLEED_HALO_FACTOR`] /
+/// [`BLEED_INTENSITY`] for the constant provenance. The paper-grain noise (step 4)
+/// is **omitted** on the GPU (loose-parity decision documented there).
+fn orb_glyph_bleed_wgsl() -> &'static str {
+    include_str!("orb_glyph_bleed.wgsl")
+}
+
+/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()` (the
+/// values the CPU `render_frame` passes: `radius = 3.0, intensity = 0.5,
+/// halo = 0.3`) so the GPU 2nd pass matches the CPU paper-bleed.
+///
+/// `BLEED_BOX_RADIUS` is `round(radius * 1.15).max(1)` = `round(3.45)` = `3`, the
+/// box-blur half-window the crate derives from `radius` (see
+/// `aquarelle::render_aquarelle_bleed_pass`). `BLEED_HALO_FACTOR` is
+/// `1.0 + 0.6 * halo` = `1.18` (the saturation multiplier
+/// `boost_saturation_buffer` applies). `BLEED_INTENSITY` is the compose mix
+/// (`dst = original * (1 - t) + blurred * t`). `BLEED_BLUR_ITERATIONS` is the
+/// crate's 3-pass (H→V) box-blur loop.
+const BLEED_BOX_RADIUS: f32 = 3.0;
+const BLEED_HALO_FACTOR: f32 = 1.18;
+const BLEED_INTENSITY: f32 = 0.5;
+const BLEED_BLUR_ITERATIONS: usize = 3;
+
 /// Header uniform block handed to the Circle shader. Mirrors `struct Params` in
 /// `orb_circle.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
 /// uniform layout (vec2 then scalars packed into 16-byte rows).
@@ -165,12 +192,62 @@ struct GpuOrb {
     rot: [f32; 4],   // base_angle, rot_speed_signed, _, _
 }
 
+/// Uniform block for the Glyph bleed pass shader (`orb_glyph_bleed.wgsl`).
+/// Mirrors `struct BleedParams` there. `#[repr(C)]` + padding to a 32-byte (two
+/// 16-byte rows) uniform layout. One of these is built per bleed sub-pass with the
+/// per-pass `radius` / `premultiply` set; `halo_factor` / `intensity` are constant
+/// across passes but live here so every pass shares one uniform/bind-group layout.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BleedParams {
+    // row 0: resolution.xy, radius, premultiply
+    resolution: [f32; 2],
+    radius: f32,
+    premultiply: f32,
+    // row 1: halo_factor, intensity, pad, pad
+    halo_factor: f32,
+    intensity: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+
 /// A render pipeline plus its bind-group layout, compiled once per distinct
 /// shader source. Caching keeps shader compilation / pipeline creation off the
 /// per-frame path: a long video renders the same shader for every frame.
 struct CachedPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// The four bleed-pass pipelines (one per `orb_glyph_bleed.wgsl` fragment entry
+/// point), plus the shared bind-group layout. Built once per renderer; the
+/// vertex-only-varying pipelines differ solely in their fragment entry point, so
+/// they all reuse the same layout (uniform 0 + `src` 1 + `blurred` 2). Cached so a
+/// long glyph clip compiles the bleed shader and its pipelines only once.
+struct BleedPipelines {
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// Horizontal box-blur (`fs_blur_h`); the `premultiply` uniform flag turns the
+    /// straight-RGBA glyph fill into premultiplied on the first iteration only.
+    blur_h: wgpu::RenderPipeline,
+    /// Vertical box-blur (`fs_blur_v`).
+    blur_v: wgpu::RenderPipeline,
+    /// Halo saturation boost (`fs_halo`).
+    halo: wgpu::RenderPipeline,
+    /// Intensity compose + finalize to straight RGBA (`fs_compose`).
+    compose: wgpu::RenderPipeline,
+}
+
+/// Per-size intermediate textures for the Glyph bleed pass, reused across
+/// same-sized frames (mirrors [`SizedResources`]). The glyph fill renders into
+/// `fill` (straight RGBA, as the glyph shader emits); the box-blur ping-pongs
+/// between `ping` / `pong` (premultiplied); the compose pass reads `fill` +
+/// the final blurred texture and writes straight RGBA to the `SizedResources`
+/// `target`. All three are `Rgba8Unorm` so each box-blur pass quantizes to u8 the
+/// way the CPU crate does between its H/V passes.
+struct BleedTextures {
+    fill_view: wgpu::TextureView,
+    ping_view: wgpu::TextureView,
+    pong_view: wgpu::TextureView,
 }
 
 /// Per-dimension GPU resources reused across same-sized frames: the render
@@ -245,6 +322,14 @@ pub struct GpuRenderer {
     /// The bilinear (linear/linear, clamp-to-edge) sampler the Glyph shader uses
     /// to read the `R8Unorm` SDF. Built once; reused for every glyph frame.
     glyph_sampler: wgpu::Sampler,
+    /// The four Glyph bleed-pass pipelines (#214), compiled lazily once. `None`
+    /// until the first glyph frame (Circle never touches the bleed path, so a
+    /// Circle-only run never compiles the bleed shader).
+    bleed_pipelines: std::sync::Mutex<Option<BleedPipelines>>,
+    /// Per-size bleed intermediate textures (`fill` + blur ping-pong), keyed by
+    /// `(width, height)`. Grow-only / never-evicts like `sized_cache`: a glyph clip
+    /// at one size keeps a single entry.
+    bleed_textures: std::sync::Mutex<HashMap<(u32, u32), BleedTextures>>,
     /// Serializes the whole GPU side of [`Self::render_packed`] (orb/params
     /// upload → pass record → `queue.submit` → map/readback) so concurrent
     /// `render_frame` calls on one shared renderer cannot alias the shared cached
@@ -304,6 +389,8 @@ impl GpuRenderer {
             orb_texture: std::sync::Mutex::new(None),
             glyph_sdf_cache: std::sync::Mutex::new(HashMap::new()),
             glyph_sampler,
+            bleed_pipelines: std::sync::Mutex::new(None),
+            bleed_textures: std::sync::Mutex::new(HashMap::new()),
             render_guard: std::sync::Mutex::new(()),
         })
     }
@@ -715,13 +802,20 @@ impl GpuRenderer {
     /// texture, and the Glyph shader bilinear-samples it and fills with
     /// `falloff_curve(1 - signed_unit)`.
     ///
-    /// # Parity scope (loose — bleed is excluded)
+    /// # Parity scope (loose — structural + tolerant)
     ///
     /// The CPU `render_frame` applies a per-frame aquarelle **bleed pass** after
-    /// the glyph fill (#195); this GPU path renders only the **pre-bleed** fill.
-    /// So lit coverage / edge position / softness response / rotation match the CPU
-    /// within a loose tolerance, but bleed-derived halo differences are expected and
-    /// allowed (a separate slice will add the bleed pass).
+    /// the glyph fill (#195). This GPU path now reproduces it as a 2nd pass group
+    /// (#214): the glyph fill renders into an intermediate texture, then a WGSL
+    /// premultiply → separable box-blur ×3 → halo saturation → intensity compose +
+    /// finalize writes the backbuffer (see [`Self::run_glyph_fill_bleed_readback`]
+    /// / `orb_glyph_bleed.wgsl`). Parity is **loose, not bit-exact**: the box-blur
+    /// structure / halo / intensity match the crate, but the aquarelle paper-grain
+    /// noise (a faint ±0.05 seed-derived jitter) is **omitted** on the GPU because
+    /// its ChaCha8 per-pixel-order consumption cannot be bit-reproduced in parallel,
+    /// and the GPU's HSL path differs from `palette`'s by sub-ULP rounding. Those
+    /// small per-pixel differences vs. the CPU are **expected and allowed** (a
+    /// future WGSL hash could approximate the noise).
     ///
     /// Returns a background-only frame (no glyph fill) when the glyph is unknown /
     /// empty in the bundled font, mirroring the CPU "draw nothing for tofu"
@@ -984,7 +1078,18 @@ impl GpuRenderer {
                     layout: &cached.bind_group_layout,
                     entries: &entries,
                 });
-                self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
+                if glyph.is_some() {
+                    // Glyph (#214): render the fill into the bleed `fill` texture,
+                    // then run the aquarelle bleed pass group (premult → box-blur×3
+                    // → halo → compose) into `res.target`, then read `res.target`
+                    // back. The bleed pipelines / intermediate textures are taken
+                    // here, nested under the (already-held) render_guard → pipeline
+                    // → sized locks; this is the only path that touches them, so the
+                    // ordering stays consistent and cannot deadlock.
+                    self.run_glyph_fill_bleed_readback(&cached.pipeline, &bind_group, res)
+                } else {
+                    self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
+                }
             })
         })
     }
@@ -1029,6 +1134,22 @@ impl GpuRenderer {
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        self.copy_target_and_readback(encoder, extent, res)
+    }
+
+    /// Copy `res.target` into the padded read-back buffer, submit, map, and strip
+    /// wgpu's row padding into a tight `RgbaImage`. Shared by the Circle path
+    /// ([`run_pass_and_readback`](Self::run_pass_and_readback)) and the Glyph bleed
+    /// path ([`run_glyph_fill_bleed_readback`](Self::run_glyph_fill_bleed_readback)),
+    /// which both end by reading `res.target` back the same way; `encoder` already
+    /// holds the render pass(es) that wrote `res.target`.
+    fn copy_target_and_readback(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        extent: wgpu::Extent3d,
+        res: &SizedResources,
+    ) -> RgbaImage {
+        let (width, height) = (res.width, res.height);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &res.target,
@@ -1067,6 +1188,321 @@ impl GpuRenderer {
 
         RgbaImage::from_raw(width, height, pixels)
             .expect("read-back buffer matches image dimensions")
+    }
+
+    /// Get-or-build the four Glyph bleed-pass pipelines (#214), compiling the bleed
+    /// shader and its pipelines at most once for the renderer's life. Returns the
+    /// caller's `f` applied to the cached `BleedPipelines`. Lazy: a Circle-only run
+    /// never compiles the bleed shader.
+    fn bleed_pipelines<R>(&self, f: impl FnOnce(&BleedPipelines) -> R) -> R {
+        let mut guard = self
+            .bleed_pipelines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pipelines = guard.get_or_insert_with(|| self.build_bleed_pipelines());
+        f(pipelines)
+    }
+
+    /// Compile the bleed shader once and build its four fragment-entry pipelines,
+    /// all sharing one bind-group layout (uniform 0 + `src` texture 1 + `blurred`
+    /// texture 2; both textures `filterable: false` because the shader reads them
+    /// with `textureLoad`, keeping the box-blur on exact texel centers like the CPU
+    /// crate). All targets are `Rgba8Unorm`, `blend: None`.
+    fn build_bleed_pipelines(&self) -> BleedPipelines {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("orber-bleed-bgl"),
+                    entries: &[
+                        uniform_entry(0),
+                        // `src` / `blurred` read via textureLoad (no sampler).
+                        orb_texture_entry(1),
+                        orb_texture_entry(2),
+                    ],
+                });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("orber-bleed-shader"),
+                source: wgpu::ShaderSource::Wgsl(orb_glyph_bleed_wgsl().into()),
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orber-bleed-pl"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let make = |fs_entry: &str| {
+            self.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("orber-bleed-pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(fs_entry),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        };
+        BleedPipelines {
+            blur_h: make("fs_blur_h"),
+            blur_v: make("fs_blur_v"),
+            halo: make("fs_halo"),
+            compose: make("fs_compose"),
+            bind_group_layout,
+        }
+    }
+
+    /// Get-or-build the per-size bleed intermediate textures (`fill` + blur
+    /// ping-pong), allocating only on first use of a `(width, height)`. Grow-only
+    /// like `sized_cache`.
+    fn bleed_textures<R>(&self, width: u32, height: u32, f: impl FnOnce(&BleedTextures) -> R) -> R {
+        let mut map = self
+            .bleed_textures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map
+            .entry((width, height))
+            .or_insert_with(|| Self::build_bleed_textures(&self.device, width, height));
+        f(entry)
+    }
+
+    /// Allocate the three `Rgba8Unorm` bleed intermediates for a size: `fill` (the
+    /// glyph fill target, sampled by the bleed passes) and the `ping` / `pong`
+    /// blur ping-pong. Each is `RENDER_ATTACHMENT | TEXTURE_BINDING` (written by one
+    /// pass, read by the next); none needs `COPY_SRC` (only `res.target` is read
+    /// back).
+    fn build_bleed_textures(device: &wgpu::Device, width: u32, height: u32) -> BleedTextures {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let make = |label: &str| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            });
+            tex.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        BleedTextures {
+            fill_view: make("orber-bleed-fill"),
+            ping_view: make("orber-bleed-ping"),
+            pong_view: make("orber-bleed-pong"),
+        }
+    }
+
+    /// The Glyph (#214) render: draw the glyph fill into the `fill` intermediate,
+    /// run the aquarelle bleed pass group over it (premultiply → separable
+    /// box-blur ×[`BLEED_BLUR_ITERATIONS`] → halo saturation → intensity compose +
+    /// finalize) into `res.target`, then read `res.target` back. `fill_pipeline` /
+    /// `fill_bind_group` are the already-built Glyph fill pipeline + bind group.
+    ///
+    /// One command encoder records every pass in order; wgpu serializes passes that
+    /// read a texture a prior pass wrote, so the box-blur ping-pong is correct
+    /// without manual barriers. All work runs under the outer `render_guard`, so
+    /// concurrent `render_frame` calls cannot alias these shared intermediates.
+    fn run_glyph_fill_bleed_readback(
+        &self,
+        fill_pipeline: &wgpu::RenderPipeline,
+        fill_bind_group: &wgpu::BindGroup,
+        res: &SizedResources,
+    ) -> RgbaImage {
+        let (width, height) = (res.width, res.height);
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        self.bleed_pipelines(|bp| {
+            self.bleed_textures(width, height, |bt| {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("orber-glyph-bleed-encoder"),
+                        });
+
+                // 1) Glyph fill → `fill` (straight RGBA, as the glyph shader emits).
+                self.record_fullscreen_pass(
+                    &mut encoder,
+                    "orber-glyph-fill-pass",
+                    &bt.fill_view,
+                    fill_pipeline,
+                    fill_bind_group,
+                );
+
+                // 2) Bleed pass group. Two blur textures ping-pong: H always writes
+                // `ping` (reading the previous V output, or `fill` on iter 0), V
+                // always reads `ping` and writes `pong`. After every iteration the
+                // blurred layer is in `pong`; the next H reads `pong`. No pass ever
+                // reads and writes the same texture. The first H pass sets
+                // `premultiply = 1` to turn the straight fill into premultiplied;
+                // every later pass reads already-premultiplied data.
+                let base = |radius: f32, premultiply: f32| BleedParams {
+                    resolution: [width as f32, height as f32],
+                    radius,
+                    premultiply,
+                    halo_factor: BLEED_HALO_FACTOR,
+                    intensity: BLEED_INTENSITY,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                };
+                for i in 0..BLEED_BLUR_ITERATIONS {
+                    // H: (fill | pong) → ping. premultiply only on the first pass.
+                    let h_src = if i == 0 { &bt.fill_view } else { &bt.pong_view };
+                    self.record_bleed_pass(
+                        &mut encoder,
+                        bp,
+                        &bp.blur_h,
+                        &bt.ping_view,
+                        h_src,
+                        None,
+                        base(BLEED_BOX_RADIUS, if i == 0 { 1.0 } else { 0.0 }),
+                    );
+                    // V: ping → pong.
+                    self.record_bleed_pass(
+                        &mut encoder,
+                        bp,
+                        &bp.blur_v,
+                        &bt.pong_view,
+                        &bt.ping_view,
+                        None,
+                        base(BLEED_BOX_RADIUS, 0.0),
+                    );
+                }
+                // The 3×(H,V) blurred premult layer is now in `pong`.
+
+                // 3) Halo saturation boost: pong → ping (ping is free again).
+                self.record_bleed_pass(
+                    &mut encoder,
+                    bp,
+                    &bp.halo,
+                    &bt.ping_view,
+                    &bt.pong_view,
+                    None,
+                    base(BLEED_BOX_RADIUS, 0.0),
+                );
+
+                // 4) Compose + finalize: original = `fill` (premultiplied inline),
+                // blurred = halo output (`ping`) → `res.target` (straight RGBA, read
+                // back).
+                self.record_bleed_pass(
+                    &mut encoder,
+                    bp,
+                    &bp.compose,
+                    &res.target_view,
+                    &bt.fill_view,
+                    Some(&bt.ping_view),
+                    base(BLEED_BOX_RADIUS, 0.0),
+                );
+
+                self.copy_target_and_readback(encoder, extent, res)
+            })
+        })
+    }
+
+    /// Record a single full-screen triangle pass into `target` with `pipeline` +
+    /// `bind_group` (clear-to-transparent load). Shared by the glyph fill pass and
+    /// indirectly by the bleed passes.
+    fn record_fullscreen_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        target: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Record one bleed sub-pass: build the per-pass uniform + bind group (uniform
+    /// 0, `src` texture 1, `blurred` texture 2 — bound to `src` itself when the pass
+    /// does not use a second input), then draw the full-screen triangle into
+    /// `target`. `pipeline` selects which `orb_glyph_bleed.wgsl` fragment entry runs.
+    #[allow(clippy::too_many_arguments)]
+    fn record_bleed_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bp: &BleedPipelines,
+        pipeline: &wgpu::RenderPipeline,
+        target: &wgpu::TextureView,
+        src: &wgpu::TextureView,
+        blurred: Option<&wgpu::TextureView>,
+        params: BleedParams,
+    ) {
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("orber-bleed-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        // Binding 2 (`blurred`) is only read by the compose pass; for the other
+        // passes bind `src` to it so the one bind-group layout is always satisfied.
+        let blurred_view = blurred.unwrap_or(src);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orber-bleed-bg"),
+            layout: &bp.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(blurred_view),
+                },
+            ],
+        });
+        self.record_fullscreen_pass(encoder, "orber-bleed-pass", target, pipeline, &bind_group);
     }
 }
 
