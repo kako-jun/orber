@@ -102,11 +102,14 @@ fn div255(v: f32) -> f32 {
 }
 
 // straight float (0..1) を tiny-skia の lowp 量子化で u8 (0..255 float) にする。
+// rgb は normalize(clamp 0..1) 後に *255+0.5 を floor。alpha は clamp 無し。
+// orb_circle.wgsl の to_u8_rgb / to_u8_a と完全に同一（aquarelle の alpha は
+// すべて N/255 の定数を mix した [0,1] 値なので clamp は元から no-op）。
 fn to_u8_rgb(c: f32) -> f32 {
     return floor(clampf(c, 0.0, 1.0) * 255.0 + 0.5);
 }
 fn to_u8_a(c: f32) -> f32 {
-    return floor(clampf(c, 0.0, 1.0) * 255.0 + 0.5);
+    return floor(c * 255.0 + 0.5);
 }
 
 // 1 つの 3-stop radial（aquarelle::draw_radial 相当）を評価し、straight rgba (0..1)

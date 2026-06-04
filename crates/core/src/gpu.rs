@@ -17,7 +17,8 @@
 //!   differences), not bit-exact — see `render_frame_glyph` /
 //!   `render_frame_aquarelle`. The `image` shape is web-only and rides the Glyph
 //!   SDF path (core/wasm have no native `image` shape). The CPU renderer is now
-//!   only a no-GPU-adapter fallback (removed in Phase 1.5);
+//!   only a no-GPU-adapter fallback (it will be removed in Phase 1.5, but still
+//!   exists today);
 //! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
 //!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
 //!   `opts.saturation` to each packed orb color after
@@ -62,9 +63,9 @@
 //! #216) all render on the GPU. The `image` shape is web-only and reuses the
 //! Glyph SDF path (core/wasm have no `image` shape — the browser hands an image
 //! silhouette in as a glyph SDF). The CPU (tiny-skia) renderer remains only as a
-//! no-GPU-adapter fallback and as the parity oracle; both are removed in
-//! Phase 1.5. Video and per-orb color/keyframe tracks (#7 / #33) are still
-//! CPU-only.
+//! no-GPU-adapter fallback and as the parity oracle; both will be removed in
+//! Phase 1.5 (they still exist today). Video and per-orb color/keyframe tracks
+//! (#7 / #33) are still CPU-only.
 
 use std::collections::HashMap;
 
