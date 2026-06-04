@@ -785,12 +785,39 @@ fn render_frame_aquarelle(
     params: &[OrbParams],
     t: f32,
 ) -> RgbaImage {
-    use crate::cluster::Centroid;
     use crate::orb::{render_static, RenderOptions};
+
+    let modulated = modulate_aquarelle_clusters(clusters, opts, params, t);
+
+    let render_opts = RenderOptions {
+        width: opts.width,
+        height: opts.height,
+        orb_size: opts.orb_size,
+        blur: opts.blur,
+        saturation: opts.saturation,
+        background: opts.background,
+        shape: opts.shape,
+        softness: opts.softness,
+    };
+    render_static(&modulated, &render_opts)
+}
+
+/// Aquarelle フレームの per-orb 変調（位置 wrap・半径呼吸・#33/#7 色補間）を 1 箇所に
+/// 集約したヘルパ。`render_frame_aquarelle`（CPU 経路）と GPU 経路
+/// （[`aquarelle_modulated_clusters`]）が同じ算術を共有し、片方だけ挙動が
+/// ずれるのを防ぐ。返す `Vec<Cluster>` の index は `render_static` での描画 index と
+/// 一致し、`render_aquarelle_orb` の `seed = i` に対応する。
+fn modulate_aquarelle_clusters(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    params: &[OrbParams],
+    t: f32,
+) -> Vec<Cluster> {
+    use crate::cluster::Centroid;
 
     let cycle = opts.speed.cycle_count();
 
-    let modulated: Vec<Cluster> = clusters
+    clusters
         .iter()
         .zip(params.iter())
         .enumerate()
@@ -824,19 +851,24 @@ fn render_frame_aquarelle(
                 weight: (weight_t33 * weight_scale).max(0.0),
             }
         })
-        .collect();
+        .collect()
+}
 
-    let render_opts = RenderOptions {
-        width: opts.width,
-        height: opts.height,
-        orb_size: opts.orb_size,
-        blur: opts.blur,
-        saturation: opts.saturation,
-        background: opts.background,
-        shape: opts.shape,
-        softness: opts.softness,
-    };
-    render_static(&modulated, &render_opts)
+/// GPU Aquarelle 経路（#216）が CPU `render_frame_aquarelle` と完全に同じ変調済み
+/// cluster 列を得るための `#[doc(hidden)]` シーム。`pack_render_data_for_webgl` と
+/// 同様、内部の `OrbParams` レイアウトや RNG 列は公開しない。
+///
+/// 返り値の index は `render_static`（= `render_aquarelle_orb` の `seed = i`）の
+/// 描画順に一致する。`gpu::GpuRenderer::render_frame_aquarelle` が各 cluster の
+/// 変調済み中心 / 重み / 色を読み、per-orb の 4 層を WGSL で描く。
+#[doc(hidden)]
+pub fn aquarelle_modulated_clusters(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    t: f32,
+) -> Vec<Cluster> {
+    let cache = precompute_orb_params(opts, clusters);
+    modulate_aquarelle_clusters(clusters, opts, &cache.params, t)
 }
 
 /// Pixmap → RgbaImage 変換（un-premultiply 込み）。
