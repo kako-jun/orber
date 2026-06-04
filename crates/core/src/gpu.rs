@@ -3037,6 +3037,113 @@ mod tests {
         eprintln!("glyph lit pixels = {lit}");
     }
 
+    /// #217: build an `OrbShape::Image` from a synthetic centered silhouette so GPU
+    /// image tests do not depend on font assets.
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 16..48 {
+            for x in 16..48 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    fn image_opts(w: u32, h: u32) -> AnimateOptions {
+        AnimateOptions {
+            shape: test_image_shape(),
+            ..glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true)
+        }
+    }
+
+    /// #217: the Image WGSL path (shared with Glyph) must compile and the supplied
+    /// silhouette SDF must paint a non-trivial number of foreground pixels.
+    #[test]
+    fn gpu_image_renders_lit_pixels() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_renders_lit_pixels") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = image_opts(120, 90);
+        let img = renderer.render_frame_image(&clusters, &opts, 0.0);
+        assert_eq!(img.dimensions(), (120, 90));
+        let lit = lit_vs_bg(&img, opts.background, 8);
+        assert!(
+            lit > 200,
+            "image silhouette fill must paint a non-trivial number of lit pixels, got {lit}"
+        );
+    }
+
+    /// #217: `render_frame_image` is deterministic for the same seed / t.
+    #[test]
+    fn gpu_image_is_deterministic() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_is_deterministic") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = image_opts(96, 96);
+        let a = renderer.render_frame_image(&clusters, &opts, 0.37);
+        let b = renderer.render_frame_image(&clusters, &opts, 0.37);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "render_frame_image must be byte-equal for same seed/t"
+        );
+    }
+
+    /// #217: an empty (all-zero) image SDF yields a background-only frame, mirroring
+    /// the CPU "draw nothing" contract (no panic).
+    #[test]
+    fn gpu_image_empty_sdf_is_background_only() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_empty_sdf_is_background_only")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = AnimateOptions {
+            shape: OrbShape::Image {
+                sdf: std::sync::Arc::from(vec![0u8; 256 * 256]),
+                size: 256,
+            },
+            ..glyph_opts(
+                64,
+                64,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Slow,
+                true,
+            )
+        };
+        let img = renderer.render_frame_image(&clusters, &opts, 0.0);
+        let lit = lit_vs_bg(&img, opts.background, 8);
+        assert_eq!(lit, 0, "empty image SDF must paint no foreground pixels");
+    }
+
+    /// #217: `render_frame_image` on a non-Image shape falls back to the Circle path
+    /// (the call is total). It must still produce a valid frame.
+    #[test]
+    fn gpu_image_entry_non_image_falls_back_to_circle() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_image_entry_non_image_falls_back_to_circle")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = image_opts(80, 80);
+        opts.shape = OrbShape::Circle;
+        let via_image_entry = renderer.render_frame_image(&clusters, &opts, 0.5);
+        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        assert_eq!(
+            via_image_entry.as_raw(),
+            via_circle.as_raw(),
+            "render_frame_image on Circle must equal render_frame (Circle path)"
+        );
+    }
+
     /// Lit-pixel bounding box of `img` against the opaque background, with a
     /// per-channel `thresh`. Returns `None` when nothing is lit.
     fn lit_bbox(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> Option<(u32, u32, u32, u32)> {
