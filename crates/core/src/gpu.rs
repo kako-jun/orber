@@ -4334,6 +4334,100 @@ mod tests {
         );
     }
 
+    /// #216: concurrent aquarelle renders on the shared renderer must each match
+    /// their solo oracle — no panic / poison, no cross-thread aliasing of the shared
+    /// aquarelle data-texture / per-size target / read-back buffer (the #210
+    /// serialization contract). Several threads render different aquarelle frames
+    /// (mixed params + t) on the *same* renderer; each thread's output must equal
+    /// that same input rendered alone (a fresh renderer). Mirrors the Circle
+    /// (`shared_gpu_concurrent_high_count_render`) and Glyph
+    /// (`shared_gpu_concurrent_glyph_render`) concurrent tests for the aquarelle
+    /// path. Aquarelle is deterministic (per-orb-index ChaCha8 seed, no thread_rng),
+    /// so the match is byte-identical, not just within tolerance.
+    #[test]
+    fn aquarelle_shared_gpu_concurrent_render() {
+        let Some(renderer) = require_or_skip_renderer("aquarelle_shared_gpu_concurrent_render")
+        else {
+            return;
+        };
+        // (params, t) cases — mixed layer params + time so threads exercise different
+        // packs (satellite counts, bloom, offset) and per-orb modulation at once.
+        let cases: [(AquarelleParams, f32); 4] = [
+            (
+                AquarelleParams {
+                    bleed: 1.0,
+                    bloom: 0.8,
+                    offset: 0.6,
+                    halo: 0.4,
+                },
+                0.0,
+            ),
+            (
+                AquarelleParams {
+                    bleed: 0.5,
+                    bloom: 0.0,
+                    offset: 0.3,
+                    halo: 0.7,
+                },
+                0.25,
+            ),
+            (
+                AquarelleParams {
+                    bleed: 0.0,
+                    bloom: 0.5,
+                    offset: 0.9,
+                    halo: 0.2,
+                },
+                0.5,
+            ),
+            (AquarelleParams::default(), 0.75),
+        ];
+
+        let clusters = vec![
+            cluster([220, 60, 60], 0.3, 0.35, 0.8),
+            cluster([60, 120, 220], 0.7, 0.55, 0.5),
+            cluster([200, 200, 80], 0.5, 0.8, 0.4),
+        ];
+
+        // Per-case oracle: render each alone on a fresh renderer first.
+        let mut oracles = Vec::new();
+        for &(params, t) in &cases {
+            let opts = aquarelle_opts(96, 72, params);
+            let Some(fresh) = require_or_skip_fresh_renderer(
+                "aquarelle_shared_gpu_concurrent_render (oracle leg)",
+            ) else {
+                return;
+            };
+            oracles.push(fresh.render_frame_aquarelle(&clusters, &opts, t));
+        }
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (idx, &(params, t)) in cases.iter().enumerate() {
+                let oracle = &oracles[idx];
+                let clusters = &clusters;
+                handles.push(scope.spawn(move || {
+                    let opts = aquarelle_opts(96, 72, params);
+                    // A few iterations per thread to maximize overlap on the shared
+                    // aquarelle texture / per-size resources.
+                    for _ in 0..3 {
+                        let img = renderer.render_frame_aquarelle(clusters, &opts, t);
+                        assert_eq!(
+                            oracle.as_raw(),
+                            img.as_raw(),
+                            "concurrent aquarelle (case {idx}, t={t}) must be byte-identical to its solo render"
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .expect("concurrent aquarelle render thread panicked");
+            }
+        });
+        eprintln!("concurrent aquarelle render: all threads matched their solo oracle");
+    }
+
     /// A non-Aquarelle shape passed to `render_frame_aquarelle` must fall back to the
     /// Circle path (the call is total), matching the Glyph-entry fallback contract.
     #[test]
