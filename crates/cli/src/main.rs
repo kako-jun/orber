@@ -491,12 +491,13 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
 
 /// 単一フレーム描画のバックエンド。`--renderer` を解決して GPU/CPU を選ぶ (#207)。
 ///
-/// GPU は Circle shape かつ GPU アダプタが取れた場合に使う。count は 1024 まで GPU が
-/// data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。それ以外（非 Circle、
-/// アダプタ無し、`gpu` feature 無しビルド）は CPU にフォールバックする。GPU が担う経路
-/// （Circle ∧ saturation 反映済）では出力が CPU オラクルと ±2/channel（実 GPU では
-/// bit-exact）一致するので、フォールバックしても同じ flag では見た目が変わらない。
-/// video や color/keyframe tracks は GPU pack 未対応で CPU 専用。
+/// GPU は Circle / Glyph shape かつ GPU アダプタが取れた場合に使う。count は 1024 まで
+/// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は #212
+/// Phase 1b で WGSL 化（SDF fill + 回転）。aquarelle 等の他 shape、アダプタ無し、`gpu`
+/// feature 無しビルドは CPU にフォールバックする。Circle 経路は CPU オラクルと
+/// ±2/channel（実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、
+/// per-frame の aquarelle bleed pass は当面 CPU 専用（既知の見た目差）。video や
+/// color/keyframe tracks も GPU pack 未対応で CPU 専用。
 enum FrameRenderer {
     Cpu,
     #[cfg(feature = "gpu")]
@@ -528,7 +529,7 @@ impl FrameRenderer {
             }
             RenderRoute::Cpu(None) => FrameRenderer::Cpu,
             // GPU が選ばれても、アダプタ取得失敗 / feature 無しなら最終的に CPU に落ちる。
-            RenderRoute::Gpu => Self::select_gpu_circle(),
+            RenderRoute::Gpu => Self::select_gpu(),
         }
     }
 
@@ -540,18 +541,22 @@ impl FrameRenderer {
         match choice {
             Renderer::Cpu => RenderRoute::Cpu(None),
             Renderer::Gpu => {
-                if shape != OrbShape::Circle {
-                    return RenderRoute::Cpu(Some(
-                        "orber: --renderer gpu は Phase 0 で Circle のみ対応。非 Circle shape のため cpu にフォールバックします".to_string(),
-                    ));
+                // Circle (#210) and Glyph (#212 Phase 1b) render in WGSL. Glyph
+                // matches the CPU pre-bleed fill (the per-frame aquarelle bleed
+                // pass is CPU-only for now, a known visual difference). Aquarelle
+                // and any other shape still fall back to the CPU renderer.
+                match shape {
+                    OrbShape::Circle | OrbShape::Glyph { .. } => RenderRoute::Gpu,
+                    _ => RenderRoute::Cpu(Some(
+                        "orber: --renderer gpu は Circle / Glyph のみ対応。aquarelle 等のため cpu にフォールバックします".to_string(),
+                    )),
                 }
-                RenderRoute::Gpu
             }
         }
     }
 
     #[cfg(feature = "gpu")]
-    fn select_gpu_circle() -> Self {
+    fn select_gpu() -> Self {
         match orber_core::gpu::GpuRenderer::new() {
             Some(gpu) => {
                 eprintln!(
@@ -568,14 +573,14 @@ impl FrameRenderer {
     }
 
     #[cfg(not(feature = "gpu"))]
-    fn select_gpu_circle() -> Self {
+    fn select_gpu() -> Self {
         eprintln!(
             "orber: この orber は gpu feature 無しでビルドされています。cpu にフォールバックします"
         );
         FrameRenderer::Cpu
     }
 
-    /// 1 フレームを描画する。GPU 経路は Circle のみ（select で保証済み）。
+    /// 1 フレームを描画する。GPU 経路は Circle / Glyph（select / route で保証済み）。
     fn render(
         &self,
         clusters: &[Cluster],
@@ -585,7 +590,13 @@ impl FrameRenderer {
         match self {
             FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
             #[cfg(feature = "gpu")]
-            FrameRenderer::Gpu(gpu) => gpu.render_frame(clusters, opts, t),
+            FrameRenderer::Gpu(gpu) => match opts.shape {
+                // Glyph uses the dedicated WGSL glyph path (#212); Circle the
+                // default. (Aquarelle never reaches the GPU branch — `route`
+                // sends it to the CPU renderer.)
+                OrbShape::Glyph { .. } => gpu.render_frame_glyph(clusters, opts, t),
+                _ => gpu.render_frame(clusters, opts, t),
+            },
         }
     }
 }
@@ -1344,12 +1355,13 @@ mod tests {
         );
     }
 
-    /// C2 (#210): 非 Circle shape の CPU フォールバック（理由つき）は温存する。
-    /// #210 は count による分岐だけを撤去した。route が count 引数を失っても、
-    /// --renderer gpu + 非 Circle は今まで通り `Cpu(Some(非 Circle 文言))` に落ちる。
-    /// あわせて --renderer cpu は理由なし `Cpu(None)` のままであることも確認する。
+    /// C2 (#210 → #212): Aquarelle（および将来の非 Circle/非 Glyph shape）は GPU 要求でも
+    /// 理由つき CPU フォールバックを温存する。#212 で Glyph が GPU 経路に乗ったので、
+    /// route(Gpu, Glyph) は `Gpu` になることもあわせて確認する。
+    /// --renderer cpu は理由なし `Cpu(None)` のまま。
     #[test]
-    fn gpu_route_falls_back_for_non_circle_unchanged() {
+    fn gpu_route_falls_back_for_aquarelle_but_not_glyph() {
+        // Aquarelle は CPU フォールバック（理由つき）。
         match FrameRenderer::route(
             Renderer::Gpu,
             OrbShape::Aquarelle(AquarelleParams {
@@ -1361,12 +1373,25 @@ mod tests {
         ) {
             RenderRoute::Cpu(Some(msg)) => {
                 assert!(
-                    msg.contains("Circle"),
-                    "non-Circle fallback message should mention the Circle-only limitation, got: {msg}"
+                    msg.contains("aquarelle") || msg.contains("Circle"),
+                    "aquarelle fallback message should explain the limitation, got: {msg}"
                 );
             }
-            other => panic!("non-Circle shape with gpu must route to Cpu(Some(_)), got {other:?}"),
+            other => panic!("aquarelle + gpu must route to Cpu(Some(_)), got {other:?}"),
         }
+
+        // Glyph (#212) は GPU 経路に乗る（フォールバック文言なし）。
+        assert_eq!(
+            FrameRenderer::route(
+                Renderer::Gpu,
+                OrbShape::Glyph {
+                    ch: '☆',
+                    font: GlyphFontId::NotoSymbols2,
+                },
+            ),
+            RenderRoute::Gpu,
+            "glyph + gpu must route to the gpu path (#212)"
+        );
 
         // --renderer cpu は理由なしで CPU（明示指定なので警告は出さない）。
         assert_eq!(
