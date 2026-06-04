@@ -491,12 +491,14 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
 
 /// 単一フレーム描画のバックエンド。`--renderer` を解決して GPU/CPU を選ぶ (#207)。
 ///
-/// GPU は Circle / Glyph shape かつ GPU アダプタが取れた場合に使う。count は 1024 まで
-/// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は #212
-/// Phase 1b で WGSL 化（SDF fill + 回転）。aquarelle 等の他 shape、アダプタ無し、`gpu`
-/// feature 無しビルドは CPU にフォールバックする。Circle 経路は CPU オラクルと
-/// ±2/channel（実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、
-/// per-frame の aquarelle bleed pass は当面 CPU 専用（既知の見た目差）。video や
+/// GPU は Circle / Glyph / Aquarelle shape かつ GPU アダプタが取れた場合に使う。count は
+/// 1024 まで GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は
+/// #212 Phase 1b で WGSL 化（SDF fill + 回転）。Aquarelle は #216 Phase 1c で WGSL 化
+/// （4 層を解析 radial で評価、RNG/色は CPU pack で算出）。アダプタ無し・`gpu` feature
+/// 無しビルドは CPU にフォールバックする。Circle 経路は CPU オラクルと ±2/channel
+/// （実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、per-frame の
+/// aquarelle bleed pass は当面 CPU 専用（既知の見た目差）。Aquarelle は 4 層が構造一致し
+/// RNG/色は bit-identical、残差は tiny-skia の AA 塗りとの差のみ。video や
 /// color/keyframe tracks も GPU pack 未対応で CPU 専用。
 enum FrameRenderer {
     Cpu,
@@ -541,15 +543,15 @@ impl FrameRenderer {
         match choice {
             Renderer::Cpu => RenderRoute::Cpu(None),
             Renderer::Gpu => {
-                // Circle (#210) and Glyph (#212 Phase 1b) render in WGSL. Glyph
-                // matches the CPU pre-bleed fill (the per-frame aquarelle bleed
-                // pass is CPU-only for now, a known visual difference). Aquarelle
-                // and any other shape still fall back to the CPU renderer.
+                // Circle (#210), Glyph (#212 Phase 1b) and Aquarelle (#216 Phase 1c)
+                // render in WGSL. Glyph matches the CPU pre-bleed fill (the per-frame
+                // aquarelle bleed pass is CPU-only for now, a known visual difference).
+                // Aquarelle reproduces the crate's four layers analytically (structural
+                // parity, AA-only residual). All three shapes route to the GPU.
                 match shape {
-                    OrbShape::Circle | OrbShape::Glyph { .. } => RenderRoute::Gpu,
-                    _ => RenderRoute::Cpu(Some(
-                        "orber: --renderer gpu は Circle / Glyph のみ対応。aquarelle 等のため cpu にフォールバックします".to_string(),
-                    )),
+                    OrbShape::Circle | OrbShape::Glyph { .. } | OrbShape::Aquarelle(_) => {
+                        RenderRoute::Gpu
+                    }
                 }
             }
         }
@@ -591,10 +593,10 @@ impl FrameRenderer {
             FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
             #[cfg(feature = "gpu")]
             FrameRenderer::Gpu(gpu) => match opts.shape {
-                // Glyph uses the dedicated WGSL glyph path (#212); Circle the
-                // default. (Aquarelle never reaches the GPU branch — `route`
-                // sends it to the CPU renderer.)
+                // Glyph uses the dedicated WGSL glyph path (#212); Aquarelle the
+                // dedicated WGSL four-layer path (#216); Circle the default.
                 OrbShape::Glyph { .. } => gpu.render_frame_glyph(clusters, opts, t),
+                OrbShape::Aquarelle(_) => gpu.render_frame_aquarelle(clusters, opts, t),
                 _ => gpu.render_frame(clusters, opts, t),
             },
         }
@@ -1355,30 +1357,25 @@ mod tests {
         );
     }
 
-    /// C2 (#210 → #212): Aquarelle（および将来の非 Circle/非 Glyph shape）は GPU 要求でも
-    /// 理由つき CPU フォールバックを温存する。#212 で Glyph が GPU 経路に乗ったので、
-    /// route(Gpu, Glyph) は `Gpu` になることもあわせて確認する。
-    /// --renderer cpu は理由なし `Cpu(None)` のまま。
+    /// C2 (#210 → #212 → #216): GPU 要求時、Circle / Glyph / Aquarelle の全 shape が
+    /// `Gpu` に乗る（#216 Phase 1c で aquarelle も WGSL 化され、理由つき CPU フォール
+    /// バックは無くなった）。--renderer cpu は理由なし `Cpu(None)` のまま。
     #[test]
-    fn gpu_route_falls_back_for_aquarelle_but_not_glyph() {
-        // Aquarelle は CPU フォールバック（理由つき）。
-        match FrameRenderer::route(
-            Renderer::Gpu,
-            OrbShape::Aquarelle(AquarelleParams {
-                bleed: 0.5,
-                bloom: 0.5,
-                offset: 0.5,
-                halo: 0.5,
-            }),
-        ) {
-            RenderRoute::Cpu(Some(msg)) => {
-                assert!(
-                    msg.contains("aquarelle") || msg.contains("Circle"),
-                    "aquarelle fallback message should explain the limitation, got: {msg}"
-                );
-            }
-            other => panic!("aquarelle + gpu must route to Cpu(Some(_)), got {other:?}"),
-        }
+    fn gpu_route_covers_circle_glyph_and_aquarelle() {
+        // Aquarelle (#216) は GPU 経路に乗る（フォールバック文言なし）。
+        assert_eq!(
+            FrameRenderer::route(
+                Renderer::Gpu,
+                OrbShape::Aquarelle(AquarelleParams {
+                    bleed: 0.5,
+                    bloom: 0.5,
+                    offset: 0.5,
+                    halo: 0.5,
+                }),
+            ),
+            RenderRoute::Gpu,
+            "aquarelle + gpu must route to the gpu path (#216)"
+        );
 
         // Glyph (#212) は GPU 経路に乗る（フォールバック文言なし）。
         assert_eq!(
@@ -1391,6 +1388,13 @@ mod tests {
             ),
             RenderRoute::Gpu,
             "glyph + gpu must route to the gpu path (#212)"
+        );
+
+        // Circle (#210) も GPU 経路。
+        assert_eq!(
+            FrameRenderer::route(Renderer::Gpu, OrbShape::Circle),
+            RenderRoute::Gpu,
+            "circle + gpu must route to the gpu path (#210)"
         );
 
         // --renderer cpu は理由なしで CPU（明示指定なので警告は出さない）。
