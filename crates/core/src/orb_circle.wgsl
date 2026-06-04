@@ -61,15 +61,16 @@ struct Params {
     _pad2: f32,
 };
 
-// per-orb のパック（data-texture, #210）。pack_render_data_for_webgl の per-orb
-// 16 words のうち Circle 経路が使う分を 3 つの vec4 にほどき、gpu.rs が
-// **幅3 texel × 高さ N** の Rgba32Float テクスチャへ詰める。texel レイアウトは
+// per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
+// pack_render_data_for_webgl の per-orb 16 words を gpu.rs が
+// **幅4 texel × 高さ N** の Rgba32Float テクスチャへ詰める。texel レイアウトは
 //   x=0: color = (r, g, b, weight)
 //   x=1: phase = (phase, phi_radius, phi_blur, phi_opacity)
 //   x=2: misc  = (cross_axis, style_bit, speed_mult, _)
+//   x=3: rot   = (base_angle, rot_speed_signed, _, _)  ← Glyph 専用、Circle は無視
 //   y  : orb index
-// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。回転
-// (base_angle / rot_speed) は Circle では未使用なので持ち込まない。
+// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。Circle 経路は
+// x=0..2 の 3 つの vec4 だけを読み、回転 (x=3) は未使用なので持ち込まない。
 //
 // sampler は持たず textureLoad（texelFetch 相当）のみで読むので linear filtering に
 // 依存しない（gpu.rs の sample_type は Float{ filterable: false }）。これにより

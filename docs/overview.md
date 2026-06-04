@@ -458,6 +458,12 @@ color. The pipeline:
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
 
+Native `--renderer gpu` also draws Glyph orbs on the GPU (#212 Phase 1b): a WGSL
+shader fills each glyph from its SDF and applies the per-orb rotation, reproducing
+the CPU **pre-bleed** fill. The aquarelle bleed/halo pass (step 5 above) is **not
+yet implemented on the GPU path** — it lands in a separate slice — so a GPU Glyph
+render is the SDF fill only, without the paper-bleed softening.
+
 ## Softness axis
 
 `--softness {low, mid, high}` is a **single user-facing axis** that bundles

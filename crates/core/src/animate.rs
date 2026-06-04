@@ -1270,6 +1270,53 @@ mod tests {
         }
     }
 
+    /// #212: WGSL の turns 式 `x - floor(x)` は Rust の `rem_euclid(x, 1.0)` と
+    /// 一致しなければならない。`orb_glyph.wgsl::glyph_rotation_angle` は
+    /// `turns = x - floor(x)` で turns を出すが、CPU 側 `glyph_rotation_angle` は
+    /// `rem_euclid(1.0)` を使う。両者は **負の speed** で wrap の挙動が割れやすい
+    /// （`rem_euclid` は非負を返す一方、素朴な `%` は負を返しうる）。WGSL の式を
+    /// Rust に移植し、cycle∈1..=4 × 複数 t × **符号付き speed（負を含む）**で
+    /// CPU 実装と完全一致することを assert し、回転角が WGSL と CPU で乖離しない
+    /// ことを固定する。`floor` 版は 1.0 が正なので負入力でも非負 turns を返し、
+    /// `rem_euclid` と一致するのが期待値。
+    #[test]
+    fn wgsl_glyph_rotation_angle_matches_rust_rem_euclid() {
+        // orb_glyph.wgsl の turns 式（`let x = cycle * rot_speed_signed * t;
+        // let turns = x - floor(x);`）をそのまま Rust に移植したもの。
+        fn wgsl_turns(cycle: u32, rot_speed_signed: f32, t: f32) -> f32 {
+            let x = cycle as f32 * rot_speed_signed * t;
+            x - x.floor()
+        }
+
+        // base_angle を載せた WGSL 側の最終角（`base_angle + turns * TAU`）。
+        fn wgsl_angle(cycle: u32, t: f32, base_angle: f32, rot_speed_signed: f32) -> f32 {
+            base_angle + wgsl_turns(cycle, rot_speed_signed, t) * TAU
+        }
+
+        // 符号付き speed: 正・負の両方を直接ピンする（負速度の wrap 乖離を狙う）。
+        let base_angles = [0.0_f32, 0.3, 1.7, std::f32::consts::PI];
+        let speeds = [-2.0_f32, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0];
+        let times = [0.0_f32, 0.1, 0.25, 0.4999, 0.5, 0.7777, 0.9, 1.0];
+        for cycle in 1u32..=4 {
+            for &base_angle in &base_angles {
+                for &speed in &speeds {
+                    for &t in &times {
+                        // CPU 実装（rem_euclid(_, 1.0)）。glyph_rotate=true。
+                        let rust = glyph_rotation_angle(cycle, t, base_angle, speed, true);
+                        // WGSL 移植（x - floor(x)）。
+                        let wgsl = wgsl_angle(cycle, t, base_angle, speed);
+                        assert!(
+                            (rust - wgsl).abs() < 1e-5,
+                            "WGSL turns (x - floor(x)) must match Rust rem_euclid(_, 1.0): \
+                             cycle={cycle} base={base_angle} speed={speed} t={t} \
+                             rust={rust} wgsl={wgsl}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn glyph_rotation_does_not_perturb_legacy_rng_sequence() {
         let seed = 42;
