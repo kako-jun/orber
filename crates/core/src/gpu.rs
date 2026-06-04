@@ -445,6 +445,34 @@ impl GpuRenderer {
             .len()
     }
 
+    /// Number of live entries in the grow-only per-size bleed-texture cache (one
+    /// `BleedTextures` per distinct `(width, height)`). Exposed for the #214
+    /// bleed-cache tests (`gpu_glyph_bleed_textures_reuse_same_size` /
+    /// `gpu_glyph_bleed_textures_grow_on_new_size`): re-rendering a glyph at the
+    /// same size must keep this at 1, while a new size must add an entry. Mirrors
+    /// the `cache_sizes` / `glyph_sdf_cache_len` hooks (poison recovery via
+    /// `into_inner`, `#[cfg(test)]` so the production API stays clean).
+    #[cfg(test)]
+    fn bleed_textures_len(&self) -> usize {
+        self.bleed_textures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the lazy bleed pipelines have been compiled yet (`Some`). Exposed
+    /// for `gpu_bleed_pipelines_lazy_not_built_for_circle_only`: a Circle-only run
+    /// must leave this `false` (the bleed shader never compiles), and the first
+    /// glyph frame must flip it to `true`. Mirrors the `cache_sizes` /
+    /// `glyph_sdf_cache_len` hooks (poison recovery via `into_inner`).
+    #[cfg(test)]
+    fn bleed_pipelines_built(&self) -> bool {
+        self.bleed_pipelines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
@@ -3200,5 +3228,490 @@ mod tests {
             "same opts/seed/t must render byte-identical glyph frames (rotation ON)"
         );
         eprintln!("glyph determinism: two renders byte-identical");
+    }
+
+    // ---- #214 Phase 1b.5: Glyph bleed/halo 2nd pass (WGSL) ----
+
+    /// A Glyph `AnimateOptions` matching the CPU bleed oracle's setup: a single
+    /// white centered cluster, `orb_size = 1.0`, `softness = Low` (the sharp
+    /// pre-#205 baseline the CPU bleed tests pin so the halo R survives the blur),
+    /// no flow advance / rotation so the glyph sits at the canvas center. Mirrors
+    /// the `orb.rs` `glyph_bleed_produces_halo_around_lit_pixel_cluster` opts.
+    fn glyph_bleed_opts(w: u32, h: u32) -> AnimateOptions {
+        AnimateOptions {
+            width: w,
+            height: h,
+            orb_size: 1.0,
+            blur: 0.5,
+            saturation: 1.0,
+            direction: MotionDirection::LeftToRight,
+            speed: MotionSpeed::Slow,
+            seed: 0,
+            count: Some(1),
+            background: [0, 0, 0, 255],
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: crate::glyph::GlyphFontId::NotoSymbols2,
+            },
+            softness: SoftnessPreset::Low,
+            glyph_rotate: false,
+            color_tracks: None,
+            keyframe_tracks: None,
+        }
+    }
+
+    /// #214 (A): the GPU bleed pass must leak a **halo ring** outside the glyph
+    /// body — the direct evidence the box-blur/compose 2nd pass ran. Mirrors the
+    /// CPU oracle `glyph_bleed_produces_halo_around_lit_pixel_cluster`: a single
+    /// white ☆ at 64×64, `orb_size = 1.0` (radius ≈ 16 px, center (32,32)). The
+    /// star body is essentially complete by r ≈ 16; the ring 18..21 px from the
+    /// center is outside the body, so any lit (R>0) pixel there must come from the
+    /// bleed pass spreading the fill outward. Without the 2nd pass that ring would
+    /// be pure background black. Loose count (`>= 10`) like the CPU oracle (noise
+    /// is omitted on the GPU, so the absolute count differs from the CPU's).
+    #[test]
+    fn gpu_glyph_bleed_produces_halo_ring() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_produces_halo_ring") else {
+            return;
+        };
+        eprintln!(
+            "GPU Glyph bleed halo test running on adapter: {}",
+            renderer.adapter_name()
+        );
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = glyph_bleed_opts(64, 64);
+        let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
+        assert_eq!(img.dimensions(), (64, 64));
+        let (cx, cy) = (32.0f32, 32.0f32);
+        let mut halo_count = 0usize;
+        let mut halo_max_r = 0u8;
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let d = (dx * dx + dy * dy).sqrt();
+                if (18.0..21.0).contains(&d) {
+                    let px = img.get_pixel(x, y);
+                    if px[0] > 0 {
+                        halo_count += 1;
+                        halo_max_r = halo_max_r.max(px[0]);
+                    }
+                }
+            }
+        }
+        assert!(
+            halo_count >= 10,
+            "GPU bleed pass must leak a halo (R>0) into the ring 18..21px from the \
+             glyph center; found {halo_count} halo pixels (max R = {halo_max_r}). \
+             A missing 2nd pass would leave this ring pure background black."
+        );
+        eprintln!("gpu bleed halo ring: {halo_count} lit pixels (max R = {halo_max_r})");
+    }
+
+    /// #214 (A): the bleed pass must not wash the glyph fill out — the lit body
+    /// pixels must survive the box-blur/compose. Mirrors the CPU oracle
+    /// `glyph_lit_pixels_remain_visible_after_bleed` (softness Low ☆, `lit > 32`
+    /// counted as R > 32). If the compose `intensity` over-weighted the (dimmer)
+    /// blurred layer the bright body would collapse below this threshold.
+    #[test]
+    fn gpu_glyph_lit_pixels_remain_visible_after_bleed() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_lit_pixels_remain_visible_after_bleed")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = glyph_bleed_opts(100, 100);
+        let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
+        let lit = img.pixels().filter(|p| p[0] > 32).count();
+        assert!(
+            lit > 32,
+            "glyph lit pixels must survive the GPU bleed pass (R>32), got lit={lit}"
+        );
+        eprintln!("gpu lit-after-bleed: lit={lit}");
+    }
+
+    /// #214 (A): empty clusters routed explicitly through `render_frame_glyph`
+    /// must stay background-only after the bleed contract — a blur of nothing is
+    /// still nothing. (The empty path early-outs before the fill, so this also
+    /// pins that the bleed orchestration is never asked to halo a blank canvas.)
+    /// Named for the bleed intent even though `gpu_glyph_empty_clusters_background_only`
+    /// covers the plain glyph dispatch.
+    #[test]
+    fn gpu_glyph_bleed_empty_clusters_stays_background() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_bleed_empty_clusters_stays_background")
+        else {
+            return;
+        };
+        let opts = glyph_bleed_opts(48, 40);
+        let img = renderer.render_frame_glyph(&[], &opts, 0.3);
+        assert_eq!(img.dimensions(), (48, 40));
+        let lit = lit_vs_bg(&img, opts.background, 1);
+        assert_eq!(
+            lit, 0,
+            "empty clusters + glyph bleed path must stay background-only, got {lit} non-bg pixels"
+        );
+    }
+
+    /// #214 (A): a weight-0 cluster yields zero orbs (radius 0 → skipped), so the
+    /// glyph fill is empty and the bleed pass has nothing to spread. The frame
+    /// must stay background-only. Mirrors the CPU oracle
+    /// `glyph_zero_weight_cluster_stays_black_after_bleed`.
+    #[test]
+    fn gpu_glyph_bleed_weight_zero_stays_background() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_bleed_weight_zero_stays_background")
+        else {
+            return;
+        };
+        let opts = glyph_bleed_opts(48, 40);
+        let img =
+            renderer.render_frame_glyph(&[cluster([255, 255, 255], 0.5, 0.5, 0.0)], &opts, 0.3);
+        let lit = lit_vs_bg(&img, opts.background, 1);
+        assert_eq!(
+            lit, 0,
+            "weight=0 cluster + glyph bleed path must stay background-only, got {lit} non-bg pixels"
+        );
+    }
+
+    /// #214 (A): an unknown glyph (pizza emoji, absent from the bundled Symbols 2
+    /// subset) produces no SDF, so the fill is empty and the bleed pass spreads
+    /// nothing — the frame must stay background-only. The "draw nothing for tofu"
+    /// contract must hold through the bleed path too.
+    #[test]
+    fn gpu_glyph_bleed_unknown_char_stays_background() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_bleed_unknown_char_stays_background")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let mut opts = glyph_bleed_opts(48, 40);
+        opts.shape = OrbShape::Glyph {
+            ch: '\u{1F355}', // pizza — not in Noto Sans Symbols 2
+            font: crate::glyph::GlyphFontId::NotoSymbols2,
+        };
+        let img = renderer.render_frame_glyph(&[c], &opts, 0.3);
+        let lit = lit_vs_bg(&img, opts.background, 1);
+        assert_eq!(
+            lit, 0,
+            "unknown glyph + bleed path must stay background-only, got {lit} non-bg pixels"
+        );
+    }
+
+    /// #214 (A): the whole glyph + bleed pipeline is fully deterministic. The
+    /// paper-grain noise (the one nondeterministic-looking step) is omitted on the
+    /// GPU, so the same opts/seed/t rendered twice must be **byte-identical** — no
+    /// jitter from the box-blur ping-pong, the halo HSL transform, or the compose.
+    /// Stronger than `gpu_glyph_determinism_same_seed_same_output` because it pins
+    /// determinism specifically over the bleed pass (single centered glyph, the
+    /// halo well clear of the body).
+    #[test]
+    fn gpu_glyph_bleed_determinism_byte_identical() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_determinism_byte_identical")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = glyph_bleed_opts(64, 64);
+        let a = renderer.render_frame_glyph(&[c], &opts, 0.42);
+        let b = renderer.render_frame_glyph(&[c], &opts, 0.42);
+        assert_eq!(
+            a, b,
+            "glyph bleed pass must be byte-identical on repeat (noise omitted → full determinism)"
+        );
+        eprintln!("gpu glyph bleed determinism: two renders byte-identical");
+    }
+
+    /// #214 (A / D1 pin): adding the bleed pass group must leave the **Circle**
+    /// path untouched. Circle never enters `run_glyph_fill_bleed_readback` (it goes
+    /// through `run_pass_and_readback` instead), so a Circle frame must still match
+    /// the CPU oracle within the ±2/channel contract every other Circle parity test
+    /// uses. This is the explicit non-regression pin that the #214 addition did not
+    /// leak into the Circle dispatch.
+    #[test]
+    fn gpu_circle_unaffected_by_bleed_addition() {
+        let Some(renderer) = require_or_skip_renderer("gpu_circle_unaffected_by_bleed_addition")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut overall_max = 0u8;
+        for &(dir, t) in &[
+            (MotionDirection::LeftToRight, 0.0_f32),
+            (MotionDirection::TopToBottom, 0.5),
+            (MotionDirection::BottomToTop, 1.0),
+        ] {
+            let opts = circle_opts(48, 32, dir, MotionSpeed::Mid);
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame(&clusters, &opts, t);
+            let max_diff = assert_within_tolerance(
+                &cpu,
+                &gpu,
+                &format!("circle bleed-unaffected {dir:?} t={t}"),
+            );
+            overall_max = overall_max.max(max_diff);
+        }
+        eprintln!(
+            "circle unaffected by bleed addition: overall max per-channel diff = {overall_max}"
+        );
+    }
+
+    /// #214 (B): the box-blur radius clamp (`r = min(radius, w-1)` / `min(radius,
+    /// h-1)` in `orb_glyph_bleed.wgsl`) must keep tiny canvases from sampling out
+    /// of bounds. Several sub-`2r+1` sizes (1×1, 2×2, 5×4, where the box radius 3
+    /// exceeds the dimension) must render without panic / device loss and produce a
+    /// correctly-sized image. A missing clamp would read negative / past-edge
+    /// texels.
+    #[test]
+    fn gpu_glyph_bleed_tiny_canvas_no_panic() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_tiny_canvas_no_panic")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        for &(w, h) in &[(1u32, 1u32), (2, 2), (5, 4)] {
+            let opts = glyph_bleed_opts(w, h);
+            let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
+            assert_eq!(
+                img.dimensions(),
+                (w, h),
+                "tiny {w}x{h} glyph bleed frame must have correct dims (radius clamp held)"
+            );
+        }
+        eprintln!("gpu glyph bleed tiny canvas: 1x1 / 2x2 / 5x4 rendered without panic");
+    }
+
+    /// #214 (B): re-rendering a glyph at the **same size** must reuse the cached
+    /// `BleedTextures` (fill + ping/pong), leaving the per-size bleed cache at
+    /// exactly one entry — mirrors `caches_resources_across_a_clip` for the bleed
+    /// intermediates. Uses a *fresh* renderer so the count is observable in
+    /// isolation (the shared renderer accumulates sizes from other tests).
+    #[test]
+    fn gpu_glyph_bleed_textures_reuse_same_size() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("gpu_glyph_bleed_textures_reuse_same_size")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = glyph_bleed_opts(64, 48);
+        assert_eq!(
+            renderer.bleed_textures_len(),
+            0,
+            "no glyph frame yet → 0 bleed entries"
+        );
+        let _ = renderer.render_frame_glyph(&[c], &opts, 0.0);
+        assert_eq!(
+            renderer.bleed_textures_len(),
+            1,
+            "first glyph frame must allocate exactly one bleed-texture entry"
+        );
+        let _ = renderer.render_frame_glyph(&[c], &opts, 0.5);
+        assert_eq!(
+            renderer.bleed_textures_len(),
+            1,
+            "same-size second glyph frame must reuse the cached bleed textures (still 1)"
+        );
+    }
+
+    /// #214 (B): a glyph frame at a **new size** must add one bleed-texture entry
+    /// (grow-only, like `sized_cache`). Uses a *fresh* renderer so the exact entry
+    /// count is observable. Two distinct sizes → exactly two entries.
+    #[test]
+    fn gpu_glyph_bleed_textures_grow_on_new_size() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("gpu_glyph_bleed_textures_grow_on_new_size")
+        else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(64, 48), 0.0);
+        assert_eq!(
+            renderer.bleed_textures_len(),
+            1,
+            "first size → 1 bleed entry"
+        );
+        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(40, 32), 0.0);
+        assert_eq!(
+            renderer.bleed_textures_len(),
+            2,
+            "a second distinct size must add one bleed-texture entry (grow-only)"
+        );
+    }
+
+    /// #214 (B): the bleed pipelines are **lazy** — a renderer that only ever drew
+    /// Circle frames must never compile the bleed shader (`bleed_pipelines_built()`
+    /// stays `false`), and the first glyph (lit) frame must compile them (flips to
+    /// `true`). A fresh renderer isolates the lazy state. Uses a real ☆ so the
+    /// glyph path actually enters `run_glyph_fill_bleed_readback` (an empty/unknown
+    /// glyph early-outs through the Circle pipeline and would *not* build them).
+    #[test]
+    fn gpu_bleed_pipelines_lazy_not_built_for_circle_only() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("gpu_bleed_pipelines_lazy_not_built_for_circle_only")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        assert!(
+            !renderer.bleed_pipelines_built(),
+            "fresh renderer must not have compiled the bleed pipelines yet"
+        );
+        // Several Circle frames: still no bleed shader.
+        let circle = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        for k in 0..4 {
+            let _ = renderer.render_frame(&clusters, &circle, k as f32 / 4.0);
+        }
+        assert!(
+            !renderer.bleed_pipelines_built(),
+            "Circle-only rendering must never compile the bleed pipelines"
+        );
+        // First glyph frame with a real fill compiles them.
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(48, 32), 0.0);
+        assert!(
+            renderer.bleed_pipelines_built(),
+            "the first glyph (lit) frame must compile the bleed pipelines"
+        );
+    }
+
+    /// #214 (C): concurrent glyph+bleed renders on the shared renderer at the
+    /// **same size** must each match their solo oracle within ±2/channel — i.e. the
+    /// bleed intermediates (`fill` / `ping` / `pong`) are never aliased across
+    /// threads. The per-size bleed textures are shared mutable state behind the
+    /// `render_guard`; if a second thread's box-blur overwrote `ping` mid-pass for
+    /// the first thread the halo would corrupt. Several threads hammer the *same*
+    /// size + char + t (collision maximized), each output compared to a fresh solo
+    /// render. Strengthens `shared_gpu_concurrent_glyph_render` by explicitly
+    /// stressing the bleed mid-pass textures (Phase 1a's #210 aliasing class).
+    #[test]
+    fn shared_gpu_concurrent_glyph_bleed_no_aliasing() {
+        let Some(renderer) =
+            require_or_skip_renderer("shared_gpu_concurrent_glyph_bleed_no_aliasing")
+        else {
+            return;
+        };
+        // Same size for every thread so they all contend the one cached
+        // `(w,h)` BleedTextures entry — that is the aliasing surface under test.
+        let (w, h) = (72u32, 56u32);
+        let make_opts = || glyph_bleed_opts(w, h);
+
+        // Solo oracle on a fresh renderer (its own bleed textures, uncontended).
+        let Some(oracle_renderer) = require_or_skip_fresh_renderer(
+            "shared_gpu_concurrent_glyph_bleed_no_aliasing (oracle)",
+        ) else {
+            return;
+        };
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let oracle = oracle_renderer.render_frame_glyph(&[c], &make_opts(), 0.3);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let oracle = &oracle;
+                handles.push(scope.spawn(move || {
+                    let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+                    let opts = make_opts();
+                    // Reuse the same char/size/t so all threads collide on the one
+                    // shared BleedTextures entry as hard as possible.
+                    for _ in 0..4 {
+                        let img = renderer.render_frame_glyph(&[c], &opts, 0.3);
+                        assert_within_tolerance(
+                            oracle,
+                            &img,
+                            "concurrent glyph bleed vs solo render (no intermediate aliasing)",
+                        );
+                    }
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("concurrent glyph bleed thread panicked");
+            }
+        });
+        eprintln!("concurrent glyph bleed: all threads matched solo oracle (no mid-pass aliasing)");
+    }
+
+    /// #214 (structural parity tighten): with the bleed pass now reproduced on the
+    /// GPU, the lit bbox and overlap should agree **more tightly** than the
+    /// pre-bleed `gpu_glyph_structural_parity_with_cpu` allowed — bbox within 3 px
+    /// (was 6) and overlap > 80% (was 60%). The **lit-count band [0.5, 2.0] is left
+    /// unchanged**: the GPU omits the paper-grain noise, so the CPU still scatters
+    /// extra faint soft pixels the GPU lacks, and pinning the count ratio tighter
+    /// would be a false positive. The existing looser test is intentionally left in
+    /// place; this one is the tightened companion.
+    #[test]
+    fn gpu_glyph_bleed_parity_tighter_bbox_overlap() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_bleed_parity_tighter_bbox_overlap")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = glyph_opts(
+            120,
+            90,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        for &t in &[0.0_f32, 0.5] {
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame_glyph(&clusters, &opts, t);
+            assert_eq!(cpu.dimensions(), gpu.dimensions());
+
+            let bg = opts.background;
+            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
+            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
+            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
+
+            // Lit-count band left at the looser [0.5, 2.0] (noise omitted on GPU).
+            let ratio = gpu_lit as f32 / cpu_lit as f32;
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "t={t}: gpu_lit={gpu_lit}/cpu_lit={cpu_lit}={ratio:.2}, band [0.5,2.0] (unchanged)"
+            );
+
+            // Tighter bbox: 3 px slack on each edge (was 6).
+            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
+            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
+            let tol = 3i64;
+            for (label, a, b) in [
+                ("minx", cb.0 as i64, gb.0 as i64),
+                ("miny", cb.1 as i64, gb.1 as i64),
+                ("maxx", cb.2 as i64, gb.2 as i64),
+                ("maxy", cb.3 as i64, gb.3 as i64),
+            ] {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tightened tol={tol}",
+                    (a - b).abs()
+                );
+            }
+
+            // Tighter overlap: > 80% of the smaller lit set (was 60%).
+            let mut overlap = 0usize;
+            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
+                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
+                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
+                if c_lit && g_lit {
+                    overlap += 1;
+                }
+            }
+            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
+            assert!(
+                overlap_frac > 0.8,
+                "t={t}: lit overlap {:.1}% of the smaller set; tightened expectation >80%",
+                overlap_frac * 100.0
+            );
+            eprintln!(
+                "glyph bleed tighter parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} \
+                 ratio={ratio:.2} overlap={:.1}%",
+                overlap_frac * 100.0
+            );
+        }
     }
 }
