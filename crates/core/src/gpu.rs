@@ -240,6 +240,19 @@ impl GpuRenderer {
         )
     }
 
+    /// Current capacity (height in orbs) of the grow-only orb data-texture, or
+    /// `0` if no frame has been rendered yet. Exposed for the grow-only test
+    /// (`orb_texture_grows_only_on_increase`): a higher count must grow it, a lower
+    /// or equal count must leave it unchanged. Mirrors the `cache_sizes` test hook.
+    #[cfg(test)]
+    fn orb_capacity(&self) -> u32 {
+        self.orb_texture
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |tex| tex.capacity)
+    }
+
     /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
@@ -1129,5 +1142,391 @@ mod tests {
         let max_diff =
             assert_within_tolerance(&b_fresh, &b_cached, "reused frame B vs fresh render");
         eprintln!("reuse-vs-fresh frame B: max per-channel diff = {max_diff}");
+    }
+
+    /// `n` clusters each with its **own** distinct color / position / weight, so a
+    /// `count = n` render exercises `n` independent texture rows (not the
+    /// weight-scattered expansion of the 4-color `sample_clusters` palette). Used
+    /// by the distinct-rows parity test to prove every orb-texture row is loaded
+    /// independently and correctly.
+    fn distinct_clusters(n: usize) -> Vec<Cluster> {
+        (0..n)
+            .map(|i| {
+                // Spread hue across all three channels and scatter the centroid on a
+                // lattice so no two clusters collapse to the same color/position.
+                let r = (37 + (i * 53)) % 256;
+                let g = (91 + (i * 17)) % 256;
+                let b = (151 + (i * 31)) % 256;
+                let cx = ((i * 7) % 19) as f32 / 19.0;
+                let cy = ((i * 11) % 23) as f32 / 23.0;
+                let weight = 0.1 + ((i % 5) as f32) * 0.15;
+                cluster([r as u8, g as u8, b as u8], cx, cy, weight)
+            })
+            .collect()
+    }
+
+    /// C3 (#210): parity with **65+ individually-colored** clusters. The existing
+    /// `gpu_matches_cpu_high_count` only has the 4-color `sample_clusters`, so a
+    /// high `count` there just re-scatters those 4 colors — it can't catch a bug
+    /// where texture row `k` loads the wrong orb's color. Here each cluster is its
+    /// own color, so the `clusters.len()` (= count) distinct rows must each load
+    /// independently and correctly for CPU↔GPU to agree within ±2/channel.
+    #[test]
+    fn gpu_matches_cpu_high_count_distinct_clusters() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_matches_cpu_high_count_distinct_clusters")
+        else {
+            return;
+        };
+        for &n in &[65usize, 200] {
+            let clusters = distinct_clusters(n);
+            // count = None so every distinct cluster becomes its own orb row.
+            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
+            opts.count = Some(n);
+            for &t in &[0.0_f32, 0.5] {
+                let cpu = render_frame(&clusters, &opts, t);
+                let gpu = renderer.render_frame(&clusters, &opts, t);
+                let max_diff =
+                    assert_within_tolerance(&cpu, &gpu, &format!("distinct n={n} t={t}"));
+                eprintln!("distinct n={n} t={t}: max per-channel diff = {max_diff}");
+            }
+        }
+    }
+
+    /// C4 (#210): the orb data-texture grows **only on increase**. A higher count
+    /// must grow `capacity`; a lower or equal count must leave it unchanged (no
+    /// shrink, no reallocation when it already fits). Uses a *private* renderer so
+    /// the capacity isn't perturbed by the shared parity tests, and the
+    /// `orb_capacity()` test hook to observe the grow-only invariant directly.
+    #[test]
+    fn orb_texture_grows_only_on_increase() {
+        let Some(renderer) = require_or_skip_fresh_renderer("orb_texture_grows_only_on_increase")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
+
+        assert_eq!(renderer.orb_capacity(), 0, "no frame yet → capacity 0");
+
+        // First frame at count=50 allocates capacity >= 50.
+        opts.count = Some(50);
+        let _ = renderer.render_frame(&clusters, &opts, 0.0);
+        let cap_50 = renderer.orb_capacity();
+        assert!(
+            cap_50 >= 50,
+            "count=50 must allocate capacity >= 50, got {cap_50}"
+        );
+
+        // Increase to 200 → must grow.
+        opts.count = Some(200);
+        let _ = renderer.render_frame(&clusters, &opts, 0.0);
+        let cap_200 = renderer.orb_capacity();
+        assert!(
+            cap_200 >= 200 && cap_200 > cap_50,
+            "count=200 must grow capacity (was {cap_50}, now {cap_200})"
+        );
+
+        // Decrease to 100 → must NOT shrink (grow-only) and must not reallocate.
+        opts.count = Some(100);
+        let _ = renderer.render_frame(&clusters, &opts, 0.0);
+        assert_eq!(
+            renderer.orb_capacity(),
+            cap_200,
+            "count down to 100 must leave capacity unchanged (grow-only)"
+        );
+
+        // Re-render the same count=100 → no reallocation (capacity stable).
+        let _ = renderer.render_frame(&clusters, &opts, 0.5);
+        assert_eq!(
+            renderer.orb_capacity(),
+            cap_200,
+            "same count re-render must not reallocate the orb texture"
+        );
+    }
+
+    /// C5 (#210): after the orb texture grows, a later **smaller** frame must not
+    /// leak the previous (larger) frame's rows. Render count=256 then count=100 on
+    /// the same renderer (the texture stays at capacity 256, but only 100 rows are
+    /// live); the count=100 output must equal a *fresh* renderer's single count=100
+    /// render. Mirrors `cached_resources_do_not_leak_previous_frame` but for the
+    /// grow-only orb texture's stale-row risk.
+    #[test]
+    fn high_count_cache_does_not_leak_previous_frame() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("high_count_cache_does_not_leak_previous_frame")
+        else {
+            return;
+        };
+        let clusters = distinct_clusters(256);
+        let mut opts = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Mid);
+
+        // Grow the texture to 256 rows first, then render the same renderer at 100.
+        opts.count = Some(256);
+        let _ = renderer.render_frame(&clusters, &opts, 0.4);
+        opts.count = Some(100);
+        let grown_then_100 = renderer.render_frame(&clusters, &opts, 0.4);
+
+        // Oracle: a fresh renderer that only ever saw count=100 (texture sized 100).
+        let Some(fresh) = require_or_skip_fresh_renderer(
+            "high_count_cache_does_not_leak_previous_frame (oracle leg)",
+        ) else {
+            return;
+        };
+        let fresh_100 = fresh.render_frame(&clusters, &opts, 0.4);
+
+        let max_diff = assert_within_tolerance(
+            &fresh_100,
+            &grown_then_100,
+            "grown-to-256-then-100 vs fresh-100",
+        );
+        eprintln!("grow-then-shrink leak check: max per-channel diff = {max_diff}");
+    }
+
+    /// C6 (#210): `render_packed` zero-fills short rows. Hand-build a pack whose
+    /// header `n_orbs` is larger than the per-orb rows actually present in the
+    /// buffer; the missing rows must stay zeroed (the early `off + 11 > len` break)
+    /// and the render must not panic. The orb-texture row count equals the header
+    /// `n_orbs` (clamped), so a short buffer is safe — verified by rendering and
+    /// comparing to a pack truncated to its real orb count (the trailing zeroed
+    /// rows are alpha-0 orbs that contribute nothing, so both must match).
+    #[test]
+    fn render_packed_zero_fills_short_rows() {
+        let Some(renderer) = require_or_skip_renderer("render_packed_zero_fills_short_rows") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let (w, h) = (40u32, 28u32);
+        // A valid 8-orb pack via the production packer (header + 8 per-orb rows).
+        let real_orbs = 8usize;
+        let mut pack = pack_render_data_for_webgl(
+            &clusters,
+            [12, 18, 28, 255],
+            1.0,
+            0.5,
+            0.0, // direction_id = LeftToRight
+            MotionSpeed::Mid.cycle_count() as f32,
+            12345,
+            real_orbs,
+            1.0,
+            0.0,  // shape_id (Circle)
+            true, // glyph_rotate (ignored by Circle)
+            0.5,  // edge_softness (ignored by Circle)
+        );
+        // Lie in the header: claim more orbs than the buffer actually carries.
+        // The buffer still only has `real_orbs` per-orb rows, so rows
+        // [real_orbs..claimed) must zero-fill rather than read OOB or panic.
+        let claimed = 40usize;
+        pack[8] = claimed as f32;
+
+        // Must not panic; the extra claimed rows are zeroed (alpha-0, no contribution).
+        let short = renderer.render_packed(&pack, w, h, 0.3);
+
+        // Oracle: an honest pack that declares exactly its real orb count.
+        let honest = pack_render_data_for_webgl(
+            &clusters,
+            [12, 18, 28, 255],
+            1.0,
+            0.5,
+            0.0, // direction_id = LeftToRight
+            MotionSpeed::Mid.cycle_count() as f32,
+            12345,
+            real_orbs,
+            1.0,
+            0.0,
+            true,
+            0.5,
+        );
+        let honest_img = renderer.render_packed(&honest, w, h, 0.3);
+
+        assert_eq!(
+            short.dimensions(),
+            (w, h),
+            "short-row pack must still produce a {w}x{h} image (row count = output size, not n_orbs)"
+        );
+        let max_diff =
+            assert_within_tolerance(&honest_img, &short, "short-row zero-fill vs honest pack");
+        eprintln!("short-row zero-fill: max per-channel diff = {max_diff}");
+    }
+
+    /// C7 (#210): a width whose `width*4` is **not** 256-aligned, at the max
+    /// count=1024, in a single frame. Stresses the read-back row-padding strip and
+    /// the tall (1024-row) orb texture at once; CPU↔GPU must still agree.
+    #[test]
+    fn gpu_matches_cpu_high_count_unaligned_width_max() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_matches_cpu_high_count_unaligned_width_max")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        // 50*4 = 200, not a multiple of 256 → read-back rows are padded.
+        let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        opts.count = Some(1024);
+        let cpu = render_frame(&clusters, &opts, 0.5);
+        let gpu = renderer.render_frame(&clusters, &opts, 0.5);
+        let max_diff = assert_within_tolerance(&cpu, &gpu, "unaligned width × count=1024");
+        eprintln!("unaligned-width count=1024: max per-channel diff = {max_diff}");
+    }
+
+    /// C8 (#210): count=1 — the minimum (one orb row, `rows.max(1)` / `n_orbs.max(1)`
+    /// lower bounds). The single-row orb texture must render and match the CPU.
+    #[test]
+    fn gpu_matches_cpu_count_one() {
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_count_one") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        opts.count = Some(1);
+        for &t in &[0.0_f32, 0.5, 1.0] {
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame(&clusters, &opts, t);
+            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count=1 t={t}"));
+            eprintln!("count=1 t={t}: max per-channel diff = {max_diff}");
+        }
+    }
+
+    /// C9 (#210): the internal `render_packed` contract clamps a header `n_orbs`
+    /// above [`MAX_ORB_COUNT`] (1024) down to 1024 — no panic, no out-of-bounds
+    /// texture read. This bypasses the CLI (which can't request > 1024 via
+    /// `--count`), so it pins the *internal* clamp directly. Build an honest pack
+    /// then overwrite the header count to 2000; the render must succeed at the
+    /// frame size. (The shader reads `params.n_orbs` rows from a texture sized to
+    /// the same clamped count, so an unclamped header would read past the texture.)
+    #[test]
+    fn gpu_clamps_count_above_max_orb_count() {
+        let Some(renderer) = require_or_skip_renderer("gpu_clamps_count_above_max_orb_count")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let (w, h) = (40u32, 28u32);
+        // An honest 1024-orb pack, then a lying header claiming 2000 orbs.
+        let mut pack = pack_render_data_for_webgl(
+            &clusters,
+            [12, 18, 28, 255],
+            1.0,
+            0.5,
+            0.0, // direction_id = LeftToRight
+            MotionSpeed::Mid.cycle_count() as f32,
+            12345,
+            MAX_ORB_COUNT,
+            1.0,
+            0.0,
+            true,
+            0.5,
+        );
+        pack[8] = 2000.0;
+
+        // Must clamp to 1024 internally: no panic, no OOB texture read.
+        let clamped = renderer.render_packed(&pack, w, h, 0.5);
+        assert_eq!(
+            clamped.dimensions(),
+            (w, h),
+            "clamped over-max render must still produce a {w}x{h} image"
+        );
+
+        // Equivalence: header=2000 (clamped to 1024) must equal header=1024 exactly,
+        // since both render the same 1024 rows.
+        let mut honest = pack.clone();
+        honest[8] = MAX_ORB_COUNT as f32;
+        let honest_img = renderer.render_packed(&honest, w, h, 0.5);
+        let max_diff = assert_within_tolerance(
+            &honest_img,
+            &clamped,
+            "header=2000 (clamped) vs header=1024",
+        );
+        eprintln!("over-max clamp: max per-channel diff = {max_diff}");
+    }
+
+    /// C10 (#210): `--saturation != 1.0` parity holds at high count. The
+    /// `apply_saturation_to_pack` loop must run over **all** 256 orb rows (not just
+    /// the first 64), so a desaturated (0.5) and a boosted (2.0) high-count frame
+    /// must each still match the CPU oracle.
+    #[test]
+    fn gpu_matches_cpu_high_count_with_saturation() {
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count_with_saturation")
+        else {
+            return;
+        };
+        let clusters = distinct_clusters(256);
+        for &saturation in &[0.5_f32, 2.0] {
+            let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
+            opts.count = Some(256);
+            opts.saturation = saturation;
+            let cpu = render_frame(&clusters, &opts, 0.5);
+            let gpu = renderer.render_frame(&clusters, &opts, 0.5);
+            let max_diff =
+                assert_within_tolerance(&cpu, &gpu, &format!("sat={saturation} count=256"));
+            eprintln!("sat={saturation} count=256: max per-channel diff = {max_diff}");
+        }
+    }
+
+    /// C11 (#210): the shared renderer's orb-texture must not race. Several threads
+    /// render **different** high counts concurrently on the *same* renderer; each
+    /// thread's output must equal that same input rendered alone (a fresh renderer).
+    /// This is the only test exercising the new `orb_texture` under contention.
+    ///
+    /// **`#[ignore]`d: this test fails — it exposes a real, latent production data
+    /// race in `GpuRenderer` (see report).** `upload_orb_texture` holds the
+    /// `orb_texture` Mutex only for the `write_texture` *enqueue* and then returns,
+    /// releasing the lock; the render pass that *samples* the single shared orb
+    /// texture runs afterwards, outside the lock. So a second thread's
+    /// `upload_orb_texture` can overwrite the one shared texture before the first
+    /// thread's pass reads it, and frames render with another thread's orb colors
+    /// (observed diffs ~120–140/channel). Production currently calls `render_frame`
+    /// single-threaded, so the bug is latent. Left in place (ignored) to document
+    /// the race; run with `cargo test -- --ignored` after the lock is widened to
+    /// cover the pass (or the orb texture is made per-render). Not fixed here per
+    /// the task's "don't change production to make a test pass" rule.
+    #[test]
+    #[ignore = "exposes a real production data race on the shared orb texture (see doc-comment / report); not fixed here"]
+    fn shared_gpu_concurrent_high_count_render() {
+        let Some(renderer) = require_or_skip_renderer("shared_gpu_concurrent_high_count_render")
+        else {
+            return;
+        };
+        let counts = [80usize, 150, 256, 400];
+        // Per-count oracle: render each count alone on a fresh renderer first, so
+        // the concurrent outputs have something independent to match against.
+        let mut oracles = Vec::new();
+        for &c in &counts {
+            let clusters = distinct_clusters(c);
+            let mut opts = circle_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
+            opts.count = Some(c);
+            let Some(fresh) = require_or_skip_fresh_renderer(
+                "shared_gpu_concurrent_high_count_render (oracle leg)",
+            ) else {
+                return;
+            };
+            oracles.push(fresh.render_frame(&clusters, &opts, 0.5));
+        }
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (idx, &c) in counts.iter().enumerate() {
+                let oracle = &oracles[idx];
+                handles.push(scope.spawn(move || {
+                    let clusters = distinct_clusters(c);
+                    let mut opts =
+                        circle_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
+                    opts.count = Some(c);
+                    // Each thread renders a few times to maximize grow/clone overlap.
+                    for _ in 0..3 {
+                        let img = renderer.render_frame(&clusters, &opts, 0.5);
+                        assert_within_tolerance(
+                            oracle,
+                            &img,
+                            &format!("concurrent count={c} vs solo render"),
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("concurrent render thread panicked");
+            }
+        });
+        eprintln!("concurrent high-count render: all threads matched their solo oracle");
     }
 }

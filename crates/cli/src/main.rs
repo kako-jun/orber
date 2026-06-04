@@ -1317,28 +1317,38 @@ mod tests {
         assert_eq!(cli.count, 20);
     }
 
+    /// C1 (#210): count が GPU 容量を超えても CPU フォールバック警告は出ない。
+    /// 旧仕様では --renderer gpu + Circle + count > 64 が `Cpu(Some(警告))` に落ちて
+    /// いた。data-texture 化で 64 cap が消えたので、65〜1024 のどの count でも
+    /// route(Gpu, Circle) は `Gpu`（= フォールバック文言を返さない）であることを守る。
+    /// route はもう count を受け取らないが、過去にフォールバックしていた count 値で
+    /// 観点を明示するため複数値でループする。アダプタ非依存のルーティング判定のみ。
     #[test]
-    fn gpu_route_keeps_circle_on_gpu_regardless_of_count() {
-        // #210: count による CPU フォールバックは撤去した。GPU は data-texture で
-        // 1024 まで直接描くので、Circle はどの count でも GPU のまま。アダプタの有無に
-        // 依存しないルーティング判定だけを確認する。
-        for &count in &[1usize, 64, 65, 256, 1024] {
-            // count はルーティングに影響しないが、過去の 64 境界が GPU に残ることを
-            // 明示するため複数値で確認する（route はもう count を受け取らない）。
+    fn gpu_route_emits_no_warning_for_high_count() {
+        for &count in &[65usize, 100, 256, 1024] {
+            // count は route のシグネチャに無いが、回帰対象の旧 64 境界超えを
+            // テスト名・ループで明示する（この count では旧仕様だと警告が出ていた）。
             let _ = count;
+            let route = FrameRenderer::route(Renderer::Gpu, OrbShape::Circle);
             assert_eq!(
-                FrameRenderer::route(Renderer::Gpu, OrbShape::Circle),
+                route,
                 RenderRoute::Gpu,
-                "Circle must always route to gpu (no count cap, #210)"
+                "count {count}: Circle + gpu must stay on the gpu route with no fallback warning (#210)"
+            );
+            // 念のため「警告文言を持つ Cpu」では絶対にないことも明示する。
+            assert!(
+                !matches!(route, RenderRoute::Cpu(Some(_))),
+                "count {count}: must not emit a CPU fallback warning anymore (#210)"
             );
         }
+    }
 
-        // --renderer cpu は理由なしで CPU。非 Circle shape は理由つきで CPU。
-        assert_eq!(
-            FrameRenderer::route(Renderer::Cpu, OrbShape::Circle),
-            RenderRoute::Cpu(None),
-            "explicit cpu must route to Cpu(None)"
-        );
+    /// C2 (#210): 非 Circle shape の CPU フォールバック（理由つき）は温存する。
+    /// #210 は count による分岐だけを撤去した。route が count 引数を失っても、
+    /// --renderer gpu + 非 Circle は今まで通り `Cpu(Some(非 Circle 文言))` に落ちる。
+    /// あわせて --renderer cpu は理由なし `Cpu(None)` のままであることも確認する。
+    #[test]
+    fn gpu_route_falls_back_for_non_circle_unchanged() {
         match FrameRenderer::route(
             Renderer::Gpu,
             OrbShape::Aquarelle(AquarelleParams {
@@ -1348,9 +1358,21 @@ mod tests {
                 halo: 0.5,
             }),
         ) {
-            RenderRoute::Cpu(Some(_)) => {}
+            RenderRoute::Cpu(Some(msg)) => {
+                assert!(
+                    msg.contains("Circle"),
+                    "non-Circle fallback message should mention the Circle-only limitation, got: {msg}"
+                );
+            }
             other => panic!("non-Circle shape with gpu must route to Cpu(Some(_)), got {other:?}"),
         }
+
+        // --renderer cpu は理由なしで CPU（明示指定なので警告は出さない）。
+        assert_eq!(
+            FrameRenderer::route(Renderer::Cpu, OrbShape::Circle),
+            RenderRoute::Cpu(None),
+            "explicit cpu must route to Cpu(None) with no warning"
+        );
     }
 
     #[test]
