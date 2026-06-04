@@ -892,7 +892,13 @@ impl GpuRenderer {
 
         // No glyph (radius 0 / unknown char / empty SDF) ⇒ background-only frame,
         // matching the CPU "draw nothing" contract. Build a glyph-shaped pack with
-        // zero orbs so only the background paints.
+        // zero orbs so only the background paints. This routes through `render_packed`
+        // (the Circle path), so the bleed 2nd pass is skipped — intentional: the CPU
+        // runs `render_aquarelle_bleed_pass` unconditionally for Glyph, but blurring
+        // orber's uniform opaque background is a no-op *up to the omitted paper-grain
+        // noise* (the CPU would jitter that flat background by ±0.05; the GPU leaves it
+        // flat). Both yield a background-only frame within the same noise-omitted
+        // loose-parity contract this pass already accepts.
         let Some((sdf, sdf_size)) =
             crate::glyph::cached_glyph_sdf_for_radius(font, ch, frame_radius)
         else {
