@@ -79,7 +79,8 @@ blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen buffer would interfere with the
 > rendered halo). The off-screen wrap buffer described above applies to the
-> `circle` and `glyph` shapes only.
+> `circle`, `glyph`, and `image` shapes (`image` shares the `glyph` SDF render
+> path).
 
 ### Orb count
 

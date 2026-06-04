@@ -710,6 +710,16 @@ fn resolve_orb_shape(cli: &Cli) -> Result<OrbShape, ExitCode> {
 }
 
 fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
+    // SVG / CSS 出力は静的な radial-gradient のみで orb 形状を持たないため、
+    // `--shape`（と `--shape image` の `--image-mask`）は無視される。黙って円に
+    // 落ちると驚くので、circle 以外を指定したら警告する（PNG / video 出力では効く）。
+    if cli.shape != Shape::Circle {
+        eprintln!(
+            "orber: warning: --shape {:?} is ignored for {:?} output (SVG/CSS render circles only); use a PNG or video output to apply the orb shape",
+            cli.shape, mode
+        );
+    }
+
     // 1. 入力画像を読み込み RGB8 に正規化。
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
