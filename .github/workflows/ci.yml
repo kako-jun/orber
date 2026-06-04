@@ -125,7 +125,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --features gpu -- -D warnings
 
       - name: Run GPU parity tests (lavapipe, must not skip)
-        # --test-threads=1 belt-and-suspenders: the parity tests share one wgpu
-        # context via OnceLock so they no longer race on adapter/device bring-up,
-        # but serializing them removes any remaining contention on lavapipe.
-        run: cargo test -p orber-core --features gpu -- --nocapture --test-threads=1
+        # Run multi-threaded (the cargo default) on purpose: the parity tests share
+        # one wgpu context via OnceLock (no adapter/device bring-up race), and
+        # `GpuRenderer::render_packed` now serializes its whole GPU body under an
+        # internal `render_guard`, so concurrent `render_frame` on the shared
+        # renderer can no longer alias the shared orb texture / sized resources
+        # (#210). Keeping the run parallel is deliberate: it lets CI detect any
+        # regression of that data race (which `--test-threads=1` would have hidden).
+        run: cargo test -p orber-core --features gpu -- --nocapture
