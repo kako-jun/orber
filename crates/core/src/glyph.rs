@@ -406,7 +406,11 @@ pub fn image_rgba_to_sdf(rgba: &image::RgbaImage, size: u32) -> Option<Vec<u8>> 
                 }
             }
         }
-        let inside_is_dark = dark_count < drawn_pixel_count / 2;
+        // Web parity: `darkCount < drawnPixelCount / 2` uses float division in
+        // jsGlyphSdf.ts. Use `2 * dark_count < drawn_pixel_count` (not integer
+        // `dark_count < drawn_pixel_count / 2`, which floors and flips the
+        // polarity at the odd-count tie `dark_count == floor(N/2)`).
+        let inside_is_dark = 2 * dark_count < drawn_pixel_count;
         for y in dy..dy + dh {
             for x in dx..dx + dw {
                 let yv = y_buf[y * s + x];
