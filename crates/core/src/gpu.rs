@@ -4337,4 +4337,533 @@ mod tests {
             "non-aquarelle shape must fall back to the Circle path byte-for-byte"
         );
     }
+
+    // --- #216 new coverage: RNG reproduction / offset / round boundaries / clamp /
+    //     desaturation / count-ignore / GPU corner & branch parity ---
+
+    /// Oracle satellite placement for one orb, mirroring `render_aquarelle_orb`'s
+    /// **exact** ChaCha8 consumption order (offset θ → per satellite θ/dist/radius)
+    /// so the test owns an independent reference the pack must match bit-for-bit.
+    /// `seed` == orb index (the pack seeds `ChaCha8Rng::seed_from_u64(i)`).
+    fn oracle_aquarelle_sats(
+        seed: u64,
+        center: (f32, f32),
+        radius: f32,
+        bleed: f32,
+    ) -> (f32, Vec<(f32, f32, f32)>) {
+        use std::f32::consts::TAU;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        // 1) offset angle is the first draw (consumed even when offset==0).
+        let theta: f32 = rng.gen_range(0.0..TAU);
+        // 2) satellites, in θ → dist → radius-factor order, `round(3*bleed)` of them.
+        let bleed_count = (3.0 * bleed).round() as u32;
+        let mut sats = Vec::new();
+        for _ in 0..bleed_count.min(3) {
+            let bleed_theta: f32 = rng.gen_range(0.0..TAU);
+            let bleed_dist = radius * rng.gen_range(0.4..0.9);
+            let bx = center.0 + bleed_dist * bleed_theta.cos();
+            let by = center.1 + bleed_dist * bleed_theta.sin();
+            let bleed_radius = radius * rng.gen_range(0.2..0.4) * (0.5 + 0.5 * bleed);
+            sats.push((bx, by, bleed_radius));
+        }
+        (theta, sats)
+    }
+
+    /// (#1, most important) The packed satellite centers/radii must be **bit-identical**
+    /// to an independent ChaCha8 oracle consuming the RNG in `render_aquarelle_orb`'s
+    /// exact order. Guards the RNG-reproduction contract the whole WGSL path rests on.
+    #[test]
+    fn aquarelle_pack_satellite_positions_match_crate() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_satellite_positions_match_crate")
+        else {
+            return;
+        };
+        let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
+        // weight 1.0 ⇒ radius == base_radius_unit; center at (0.5,0.5) ⇒ (100,100).
+        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
+        let radius = base_radius_unit * 1.0_f32.sqrt();
+        let center = (0.5_f32.clamp(0.0, 1.0) * w, 0.5_f32.clamp(0.0, 1.0) * h);
+
+        // bleed=1.0 ⇒ 3 satellites; saturation 1.0 keeps colors untouched.
+        let params = AquarelleParams {
+            bleed: 1.0,
+            bloom: 0.5,
+            offset: 0.5,
+            halo: 0.5,
+        };
+        let orbs =
+            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, params.clamped());
+        assert_eq!(orbs.len(), 1);
+        assert_eq!(
+            orbs[0].main[3] as u32, 3,
+            "bleed=1.0 must pack 3 satellites"
+        );
+
+        let (_, sats) = oracle_aquarelle_sats(0, center, radius, 1.0);
+        assert_eq!(sats.len(), 3);
+        let packed = [orbs[0].sat0, orbs[0].sat1, orbs[0].sat2];
+        for (i, ((ox, oy, or), p)) in sats.iter().zip(packed.iter()).enumerate() {
+            assert_eq!(
+                p[0], *ox,
+                "sat{i} cx must bit-match oracle (packed={}, oracle={ox})",
+                p[0]
+            );
+            assert_eq!(
+                p[1], *oy,
+                "sat{i} cy must bit-match oracle (packed={}, oracle={oy})",
+                p[1]
+            );
+            assert_eq!(
+                p[2], *or,
+                "sat{i} radius must bit-match oracle (packed={}, oracle={or})",
+                p[2]
+            );
+        }
+    }
+
+    /// (#2) offset direction. With `offset=1.0` the packed main center must equal
+    /// `center + radius*0.25*(cosθ,sinθ)` for the seed's first `gen_range(0..TAU)`;
+    /// with `offset=0.0` the offset distance is 0 so the main center is the geometric
+    /// center *exactly* (the θ draw is still consumed but multiplied by 0).
+    #[test]
+    fn aquarelle_pack_offset_direction_matches_seed_angle() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_offset_direction_matches_seed_angle")
+        else {
+            return;
+        };
+        let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
+        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
+        let radius = base_radius_unit;
+        let center = (100.0_f32, 100.0_f32);
+        let (theta, _) = oracle_aquarelle_sats(0, center, radius, 0.0);
+
+        // offset == 1.0 ⇒ center shifted radius*0.25 along θ.
+        let p1 = AquarelleParams {
+            bleed: 0.0,
+            bloom: 0.0,
+            offset: 1.0,
+            halo: 0.0,
+        };
+        let orbs1 =
+            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p1.clamped());
+        let exp_cx = center.0 + radius * 0.25 * theta.cos();
+        let exp_cy = center.1 + radius * 0.25 * theta.sin();
+        assert_eq!(
+            orbs1[0].main[0], exp_cx,
+            "offset=1.0 main cx must follow seed θ"
+        );
+        assert_eq!(
+            orbs1[0].main[1], exp_cy,
+            "offset=1.0 main cy must follow seed θ"
+        );
+
+        // offset == 0.0 ⇒ exact geometric center (no shift).
+        let p0 = AquarelleParams {
+            bleed: 0.0,
+            bloom: 0.0,
+            offset: 0.0,
+            halo: 0.0,
+        };
+        let orbs0 =
+            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p0.clamped());
+        assert_eq!(
+            orbs0[0].main[0], center.0,
+            "offset=0.0 main cx must be exact center"
+        );
+        assert_eq!(
+            orbs0[0].main[1], center.1,
+            "offset=0.0 main cy must be exact center"
+        );
+    }
+
+    /// (#3) `round(3*bleed)` boundaries (round-half-away-from-zero). The existing test
+    /// only covers 0.0/0.5/1.0; this nails the three rounding edges so a `.round()` →
+    /// `.floor()`/`.trunc()` regression in the satellite count is caught.
+    #[test]
+    fn aquarelle_pack_bleed_count_round_boundaries() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_bleed_count_round_boundaries")
+        else {
+            return;
+        };
+        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
+        // (bleed, expected sat_count): just below/above each .5 boundary.
+        for (bleed, expected) in [
+            (0.16_f32, 0u32), // 0.48 → 0
+            (0.17, 1),        // 0.51 → 1
+            (0.49, 1),        // 1.47 → 1
+            (0.50, 2),        // 1.50 → 2 (half away from zero)
+            (0.83, 2),        // 2.49 → 2
+            (0.84, 3),        // 2.52 → 3
+        ] {
+            let params = AquarelleParams {
+                bleed,
+                bloom: 0.0,
+                offset: 0.0,
+                halo: 0.0,
+            };
+            let orbs =
+                renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, params.clamped());
+            assert_eq!(
+                orbs[0].main[3] as u32, expected,
+                "bleed={bleed} ⇒ round(3*bleed) must be {expected}"
+            );
+        }
+    }
+
+    /// (#4) bloom guard. A tiny positive bloom (`1e-4`) must still set the bloom flag
+    /// and produce a positive core radius (the inner `core_radius > 0.0` guard must not
+    /// reject it); bloom `0.0` must clear the flag and pack a zero core radius.
+    #[test]
+    fn aquarelle_pack_bloom_tiny_positive_keeps_core_positive() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_bloom_tiny_positive_keeps_core_positive")
+        else {
+            return;
+        };
+        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
+
+        let tiny = AquarelleParams {
+            bleed: 0.0,
+            bloom: 1e-4,
+            offset: 0.0,
+            halo: 0.0,
+        };
+        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, tiny.clamped());
+        assert!(
+            orbs[0].inner[3] > 0.5,
+            "bloom=1e-4 (>0) must set bloom_flag"
+        );
+        assert!(
+            orbs[0].bloom_geom[2] > 0.0,
+            "bloom=1e-4 must keep core radius positive (got {})",
+            orbs[0].bloom_geom[2]
+        );
+
+        let zero = AquarelleParams {
+            bleed: 0.0,
+            bloom: 0.0,
+            offset: 0.0,
+            halo: 0.0,
+        };
+        let orbs0 = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, zero.clamped());
+        assert!(orbs0[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
+        assert_eq!(
+            orbs0[0].bloom_geom[2], 0.0,
+            "bloom=0 must pack zero core radius"
+        );
+    }
+
+    /// (#5) A zero-weight orb packs a fully zeroed row (radius 0, every layer slot 0),
+    /// and a positive-weight orb mixed in the same call is unaffected — only the dead
+    /// row collapses. Guards the early `radius <= 0.0` skip path and row independence.
+    #[test]
+    fn aquarelle_pack_zero_weight_orb_packs_skip_row() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_zero_weight_orb_packs_skip_row")
+        else {
+            return;
+        };
+        // Orb 0: zero weight (dead). Orb 1: positive weight (real).
+        let clusters = vec![
+            cluster([200, 120, 60], 0.3, 0.3, 0.0),
+            cluster([60, 120, 220], 0.7, 0.7, 1.0),
+        ];
+        let params = AquarelleParams::default();
+        let orbs =
+            renderer.pack_aquarelle_orbs(&clusters, 200.0, 200.0, 40.0, 1.0, params.clamped());
+        assert_eq!(orbs.len(), 2);
+
+        // Dead row: radius 0, sat_count 0, all layer slots zero.
+        assert_eq!(orbs[0].main[2], 0.0, "zero-weight orb must pack radius 0");
+        assert_eq!(
+            orbs[0].main[3], 0.0,
+            "zero-weight orb must pack 0 satellites"
+        );
+        for slot in [
+            orbs[0].inner,
+            orbs[0].halo,
+            orbs[0].bloom_geom,
+            orbs[0].bloom_col,
+            orbs[0].bleed_col,
+            orbs[0].sat0,
+            orbs[0].sat1,
+            orbs[0].sat2,
+        ] {
+            assert_eq!(slot, [0.0; 4], "zero-weight orb layer slots must be zeroed");
+        }
+
+        // Live row: positive radius (the dead neighbor did not poison it).
+        assert!(
+            orbs[1].main[2] > 0.0,
+            "positive-weight orb must have radius > 0"
+        );
+    }
+
+    /// (#6) Out-of-range slider values are clamped (the pack calls `params.clamped()`):
+    /// `bleed=5.0` must still cap at 3 satellites, and a negative `bloom=-1.0` must
+    /// clear the bloom flag (clamped to 0) rather than wrapping to a huge core.
+    #[test]
+    fn aquarelle_pack_clamps_out_of_range_params() {
+        let Some(renderer) = require_or_skip_renderer("aquarelle_pack_clamps_out_of_range_params")
+        else {
+            return;
+        };
+        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
+        let wild = AquarelleParams {
+            bleed: 5.0,
+            bloom: -1.0,
+            offset: 9.0,
+            halo: -3.0,
+        };
+        // The renderer clamps internally; pass the raw params (matching production:
+        // `pack_aquarelle_orbs` calls `params.clamped()`).
+        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, wild);
+        assert!(
+            (orbs[0].main[3] as u32) <= 3,
+            "bleed=5.0 must clamp to ≤3 satellites (got {})",
+            orbs[0].main[3]
+        );
+        assert!(
+            orbs[0].inner[3] < 0.5,
+            "negative bloom must clamp to 0 and clear the bloom flag"
+        );
+        assert_eq!(
+            orbs[0].bloom_geom[2], 0.0,
+            "negative bloom must pack a zero core radius (clamped)"
+        );
+    }
+
+    /// (#7) `saturation=0.0` desaturates every packed layer color: each must equal the
+    /// grayscale `adjust_saturation_pub(base, 0.0)` (boosting a gray stays gray, mixing
+    /// a gray toward white stays gray), so the GPU never sees a saturated color the CPU
+    /// oracle desaturated.
+    #[test]
+    fn aquarelle_pack_saturation_zero_desaturates_layer_colors() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_pack_saturation_zero_desaturates_layer_colors")
+        else {
+            return;
+        };
+        let base = [200u8, 120, 60];
+        let single = vec![cluster(base, 0.5, 0.5, 1.0)];
+        // bleed=1.0 ⇒ satellites exist; bloom=0.5 ⇒ bloom color packed; halo=0.5.
+        let params = AquarelleParams {
+            bleed: 1.0,
+            bloom: 0.5,
+            offset: 0.5,
+            halo: 0.5,
+        };
+        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 0.0, params.clamped());
+
+        // The pack desaturates the source first (saturation 0.0 ⇒ grayscale), then
+        // boost_saturation/mix_with_white operate on that gray. A boost of an
+        // already-gray color stays gray; a white-mix of gray stays gray. So every
+        // packed layer's three channels must be equal (chroma == 0).
+        let gray = adjust_saturation_pub(base, 0.0);
+        assert_eq!(gray[0], gray[1], "desaturated base must be gray");
+        assert_eq!(gray[1], gray[2], "desaturated base must be gray");
+
+        let is_gray = |rgb: [f32; 4]| -> bool {
+            let to8 = |c: f32| (c * 255.0).round() as i32;
+            (to8(rgb[0]) - to8(rgb[1])).abs() <= 1 && (to8(rgb[1]) - to8(rgb[2])).abs() <= 1
+        };
+        assert!(
+            is_gray(orbs[0].inner),
+            "inner color must be gray at saturation 0"
+        );
+        assert!(
+            is_gray(orbs[0].halo),
+            "halo color must be gray at saturation 0"
+        );
+        assert!(
+            is_gray(orbs[0].bleed_col),
+            "bleed color must be gray at saturation 0"
+        );
+        assert!(
+            is_gray(orbs[0].bloom_col),
+            "bloom color must be gray at saturation 0"
+        );
+        // And the inner color is exactly the desaturated base (round-trip via u8).
+        let inner8 = [
+            (orbs[0].inner[0] * 255.0).round() as u8,
+            (orbs[0].inner[1] * 255.0).round() as u8,
+            (orbs[0].inner[2] * 255.0).round() as u8,
+        ];
+        assert_eq!(
+            inner8, gray,
+            "inner layer must be the desaturated base color"
+        );
+    }
+
+    /// (#8, pure CPU — runs everywhere) Aquarelle ignores `--count`: one orb per
+    /// cluster. `count=Some(64)` with 3 clusters must render byte-identically to
+    /// `count=None`. Uses only the CPU `render_frame` oracle (no GPU needed).
+    #[test]
+    fn aquarelle_render_frame_ignores_count() {
+        let clusters = vec![
+            cluster([220, 60, 60], 0.3, 0.35, 0.8),
+            cluster([60, 120, 220], 0.7, 0.55, 0.5),
+            cluster([200, 200, 80], 0.5, 0.8, 0.4),
+        ];
+        let mut opts = aquarelle_opts(72, 56, AquarelleParams::default());
+        opts.count = None;
+        let none = render_frame(&clusters, &opts, 0.0);
+        opts.count = Some(64);
+        let with_count = render_frame(&clusters, &opts, 0.0);
+        assert_eq!(
+            none.as_raw(),
+            with_count.as_raw(),
+            "aquarelle must render one orb per cluster regardless of --count"
+        );
+    }
+
+    /// Shared structural-parity check: GPU↔CPU aquarelle must light overlapping pixel
+    /// sets and stay close in mean per-channel diff (AA-only residual, like Circle).
+    /// Returns nothing; panics on failure. Used by the corner / branch tests below.
+    fn assert_aquarelle_structural_parity(
+        renderer: &GpuRenderer,
+        clusters: &[Cluster],
+        opts: &AnimateOptions,
+        t: f32,
+        label: &str,
+    ) {
+        let cpu = render_frame(clusters, opts, t);
+        let gpu = renderer.render_frame_aquarelle(clusters, opts, t);
+        assert_eq!(cpu.dimensions(), gpu.dimensions(), "{label}: dim mismatch");
+        let bg = opts.background;
+        let (mut cpu_lit, mut gpu_lit, mut overlap, mut sum_abs) = (0usize, 0usize, 0usize, 0u64);
+        for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
+            let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
+            let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
+            if c_lit {
+                cpu_lit += 1;
+            }
+            if g_lit {
+                gpu_lit += 1;
+            }
+            if c_lit && g_lit {
+                overlap += 1;
+            }
+            for c in 0..3 {
+                sum_abs += cp.0[c].abs_diff(gp.0[c]) as u64;
+            }
+        }
+        assert!(
+            cpu_lit > 0 && gpu_lit > 0,
+            "{label}: both renders must light pixels"
+        );
+        let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
+        assert!(
+            overlap_frac > 0.85,
+            "{label}: lit overlap {:.1}% of smaller set; expected >85% (cpu_lit={cpu_lit} gpu_lit={gpu_lit})",
+            overlap_frac * 100.0
+        );
+        let (w, h) = cpu.dimensions();
+        let mean_abs = sum_abs as f64 / (w as f64 * h as f64 * 3.0);
+        assert!(
+            mean_abs < 3.0,
+            "{label}: mean per-channel |cpu-gpu| {mean_abs:.3} should be small (AA-only residual)"
+        );
+    }
+
+    /// (#9) A large orb near a corner pushes its satellites' `radius*1.5` cutoff past
+    /// the frame edge. The shader clips at the cutoff (outside ⇒ background); the GPU
+    /// must still match the CPU within the structural-parity band, proving the
+    /// edge-clipped arc is composited correctly rather than smeared or wrapped.
+    #[test]
+    fn aquarelle_gpu_satellite_cutoff_clipped_at_edge() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_gpu_satellite_cutoff_clipped_at_edge")
+        else {
+            return;
+        };
+        // Big orb (weight 1.0 ⇒ radius == base_radius_unit, large for 64x64) tucked in
+        // the top-left corner so the main + satellites overhang the edge.
+        let clusters = vec![cluster([220, 80, 80], 0.08, 0.08, 1.0)];
+        let params = AquarelleParams {
+            bleed: 1.0,
+            bloom: 0.5,
+            offset: 0.5,
+            halo: 0.5,
+        };
+        let opts = aquarelle_opts(64, 64, params);
+        assert_aquarelle_structural_parity(
+            renderer,
+            &clusters,
+            &opts,
+            0.0,
+            "aquarelle edge-clipped satellites",
+        );
+    }
+
+    /// (#10) Transparent background (`bg.a < 255`, here fully transparent). The shader's
+    /// `0 < acc_a8 < 255` un-premultiply branch in `fs_main` must round-trip premultiplied
+    /// → straight the same way the CPU `finalize_pixmap` does, so GPU↔CPU stay within the
+    /// structural-parity band over a transparent canvas.
+    #[test]
+    fn aquarelle_gpu_transparent_background_premul_roundtrip() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_gpu_transparent_background_premul_roundtrip")
+        else {
+            return;
+        };
+        let clusters = vec![
+            cluster([220, 60, 60], 0.35, 0.4, 0.6),
+            cluster([60, 140, 220], 0.65, 0.6, 0.5),
+        ];
+        let mut opts = aquarelle_opts(80, 80, AquarelleParams::default());
+        opts.background = [0, 0, 0, 0]; // fully transparent canvas
+        assert_aquarelle_structural_parity(
+            renderer,
+            &clusters,
+            &opts,
+            0.0,
+            "aquarelle transparent bg premul round-trip",
+        );
+    }
+
+    /// (#11) Param-corner parity. The existing structural test only exercises the
+    /// default mid (0.5) params; this sweeps representative `{bleed,bloom,halo,offset}`
+    /// corners in `{0,1}` so an extreme-param divergence (e.g. bloom-off vs bloom-max,
+    /// no-bleed vs full-bleed) is caught by the GPU↔CPU structural band.
+    #[test]
+    fn aquarelle_gpu_parity_across_param_corners() {
+        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_parity_across_param_corners")
+        else {
+            return;
+        };
+        let clusters = vec![
+            cluster([220, 60, 60], 0.3, 0.35, 0.7),
+            cluster([60, 120, 220], 0.7, 0.6, 0.5),
+        ];
+        // Representative corners (not the full 16 — keep GPU work bounded).
+        let corners = [
+            (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32),
+            (1.0, 0.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0, 0.0),
+            (1.0, 1.0, 1.0, 1.0),
+            (1.0, 0.0, 1.0, 0.0),
+        ];
+        for (bleed, bloom, halo, offset) in corners {
+            let params = AquarelleParams {
+                bleed,
+                bloom,
+                offset,
+                halo,
+            };
+            let opts = aquarelle_opts(72, 72, params);
+            assert_aquarelle_structural_parity(
+                renderer,
+                &clusters,
+                &opts,
+                0.0,
+                &format!(
+                    "aquarelle corner bleed={bleed} bloom={bloom} halo={halo} offset={offset}"
+                ),
+            );
+        }
+    }
 }
