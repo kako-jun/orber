@@ -314,6 +314,123 @@ pub fn mask_to_sdf(mask: &[u8], size: u32) -> Vec<u8> {
     out
 }
 
+/// 画像シルエットを `size × size` の SDF（[`mask_to_sdf`] と同フォーマット）に変換する
+/// （#217、`web/src/lib/jsGlyphSdf.ts::generateImageSdf` の Rust 移植）。
+///
+/// 入力はデコード済みの [`image::RgbaImage`]（デコードは wasm 配慮で CLI 側に置く。
+/// core の image dep は png のみ）。Web の `generateImageSdf` と **1:1 同一**の
+/// ヒューリスティックで inside mask を作り、[`mask_to_sdf`] で SDF にする。
+///
+/// 処理:
+/// 1. **contain リサンプル**でアスペクト維持のまま `size × size` の透明キャンバスに
+///    レターボックスして描く（Canvas の `drawImage(... dx,dy,dw,dh)` 相当）。dx/dy/dw/dh
+///    は Web と同式。リサンプルは bilinear（`FilterType::Triangle`、cluster.rs と同じ）。
+/// 2. **評価範囲は描画矩形 `dx..dx+dw, dy..dy+dh` に限定**（#174 のレタボ修正）。
+/// 3. 描画矩形内で `alpha < 255` のピクセルが **1% 以上**（`alphaPixelCount*100 >=
+///    drawnPixelCount`）なら **alpha 経路**（`alpha >= 128` を inside）。そうでなければ
+///    **輝度経路** `Y = 0.299R + 0.587G + 0.114B`、平均輝度境界、
+///    **auto-polarity（少数派 = 被写体）**。`invert` は #181 で削除済み＝移植しない。
+/// 4. `insideCount == 0` または `== drawnPixelCount`（コントラスト無し）は **`None`**
+///    を返す（#169 相当。CLI 側で明示エラーにする）。
+///
+/// 戻り値の `Vec<u8>` は長さ `size * size`、glyph SDF と同フォーマット（R8、128≈edge）。
+pub fn image_rgba_to_sdf(rgba: &image::RgbaImage, size: u32) -> Option<Vec<u8>> {
+    let s = size.max(1) as usize;
+    let bw = rgba.width().max(1);
+    let bh = rgba.height().max(1);
+
+    // contain リサンプル。Web: scale = min(s/bw, s/bh)、dw/dh = round(bw/bh * scale)、
+    // dx/dy = round((s - dw/dh) / 2)。
+    let scale = (s as f32 / bw as f32).min(s as f32 / bh as f32);
+    let dw = ((bw as f32 * scale).round() as u32).max(1);
+    let dh = ((bh as f32 * scale).round() as u32).max(1);
+    // dx/dy は Web の `Math.round((s - dw) / 2)` と同式。dw/dh <= s が contain で
+    // 保証されるので非負だが、丸め後に念のため 0 で下限を取る。
+    let dx = (((s as f32 - dw as f32) / 2.0).round() as i64).max(0) as usize;
+    let dy = (((s as f32 - dh as f32) / 2.0).round() as i64).max(0) as usize;
+
+    // 透明キャンバス (alpha=0) に bilinear リサンプル結果をレターボックス配置する。
+    // Canvas の clearRect + drawImage と同じ「描画矩形の外は alpha=0 のまま」を再現。
+    let resized =
+        image::imageops::resize(rgba, dw, dh, image::imageops::FilterType::Triangle);
+    let mut canvas = image::RgbaImage::from_pixel(s as u32, s as u32, image::Rgba([0, 0, 0, 0]));
+    image::imageops::replace(&mut canvas, &resized, dx as i64, dy as i64);
+
+    // 評価範囲は描画矩形に限定。dx..dx+dw / dy..dy+dh は canvas 内に収まる。
+    let dw = dw as usize;
+    let dh = dh as usize;
+    let drawn_pixel_count = dw * dh;
+    let px = |x: usize, y: usize| -> &image::Rgba<u8> { canvas.get_pixel(x as u32, y as u32) };
+
+    // #171 + #174: 描画矩形内で alpha<255 が 1% 以上なら alpha 経路。
+    let mut alpha_pixel_count = 0usize;
+    for y in dy..dy + dh {
+        for x in dx..dx + dw {
+            if px(x, y)[3] < 255 {
+                alpha_pixel_count += 1;
+            }
+        }
+    }
+    let has_meaningful_alpha = alpha_pixel_count * 100 >= drawn_pixel_count;
+
+    let mut inside = vec![0u8; s * s];
+    let mut inside_count = 0usize;
+    if has_meaningful_alpha {
+        // alpha しきい値経路（描画矩形内のみ）。
+        for y in dy..dy + dh {
+            for x in dx..dx + dw {
+                if px(x, y)[3] >= 128 {
+                    inside[y * s + x] = 255;
+                    inside_count += 1;
+                }
+            }
+        }
+    } else {
+        // 輝度しきい値経路（auto-polarity: 少数派 = 被写体）。
+        let mut sum_y = 0.0f32;
+        let mut y_buf = vec![0.0f32; s * s];
+        for y in dy..dy + dh {
+            for x in dx..dx + dw {
+                let p = px(x, y);
+                let yv = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+                y_buf[y * s + x] = yv;
+                sum_y += yv;
+            }
+        }
+        let avg_y = sum_y / drawn_pixel_count as f32;
+        let mut dark_count = 0usize;
+        for y in dy..dy + dh {
+            for x in dx..dx + dw {
+                if y_buf[y * s + x] < avg_y {
+                    dark_count += 1;
+                }
+            }
+        }
+        let inside_is_dark = dark_count < drawn_pixel_count / 2;
+        for y in dy..dy + dh {
+            for x in dx..dx + dw {
+                let yv = y_buf[y * s + x];
+                let is_inside = if inside_is_dark {
+                    yv < avg_y
+                } else {
+                    yv >= avg_y
+                };
+                if is_inside {
+                    inside[y * s + x] = 255;
+                    inside_count += 1;
+                }
+            }
+        }
+    }
+
+    // #169: 全 inside でも全 outside でもコントラスト 0 として None。
+    if inside_count == 0 || inside_count == drawn_pixel_count {
+        return None;
+    }
+
+    Some(mask_to_sdf(&inside, size))
+}
+
 /// Glyph 1 文字の signed-distance field を `size × size` の 8-bit R texture として返す。
 ///
 /// 値域は `[-1, +1]` を `[0, 255]` に写したもの。0.5 (= 128 前後) が輪郭、
@@ -705,6 +822,94 @@ mod tests {
     fn mask_to_sdf_all_zero_is_all_zero() {
         let sdf = mask_to_sdf(&vec![0u8; 16 * 16], 16);
         assert!(sdf.iter().all(|&b| b == 0));
+    }
+
+    // ===== #217: image_rgba_to_sdf（generateImageSdf 移植）の経路別サニティ =====
+
+    /// 透過画像（alpha 1% 以上）: alpha 経路で「不透明部分 = inside」になり SDF が出る。
+    /// 透明背景に中央の不透明ブロックを置く → inside ピクセルが取れて Some。
+    #[test]
+    fn image_rgba_to_sdf_transparent_alpha_path() {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = image_rgba_to_sdf(&img, 256).expect("opaque block on transparent bg → Some");
+        assert_eq!(sdf.len(), 256 * 256);
+        assert!(
+            sdf.iter().any(|&b| b > 128),
+            "alpha path must yield inside (>128) samples"
+        );
+        assert!(
+            sdf.iter().any(|&b| b < 128),
+            "alpha path must yield outside (<128) samples"
+        );
+    }
+
+    /// 不透明画像（輝度経路 + auto-polarity）: 白背景に小さい黒い被写体。
+    /// 被写体は少数派なので auto-polarity で「暗い側 = inside」が選ばれる。
+    #[test]
+    fn image_rgba_to_sdf_opaque_luma_auto_polarity_dark_subject() {
+        let w = 64u32;
+        // 全面白 (不透明)。
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([255, 255, 255, 255]));
+        // 中央に小さい黒い四角（少数派 = 被写体）。
+        for y in 26..38 {
+            for x in 26..38 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let sdf =
+            image_rgba_to_sdf(&img, 256).expect("dark subject on white bg → Some (luma path)");
+        // 中央（被写体）が inside 側になっているはず。
+        assert!(
+            sdf.iter().any(|&b| b > 128),
+            "luma auto-polarity must produce inside region for the minority (dark) subject"
+        );
+        assert!(sdf.iter().any(|&b| b < 128), "must produce outside region too");
+    }
+
+    /// 不透明・少数派が明るい被写体でも auto-polarity が拾う（黒背景に白い小四角）。
+    #[test]
+    fn image_rgba_to_sdf_opaque_luma_auto_polarity_light_subject() {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 255]));
+        for y in 26..38 {
+            for x in 26..38 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf =
+            image_rgba_to_sdf(&img, 256).expect("light subject on black bg → Some (luma path)");
+        assert!(sdf.iter().any(|&b| b > 128));
+        assert!(sdf.iter().any(|&b| b < 128));
+    }
+
+    /// コントラスト無し（単色不透明）→ None（#169）。
+    #[test]
+    fn image_rgba_to_sdf_no_contrast_returns_none() {
+        let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([128, 128, 128, 255]));
+        assert!(
+            image_rgba_to_sdf(&img, 256).is_none(),
+            "flat solid color has no contrast → None"
+        );
+    }
+
+    /// 非正方形入力でもパニックせず contain で SDF が出る（#174 レタボ範囲限定）。
+    #[test]
+    fn image_rgba_to_sdf_non_square_input_ok() {
+        // 横長 (alpha 経路)。透明背景に中央不透明ブロック。
+        let mut img = image::RgbaImage::from_pixel(120, 40, image::Rgba([0, 0, 0, 0]));
+        for y in 10..30 {
+            for x in 40..80 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = image_rgba_to_sdf(&img, 128).expect("non-square with shape → Some");
+        assert_eq!(sdf.len(), 128 * 128);
     }
 
     #[test]
