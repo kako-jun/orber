@@ -188,6 +188,17 @@ pub struct GpuRenderer {
     /// The grow-only per-orb data-texture (reallocated only when a frame needs
     /// more rows than the cached capacity). `None` until the first frame.
     orb_texture: std::sync::Mutex<Option<OrbTexture>>,
+    /// Serializes the whole GPU side of [`Self::render_packed`] (orb/params
+    /// upload → pass record → `queue.submit` → map/readback) so concurrent
+    /// `render_frame` calls on one shared renderer cannot alias the shared cached
+    /// resources (the grow-only orb texture, the per-size output texture /
+    /// read-back buffer). Without it a second thread's upload could overwrite the
+    /// one shared orb texture before the first thread's pass samples it, so frames
+    /// render with another thread's orb colors (#210). The single-threaded CLI
+    /// never contends this lock, so it costs nothing there. Taken as the outermost
+    /// lock, exactly once per `render_packed`, before any cache Mutex, so it cannot
+    /// deadlock against the inner caches.
+    render_guard: std::sync::Mutex<()>,
 }
 
 impl GpuRenderer {
@@ -221,6 +232,7 @@ impl GpuRenderer {
             pipeline_cache: std::sync::Mutex::new(HashMap::new()),
             sized_cache: std::sync::Mutex::new(HashMap::new()),
             orb_texture: std::sync::Mutex::new(None),
+            render_guard: std::sync::Mutex::new(()),
         })
     }
 
@@ -530,6 +542,21 @@ impl GpuRenderer {
     /// shader's `u_t`; it is clamped to `0.0..=1.0`. This is the seam the WebGL
     /// path will also share (Phase 2).
     pub fn render_packed(&self, pack: &[f32], width: u32, height: u32, t: f32) -> RgbaImage {
+        // Serialize the whole GPU body below (orb/params upload → pass record →
+        // submit → readback). Concurrent `render_frame` on one shared renderer
+        // otherwise alias the shared cached resources (grow-only orb texture,
+        // per-size output texture / read-back buffer): a second thread's upload
+        // could overwrite the one shared orb texture before the first thread's pass
+        // samples it, rendering a frame with another thread's orb colors (#210).
+        // This is the outermost lock, taken exactly once before any cache Mutex, so
+        // it cannot deadlock against the inner pipeline / sized / orb caches. The
+        // single-threaded CLI never contends it. It does not change the drawing
+        // result — bit-exact parity is preserved.
+        let _render_guard = self
+            .render_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let width = width.max(1);
         let height = height.max(1);
         let t = t.clamp(0.0, 1.0);
@@ -1463,25 +1490,22 @@ mod tests {
         }
     }
 
-    /// C11 (#210): the shared renderer's orb-texture must not race. Several threads
-    /// render **different** high counts concurrently on the *same* renderer; each
-    /// thread's output must equal that same input rendered alone (a fresh renderer).
-    /// This is the only test exercising the new `orb_texture` under contention.
+    /// C11 (#210): after the lock fix, concurrent `render_frame` on a shared
+    /// renderer must each match its solo render. Several threads render **different**
+    /// high counts concurrently on the *same* renderer; each thread's output must
+    /// equal that same input rendered alone (a fresh renderer). This is the only
+    /// test exercising the shared `orb_texture` / sized caches under contention.
     ///
-    /// **`#[ignore]`d: this test fails — it exposes a real, latent production data
-    /// race in `GpuRenderer` (see report).** `upload_orb_texture` holds the
-    /// `orb_texture` Mutex only for the `write_texture` *enqueue* and then returns,
-    /// releasing the lock; the render pass that *samples* the single shared orb
-    /// texture runs afterwards, outside the lock. So a second thread's
-    /// `upload_orb_texture` can overwrite the one shared texture before the first
-    /// thread's pass reads it, and frames render with another thread's orb colors
-    /// (observed diffs ~120–140/channel). Production currently calls `render_frame`
-    /// single-threaded, so the bug is latent. Left in place (ignored) to document
-    /// the race; run with `cargo test -- --ignored` after the lock is widened to
-    /// cover the pass (or the orb texture is made per-render). Not fixed here per
-    /// the task's "don't change production to make a test pass" rule.
+    /// `GpuRenderer::render_packed` now serializes its whole GPU body under
+    /// `render_guard` (orb/params upload → pass record → submit → readback), so the
+    /// shared orb texture and per-size resources can no longer be aliased mid-frame
+    /// by another thread. Before that fix `upload_orb_texture` released the
+    /// `orb_texture` Mutex right after the `write_texture` enqueue, so a second
+    /// thread could overwrite the one shared texture before the first thread's pass
+    /// sampled it, and frames rendered with another thread's orb colors (observed
+    /// diffs ~120–140/channel). With the serialization in place each concurrent
+    /// frame matches its solo oracle within the ±2/channel contract.
     #[test]
-    #[ignore = "exposes a real production data race on the shared orb texture (see doc-comment / report); not fixed here"]
     fn shared_gpu_concurrent_high_count_render() {
         let Some(renderer) = require_or_skip_renderer("shared_gpu_concurrent_high_count_render")
         else {

@@ -1321,26 +1321,27 @@ mod tests {
     /// 旧仕様では --renderer gpu + Circle + count > 64 が `Cpu(Some(警告))` に落ちて
     /// いた。data-texture 化で 64 cap が消えたので、65〜1024 のどの count でも
     /// route(Gpu, Circle) は `Gpu`（= フォールバック文言を返さない）であることを守る。
-    /// route はもう count を受け取らないが、過去にフォールバックしていた count 値で
-    /// 観点を明示するため複数値でループする。アダプタ非依存のルーティング判定のみ。
+    /// route はもう count を受け取らないので判定は count に依存しない単一呼び出しで行い、
+    /// 旧 64/1024 境界という回帰意図はテスト名・コメントで残す。アダプタ非依存のルー
+    /// ティング判定のみ。
     #[test]
     fn gpu_route_emits_no_warning_for_high_count() {
-        for &count in &[65usize, 100, 256, 1024] {
-            // count は route のシグネチャに無いが、回帰対象の旧 64 境界超えを
-            // テスト名・ループで明示する（この count では旧仕様だと警告が出ていた）。
-            let _ = count;
-            let route = FrameRenderer::route(Renderer::Gpu, OrbShape::Circle);
-            assert_eq!(
-                route,
-                RenderRoute::Gpu,
-                "count {count}: Circle + gpu must stay on the gpu route with no fallback warning (#210)"
-            );
-            // 念のため「警告文言を持つ Cpu」では絶対にないことも明示する。
-            assert!(
-                !matches!(route, RenderRoute::Cpu(Some(_))),
-                "count {count}: must not emit a CPU fallback warning anymore (#210)"
-            );
-        }
+        // 旧仕様では --renderer gpu + Circle + count > 64（65/100/256/1024 等）が
+        // `Cpu(Some(警告))` に落ちていた。data-texture 化で 64 cap が消え、route は
+        // count 引数も失ったので、もはや count に依らず route(Gpu, Circle) は `Gpu`
+        // 一択。回帰意図（旧 64/1024 境界）はテスト名・コメントで残し、判定は count に
+        // 依存しない単一呼び出しで行う。アダプタ非依存のルーティング判定のみ。
+        let route = FrameRenderer::route(Renderer::Gpu, OrbShape::Circle);
+        assert_eq!(
+            route,
+            RenderRoute::Gpu,
+            "Circle + gpu must stay on the gpu route with no fallback warning at any count (#210)"
+        );
+        // 念のため「警告文言を持つ Cpu」では絶対にないことも明示する。
+        assert!(
+            !matches!(route, RenderRoute::Cpu(Some(_))),
+            "must not emit a CPU fallback warning anymore (#210)"
+        );
     }
 
     /// C2 (#210): 非 Circle shape の CPU フォールバック（理由つき）は温存する。
