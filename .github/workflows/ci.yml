@@ -67,3 +67,65 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
+
+  gpu-parity:
+    name: GPU parity (lavapipe)
+    # Pinned to 22.04: on the ubuntu-24.04 runner the apt mesa lavapipe ICD is
+    # rejected by the stock Vulkan loader (vkCreateInstance -> ERROR_INCOMPATIBLE_DRIVER),
+    # so request_adapter() returns nothing. 22.04 ships a loader/mesa pair that brings
+    # lavapipe up out of the box, which is what GPU-testing Rust projects rely on.
+    runs-on: ubuntu-22.04
+    # The default CI 'test'/'clippy' jobs build WITHOUT --features gpu, so gpu.rs /
+    # orb_circle.wgsl are never compiled, linted, or parity-checked there. This job
+    # is the only place the wgpu path is exercised: it brings up Mesa's lavapipe
+    # software Vulkan so request_adapter() actually succeeds on a GPU-less runner,
+    # and ORBER_REQUIRE_GPU=1 turns "no adapter" into a hard test failure instead of
+    # a silent skip (so the parity asserts must really run).
+    env:
+      # lavapipe (LLVMpipe Vulkan) ICD installed by mesa-vulkan-drivers.
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # Fail (don't skip) the parity tests if no adapter comes up.
+      ORBER_REQUIRE_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Mesa software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+          # Diagnostics (non-fatal): prove the ICD the loader is pinned to exists and
+          # that an adapter actually comes up. If these are wrong, ORBER_REQUIRE_GPU=1
+          # still turns it into a hard FAIL in the parity step below — these prints
+          # just make the *reason* obvious in the log.
+          echo "== ICD manifests ==" ; ls -la /usr/share/vulkan/icd.d/ || true
+          echo "== loader / mesa versions ==" ; dpkg -l | grep -iE "libvulkan1|mesa-vulkan" || true
+          echo "== vulkaninfo ==" ; vulkaninfo --summary || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build orber-core with gpu feature
+        run: cargo build -p orber-core --features gpu
+
+      - name: Clippy (gpu feature, all targets)
+        run: cargo clippy --workspace --all-targets --features gpu -- -D warnings
+
+      - name: Run GPU parity tests (lavapipe, must not skip)
+        # --test-threads=1 belt-and-suspenders: the parity tests share one wgpu
+        # context via OnceLock so they no longer race on adapter/device bring-up,
+        # but serializing them removes any remaining contention on lavapipe.
+        run: cargo test -p orber-core --features gpu -- --nocapture --test-threads=1

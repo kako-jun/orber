@@ -482,10 +482,7 @@ mod tests {
         let b = center[2] as i32;
         assert!(
             (r - g).abs() <= 2 && (g - b).abs() <= 2 && (r - b).abs() <= 2,
-            "saturation=0 should produce grayscale, got R={} G={} B={}",
-            r,
-            g,
-            b
+            "saturation=0 should produce grayscale, got R={r} G={g} B={b}"
         );
     }
 
@@ -965,8 +962,7 @@ mod tests {
                     assert_eq!(
                         [px[0], px[1], px[2]],
                         [0, 0, 0],
-                        "alpha=0 pixel must have RGB=0 for shape={:?}",
-                        shape
+                        "alpha=0 pixel must have RGB=0 for shape={shape:?}"
                     );
                 }
             }
@@ -998,8 +994,7 @@ mod tests {
             assert_eq!(
                 img.as_raw().len(),
                 (opts.width * opts.height * 4) as usize,
-                "buffer length must be width*height*4 for shape={:?}",
-                shape
+                "buffer length must be width*height*4 for shape={shape:?}"
             );
         }
     }

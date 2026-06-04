@@ -144,6 +144,25 @@ impl From<CliVariationMode> for VariationMode {
     }
 }
 
+/// Which renderer backend to drive (`--renderer`).
+///
+/// `gpu` is the wgpu (Rust + WGSL) production path (#207). It falls back to the
+/// CPU renderer when no GPU adapter is available, for non-Circle shapes (Phase 0
+/// covers Circle only), when the resolved orb count exceeds the GPU capacity
+/// (`GPU_MAX_ORBS` = 64; the CPU scales to 1024), or when the binary was built
+/// without the `gpu` feature. On the path it does cover — Circle, saturation
+/// reflected, count ≤ 64 — the GPU output matches the CPU oracle within ±2/channel
+/// (bit-exact on real GPUs), so those flags give the same image either backend.
+/// Video frames are always rendered on the CPU; color/keyframe tracks are not yet
+/// folded into the GPU pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Renderer {
+    /// Reference CPU (tiny-skia) renderer.
+    Cpu,
+    /// Production wgpu (Rust + WGSL) renderer; falls back to CPU when unavailable.
+    Gpu,
+}
+
 /// Shape used to render each orb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Shape {
@@ -300,6 +319,26 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
     shape: Shape,
 
+    /// Renderer backend: production `gpu` (wgpu) or the `cpu` reference (#207).
+    /// `gpu` falls back to `cpu` when no GPU adapter is available, for non-Circle
+    /// shapes (Phase 0 covers Circle only), when --count exceeds the GPU cap (64;
+    /// cpu goes to 1024), or when built without the `gpu` feature. On the covered
+    /// path (Circle, saturation applied, count <= 64) the two match within
+    /// +/-2/channel; video and color/keyframe tracks are cpu-only.
+    /// Default depends on the build: the `gpu` feature builds default to `gpu`,
+    /// plain (CPU-only) builds default to `cpu` — so a stock `cargo install orber`
+    /// renders silently on the CPU instead of emitting a "no gpu feature, falling
+    /// back" warning on every run. Passing `--renderer gpu` to a CPU-only build
+    /// still warns (the user asked for something this build can't do).
+    #[cfg(feature = "gpu")]
+    #[arg(long, value_enum, default_value_t = Renderer::Gpu)]
+    renderer: Renderer,
+
+    /// See the `gpu`-build variant above; CPU-only builds default to `cpu`.
+    #[cfg(not(feature = "gpu"))]
+    #[arg(long, value_enum, default_value_t = Renderer::Cpu)]
+    renderer: Renderer,
+
     /// Glyph character used when --shape glyph (#55). Must be a single character.
     /// Defaults to ☆ (U+2606). Use a character covered by Noto Sans Symbols 2.
     #[arg(long, default_value = "\u{2606}", value_parser = parse_single_char)]
@@ -447,6 +486,130 @@ fn main() -> ExitCode {
 /// CLI の `--direction` / `--speed` を内部表現に変換する。
 fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
     (cli.direction.into(), cli.speed.into())
+}
+
+/// 単一フレーム描画のバックエンド。`--renderer` を解決して GPU/CPU を選ぶ (#207)。
+///
+/// GPU は Circle shape かつ count <= GPU_MAX_ORBS かつ GPU アダプタが取れた場合のみ
+/// 使う。それ以外（非 Circle、count 超過、アダプタ無し、`gpu` feature 無しビルド）は
+/// CPU にフォールバックする。GPU が担う経路（Circle ∧ saturation 反映済 ∧ count <= 64）
+/// では出力が CPU オラクルと ±2/channel（実 GPU では bit-exact）一致するので、
+/// フォールバックしても同じ flag では見た目が変わらない。video や color/keyframe
+/// tracks は GPU pack 未対応で CPU 専用。
+enum FrameRenderer {
+    Cpu,
+    #[cfg(feature = "gpu")]
+    Gpu(Box<orber_core::gpu::GpuRenderer>),
+}
+
+/// GPU Circle 経路が一度に扱える最大 orb 数。`orber_core::gpu::MAX_ORBS` (= 64) の
+/// ミラー。`gpu` feature 無しビルドでも `select` のルーティング判定で必要なので、
+/// feature に依存しないリテラルとして持つ。feature 有効時は下の assert で SoT 一致を
+/// 担保する（ズレたらコンパイル時 const eval で落ちる）。
+const GPU_MAX_ORBS: usize = 64;
+
+/// アダプタ取得前のルーティング判定（`FrameRenderer::route` の戻り値）。`Cpu` の
+/// `Option<String>` は「GPU を諦めた理由」の stderr 文言（CPU 明示指定なら `None`）。
+#[derive(Debug, PartialEq, Eq)]
+enum RenderRoute {
+    Cpu(Option<String>),
+    Gpu,
+}
+
+#[cfg(feature = "gpu")]
+const _: () = assert!(
+    GPU_MAX_ORBS == orber_core::gpu::MAX_ORBS,
+    "GPU_MAX_ORBS must mirror orber_core::gpu::MAX_ORBS"
+);
+
+impl FrameRenderer {
+    /// `--renderer` の選択と shape / orb 数からバックエンドを決める。GPU 要求でも、
+    /// 非 Circle / count が GPU 容量超過 / アダプタ取得失敗 / feature 無しなら CPU に
+    /// フォールバックし、stderr に一言出す。
+    ///
+    /// `count` は解決済み orb 数（`--count` / `--count-preset`）。GPU の per-orb
+    /// uniform 配列は `orber_core::gpu::MAX_ORBS` (64) 固定で、それを超えると GPU は
+    /// 黙って 64 に clamp する一方 CPU は最大 `MAX_ORB_COUNT` (1024) まで描く。両者で
+    /// 別画像にならないよう、64 超は CPU にフォールバックする。
+    ///
+    /// GPU 容量を 64 超へ拡張しない理由: per-orb データは uniform 配列で渡しており、
+    /// 配列長は WGSL のリテラル上限・uniform サイズ上限に縛られる。64 超を portable に
+    /// 増やすには per-orb データを data-texture に積んで fragment shader で sample する
+    /// 方式が要る。storage buffer は wgpu の WebGL2 backend では非対応で、Phase 2 の
+    /// ブラウザ fallback を壊すため使えない。これは Phase 1 follow-up（#207 系）。
+    fn select(choice: Renderer, shape: OrbShape, count: usize) -> Self {
+        match Self::route(choice, shape, count) {
+            RenderRoute::Cpu(Some(reason)) => {
+                eprintln!("{reason}");
+                FrameRenderer::Cpu
+            }
+            RenderRoute::Cpu(None) => FrameRenderer::Cpu,
+            // GPU が選ばれても、アダプタ取得失敗 / feature 無しなら最終的に CPU に落ちる。
+            RenderRoute::Gpu => Self::select_gpu_circle(),
+        }
+    }
+
+    /// アダプタ取得より前の「どのバックエンドに振るか」だけを決める純関数。GPU を
+    /// 諦めるときは stderr 文言を `Cpu(Some(_))` に載せる。GPU を選んでも、最終的に
+    /// アダプタが取れなければ `select_gpu_circle` がさらに CPU に落とす。アダプタに
+    /// 依存しないので、ルーティング判定をそのままユニットテストできる。
+    fn route(choice: Renderer, shape: OrbShape, count: usize) -> RenderRoute {
+        match choice {
+            Renderer::Cpu => RenderRoute::Cpu(None),
+            Renderer::Gpu => {
+                if shape != OrbShape::Circle {
+                    return RenderRoute::Cpu(Some(
+                        "orber: --renderer gpu は Phase 0 で Circle のみ対応。非 Circle shape のため cpu にフォールバックします".to_string(),
+                    ));
+                }
+                if count > GPU_MAX_ORBS {
+                    return RenderRoute::Cpu(Some(format!(
+                        "orber: --renderer gpu は Phase 0 で最大 {GPU_MAX_ORBS} orb まで対応。--count {count} のため cpu にフォールバックします（>{GPU_MAX_ORBS} は Phase 1 で対応予定）"
+                    )));
+                }
+                RenderRoute::Gpu
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn select_gpu_circle() -> Self {
+        match orber_core::gpu::GpuRenderer::new() {
+            Some(gpu) => {
+                eprintln!(
+                    "orber: using gpu renderer (adapter: {})",
+                    gpu.adapter_name()
+                );
+                FrameRenderer::Gpu(Box::new(gpu))
+            }
+            None => {
+                eprintln!("orber: GPU アダプタが取得できないため cpu にフォールバックします");
+                FrameRenderer::Cpu
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn select_gpu_circle() -> Self {
+        eprintln!(
+            "orber: この orber は gpu feature 無しでビルドされています。cpu にフォールバックします"
+        );
+        FrameRenderer::Cpu
+    }
+
+    /// 1 フレームを描画する。GPU 経路は Circle のみ（select で保証済み）。
+    fn render(
+        &self,
+        clusters: &[Cluster],
+        opts: &orber_core::animate::AnimateOptions,
+        t: f32,
+    ) -> image::RgbaImage {
+        match self {
+            FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
+            #[cfg(feature = "gpu")]
+            FrameRenderer::Gpu(gpu) => gpu.render_frame(clusters, opts, t),
+        }
+    }
 }
 
 /// orb プールが空になった（K=1 / 単色画像）ときに stderr で警告し、処理は継続する。
@@ -637,7 +800,9 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         color_tracks: None,
         keyframe_tracks: None,
     };
-    let out = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+    // #207: --renderer で GPU/CPU を選ぶ。GPU は Circle かつ count <= GPU_MAX_ORBS のみ。
+    let renderer = FrameRenderer::select(cli.renderer, cli.orb_shape(), cli.resolved_count());
+    let out = renderer.render(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
     if let Err(e) = out.save(output) {
@@ -1171,6 +1336,55 @@ mod tests {
     fn count_default_is_twenty() {
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
         assert_eq!(cli.count, 20);
+    }
+
+    #[test]
+    fn gpu_route_falls_back_to_cpu_when_count_exceeds_gpu_cap() {
+        // --renderer gpu + Circle + count > GPU_MAX_ORBS は CPU にルーティングされる
+        // （GPU は 64 で clamp、CPU は最大 1024 なので「黙って別画像」を避ける）。
+        // アダプタの有無に依存しないルーティング判定だけを確認する。
+        let over = GPU_MAX_ORBS + 1;
+        match FrameRenderer::route(Renderer::Gpu, OrbShape::Circle, over) {
+            RenderRoute::Cpu(Some(msg)) => {
+                assert!(
+                    msg.contains(&over.to_string()),
+                    "fallback message should mention the requested count, got: {msg}"
+                );
+            }
+            other => panic!("count {over} with gpu must route to Cpu(Some(_)), got {other:?}"),
+        }
+
+        // 境界値: ちょうど GPU_MAX_ORBS は GPU のまま、超過した瞬間に CPU。
+        assert_eq!(
+            FrameRenderer::route(Renderer::Gpu, OrbShape::Circle, GPU_MAX_ORBS),
+            RenderRoute::Gpu,
+            "count == GPU_MAX_ORBS must stay on the gpu route"
+        );
+        assert_eq!(
+            FrameRenderer::route(Renderer::Gpu, OrbShape::Circle, 1),
+            RenderRoute::Gpu,
+            "small count with gpu must stay on the gpu route"
+        );
+
+        // --renderer cpu は理由なしで CPU。非 Circle shape も CPU（理由つき）。
+        assert_eq!(
+            FrameRenderer::route(Renderer::Cpu, OrbShape::Circle, over),
+            RenderRoute::Cpu(None),
+            "explicit cpu must route to Cpu(None)"
+        );
+        match FrameRenderer::route(
+            Renderer::Gpu,
+            OrbShape::Aquarelle(AquarelleParams {
+                bleed: 0.5,
+                bloom: 0.5,
+                offset: 0.5,
+                halo: 0.5,
+            }),
+            10,
+        ) {
+            RenderRoute::Cpu(Some(_)) => {}
+            other => panic!("non-Circle shape with gpu must route to Cpu(Some(_)), got {other:?}"),
+        }
     }
 
     #[test]

@@ -15,6 +15,14 @@ categories = ["graphics", "multimedia"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# OFF (default): pure CPU (tiny-skia) reference renderer のみ。wasm32 ビルドを
+# 最小に保ち、wgpu / pollster / bytemuck を引かない。
+# ON: native CLI 向けの wgpu (Rust + WGSL) production render path (#207) を足す。
+# Circle orb を WGSL で描き、CPU(tiny-skia) と ±2/channel のパリティを取る。
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
 [dependencies]
 aquarelle = { workspace = true }
 image = { workspace = true, features = ["png"] }
@@ -27,6 +35,10 @@ tiny-skia = { workspace = true }
 # OrbShape::Glyph 用のフォントパース。'static lifetime のスライスから Face::parse で
 # 読めるので、include_bytes! 経路と相性がよい。
 ttf-parser = "0.25"
+# wgpu production renderer (#207)。gpu feature 内に閉じ込め、wasm32 を汚さない。
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 
 # wasm32: getrandom needs the `wasm_js` backend so kmeans_colors' thread_rng compiles.
 # kmeans_colors 0.7 経由で getrandom 0.2 が、rand 0.9 経由で 0.3 が引かれるため両方を明示する。

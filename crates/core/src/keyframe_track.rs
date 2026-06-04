@@ -126,11 +126,7 @@ mod tests {
     fn approx(a: f32, b: f32, eps: f32, label: &str) {
         assert!(
             (a - b).abs() < eps,
-            "{}: expected ~{}, got {} (eps={})",
-            label,
-            b,
-            a,
-            eps
+            "{label}: expected ~{b}, got {a} (eps={eps})"
         );
     }
 

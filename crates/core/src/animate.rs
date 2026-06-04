@@ -702,7 +702,10 @@ pub fn render_frame_with_params(
 }
 
 /// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
-const MAX_ORB_COUNT: usize = 1024;
+///
+/// GPU 経路 (#207) も同じ上限で n_orbs を clamp するため `pub`。WebGL 経路の
+/// `GL_RENDERER_MAX_ORBS`(=64) とは別の、CPU/アニメーション側の絶対上限。
+pub const MAX_ORB_COUNT: usize = 1024;
 
 /// Aquarelle shape は既存の render_static フォールバック経路。
 ///
@@ -1340,21 +1343,15 @@ mod tests {
         // TAU ≈ 6.28 のうち、16 サンプルあれば spread が 1.0 以上は固い。
         assert!(
             max_r - min_r > 1.0,
-            "phi_radius spread too narrow ({} .. {})",
-            min_r,
-            max_r
+            "phi_radius spread too narrow ({min_r} .. {max_r})"
         );
         assert!(
             max_b - min_b > 1.0,
-            "phi_blur spread too narrow ({} .. {})",
-            min_b,
-            max_b
+            "phi_blur spread too narrow ({min_b} .. {max_b})"
         );
         assert!(
             max_o - min_o > 1.0,
-            "phi_opacity spread too narrow ({} .. {})",
-            min_o,
-            max_o
+            "phi_opacity spread too narrow ({min_o} .. {max_o})"
         );
     }
 

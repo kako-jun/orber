@@ -260,11 +260,7 @@ mod tests {
     fn approx(a: f32, b: f32, eps: f32, label: &str) {
         assert!(
             (a - b).abs() < eps,
-            "{}: expected ~{}, got {} (eps={})",
-            label,
-            b,
-            a,
-            eps
+            "{label}: expected ~{b}, got {a} (eps={eps})"
         );
     }
 
@@ -351,7 +347,7 @@ mod tests {
         let img: RgbImage = ImageBuffer::new(0, 0);
         match extract_clusters(&img, 3) {
             Err(ClusterError::EmptyImage) => {}
-            other => panic!("expected EmptyImage, got {:?}", other),
+            other => panic!("expected EmptyImage, got {other:?}"),
         }
     }
 
@@ -360,7 +356,7 @@ mod tests {
         let img: RgbImage = ImageBuffer::from_fn(8, 8, |_, _| Rgb([10u8, 20, 30]));
         match extract_clusters(&img, 0) {
             Err(ClusterError::KZero) => {}
-            other => panic!("expected KZero, got {:?}", other),
+            other => panic!("expected KZero, got {other:?}"),
         }
     }
 

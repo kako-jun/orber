@@ -23,6 +23,11 @@ thiserror = "1"
 tiny-skia = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
+# wgpu (Rust + WGSL) production renderer (#207). core / cli の gpu feature でのみ
+# 有効化する。wasm32 ビルドは引かないこと（バンドルを最小に保つ）。
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
 # wasm 向け
 wasm-bindgen = "0.2"
 js-sys = "0.3"
