@@ -769,12 +769,36 @@ impl GpuRenderer {
     /// as an `R8Unorm` texture and return a view to bind, cached per `(ch, size)`.
     /// The cache is grow-only (mirrors the other caches): one glyph at one size
     /// keeps a single entry across a whole clip.
-    ///
-    /// `R8Unorm` rows are 1 byte/texel; `write_texture` is exempt from the 256-byte
-    /// row-alignment requirement (that is buffer→texture only), so the tight `size`
-    /// bytes-per-row is used as-is.
     fn upload_glyph_sdf(&self, ch: char, size: u32, sdf: &[u8]) -> wgpu::TextureView {
-        let key = (ch as u32, size);
+        // `ch as u32` is a Unicode scalar (<= 0x10FFFF). `upload_image_sdf` derives
+        // keys with the high bit set (> 0x10FFFF) so glyph / image never collide in
+        // the shared `glyph_sdf_cache`.
+        self.upload_sdf_texture(ch as u32, size, sdf)
+    }
+
+    /// Get-or-upload an **image silhouette** SDF (#217) as an `R8Unorm` texture and
+    /// return a view to bind, reusing the same `glyph_sdf_cache`. The cache key is
+    /// **content-derived** (FNV-1a hash of the SDF bytes, folded to 31 bits) with bit
+    /// 31 forced on so it lands at `> 0x10FFFF` and can never collide with a glyph's
+    /// `(ch as u32, size)` key. A single image is one SDF, so this keeps exactly one
+    /// entry for the whole clip; identical re-uploads (same content) reuse it.
+    fn upload_image_sdf(&self, size: u32, sdf: &[u8]) -> wgpu::TextureView {
+        // FNV-1a over the SDF bytes → stable per-content id, disjoint from any char.
+        let mut hash: u32 = 0x811c_9dc5;
+        for &b in sdf {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        let key_id = (hash & 0x7fff_ffff) | 0x8000_0000; // bit31 set ⇒ > 0x10FFFF
+        self.upload_sdf_texture(key_id, size, sdf)
+    }
+
+    /// Shared `R8Unorm` SDF upload (glyph + image), cached per `(key_id, size)` in
+    /// `glyph_sdf_cache`. `R8Unorm` rows are 1 byte/texel; `write_texture` is exempt
+    /// from the 256-byte row-alignment requirement (that is buffer→texture only), so
+    /// the tight `size` bytes-per-row is used as-is.
+    fn upload_sdf_texture(&self, key_id: u32, size: u32, sdf: &[u8]) -> wgpu::TextureView {
+        let key = (key_id, size);
         let mut cache = self
             .glyph_sdf_cache
             .lock()
@@ -1021,6 +1045,108 @@ impl GpuRenderer {
         // serialization here — `render_packed_inner` takes `render_guard` for the
         // pass/upload/readback that actually shares mutable resources.
         let sdf_view = self.upload_glyph_sdf(ch, sdf_size, &sdf);
+
+        self.render_packed_inner(
+            &pack,
+            width,
+            height,
+            t,
+            Some(GlyphBindings {
+                sdf_view: &sdf_view,
+                size: sdf_size,
+            }),
+        )
+    }
+
+    /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217),
+    /// matching the CPU [`crate::glyph::render_sdf_orb`] fill.
+    ///
+    /// `opts.shape` must be [`OrbShape::Image`]; its `sdf` / `size` are uploaded as
+    /// an `R8Unorm` texture and bound to the **same** Glyph pipeline + bleed 2nd pass
+    /// (`orb_glyph.wgsl` / `orb_glyph_bleed.wgsl`). The only difference from
+    /// [`Self::render_frame_glyph`] is the SDF source: an image silhouette (supplied
+    /// from outside, one fixed texture for the whole frame) instead of a per-radius
+    /// cached font glyph. Per-orb positions / radii / rotation reuse
+    /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
+    /// like the glyph path, so the same loose-parity contract (structural + tolerant,
+    /// paper-grain noise omitted on the GPU) applies. Non-Image shapes fall back to
+    /// the Circle path so the call is total.
+    pub fn render_frame_image(
+        &self,
+        clusters: &[Cluster],
+        opts: &AnimateOptions,
+        t: f32,
+    ) -> RgbaImage {
+        let width = opts.width.max(1);
+        let height = opts.height.max(1);
+        let t = t.clamp(0.0, 1.0);
+
+        let (sdf, sdf_size) = match &opts.shape {
+            crate::orb::OrbShape::Image { sdf, size } => (sdf.clone(), *size),
+            // Not an image shape: fall back to the Circle path so the call is total.
+            _ => return self.render_frame(clusters, opts, t),
+        };
+
+        let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
+        let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
+        let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
+        let direction_id: f32 = match opts.direction {
+            MotionDirection::LeftToRight => 0.0,
+            MotionDirection::RightToLeft => 1.0,
+            MotionDirection::TopToBottom => 2.0,
+            MotionDirection::BottomToTop => 3.0,
+        };
+        let cycle = opts.speed.cycle_count() as f32;
+        let n_orbs = opts
+            .count
+            .unwrap_or(clusters.len())
+            .min(MAX_ORB_COUNT)
+            .max(if clusters.is_empty() { 0 } else { 1 });
+
+        // Empty SDF (all-zero / no contrast slipped through) or wrong length ⇒
+        // background-only frame, matching the CPU "draw nothing" contract.
+        if sdf_size == 0
+            || sdf.len() < (sdf_size as usize) * (sdf_size as usize)
+            || sdf.iter().all(|&b| b == 0)
+        {
+            let pack = pack_render_data_for_webgl(
+                clusters,
+                opts.background,
+                base_radius_unit,
+                base_blur,
+                direction_id,
+                cycle,
+                opts.seed,
+                0, // no orbs → background only
+                alpha_mul,
+                1.0, // shape_id = SDF (glyph/image share id 1)
+                opts.glyph_rotate,
+                opts.softness.edge_softness(),
+            );
+            return self.render_packed(&pack, width, height, t);
+        }
+
+        let mut pack = pack_render_data_for_webgl(
+            clusters,
+            opts.background,
+            base_radius_unit,
+            base_blur,
+            direction_id,
+            cycle,
+            opts.seed,
+            n_orbs,
+            alpha_mul,
+            1.0, // shape_id = SDF (image uses the same glyph shader path as Web shape_id==1)
+            opts.glyph_rotate,
+            opts.softness.edge_softness(),
+        );
+        // CPU image path applies per-orb saturation too (render_sdf_orb receives the
+        // saturation-adjusted rgb in `render_frame_with_params`).
+        apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
+
+        // Upload (or reuse) the image SDF with a content-derived key disjoint from
+        // glyph keys, then render with the Glyph pipeline + bleed pass.
+        let sdf_view = self.upload_image_sdf(sdf_size, &sdf);
 
         self.render_packed_inner(
             &pack,
