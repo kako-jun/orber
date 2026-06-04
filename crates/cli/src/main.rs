@@ -1546,4 +1546,109 @@ mod tests {
         assert!(try_parse(&["--aquarelle-offset", "0.7"]).is_ok());
         assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
     }
+
+    /// #212 (#11): `FrameRenderer::Gpu::render()` must dispatch by `opts.shape` —
+    /// Glyph opts go to `render_frame_glyph`, Circle opts to `render_frame`. This
+    /// pins the `render()` match arm (main.rs) that picks the GPU sub-path: the two
+    /// sub-paths produce visibly different images for the same parameters (a star
+    /// SDF fill vs round orbs), so the dispatch is observable.
+    ///
+    /// GPU-gated and GPU-required-aware: with `ORBER_REQUIRE_GPU=1` a missing
+    /// adapter is a hard failure (matching the core parity tests); otherwise it
+    /// SKIPs. Default multi-threaded `cargo test --features gpu` exercises it.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn frame_renderer_render_dispatches_glyph_vs_circle() {
+        use orber_core::cluster::{Centroid, Cluster};
+        use orber_core::gpu::GpuRenderer;
+
+        let what = "frame_renderer_render_dispatches_glyph_vs_circle";
+        let Some(gpu) = GpuRenderer::new() else {
+            if std::env::var("ORBER_REQUIRE_GPU").as_deref() == Ok("1") {
+                panic!("{what}: ORBER_REQUIRE_GPU=1 but no GPU adapter available");
+            }
+            eprintln!("SKIP {what}: no GPU adapter available");
+            return;
+        };
+        eprintln!("{what} running on adapter: {}", gpu.adapter_name());
+
+        let clusters = vec![
+            Cluster {
+                color: [220, 60, 60],
+                centroid: Centroid { x: 0.3, y: 0.4 },
+                weight: 0.5,
+            },
+            Cluster {
+                color: [60, 120, 220],
+                centroid: Centroid { x: 0.7, y: 0.6 },
+                weight: 0.3,
+            },
+            Cluster {
+                color: [200, 200, 80],
+                centroid: Centroid { x: 0.5, y: 0.2 },
+                weight: 0.2,
+            },
+        ];
+
+        // Shared parameters; only `shape` differs between the two cases.
+        let base = AnimateOptions {
+            width: 96,
+            height: 72,
+            orb_size: 1.0,
+            blur: 0.5,
+            saturation: 1.0,
+            direction: MotionDirection::LeftToRight,
+            speed: MotionSpeed::Slow,
+            seed: 7,
+            count: Some(6),
+            background: [10, 12, 20, 255],
+            shape: OrbShape::Circle,
+            softness: SoftnessPreset::Mid,
+            glyph_rotate: true,
+            color_tracks: None,
+            keyframe_tracks: None,
+        };
+
+        let glyph_opts = AnimateOptions {
+            shape: OrbShape::Glyph {
+                ch: '☆',
+                font: GlyphFontId::NotoSymbols2,
+            },
+            ..base.clone()
+        };
+
+        // Reference sub-path outputs computed directly off the GpuRenderer.
+        let glyph_ref = gpu.render_frame_glyph(&clusters, &glyph_opts, 0.0);
+        let circle_ref_for_glyph_params = gpu.render_frame(&clusters, &glyph_opts, 0.0);
+        let circle_ref = gpu.render_frame(&clusters, &base, 0.0);
+
+        // Sanity: the two GPU sub-paths really differ for these glyph params, so the
+        // dispatch assertion below is meaningful (not trivially satisfied).
+        assert_ne!(
+            glyph_ref, circle_ref_for_glyph_params,
+            "glyph and circle GPU sub-paths must differ for the same params \
+             (otherwise the dispatch test proves nothing)"
+        );
+
+        let renderer = FrameRenderer::Gpu(Box::new(gpu));
+
+        // Glyph opts → render() must equal the glyph sub-path, not the circle one.
+        let glyph_dispatched = renderer.render(&clusters, &glyph_opts, 0.0);
+        assert_eq!(
+            glyph_dispatched, glyph_ref,
+            "FrameRenderer::render must dispatch Glyph opts to render_frame_glyph"
+        );
+        assert_ne!(
+            glyph_dispatched, circle_ref_for_glyph_params,
+            "FrameRenderer::render must NOT send Glyph opts to the circle render_frame"
+        );
+
+        // Circle opts → render() must equal the circle sub-path.
+        let circle_dispatched = renderer.render(&clusters, &base, 0.0);
+        assert_eq!(
+            circle_dispatched, circle_ref,
+            "FrameRenderer::render must dispatch Circle opts to render_frame"
+        );
+        eprintln!("{what}: glyph→glyph, circle→circle dispatch confirmed");
+    }
 }

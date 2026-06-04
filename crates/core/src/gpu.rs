@@ -343,6 +343,21 @@ impl GpuRenderer {
             .map_or(0, |tex| tex.capacity)
     }
 
+    /// Number of live entries in the grow-only glyph SDF cache (one per distinct
+    /// `(char, size)` uploaded). Exposed for the cache-reuse tests
+    /// (`gpu_glyph_sdf_cache_reuse_same_char_size` /
+    /// `gpu_glyph_sdf_cache_grows_on_new_char_or_size`): re-rendering the same
+    /// `(char, size)` must keep this at 1, while a new char / size must add an
+    /// entry. Mirrors the `cache_sizes` / `orb_capacity` test hooks (poison
+    /// recovery via `into_inner`, `#[cfg(test)]` so production API stays clean).
+    #[cfg(test)]
+    fn glyph_sdf_cache_len(&self) -> usize {
+        self.glyph_sdf_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
@@ -2253,5 +2268,503 @@ mod tests {
             "circle-shape through glyph entry vs render_frame",
         );
         eprintln!("glyph-entry circle fallback: max per-channel diff = {max_diff}");
+    }
+
+    // ---- #212 Phase 1b: 4-texel widening / glyph dispatch regression guards ----
+
+    /// #212 (#1): widening the orb data-texture 3→4 texels (x=3 = rotation) must
+    /// leave the **Circle** path bit-exact — the Circle shader ignores texel x=3.
+    /// This pins the Circle bit-exact requirement after the layout change across
+    /// several frames (count / direction / t varied), proving x=3 is dead weight
+    /// for Circle. On the real GPU the diff is expected to be 0; the assertion
+    /// allows the ±2/channel contract as the other Circle parity tests do.
+    #[test]
+    fn circle_bitexact_after_4texel_widening() {
+        let Some(renderer) = require_or_skip_renderer("circle_bitexact_after_4texel_widening")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut overall_max = 0u8;
+        // Vary count, direction, and t so the per-orb rows (and the now-present but
+        // Circle-ignored x=3 rotation texel) take many distinct values; Circle must
+        // stay byte-for-byte on the CPU oracle regardless.
+        let cases = [
+            (8usize, MotionDirection::LeftToRight, 0.0_f32),
+            (12, MotionDirection::RightToLeft, 0.25),
+            (20, MotionDirection::TopToBottom, 0.5),
+            (33, MotionDirection::BottomToTop, 0.75),
+            (50, MotionDirection::LeftToRight, 1.0),
+        ];
+        for &(count, dir, t) in &cases {
+            let mut opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
+            opts.count = Some(count);
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame(&clusters, &opts, t);
+            let max_diff =
+                assert_within_tolerance(&cpu, &gpu, &format!("count={count} {dir:?} t={t}"));
+            // Pin the *bit-exact* contract explicitly (the Circle requirement),
+            // stronger than the ±2 band the helper enforces. On the GTX 1050 Ti
+            // round(value*255) is the same arithmetic as the CPU loop, so Circle is
+            // diff 0; if x=3 ever leaked into Circle this would break first.
+            assert_eq!(
+                max_diff, 0,
+                "Circle must stay bit-exact after the 3→4 texel widening \
+                 (x=3 rotation texel must be ignored): count={count} {dir:?} t={t}"
+            );
+            overall_max = overall_max.max(max_diff);
+        }
+        eprintln!("circle 4-texel widening bit-exact: overall max diff = {overall_max}");
+    }
+
+    /// #212 (#2): the `render_packed_inner` short-row guard changed from a per-orb
+    /// `off + 11` cut-off to `off + 13` (so the new rotation words at `off+11` /
+    /// `off+12` are read). A hand-built single-orb Circle pack sized to **exactly**
+    /// `off + 13` words must render that orb — it must NOT be cut one orb early.
+    /// This is the regression guard for the boundary change: with the old `off+11`
+    /// (or a `>=` form) the last orb would have been dropped at this exact length.
+    ///
+    /// Build a real 1-orb Circle pack via the production packer (so the per-orb
+    /// arithmetic is correct), truncate it to `HEADER_WORDS + 13` (dropping only the
+    /// 3 trailing unused padding words of the 16-word slot), render it, and assert
+    /// (a) it equals the full untruncated pack bit-exact, and (b) the orb is
+    /// actually drawn (output is not background-only).
+    #[test]
+    fn render_packed_short_pack_circle_unaffected_by_13word_guard() {
+        let Some(renderer) =
+            require_or_skip_renderer("render_packed_short_pack_circle_unaffected_by_13word_guard")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let (w, h) = (40u32, 28u32);
+        let bg = [12u8, 18, 28, 255];
+        // One orb, real packed words (header 16 + per-orb 16 = 32 words total).
+        let full = pack_render_data_for_webgl(
+            &clusters,
+            bg,
+            1.0,
+            0.5,
+            0.0, // direction_id = LeftToRight
+            MotionSpeed::Mid.cycle_count() as f32,
+            12345,
+            1,    // n_orbs = 1
+            1.0,  // alpha_mul
+            0.0,  // shape_id = Circle
+            true, // glyph_rotate (ignored by Circle)
+            0.5,  // edge_softness (ignored by Circle)
+        );
+        // The single orb lives at off = HEADER_WORDS. The shader reads up to
+        // pack[off + 12] (rot_speed_signed), so off + 13 words is the minimal length
+        // that still carries the whole orb. Truncate to exactly that.
+        let off = HEADER_WORDS; // i = 0
+        let truncated_len = off + 13;
+        assert!(
+            full.len() > truncated_len,
+            "production pack must be longer than the off+13 minimal slot"
+        );
+        let mut short = full.clone();
+        short.truncate(truncated_len);
+        assert_eq!(
+            short.len(),
+            HEADER_WORDS + 13,
+            "short pack must be exactly off+13 words (the boundary case)"
+        );
+
+        // The orb must NOT be cut early: the truncated pack must equal the full one.
+        let short_img = renderer.render_packed(&short, w, h, 0.3);
+        let full_img = renderer.render_packed(&full, w, h, 0.3);
+        assert_eq!(
+            short_img.dimensions(),
+            (w, h),
+            "off+13 short pack must still produce a {w}x{h} image"
+        );
+        let max_diff = assert_within_tolerance(
+            &full_img,
+            &short_img,
+            "off+13 truncated 1-orb pack vs full pack",
+        );
+        assert_eq!(
+            max_diff, 0,
+            "off+13 truncated pack must be bit-exact to the full pack \
+             (the trailing 3 words are unused padding)"
+        );
+
+        // And the orb must actually be drawn — a one-orb-early cut would leave a
+        // background-only frame, so confirm some pixels differ from the bg.
+        let lit = lit_vs_bg(&short_img, bg, 2);
+        assert!(
+            lit > 0,
+            "the single orb must be drawn (not cut early by the guard); \
+             got a background-only frame ({lit} non-bg pixels)"
+        );
+        eprintln!("off+13 short-pack guard: lit pixels = {lit}, max diff vs full = {max_diff}");
+    }
+
+    /// #212 (#3): the Glyph path must handle orb counts straddling the orb-texture
+    /// grow boundary (64). For {1, 64, 65, 1024} the glyph fill must light pixels,
+    /// the output dims must be correct, and there must be no panic / OOB. (Circle
+    /// covers count parity numerically; here the concern is the Glyph dispatch +
+    /// data-texture growth, not bit-exactness.)
+    #[test]
+    fn gpu_glyph_count_boundaries() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_count_boundaries") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        for &count in &[1usize, 64, 65, 1024] {
+            let mut opts = glyph_opts(
+                96,
+                72,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Slow,
+                true,
+            );
+            opts.count = Some(count);
+            let img = renderer.render_frame_glyph(&clusters, &opts, 0.0);
+            assert_eq!(
+                img.dimensions(),
+                (96, 72),
+                "count={count} glyph frame must be 96x72"
+            );
+            let lit = lit_vs_bg(&img, opts.background, 8);
+            assert!(
+                lit > 0,
+                "count={count} glyph fill must light some pixels (no panic/OOB), got {lit}"
+            );
+            eprintln!("glyph count={count}: lit pixels = {lit}");
+        }
+    }
+
+    /// #212 (#4): empty clusters on the Glyph path → background-only frame, correct
+    /// dims, no panic. The glyph fill has nothing to draw, so only the background
+    /// paints (mirrors the Circle empty-clusters test for the glyph dispatch).
+    #[test]
+    fn gpu_glyph_empty_clusters_background_only() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_empty_clusters_background_only")
+        else {
+            return;
+        };
+        let opts = glyph_opts(
+            48,
+            40,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        let img = renderer.render_frame_glyph(&[], &opts, 0.3);
+        assert_eq!(img.dimensions(), (48, 40), "empty-cluster glyph frame dims");
+        let lit = lit_vs_bg(&img, opts.background, 1);
+        assert_eq!(
+            lit, 0,
+            "empty clusters must paint background only on the glyph path, got {lit} non-bg pixels"
+        );
+    }
+
+    /// #212 (#5): when `opacity * alpha_mul == 0` the glyph fill contributes nothing,
+    /// so the frame must be background-only. The fill alpha is `opacity * alpha_mul`;
+    /// driving `alpha_mul` (header[9]) to 0 collapses every orb's contribution to 0
+    /// regardless of the SDF / opacity envelope. Build a real glyph pack (so the SDF
+    /// binding and orb rows are valid), then force `alpha_mul = 0` and assert the
+    /// frame paints only the background. Pins the alpha-floor → no-fill invariant.
+    #[test]
+    fn gpu_glyph_opacity_zero_softness_floor_no_fill() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_opacity_zero_softness_floor_no_fill")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let bg = [10u8, 12, 20, 255];
+        // Pick a glyph + radius so cached_glyph_sdf_for_radius yields a real SDF.
+        let (w, h) = (80u32, 64u32);
+        let base_radius_unit = (w.min(h) as f32) * 0.25;
+        let frame_radius = base_radius_unit * 1.0 * BREATH_RADIUS_MAX_FACTOR;
+        let Some((sdf, sdf_size)) = crate::glyph::cached_glyph_sdf_for_radius(
+            crate::glyph::GlyphFontId::NotoSymbols2,
+            '☆',
+            frame_radius,
+        ) else {
+            panic!("expected a real SDF for ☆ at this radius");
+        };
+        // Build a real 4-orb glyph pack, then force alpha_mul (header[9]) to 0 so
+        // every orb's fill alpha = opacity * alpha_mul = 0 → no fill anywhere.
+        let mut pack = pack_render_data_for_webgl(
+            &clusters,
+            bg,
+            base_radius_unit,
+            0.5,
+            0.0,
+            MotionSpeed::Slow.cycle_count() as f32,
+            7,
+            4,
+            0.0, // alpha_mul = 0 → fill alpha collapses to 0
+            1.0, // shape_id = Glyph
+            true,
+            0.5,
+        );
+        // (header[9] is already 0.0 from the arg above; re-pin defensively in case
+        // the packer ever changes which header slot carries alpha_mul.)
+        pack[9] = 0.0;
+        let sdf_view = renderer.upload_glyph_sdf('☆', sdf_size, &sdf);
+        let img = renderer.render_packed_inner(
+            &pack,
+            w,
+            h,
+            0.4,
+            Some(GlyphBindings {
+                sdf_view: &sdf_view,
+                size: sdf_size,
+            }),
+        );
+        assert_eq!(img.dimensions(), (w, h));
+        let lit = lit_vs_bg(&img, bg, 1);
+        assert_eq!(
+            lit, 0,
+            "opacity*alpha_mul == 0 must paint background only, got {lit} non-bg pixels"
+        );
+    }
+
+    /// #212 (#6): rotation loop closure under stress — ON, MotionSpeed::Fast (high
+    /// cycle count) plus high per-orb speed multipliers — the t=0 and t=1 frames
+    /// must still match within tolerance. This stresses the WGSL `fract` / `floor`
+    /// wrap (`turns = cycle * speed * t - floor(...)`) against the CPU `rem_euclid`
+    /// at the largest `cycle * speed` products, where a float-precision mismatch in
+    /// the wrap would be most visible. (Loop closure relies on `cycle * speed_mult`
+    /// being integral so turns = 0 at t = 1.)
+    #[test]
+    fn gpu_glyph_rotation_loop_closure_fast_high_speed() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_rotation_loop_closure_fast_high_speed")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = glyph_opts(
+            100,
+            100,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Fast,
+            true,
+        );
+        // More orbs → a wider spread of per-orb speed_mult values, maximizing the
+        // largest cycle * speed_mult product the wrap has to close.
+        opts.count = Some(24);
+        let t0 = renderer.render_frame_glyph(&clusters, &opts, 0.0);
+        let t1 = renderer.render_frame_glyph(&clusters, &opts, 1.0);
+        let max_diff = assert_within_tolerance(
+            &t0,
+            &t1,
+            "glyph rotation loop closure (Fast, high cycle×speed) t=0 vs t=1",
+        );
+        eprintln!("glyph fast loop closure: max per-channel diff = {max_diff}");
+    }
+
+    /// #212 (#8): the glyph SDF cache reuses the same `(char, size)` upload across
+    /// frames. Two frames with the same glyph at the same frame radius/size must
+    /// leave the cache at exactly one entry (the second frame reuses the first
+    /// upload, not re-uploads). Uses a *private* renderer so the count isn't
+    /// perturbed by the other glyph tests sharing the renderer.
+    #[test]
+    fn gpu_glyph_sdf_cache_reuse_same_char_size() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("gpu_glyph_sdf_cache_reuse_same_char_size")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = glyph_opts(
+            80,
+            64,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        assert_eq!(renderer.glyph_sdf_cache_len(), 0, "no glyph uploaded yet");
+        let _ = renderer.render_frame_glyph(&clusters, &opts, 0.0);
+        assert_eq!(
+            renderer.glyph_sdf_cache_len(),
+            1,
+            "first glyph frame must upload exactly one SDF"
+        );
+        // Same char + same size (same opts → same frame radius → same SDF size).
+        let _ = renderer.render_frame_glyph(&clusters, &opts, 0.5);
+        assert_eq!(
+            renderer.glyph_sdf_cache_len(),
+            1,
+            "same (char, size) re-render must reuse the cached SDF (still 1 entry)"
+        );
+    }
+
+    /// #212 (#9): a different char (♪) or a different size must add a new glyph SDF
+    /// cache entry — both frames must still render correctly (lit pixels). Uses a
+    /// *private* renderer so the entry count is observable in isolation.
+    #[test]
+    fn gpu_glyph_sdf_cache_grows_on_new_char_or_size() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("gpu_glyph_sdf_cache_grows_on_new_char_or_size")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        // Frame 1: ☆ at the default size.
+        let star = glyph_opts(
+            80,
+            64,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        let star_img = renderer.render_frame_glyph(&clusters, &star, 0.0);
+        assert_eq!(renderer.glyph_sdf_cache_len(), 1, "first glyph → 1 entry");
+        assert!(
+            lit_vs_bg(&star_img, star.background, 8) > 0,
+            "☆ frame must light pixels"
+        );
+
+        // Frame 2: a *different char* (★, a filled star — distinct from ☆ and also
+        // present in Noto Sans Symbols 2) → new cache entry.
+        let filled = AnimateOptions {
+            shape: OrbShape::Glyph {
+                ch: '★',
+                font: crate::glyph::GlyphFontId::NotoSymbols2,
+            },
+            ..star.clone()
+        };
+        let filled_img = renderer.render_frame_glyph(&clusters, &filled, 0.0);
+        assert_eq!(
+            renderer.glyph_sdf_cache_len(),
+            2,
+            "a different char must add a glyph SDF cache entry"
+        );
+        assert!(
+            lit_vs_bg(&filled_img, filled.background, 8) > 0,
+            "★ frame must light pixels"
+        );
+
+        // Frame 3: same ☆ but a *different SDF size*. The SDF size is
+        // `next_power_of_two(max(radius * 2.25, 256))`, so the 80x64 frames above
+        // both clamp to the 256 floor; to bump the chosen size the frame radius must
+        // exceed ~114 px. A large canvas + large orb_size pushes the frame radius
+        // there, selecting a larger power-of-two SDF and thus a new `(char, size)`
+        // cache entry for the *same* char.
+        let big_star = glyph_opts(
+            400,
+            320,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        let big_star = AnimateOptions {
+            orb_size: 4.0,
+            ..big_star
+        };
+        let big_img = renderer.render_frame_glyph(&clusters, &big_star, 0.0);
+        assert_eq!(
+            renderer.glyph_sdf_cache_len(),
+            3,
+            "a different SDF size for the same char must add a glyph SDF cache entry"
+        );
+        assert!(
+            lit_vs_bg(&big_img, big_star.background, 8) > 0,
+            "larger ☆ frame must light pixels"
+        );
+    }
+
+    /// #212 (#10): concurrent glyph renders on the shared renderer must each match
+    /// their solo oracle — no panic / poison, no cross-thread aliasing of the shared
+    /// orb texture / per-size resources. Several threads render glyph frames with
+    /// mixed char / t on the *same* renderer; each thread's output must equal that
+    /// same input rendered alone (a fresh renderer). Mirrors the Circle concurrent
+    /// test (`shared_gpu_concurrent_high_count_render`) for the glyph path.
+    #[test]
+    fn shared_gpu_concurrent_glyph_render() {
+        let Some(renderer) = require_or_skip_renderer("shared_gpu_concurrent_glyph_render") else {
+            return;
+        };
+        // (char, t) cases — mixed glyph + time so threads exercise different SDF
+        // uploads and rotation angles at once. Both ☆ and ★ are in the bundled
+        // Noto Sans Symbols 2 subset, so each produces a real (distinct) fill.
+        let cases: [(char, f32); 4] = [('☆', 0.0), ('★', 0.25), ('☆', 0.5), ('★', 0.75)];
+
+        // Per-case oracle: render each alone on a fresh renderer first.
+        let mut oracles = Vec::new();
+        for &(ch, t) in &cases {
+            let mut opts = glyph_opts(
+                72,
+                56,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Slow,
+                true,
+            );
+            opts.shape = OrbShape::Glyph {
+                ch,
+                font: crate::glyph::GlyphFontId::NotoSymbols2,
+            };
+            let clusters = sample_clusters();
+            let Some(fresh) =
+                require_or_skip_fresh_renderer("shared_gpu_concurrent_glyph_render (oracle leg)")
+            else {
+                return;
+            };
+            oracles.push(fresh.render_frame_glyph(&clusters, &opts, t));
+        }
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (idx, &(ch, t)) in cases.iter().enumerate() {
+                let oracle = &oracles[idx];
+                handles.push(scope.spawn(move || {
+                    let clusters = sample_clusters();
+                    let mut opts = glyph_opts(
+                        72,
+                        56,
+                        MotionDirection::LeftToRight,
+                        MotionSpeed::Slow,
+                        true,
+                    );
+                    opts.shape = OrbShape::Glyph {
+                        ch,
+                        font: crate::glyph::GlyphFontId::NotoSymbols2,
+                    };
+                    // A few iterations per thread to maximize overlap on the shared
+                    // orb texture / per-size resources.
+                    for _ in 0..3 {
+                        let img = renderer.render_frame_glyph(&clusters, &opts, t);
+                        assert_within_tolerance(
+                            oracle,
+                            &img,
+                            &format!("concurrent glyph ch={ch} t={t} vs solo render"),
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("concurrent glyph render thread panicked");
+            }
+        });
+        eprintln!("concurrent glyph render: all threads matched their solo oracle");
+    }
+
+    /// #212 (#12): the glyph path is deterministic — same opts / seed / t rendered
+    /// twice must be byte-identical, with rotation ON (so the rotation arithmetic is
+    /// part of what must be reproducible). Guards against any nondeterminism creeping
+    /// into the glyph dispatch (e.g. uninitialized padding, cache state leaking).
+    #[test]
+    fn gpu_glyph_determinism_same_seed_same_output() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_glyph_determinism_same_seed_same_output")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = glyph_opts(88, 66, MotionDirection::LeftToRight, MotionSpeed::Mid, true);
+        let a = renderer.render_frame_glyph(&clusters, &opts, 0.37);
+        let b = renderer.render_frame_glyph(&clusters, &opts, 0.37);
+        assert_eq!(
+            a, b,
+            "same opts/seed/t must render byte-identical glyph frames (rotation ON)"
+        );
+        eprintln!("glyph determinism: two renders byte-identical");
     }
 }
