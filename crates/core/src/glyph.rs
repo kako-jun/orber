@@ -331,6 +331,36 @@ fn cached_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Arc<[u8]> {
     sdf
 }
 
+/// GPU (#212) entry point: return the cached SDF bytes **and** the chosen square
+/// size for an orb of pixel `radius`, picking the same size the CPU
+/// [`render_glyph_orb`] would (`glyph_sdf_size_for_radius`). The GPU path uploads
+/// these bytes as an `R8Unorm` texture and samples them with a bilinear sampler,
+/// exactly mirroring the CPU `sample_sdf_bilinear` so the two fills agree
+/// (pre-bleed) within a loose tolerance.
+///
+/// Returns `None` for a non-positive radius or an unknown/empty glyph (all-zero
+/// SDF), so the caller can skip GPU glyph upload and leave the frame
+/// background-only — matching the CPU "draw nothing for tofu" contract.
+pub fn cached_glyph_sdf_for_radius(
+    font: GlyphFontId,
+    ch: char,
+    radius: f32,
+) -> Option<(Arc<[u8]>, u32)> {
+    if radius <= 0.0 {
+        return None;
+    }
+    let size = glyph_sdf_size_for_radius(radius);
+    let sdf = cached_glyph_sdf(font, ch, size);
+    if sdf.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some((sdf, size))
+}
+
+/// The glyph SDF content-span constant (`1/√2`), exposed for the GPU shader so the
+/// UV mapping in `orb_glyph.wgsl` matches the CPU `render_glyph_orb` exactly.
+pub const GLYPH_SDF_CONTENT_SPAN_PUB: f32 = GLYPH_SDF_CONTENT_SPAN;
+
 #[inline]
 fn glyph_sdf_size_for_radius(radius: f32) -> u32 {
     if radius <= 0.0 {
