@@ -34,8 +34,9 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
-- `--shape` — `circle`, `aquarelle` (watercolor bleed), or `glyph` (text character)
+- `--shape` — `circle`, `aquarelle` (watercolor bleed), `glyph` (text character), or `image` (silhouette from `--image-mask`)
 - `--glyph-char` — single character used when `--shape glyph` (default `☆`)
+- `--image-mask` — silhouette image used when `--shape image` (the *shape* source; `--input` stays the *color* source). Raster only (PNG/JPEG/…); SVG is web-only
 - `--softness` — blur/edge-softness preset: `low` / `mid` / `high` (default `mid`, existing behavior)
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
@@ -264,10 +265,13 @@ two distinct places:
 
 - **`OrbShape::Aquarelle`** uses the crate's per-orb watercolor bleed renderer
   to paint each orb as an irregular pigment blob.
-- **`OrbShape::Glyph`** runs a single full-pixmap `render_aquarelle_bleed_pass`
-  after all glyph orbs have been drawn, so the SDF-derived outline picks up
-  the same paper-bleed softness even though each orb itself is still a glyph
-  fill. `OrbShape::Circle` does not invoke either path.
+- **`OrbShape::Glyph` and `OrbShape::Image`** run a single full-pixmap
+  `render_aquarelle_bleed_pass` after all SDF orbs have been drawn, so the
+  SDF-derived outline picks up the same paper-bleed softness even though each
+  orb itself is still a glyph / silhouette fill. Both share the SDF rendering
+  path (`render_sdf_orb`); the only difference is the SDF source (a bundled font
+  glyph vs. an image silhouette from `--image-mask`). `OrbShape::Circle` does
+  not invoke either path.
 
 ## Workspace layout
 
@@ -436,8 +440,10 @@ color. The pipeline:
 2. The font face is parsed once via `ttf-parser` (`0.25`) and cached in a
    process-global `OnceLock<Face<'static>>` per `GlyphFontId` enum variant.
    Going through an enum + global cache (instead of `Arc<Face>` per orb) keeps
-   `OrbShape: Copy`, which is required so `OrbShape` can flow through the
-   `Copy`-bound spec and per-orb param paths without API churn.
+   the `Glyph` arm a light, cheaply-cloneable `{ ch, font }` pair. (`OrbShape`
+   itself became `Clone` rather than `Copy` once `#217` added an
+   `Image { sdf: Arc<[u8]>, size }` arm; the `Arc` clone is a refcount bump, so
+   `OrbShape` still flows through the spec / per-orb param paths cheaply.)
 3. For each orb, the glyph outline is extracted via `Face::outline_glyph` and
    converted into a `tiny-skia::Path`. The path is filled (not stroked) with
    the orb's color at the orb's center, scaled to the orb's radius.
@@ -449,20 +455,48 @@ color. The pipeline:
    `AquarelleBleedParams::default()` and a fixed seed). This adds a
    paper-bleed-style softening to the SDF-derived outline so the Glyph result
    sits closer to the Circle and Aquarelle shapes in overall feel. The bleed
-   pass runs **only for `OrbShape::Glyph`** — Circle and Aquarelle renders are
-   bit-identical to before this pass was added. The animated Glyph path
-   (`render_frame_with_params`) applies the same single `render_aquarelle_bleed_pass`
-   per frame with a fixed seed of `0`, so the bleed pattern stays stable
-   across frames instead of flickering frame to frame.
+   pass runs for the **SDF shapes (`OrbShape::Glyph` and `OrbShape::Image`)** —
+   Circle and Aquarelle renders are bit-identical to before this pass was added.
+   The animated path (`render_frame_with_params`) applies the same single
+   `render_aquarelle_bleed_pass` per frame with a fixed seed of `0`, so the bleed
+   pattern stays stable across frames instead of flickering frame to frame.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
 
 Native `--renderer gpu` also draws Glyph orbs on the GPU (#212 Phase 1b): a WGSL
 shader fills each glyph from its SDF and applies the per-orb rotation, reproducing
-the CPU **pre-bleed** fill. The aquarelle bleed/halo pass (step 5 above) is **not
-yet implemented on the GPU path** — it lands in a separate slice — so a GPU Glyph
-render is the SDF fill only, without the paper-bleed softening.
+the CPU fill, followed by a WGSL bleed 2nd pass (#214) that mirrors step 5. Parity
+is loose (structural + tolerant): the box-blur / halo / intensity match the crate,
+but the aquarelle paper-grain noise is omitted on the GPU (its per-pixel ChaCha8
+order cannot be bit-reproduced in parallel).
+
+## Image rendering pipeline (#217)
+
+`--shape image` reuses the entire Glyph SDF pipeline above — only **where the SDF
+comes from** changes. Instead of rasterizing a font glyph, `--image-mask <PATH>`
+is decoded (CLI-side, full `image` decoders; raster only, **SVG is web-only**) and
+turned into a silhouette SDF by `orber_core::glyph::image_rgba_to_sdf`, a 1:1 port
+of the Web GUI's `generateImageSdf`:
+
+1. The mask is letterboxed (aspect-preserving "contain" resample) into a square,
+   and only the drawn rectangle is evaluated (letterbox margins stay background).
+2. If ≥1% of the drawn rectangle has `alpha < 255`, the **alpha** channel selects
+   the silhouette (`alpha >= 128` = inside). Otherwise the image is opaque and
+   **luminance** (`Y = 0.299R + 0.587G + 0.114B`) is thresholded at the mean with
+   **auto-polarity** (the minority region is the subject, so dark-on-light and
+   light-on-dark both work without a flip flag).
+3. A blank / single flat-color mask (`inside == 0` or all-inside) has no usable
+   contrast and is rejected — the CLI exits with an explicit error (no panic).
+4. The resulting binary mask goes through the **shared** `mask_to_sdf` (the same
+   EDT → signed-unit → u8 step the glyph SDF uses), so the output is byte-format
+   identical to a glyph SDF. From there it rides the same `render_sdf_orb` (CPU)
+   and `render_frame_image` (GPU, the glyph shader + bleed pass with the supplied
+   SDF texture), so `--blur` / `--softness` / the bleed pass behave identically.
+
+The image SDF is built once and shared via `Arc<[u8]>` inside `OrbShape::Image`.
+The Web GUI's `OrbShape` image arm uses the same `shape_id == 1` shader path as
+glyphs, which is why CLI and Web stay visually consistent.
 
 ## Softness axis
 
