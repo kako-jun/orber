@@ -769,12 +769,36 @@ impl GpuRenderer {
     /// as an `R8Unorm` texture and return a view to bind, cached per `(ch, size)`.
     /// The cache is grow-only (mirrors the other caches): one glyph at one size
     /// keeps a single entry across a whole clip.
-    ///
-    /// `R8Unorm` rows are 1 byte/texel; `write_texture` is exempt from the 256-byte
-    /// row-alignment requirement (that is buffer→texture only), so the tight `size`
-    /// bytes-per-row is used as-is.
     fn upload_glyph_sdf(&self, ch: char, size: u32, sdf: &[u8]) -> wgpu::TextureView {
-        let key = (ch as u32, size);
+        // `ch as u32` is a Unicode scalar (<= 0x10FFFF). `upload_image_sdf` derives
+        // keys with the high bit set (> 0x10FFFF) so glyph / image never collide in
+        // the shared `glyph_sdf_cache`.
+        self.upload_sdf_texture(ch as u32, size, sdf)
+    }
+
+    /// Get-or-upload an **image silhouette** SDF (#217) as an `R8Unorm` texture and
+    /// return a view to bind, reusing the same `glyph_sdf_cache`. The cache key is
+    /// **content-derived** (FNV-1a hash of the SDF bytes, folded to 31 bits) with bit
+    /// 31 forced on so it lands at `> 0x10FFFF` and can never collide with a glyph's
+    /// `(ch as u32, size)` key. A single image is one SDF, so this keeps exactly one
+    /// entry for the whole clip; identical re-uploads (same content) reuse it.
+    fn upload_image_sdf(&self, size: u32, sdf: &[u8]) -> wgpu::TextureView {
+        // FNV-1a over the SDF bytes → stable per-content id, disjoint from any char.
+        let mut hash: u32 = 0x811c_9dc5;
+        for &b in sdf {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        let key_id = (hash & 0x7fff_ffff) | 0x8000_0000; // bit31 set ⇒ > 0x10FFFF
+        self.upload_sdf_texture(key_id, size, sdf)
+    }
+
+    /// Shared `R8Unorm` SDF upload (glyph + image), cached per `(key_id, size)` in
+    /// `glyph_sdf_cache`. `R8Unorm` rows are 1 byte/texel; `write_texture` is exempt
+    /// from the 256-byte row-alignment requirement (that is buffer→texture only), so
+    /// the tight `size` bytes-per-row is used as-is.
+    fn upload_sdf_texture(&self, key_id: u32, size: u32, sdf: &[u8]) -> wgpu::TextureView {
+        let key = (key_id, size);
         let mut cache = self
             .glyph_sdf_cache
             .lock()
@@ -1021,6 +1045,108 @@ impl GpuRenderer {
         // serialization here — `render_packed_inner` takes `render_guard` for the
         // pass/upload/readback that actually shares mutable resources.
         let sdf_view = self.upload_glyph_sdf(ch, sdf_size, &sdf);
+
+        self.render_packed_inner(
+            &pack,
+            width,
+            height,
+            t,
+            Some(GlyphBindings {
+                sdf_view: &sdf_view,
+                size: sdf_size,
+            }),
+        )
+    }
+
+    /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217),
+    /// matching the CPU [`crate::glyph::render_sdf_orb`] fill.
+    ///
+    /// `opts.shape` must be [`OrbShape::Image`]; its `sdf` / `size` are uploaded as
+    /// an `R8Unorm` texture and bound to the **same** Glyph pipeline + bleed 2nd pass
+    /// (`orb_glyph.wgsl` / `orb_glyph_bleed.wgsl`). The only difference from
+    /// [`Self::render_frame_glyph`] is the SDF source: an image silhouette (supplied
+    /// from outside, one fixed texture for the whole frame) instead of a per-radius
+    /// cached font glyph. Per-orb positions / radii / rotation reuse
+    /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
+    /// like the glyph path, so the same loose-parity contract (structural + tolerant,
+    /// paper-grain noise omitted on the GPU) applies. Non-Image shapes fall back to
+    /// the Circle path so the call is total.
+    pub fn render_frame_image(
+        &self,
+        clusters: &[Cluster],
+        opts: &AnimateOptions,
+        t: f32,
+    ) -> RgbaImage {
+        let width = opts.width.max(1);
+        let height = opts.height.max(1);
+        let t = t.clamp(0.0, 1.0);
+
+        let (sdf, sdf_size) = match &opts.shape {
+            crate::orb::OrbShape::Image { sdf, size } => (sdf.clone(), *size),
+            // Not an image shape: fall back to the Circle path so the call is total.
+            _ => return self.render_frame(clusters, opts, t),
+        };
+
+        let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
+        let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
+        let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
+        let direction_id: f32 = match opts.direction {
+            MotionDirection::LeftToRight => 0.0,
+            MotionDirection::RightToLeft => 1.0,
+            MotionDirection::TopToBottom => 2.0,
+            MotionDirection::BottomToTop => 3.0,
+        };
+        let cycle = opts.speed.cycle_count() as f32;
+        let n_orbs = opts
+            .count
+            .unwrap_or(clusters.len())
+            .min(MAX_ORB_COUNT)
+            .max(if clusters.is_empty() { 0 } else { 1 });
+
+        // Empty SDF (all-zero / no contrast slipped through) or wrong length ⇒
+        // background-only frame, matching the CPU "draw nothing" contract.
+        if sdf_size == 0
+            || sdf.len() < (sdf_size as usize) * (sdf_size as usize)
+            || sdf.iter().all(|&b| b == 0)
+        {
+            let pack = pack_render_data_for_webgl(
+                clusters,
+                opts.background,
+                base_radius_unit,
+                base_blur,
+                direction_id,
+                cycle,
+                opts.seed,
+                0, // no orbs → background only
+                alpha_mul,
+                1.0, // shape_id = SDF (glyph/image share id 1)
+                opts.glyph_rotate,
+                opts.softness.edge_softness(),
+            );
+            return self.render_packed(&pack, width, height, t);
+        }
+
+        let mut pack = pack_render_data_for_webgl(
+            clusters,
+            opts.background,
+            base_radius_unit,
+            base_blur,
+            direction_id,
+            cycle,
+            opts.seed,
+            n_orbs,
+            alpha_mul,
+            1.0, // shape_id = SDF (image uses the same glyph shader path as Web shape_id==1)
+            opts.glyph_rotate,
+            opts.softness.edge_softness(),
+        );
+        // CPU image path applies per-orb saturation too (render_sdf_orb receives the
+        // saturation-adjusted rgb in `render_frame_with_params`).
+        apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
+
+        // Upload (or reuse) the image SDF with a content-derived key disjoint from
+        // glyph keys, then render with the Glyph pipeline + bleed pass.
+        let sdf_view = self.upload_image_sdf(sdf_size, &sdf);
 
         self.render_packed_inner(
             &pack,
@@ -2909,6 +3035,230 @@ mod tests {
             "glyph fill must paint a non-trivial number of lit pixels, got {lit}"
         );
         eprintln!("glyph lit pixels = {lit}");
+    }
+
+    /// #217: build an `OrbShape::Image` from a synthetic centered silhouette so GPU
+    /// image tests do not depend on font assets.
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 16..48 {
+            for x in 16..48 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    fn image_opts(w: u32, h: u32) -> AnimateOptions {
+        AnimateOptions {
+            shape: test_image_shape(),
+            ..glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true)
+        }
+    }
+
+    /// #217: the Image WGSL path (shared with Glyph) must compile and the supplied
+    /// silhouette SDF must paint a non-trivial number of foreground pixels.
+    #[test]
+    fn gpu_image_renders_lit_pixels() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_renders_lit_pixels") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = image_opts(120, 90);
+        let img = renderer.render_frame_image(&clusters, &opts, 0.0);
+        assert_eq!(img.dimensions(), (120, 90));
+        let lit = lit_vs_bg(&img, opts.background, 8);
+        assert!(
+            lit > 200,
+            "image silhouette fill must paint a non-trivial number of lit pixels, got {lit}"
+        );
+    }
+
+    /// #217: `render_frame_image` is deterministic for the same seed / t.
+    #[test]
+    fn gpu_image_is_deterministic() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_is_deterministic") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = image_opts(96, 96);
+        let a = renderer.render_frame_image(&clusters, &opts, 0.37);
+        let b = renderer.render_frame_image(&clusters, &opts, 0.37);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "render_frame_image must be byte-equal for same seed/t"
+        );
+    }
+
+    /// #217: an empty (all-zero) image SDF yields a background-only frame, mirroring
+    /// the CPU "draw nothing" contract (no panic).
+    #[test]
+    fn gpu_image_empty_sdf_is_background_only() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_empty_sdf_is_background_only")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let opts = AnimateOptions {
+            shape: OrbShape::Image {
+                sdf: std::sync::Arc::from(vec![0u8; 256 * 256]),
+                size: 256,
+            },
+            ..glyph_opts(
+                64,
+                64,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Slow,
+                true,
+            )
+        };
+        let img = renderer.render_frame_image(&clusters, &opts, 0.0);
+        let lit = lit_vs_bg(&img, opts.background, 8);
+        assert_eq!(lit, 0, "empty image SDF must paint no foreground pixels");
+    }
+
+    /// #217: `render_frame_image` on a non-Image shape falls back to the Circle path
+    /// (the call is total). It must still produce a valid frame.
+    #[test]
+    fn gpu_image_entry_non_image_falls_back_to_circle() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_image_entry_non_image_falls_back_to_circle")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = image_opts(80, 80);
+        opts.shape = OrbShape::Circle;
+        let via_image_entry = renderer.render_frame_image(&clusters, &opts, 0.5);
+        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        assert_eq!(
+            via_image_entry.as_raw(),
+            via_circle.as_raw(),
+            "render_frame_image on Circle must equal render_frame (Circle path)"
+        );
+    }
+
+    /// #217 (#13): structural parity of the GPU image path (`render_frame_image`)
+    /// with the CPU oracle (`render_frame` on the same `OrbShape::Image`). This is
+    /// the image analogue of `gpu_glyph_structural_parity_with_cpu`: the CPU adds
+    /// the aquarelle bleed pass after the SDF fill and the GPU resampler / bilinear
+    /// differ from the CPU's, so parity is **loose, not bit-exact**. The contract:
+    ///   (a) both paths light pixels (> 0),
+    ///   (b) lit-pixel counts are within a 2× band either way,
+    ///   (c) lit bounding boxes align within ±6 px per edge (fill is in the same
+    ///       place at the same scale → UV mapping / rotation / scale agree),
+    ///   (d) the two lit sets overlap > 60% of the smaller set.
+    /// Resampler / bleed per-pixel differences are expected and allowed.
+    #[test]
+    fn gpu_image_structural_parity_with_cpu() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_structural_parity_with_cpu")
+        else {
+            return;
+        };
+        eprintln!(
+            "GPU Image parity test running on adapter: {}",
+            renderer.adapter_name()
+        );
+        let clusters = sample_clusters();
+        let opts = image_opts(120, 90);
+        for &t in &[0.0_f32, 0.5] {
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame_image(&clusters, &opts, t);
+            assert_eq!(cpu.dimensions(), gpu.dimensions());
+
+            let bg = opts.background;
+            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
+            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
+            // (a) both light pixels.
+            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
+
+            // (b) comparable coverage (loose 2× band either direction).
+            let ratio = gpu_lit as f32 / cpu_lit as f32;
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
+            );
+
+            // (c) lit bounding boxes align within ±6 px per edge.
+            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
+            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
+            let tol = 6i64;
+            for (label, a, b) in [
+                ("minx", cb.0 as i64, gb.0 as i64),
+                ("miny", cb.1 as i64, gb.1 as i64),
+                ("maxx", cb.2 as i64, gb.2 as i64),
+                ("maxy", cb.3 as i64, gb.3 as i64),
+            ] {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
+                    (a - b).abs()
+                );
+            }
+
+            // (d) overlap > 60% of the smaller lit set.
+            let mut overlap = 0usize;
+            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
+                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
+                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
+                if c_lit && g_lit {
+                    overlap += 1;
+                }
+            }
+            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
+            assert!(
+                overlap_frac > 0.6,
+                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
+                overlap_frac * 100.0
+            );
+            eprintln!(
+                "image parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
+                overlap_frac * 100.0
+            );
+        }
+    }
+
+    /// #217 (#14): rotation loop closure for the GPU image path. With
+    /// `glyph_rotate=true`, `render_frame_image(t=0)` and `(t=1)` must render the
+    /// same frame within tolerance (the per-orb rotation + one-way conveyor both
+    /// close at integer cycle×speed_mult). Image analogue of
+    /// `gpu_glyph_rotation_loop_closure_fast_high_speed`.
+    #[test]
+    fn gpu_image_rotation_loop_closure_t0_eq_t1() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_rotation_loop_closure_t0_eq_t1")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = AnimateOptions {
+            shape: test_image_shape(),
+            speed: MotionSpeed::Fast,
+            glyph_rotate: true,
+            ..glyph_opts(
+                100,
+                100,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Fast,
+                true,
+            )
+        };
+        // More orbs → wider speed_mult spread → largest cycle×speed_mult product the
+        // wrap + rotation has to close.
+        opts.count = Some(24);
+        let t0 = renderer.render_frame_image(&clusters, &opts, 0.0);
+        let t1 = renderer.render_frame_image(&clusters, &opts, 1.0);
+        let max_diff = assert_within_tolerance(
+            &t0,
+            &t1,
+            "image rotation loop closure (Fast, high cycle×speed) t=0 vs t=1",
+        );
+        eprintln!("image fast loop closure: max per-channel diff = {max_diff}");
     }
 
     /// Lit-pixel bounding box of `img` against the opaque background, with a

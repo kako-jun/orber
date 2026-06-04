@@ -37,10 +37,11 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph), `--glyph-char`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph / image), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
 
 ```bash
 orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --softness low
+orber --input photo.jpg --output silhouette.png --shape image --image-mask logo.png
 orber --input photo.jpg --output dense.png --count-preset high --speed fast
 ```
 
@@ -78,7 +79,8 @@ blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen buffer would interfere with the
 > rendered halo). The off-screen wrap buffer described above applies to the
-> `circle` and `glyph` shapes only.
+> `circle`, `glyph`, and `image` shapes (`image` shares the `glyph` SDF render
+> path).
 
 ### Orb count
 
@@ -132,6 +134,30 @@ that base angle.
 > **Font credit:** Noto Sans Symbols 2 © Google Inc., licensed under SIL Open
 > Font License 1.1. See `crates/core/assets/fonts/OFL.txt` for the full license
 > text shipped alongside the TTF.
+
+### Image shape
+
+`--shape image` swaps the round orb for an **image silhouette**. Supply the
+silhouette with `--image-mask <PATH>` — this is the *shape* source and is
+separate from `--input`, which stays the *color* source:
+
+```bash
+orber --input photo.jpg --output logo-orbs.png --shape image --image-mask logo.png
+orber --input photo.jpg --output heart.mp4 --shape image --image-mask heart.png --direction lr
+```
+
+The mask is auto-detected, matching the Web GUI's behavior: a **transparent**
+image uses its alpha channel (opaque pixels = the silhouette); an **opaque**
+image is thresholded by **luminance** with auto-polarity (the minority region is
+treated as the subject, so a dark logo on a light background and a light logo on
+a dark background both work without a flip flag). The image is letterboxed to a
+square (aspect preserved) before thresholding, then converted to the same cached
+**signed-distance field** glyphs use — so `--blur` / `--softness` and the
+post-render watercolor **bleed pass** apply identically. A blank or single
+flat-color mask has no usable contrast and exits with an explicit error.
+
+Only **raster** images are accepted (PNG / JPEG / etc.); SVG is web-only because
+the CLI decodes raster formats only.
 
 ### Softness
 

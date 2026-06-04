@@ -16,13 +16,14 @@
 //! - 彩度調整は palette の HSL 経由
 
 use crate::cluster::Cluster;
-use crate::glyph::{render_glyph_orb, GlyphFontId};
+use crate::glyph::{render_glyph_orb, render_sdf_orb, GlyphFontId};
 use crate::style::{rim_mid_stop, soft_hold_stop, FalloffProfile, SoftnessPreset};
 use aquarelle::{
     render_aquarelle_bleed_pass, render_aquarelle_orb, AquarelleBleedParams, AquarelleParams,
 };
 use image::RgbaImage;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
+use std::sync::Arc;
 use tiny_skia::{
     Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode,
     Transform,
@@ -43,12 +44,15 @@ pub enum OrbStyle {
 
 /// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
 /// 質感セット（[`aquarelle`] crate）、`Glyph` は同梱フォント 1 文字のアウトライン
-/// 塗りを有効にする。
+/// 塗りを有効にする。`Image` (#217) は外部から供給された画像シルエット SDF を
+/// glyph と同じ SDF レンダリング経路で描く。
 ///
-/// `Glyph` のフォントは [`GlyphFontId`] enum で識別する設計のため、`OrbShape` は
-/// 引き続き `Copy + Send + Sync`。実体の `Face` パースはモジュール側の
-/// `OnceLock` キャッシュに任せ、`OrbShape` 自体に重い state を持たせない。
-#[derive(Debug, Clone, Copy, Default)]
+/// `Image` が `Arc<[u8]>`（画像シルエットの SDF テクスチャ）を持つため、`OrbShape`
+/// は `Copy` ではなく `Clone`（`Arc` の参照カウント複製は安価）。`Glyph` のフォントは
+/// [`GlyphFontId`] enum で識別し、実体の `Face` パースはモジュール側の `OnceLock`
+/// キャッシュに任せる。`Image` の SDF も `image_rgba_to_sdf` で 1 度作って `Arc` で
+/// 共有するだけなので、各 shape は依然として重い state を inline で持たない。
+#[derive(Debug, Clone, Default)]
 pub enum OrbShape {
     #[default]
     Circle,
@@ -58,12 +62,22 @@ pub enum OrbShape {
         ch: char,
         font: GlyphFontId,
     },
+    /// 画像シルエットを orb として描く（#217）。`sdf` は [`crate::glyph::mask_to_sdf`]
+    /// と同フォーマット（`size × size`、128≈edge）の SDF テクスチャ、`size` はその辺長。
+    /// SDF の生成（`image_rgba_to_sdf`）は CLI / web 側で 1 度だけ行い、`Arc` で共有する。
+    Image {
+        sdf: Arc<[u8]>,
+        size: u32,
+    },
 }
 
 impl PartialEq for OrbShape {
     // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
     // ここでの "等価" は「形が同じか」だけを判定する用途を想定している。
     // Glyph は文字とフォント識別子まで含めて比較する（軽い値なので）。
+    // Image は Aquarelle と同様に内部 SDF（重い Arc<[u8]>）を比較対象から外し、
+    // 「Image == Image なら true」とする。「形が同じか」の用途では SDF バイト列の
+    // 完全一致まで問わない（バリエーション選別等で同一 shape 判定に使うだけ）方針に揃える。
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (OrbShape::Circle, OrbShape::Circle) => true,
@@ -71,6 +85,7 @@ impl PartialEq for OrbShape {
             (OrbShape::Glyph { ch: a, font: fa }, OrbShape::Glyph { ch: b, font: fb }) => {
                 a == b && fa == fb
             }
+            (OrbShape::Image { .. }, OrbShape::Image { .. }) => true,
             _ => false,
         }
     }
@@ -153,9 +168,10 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
 
         let [r, g, b] = adjust_saturation(cluster.color, saturation);
 
-        // 3 shape を対等な match で分岐させる。Circle が暗黙の default fall-through に
-        // ならないよう、各アームで明示的にヘルパを呼ぶ（#195）。
-        match opts.shape {
+        // 4 shape を対等な match で分岐させる。Circle が暗黙の default fall-through に
+        // ならないよう、各アームで明示的にヘルパを呼ぶ（#195）。Image の SDF は Arc な
+        // ので、move しないよう `&opts.shape` を借用で分岐する。
+        match &opts.shape {
             OrbShape::Circle => {
                 // Circle は per-orb 描画ヘルパへ委譲。render_static は全 orb を Rim・
                 // softness 経由の opacity（Mid なら 1.0 で既存と完全同値）で固定。
@@ -173,7 +189,7 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
             OrbShape::Aquarelle(params) => {
                 // Aquarelle は別モジュールへ委譲。同じ Pixmap に SourceOver で書き込む。
                 // i (cluster index) を seed の差分にして orb 同士で異なるオフセットを得る。
-                render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, params);
+                render_aquarelle_orb(&mut pixmap, (cx, cy), radius, [r, g, b], i as u64, *params);
             }
             OrbShape::Glyph { ch, font } => {
                 // Glyph: 1 文字の SDF を Circle と同じ半径・blur・softness の意味で描く。
@@ -186,20 +202,37 @@ pub fn render_static(clusters: &[Cluster], opts: &RenderOptions) -> RgbaImage {
                     blur,
                     alpha_mul,
                     FalloffProfile::Rim,
-                    font,
-                    ch,
+                    *font,
+                    *ch,
+                    0.0,
+                );
+            }
+            OrbShape::Image { sdf, size } => {
+                // Image: 与えられた画像シルエット SDF を glyph と同じ共有描画 render_sdf_orb
+                // に流す。SDF の出どころ（フォント vs 画像）が違うだけで、content-span
+                // マッピング・bilinear サンプル・falloff は Glyph と完全共通。回転 0 固定。
+                render_sdf_orb(
+                    &mut pixmap,
+                    (cx, cy),
+                    radius,
+                    [r, g, b],
+                    blur,
+                    alpha_mul,
+                    FalloffProfile::Rim,
+                    sdf,
+                    *size as usize,
                     0.0,
                 );
             }
         }
     }
 
-    // Glyph shape のときだけ、全 orb 描画後に aquarelle v0.2 の bleed pass を 1 回かける。
-    // per-orb ではなく全体 1 回にすることで、グリフ群が水彩のにじみで馴染むようにする (#195)。
+    // SDF 系 shape（Glyph / Image）のときだけ、全 orb 描画後に aquarelle v0.2 の
+    // bleed pass を 1 回かける。per-orb ではなく全体 1 回にすることで、SDF 群が水彩の
+    // にじみで馴染むようにする (#195)。Image (#217) も Web の image アーム（shape_id==1
+    // ＝glyph と同経路）で bleed がかかるので、CLI/core でも揃えて Glyph と同様に掛ける。
     // seed は決定論性のため固定 0。AquarelleBleedParams::default() = radius=3, intensity=0.5, halo=0.3。
-    // seed=0 固定。RenderOptions / AnimateOptions に seed フィールドが入った時は
-    // そちらと連動させて再現性をユーザーから制御できるようにする。
-    if let OrbShape::Glyph { .. } = opts.shape {
+    if matches!(opts.shape, OrbShape::Glyph { .. } | OrbShape::Image { .. }) {
         render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
     }
 
@@ -609,6 +642,99 @@ mod tests {
         );
     }
 
+    /// #217: テスト用に「中央に不透明ブロックを置いた透過画像」から Image SDF を作る。
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    #[test]
+    fn image_shape_renders_visible_pixels_via_render_static() {
+        // OrbShape::Image が render_static 経由で一定数のピクセルを描く（CPU 経路）。
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let opts = RenderOptions {
+            width: 128,
+            height: 128,
+            shape: test_image_shape(),
+            softness: SoftnessPreset::Low,
+            ..Default::default()
+        };
+        let img = render_static(&[c], &opts);
+        let lit = img.pixels().filter(|p| p[0] > 32).count();
+        assert!(
+            lit > 32,
+            "OrbShape::Image via render_static should paint visible pixels, lit={lit}"
+        );
+    }
+
+    #[test]
+    fn image_render_differs_from_circle_for_same_cluster() {
+        // Image 経路が Circle と別物の絵を出すこと（退化検出）。
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let base = RenderOptions {
+            width: 96,
+            height: 96,
+            ..Default::default()
+        };
+        let circle_opts = RenderOptions {
+            shape: OrbShape::Circle,
+            ..base.clone()
+        };
+        let image_opts = RenderOptions {
+            shape: test_image_shape(),
+            ..base
+        };
+        let img_circle = render_static(std::slice::from_ref(&c), &circle_opts);
+        let img_image = render_static(std::slice::from_ref(&c), &image_opts);
+        assert_ne!(
+            img_circle.as_raw(),
+            img_image.as_raw(),
+            "Image rendering must differ from Circle for the same cluster"
+        );
+    }
+
+    #[test]
+    fn image_eq_is_shape_only() {
+        // PartialEq: Image==Image は SDF 中身に依らず true（Aquarelle と同方針）。
+        let a = test_image_shape();
+        let b = OrbShape::Image {
+            sdf: Arc::from(vec![0u8; 256 * 256]),
+            size: 256,
+        };
+        assert_eq!(a, b, "Image == Image must be true regardless of SDF bytes");
+        assert_ne!(a, OrbShape::Circle);
+    }
+
+    #[test]
+    fn image_shape_is_deterministic() {
+        // 同じ入力で 2 回描いて byte-equal（bleed pass seed=0 固定の決定論性）。
+        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
+        let shape = test_image_shape();
+        let opts = RenderOptions {
+            width: 64,
+            height: 64,
+            shape: shape.clone(),
+            ..Default::default()
+        };
+        let a = render_static(std::slice::from_ref(&c), &opts);
+        let b = render_static(std::slice::from_ref(&c), &opts);
+        assert_eq!(
+            a.as_raw(),
+            b.as_raw(),
+            "Image render_static must be byte-equal on repeated calls"
+        );
+    }
+
     #[test]
     fn glyph_render_differs_from_circle_for_same_cluster() {
         // 同じ cluster / opts を Circle と Glyph で別々に描画したとき、出力 RGBA が
@@ -948,12 +1074,13 @@ mod tests {
                 ch: '☆',
                 font: GlyphFontId::NotoSymbols2,
             },
+            test_image_shape(),
         ];
         for shape in shapes {
             let opts = RenderOptions {
                 width: 48,
                 height: 48,
-                shape,
+                shape: shape.clone(),
                 ..Default::default()
             };
             let img = render_static(std::slice::from_ref(&c), &opts);
@@ -971,7 +1098,7 @@ mod tests {
 
     #[test]
     fn all_shapes_produce_buffer_of_correct_size() {
-        // 3 shape どの経路でも、出力バッファ長は width*height*4 と一致する。
+        // 4 shape どの経路でも、出力バッファ長は width*height*4 と一致する。
         // RgbaImage::from_raw の expect で守られているが、明示的に契約として残す。
         use crate::glyph::GlyphFontId;
         let c = cluster([200, 100, 50], 0.5, 0.5, 1.0);
@@ -982,12 +1109,13 @@ mod tests {
                 ch: '☆',
                 font: GlyphFontId::NotoSymbols2,
             },
+            test_image_shape(),
         ];
         for shape in shapes {
             let opts = RenderOptions {
                 width: 40,
                 height: 56,
-                shape,
+                shape: shape.clone(),
                 ..Default::default()
             };
             let img = render_static(std::slice::from_ref(&c), &opts);

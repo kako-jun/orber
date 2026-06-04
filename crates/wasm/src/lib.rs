@@ -628,8 +628,10 @@ pub fn get_render_data(
     let shape_id: f32 = match shape {
         OrbShape::Circle => 0.0,
         OrbShape::Glyph { .. } => 1.0,
-        // Aquarelle は WebGL 経路非対応。parse_shape で弾かれているはずだが念のため
-        // Circle 扱いにフォールバック（パニックさせない）。
+        // Aquarelle は WebGL 経路非対応で parse_shape が弾く。Image (#217) は web が
+        // 既存の SDF 直渡し経路で描くため、この wasm 入口（parse_shape は circle/glyph
+        // のみ返す）には到達しない。いずれも念のため Circle 扱いにフォールバック
+        // （パニックさせない）。Image を wasm 入口で受けるのは将来 Phase 3。
         _ => 0.0,
     };
 
