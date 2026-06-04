@@ -45,7 +45,7 @@
 //!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
 //!   reused, never reimplemented, so the orb positions / radii / alphas are
 //!   identical to the proven web/CPU result. The per-orb data goes up as a
-//!   `Rgba32Float` data-texture (3 texels wide × N orbs tall) so float precision is
+//!   `Rgba32Float` data-texture (4 texels wide × N orbs tall) so float precision is
 //!   preserved exactly — no quantization happens on the orb data itself;
 //! - reads the result back accounting for wgpu's 256-byte row-alignment
 //!   requirement on `copy_texture_to_buffer` (that alignment applies only to the
@@ -185,7 +185,7 @@ struct SizedResources {
     padded_bytes_per_row: u32,
 }
 
-/// The per-orb data-texture (`Rgba32Float`, 3 texels wide × `capacity` orbs
+/// The per-orb data-texture (`Rgba32Float`, 4 texels wide × `capacity` orbs
 /// tall) and its view, reused across frames. `capacity` is the texture's current
 /// height in orbs; it only ever grows (a frame needing more rows reallocates to
 /// the larger size), mirroring the grow-only spirit of the other caches so a long
@@ -2466,12 +2466,10 @@ mod tests {
     /// driving `alpha_mul` (header[9]) to 0 collapses every orb's contribution to 0
     /// regardless of the SDF / opacity envelope. Build a real glyph pack (so the SDF
     /// binding and orb rows are valid), then force `alpha_mul = 0` and assert the
-    /// frame paints only the background. Pins the alpha-floor → no-fill invariant.
+    /// frame paints only the background. Pins the `alpha_mul == 0` → no-fill invariant.
     #[test]
-    fn gpu_glyph_opacity_zero_softness_floor_no_fill() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_opacity_zero_softness_floor_no_fill")
-        else {
+    fn gpu_glyph_alpha_mul_zero_no_fill() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_alpha_mul_zero_no_fill") else {
             return;
         };
         let clusters = sample_clusters();
