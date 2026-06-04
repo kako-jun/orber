@@ -274,19 +274,26 @@ fn edt_2d(features: &[bool], size: usize) -> Vec<f32> {
     out
 }
 
-/// Glyph 1 文字の signed-distance field を `size × size` の 8-bit R texture として返す。
+/// 二値 mask (`size × size`、各バイト `>= 128` を inside とみなす) を
+/// signed-distance field の 8-bit R texture に変換する。
 ///
-/// 値域は `[-1, +1]` を `[0, 255]` に写したもの。0.5 (= 128 前後) が輪郭、
-/// 1.0 側ほど内側、0.0 側ほど外側を表す。距離は glyph 全半径ではなく
-/// `size * GLYPH_SDF_MAX_DIST_FACTOR` の「エッジ近傍 falloff 幅」で正規化する。
-/// これにより `r = 1 - signed_unit` が「edge からどれだけ内側か」の共通尺度になる。
-pub fn render_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+/// Glyph (フォント由来) と Image (#217、画像シルエット由来) で共有する mask→SDF 段。
+/// inside 判定 → 内側 / 外側それぞれの 2D Euclidean Distance Transform →
+/// `signed_px` → `size * GLYPH_SDF_MAX_DIST_FACTOR` で正規化 → `[0, 255]` に量子化、
+/// という [`render_glyph_sdf`] が従来 inline で持っていた算術をそのまま括り出したもの。
+/// バイト列のフォーマットは [`render_glyph_sdf`] と完全同一なので、Image 経路は
+/// この関数で得た SDF を glyph と同じレンダラ（CPU の [`render_glyph_orb`] / GPU の
+/// glyph SDF パイプライン）にそのまま渡せる。
+///
+/// `mask` が全 0（描画なし）のときは全 0 の SDF を返す（[`render_glyph_sdf`] の
+/// tofu 契約と同じ）。`mask.len()` は `(size * size)` 以上を想定する（不足分は
+/// パニックするので、呼び出し側で長さを保証すること）。
+pub fn mask_to_sdf(mask: &[u8], size: u32) -> Vec<u8> {
     let s = size.max(1) as usize;
-    let mask = render_glyph_binary_mask(font, ch, size);
-    if mask.iter().all(|&b| b == 0) {
+    if mask.iter().take(s * s).all(|&b| b == 0) {
         return vec![0u8; s * s];
     }
-    let inside: Vec<bool> = mask.iter().map(|&b| b >= 128).collect();
+    let inside: Vec<bool> = mask.iter().take(s * s).map(|&b| b >= 128).collect();
     let outside: Vec<bool> = inside.iter().map(|&on| !on).collect();
     let dist_to_inside = edt_2d(&inside, s);
     let dist_to_outside = edt_2d(&outside, s);
@@ -305,6 +312,20 @@ pub fn render_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
         out.push(byte);
     }
     out
+}
+
+/// Glyph 1 文字の signed-distance field を `size × size` の 8-bit R texture として返す。
+///
+/// 値域は `[-1, +1]` を `[0, 255]` に写したもの。0.5 (= 128 前後) が輪郭、
+/// 1.0 側ほど内側、0.0 側ほど外側を表す。距離は glyph 全半径ではなく
+/// `size * GLYPH_SDF_MAX_DIST_FACTOR` の「エッジ近傍 falloff 幅」で正規化する。
+/// これにより `r = 1 - signed_unit` が「edge からどれだけ内側か」の共通尺度になる。
+///
+/// フォント由来の binary mask を作る段だけが glyph 固有で、mask→SDF 段は
+/// [`mask_to_sdf`] に切り出して Image (#217) と共有する。
+pub fn render_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
+    let mask = render_glyph_binary_mask(font, ch, size);
+    mask_to_sdf(&mask, size)
 }
 
 type GlyphSdfKey = (GlyphFontId, u32, u32);
@@ -640,6 +661,50 @@ mod tests {
         assert_eq!(glyph_sdf_size_for_radius(8.0), DEFAULT_GLYPH_SDF_SIZE);
         assert_eq!(glyph_sdf_size_for_radius(160.0), 512);
         assert_eq!(glyph_sdf_size_for_radius(400.0), 1024);
+    }
+
+    /// #217: `mask_to_sdf` 抽出後も `render_glyph_sdf` の出力が
+    /// 「binary mask → mask_to_sdf」と byte 完全一致すること。これがリグレッション
+    /// 検出の正本。glyph と image が同じ mask→SDF 段を共有する根拠でもある。
+    #[test]
+    fn render_glyph_sdf_equals_mask_to_sdf_of_binary_mask() {
+        for ch in ['☆', '♪', '♥'] {
+            for size in [16u32, 64, 256] {
+                let mask = render_glyph_binary_mask(GlyphFontId::NotoSymbols2, ch, size);
+                let via_mask = mask_to_sdf(&mask, size);
+                let via_glyph = render_glyph_sdf(GlyphFontId::NotoSymbols2, ch, size);
+                assert_eq!(
+                    via_glyph, via_mask,
+                    "render_glyph_sdf must equal mask_to_sdf(binary_mask) for ch={ch:?} size={size}"
+                );
+            }
+        }
+    }
+
+    /// `mask_to_sdf` 単体のサニティ: 中央に inside ブロックがある mask は、内側で
+    /// 128 超・外側で 128 未満になり、長さは size² になる。
+    #[test]
+    fn mask_to_sdf_basic_inside_outside() {
+        let size = 32u32;
+        let s = size as usize;
+        let mut mask = vec![0u8; s * s];
+        // 中央 8x8 を inside にする。
+        for y in 12..20 {
+            for x in 12..20 {
+                mask[y * s + x] = 255;
+            }
+        }
+        let sdf = mask_to_sdf(&mask, size);
+        assert_eq!(sdf.len(), s * s);
+        assert!(sdf[16 * s + 16] > 128, "center of inside block must be inside (>128)");
+        assert!(sdf[0] < 128, "far corner must be outside (<128)");
+    }
+
+    /// 全 0 mask は全 0 SDF（tofu 契約）。
+    #[test]
+    fn mask_to_sdf_all_zero_is_all_zero() {
+        let sdf = mask_to_sdf(&vec![0u8; 16 * 16], 16);
+        assert!(sdf.iter().all(|&b| b == 0));
     }
 
     #[test]
