@@ -70,7 +70,11 @@ jobs:
 
   gpu-parity:
     name: GPU parity (lavapipe)
-    runs-on: ubuntu-latest
+    # Pinned to 22.04: on the ubuntu-24.04 runner the apt mesa lavapipe ICD is
+    # rejected by the stock Vulkan loader (vkCreateInstance -> ERROR_INCOMPATIBLE_DRIVER),
+    # so request_adapter() returns nothing. 22.04 ships a loader/mesa pair that brings
+    # lavapipe up out of the box, which is what GPU-testing Rust projects rely on.
+    runs-on: ubuntu-22.04
     # The default CI 'test'/'clippy' jobs build WITHOUT --features gpu, so gpu.rs /
     # orb_circle.wgsl are never compiled, linted, or parity-checked there. This job
     # is the only place the wgpu path is exercised: it brings up Mesa's lavapipe
@@ -93,9 +97,14 @@ jobs:
       - name: Install Mesa software Vulkan (lavapipe)
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
-          # Show the adapter lavapipe exposes (diagnostic; non-fatal if it errors).
-          vulkaninfo --summary || true
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+          # Diagnostics (non-fatal): prove the ICD the loader is pinned to exists and
+          # that an adapter actually comes up. If these are wrong, ORBER_REQUIRE_GPU=1
+          # still turns it into a hard FAIL in the parity step below — these prints
+          # just make the *reason* obvious in the log.
+          echo "== ICD manifests ==" ; ls -la /usr/share/vulkan/icd.d/ || true
+          echo "== loader / mesa versions ==" ; dpkg -l | grep -iE "libvulkan1|mesa-vulkan" || true
+          echo "== vulkaninfo ==" ; vulkaninfo --summary || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4
