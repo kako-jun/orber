@@ -1,4 +1,4 @@
-//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0.
+//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c.
 //!
 //! [`GpuRenderer`] is the headless, native side of the renderer. It runs the
 //! **Circle** orb WGSL ([`orb_circle.wgsl`](../src/orb_circle.wgsl)) that is a
@@ -11,8 +11,13 @@
 //!
 //! Parity with the CPU oracle holds **only** on this exact path:
 //!
-//! - **shape = Circle** (Glyph / image / aquarelle are Phase 1; the CLI routes
-//!   those to the CPU renderer);
+//! - **shape = Circle** for the strict ±2/channel bit-exact parity described
+//!   here. Glyph (#212/#214) and Aquarelle (#216) also render on the GPU, but
+//!   match the CPU oracle only **structurally** (float SDF / analytic-vs-AA
+//!   differences), not bit-exact — see `render_frame_glyph` /
+//!   `render_frame_aquarelle`. The `image` shape is web-only and rides the Glyph
+//!   SDF path (core/wasm have no native `image` shape). The CPU renderer is now
+//!   only a no-GPU-adapter fallback (removed in Phase 1.5);
 //! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
 //!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
 //!   `opts.saturation` to each packed orb color after
@@ -53,8 +58,13 @@
 //!
 //! ## Scope
 //!
-//! Phase 0 covers **Circle orbs only**. Glyph / image shapes / aquarelle are
-//! Phase 1; the CLI falls back to the CPU renderer for non-Circle shapes.
+//! Circle (Phase 0, #209), Glyph (Phase 1b, #212/#214) and Aquarelle (Phase 1c,
+//! #216) all render on the GPU. The `image` shape is web-only and reuses the
+//! Glyph SDF path (core/wasm have no `image` shape — the browser hands an image
+//! silhouette in as a glyph SDF). The CPU (tiny-skia) renderer remains only as a
+//! no-GPU-adapter fallback and as the parity oracle; both are removed in
+//! Phase 1.5. Video and per-orb color/keyframe tracks (#7 / #33) are still
+//! CPU-only.
 
 use std::collections::HashMap;
 
@@ -828,8 +838,9 @@ impl GpuRenderer {
     /// # Panics / scope
     ///
     /// This is the **Circle** path only. The shape in `opts.shape` is ignored
-    /// here (the caller is responsible for routing non-Circle shapes to the CPU
-    /// renderer); see the module docs.
+    /// here; the caller routes `Glyph` to `render_frame_glyph` and `Aquarelle`
+    /// to `render_frame_aquarelle` (both GPU), and only falls back to the CPU
+    /// renderer when no GPU adapter is available. See the module docs.
     pub fn render_frame(&self, clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
