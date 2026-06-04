@@ -314,6 +314,101 @@ pub fn render_video(
 mod tests {
     use super::*;
 
+    use orber_core::cluster::{Centroid, Cluster};
+
+    /// #217: テスト用 `OrbShape::Image`（中央に不透明ブロックの透過画像 → SDF）。
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = orber_core::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    /// `render_video` がフレーム描画に組み立てる `AnimateOptions` を、同じ式で再現する
+    /// ヘルパ。ffmpeg を呼ばずに「VideoOptions の shape がフレーム描画まで Image として
+    /// 伝播するか」だけを検証するため、`render_video` 内の AnimateOptions 構築
+    /// （特に `shape: opts.shape.clone()`）を 1:1 で写し取る。解像度だけ小さくする。
+    fn frame_opts_like_render_video(opts: &VideoOptions, w: u32, h: u32) -> AnimateOptions {
+        AnimateOptions {
+            width: w,
+            height: h,
+            orb_size: opts.orb_size,
+            blur: opts.blur,
+            saturation: opts.saturation,
+            direction: opts.direction,
+            speed: opts.speed,
+            seed: opts.seed,
+            count: opts.count,
+            background: opts.background,
+            shape: opts.shape.clone(),
+            softness: opts.softness,
+            glyph_rotate: true,
+            color_tracks: opts.color_tracks.clone(),
+            keyframe_tracks: opts.keyframe_tracks.clone(),
+        }
+    }
+
+    /// #217 (#10): `shape = Image` の `VideoOptions` が `render_video` のフレーム描画
+    /// 経路（AnimateOptions 構築 + `render_frame_with_params`）を通っても Image として
+    /// 描かれ、Circle に退化しないこと。`OrbShape` が `Copy` → `Clone` 化された際に
+    /// `shape: opts.shape.clone()` の clone を入れ忘れるとビルドが通らない / shape が
+    /// 落ちる回帰を、ここで Circle 出力との差分で検出する（ffmpeg 不要）。
+    #[test]
+    fn video_options_image_shape_survives_render_video_clone() {
+        let clusters = vec![
+            Cluster {
+                color: [240, 60, 60],
+                centroid: Centroid { x: 0.4, y: 0.5 },
+                weight: 0.6,
+            },
+            Cluster {
+                color: [60, 120, 240],
+                centroid: Centroid { x: 0.6, y: 0.4 },
+                weight: 0.4,
+            },
+        ];
+        let (w, h) = (96u32, 96u32);
+
+        let image_opts = VideoOptions {
+            shape: test_image_shape(),
+            count: Some(8),
+            ..VideoOptions::default()
+        };
+        let circle_opts = VideoOptions {
+            shape: OrbShape::Circle,
+            count: Some(8),
+            ..VideoOptions::default()
+        };
+
+        let img_frame_opts = frame_opts_like_render_video(&image_opts, w, h);
+        let circle_frame_opts = frame_opts_like_render_video(&circle_opts, w, h);
+
+        // 組み立てた AnimateOptions の shape が Image のまま伝播していること。
+        assert!(
+            matches!(img_frame_opts.shape, OrbShape::Image { .. }),
+            "VideoOptions Image shape must survive into the render_video frame AnimateOptions"
+        );
+
+        let img_cache = precompute_orb_params(&img_frame_opts, &clusters);
+        let circle_cache = precompute_orb_params(&circle_frame_opts, &clusters);
+        let image_frame = render_frame_with_params(&clusters, &img_frame_opts, &img_cache, 0.0);
+        let circle_frame =
+            render_frame_with_params(&clusters, &circle_frame_opts, &circle_cache, 0.0);
+        assert_ne!(
+            image_frame.as_raw(),
+            circle_frame.as_raw(),
+            "Image video frame must differ from Circle (shape must not degrade to Circle)"
+        );
+    }
+
     #[test]
     fn frame_count_math() {
         // duration_ms = 5000, fps=30 -> 150 frames

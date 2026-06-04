@@ -3144,6 +3144,123 @@ mod tests {
         );
     }
 
+    /// #217 (#13): structural parity of the GPU image path (`render_frame_image`)
+    /// with the CPU oracle (`render_frame` on the same `OrbShape::Image`). This is
+    /// the image analogue of `gpu_glyph_structural_parity_with_cpu`: the CPU adds
+    /// the aquarelle bleed pass after the SDF fill and the GPU resampler / bilinear
+    /// differ from the CPU's, so parity is **loose, not bit-exact**. The contract:
+    ///   (a) both paths light pixels (> 0),
+    ///   (b) lit-pixel counts are within a 2× band either way,
+    ///   (c) lit bounding boxes align within ±6 px per edge (fill is in the same
+    ///       place at the same scale → UV mapping / rotation / scale agree),
+    ///   (d) the two lit sets overlap > 60% of the smaller set.
+    /// Resampler / bleed per-pixel differences are expected and allowed.
+    #[test]
+    fn gpu_image_structural_parity_with_cpu() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_structural_parity_with_cpu")
+        else {
+            return;
+        };
+        eprintln!(
+            "GPU Image parity test running on adapter: {}",
+            renderer.adapter_name()
+        );
+        let clusters = sample_clusters();
+        let opts = image_opts(120, 90);
+        for &t in &[0.0_f32, 0.5] {
+            let cpu = render_frame(&clusters, &opts, t);
+            let gpu = renderer.render_frame_image(&clusters, &opts, t);
+            assert_eq!(cpu.dimensions(), gpu.dimensions());
+
+            let bg = opts.background;
+            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
+            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
+            // (a) both light pixels.
+            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
+
+            // (b) comparable coverage (loose 2× band either direction).
+            let ratio = gpu_lit as f32 / cpu_lit as f32;
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
+            );
+
+            // (c) lit bounding boxes align within ±6 px per edge.
+            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
+            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
+            let tol = 6i64;
+            for (label, a, b) in [
+                ("minx", cb.0 as i64, gb.0 as i64),
+                ("miny", cb.1 as i64, gb.1 as i64),
+                ("maxx", cb.2 as i64, gb.2 as i64),
+                ("maxy", cb.3 as i64, gb.3 as i64),
+            ] {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
+                    (a - b).abs()
+                );
+            }
+
+            // (d) overlap > 60% of the smaller lit set.
+            let mut overlap = 0usize;
+            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
+                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
+                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
+                if c_lit && g_lit {
+                    overlap += 1;
+                }
+            }
+            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
+            assert!(
+                overlap_frac > 0.6,
+                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
+                overlap_frac * 100.0
+            );
+            eprintln!(
+                "image parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
+                overlap_frac * 100.0
+            );
+        }
+    }
+
+    /// #217 (#14): rotation loop closure for the GPU image path. With
+    /// `glyph_rotate=true`, `render_frame_image(t=0)` and `(t=1)` must render the
+    /// same frame within tolerance (the per-orb rotation + one-way conveyor both
+    /// close at integer cycle×speed_mult). Image analogue of
+    /// `gpu_glyph_rotation_loop_closure_fast_high_speed`.
+    #[test]
+    fn gpu_image_rotation_loop_closure_t0_eq_t1() {
+        let Some(renderer) = require_or_skip_renderer("gpu_image_rotation_loop_closure_t0_eq_t1")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = AnimateOptions {
+            shape: test_image_shape(),
+            speed: MotionSpeed::Fast,
+            glyph_rotate: true,
+            ..glyph_opts(
+                100,
+                100,
+                MotionDirection::LeftToRight,
+                MotionSpeed::Fast,
+                true,
+            )
+        };
+        // More orbs → wider speed_mult spread → largest cycle×speed_mult product the
+        // wrap + rotation has to close.
+        opts.count = Some(24);
+        let t0 = renderer.render_frame_image(&clusters, &opts, 0.0);
+        let t1 = renderer.render_frame_image(&clusters, &opts, 1.0);
+        let max_diff = assert_within_tolerance(
+            &t0,
+            &t1,
+            "image rotation loop closure (Fast, high cycle×speed) t=0 vs t=1",
+        );
+        eprintln!("image fast loop closure: max per-channel diff = {max_diff}");
+    }
+
     /// Lit-pixel bounding box of `img` against the opaque background, with a
     /// per-channel `thresh`. Returns `None` when nothing is lit.
     fn lit_bbox(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> Option<(u32, u32, u32, u32)> {

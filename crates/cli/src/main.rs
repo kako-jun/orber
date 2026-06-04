@@ -1623,6 +1623,42 @@ mod tests {
     }
 
     #[test]
+    fn shape_image_with_svg_or_undecodable_mask_errors() {
+        // #217: 実在するがラスタデコード不可なファイル（SVG テキスト等の bytes）を
+        // --image-mask に渡すと、image::open が失敗して orb_shape() が Err（panic しない）。
+        // 「存在しないパス」(shape_image_with_unreadable_mask_errors_not_panics) とは別の
+        // 経路: ファイルは読めるがデコードに失敗するケース。SVG は web 専用で raster
+        // デコーダに無い、という CLI の制約も同時に守る。
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svg_path = dir.path().join("silhouette.svg");
+        std::fs::write(
+            &svg_path,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">
+  <rect x="16" y="16" width="32" height="32" fill="black"/>
+</svg>"#,
+        )
+        .expect("write svg");
+
+        let cli = Cli::try_parse_from([
+            "orber",
+            "--input",
+            "x",
+            "--output",
+            "x.png",
+            "--shape",
+            "image",
+            "--image-mask",
+            svg_path.to_str().unwrap(),
+        ])
+        .expect("clap should parse");
+        let result = cli.orb_shape();
+        assert!(
+            result.is_err(),
+            "an existing but undecodable mask (SVG text) must be an explicit Err (decode failure path), got {result:?}"
+        );
+    }
+
+    #[test]
     fn glyph_char_rejects_multi_char() {
         // --glyph-char には 1 文字しか入れられない。
         assert!(try_parse(&["--glyph-char", "abc"]).is_err());

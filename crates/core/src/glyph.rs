@@ -959,6 +959,208 @@ mod tests {
         assert_eq!(sdf.len(), 128 * 128);
     }
 
+    /// #217 / generateImageSdf 移植: 経路選択しきい値の助手。`size × size` の不透明
+    /// 単色キャンバスに、同色のまま `transparent` (alpha=0) を `k` ピクセルだけ混ぜる。
+    ///
+    /// 色を 1 色に揃えてあるので **輝度は完全フラット**。よって輝度経路に入れば
+    /// auto-polarity が全 inside/全 outside になり `None`（#169）。alpha 経路に入れば
+    /// 不透明部分が inside で `Some`。`alphaPixelCount*100 >= drawnPixelCount`（1% 以上）
+    /// で alpha 経路という Web の `hasMeaningfulAlpha` 境界を、結果が Some/None で割れる
+    /// ように作ってある（drawn = `size*size` を入力 = `size` の正方形にすることで
+    /// 描画矩形 = キャンバス全域、`drawn_pixel_count = size*size`）。
+    fn alpha_threshold_probe(size: u32, transparent_px: usize) -> Option<Vec<u8>> {
+        let s = size;
+        let mut img = image::RgbaImage::from_pixel(s, s, image::Rgba([200, 200, 200, 255]));
+        let mut set = 0usize;
+        'outer: for y in 0..s {
+            for x in 0..s {
+                if set >= transparent_px {
+                    break 'outer;
+                }
+                // 同色のまま alpha だけ 0 に（輝度フラットを維持して経路だけ切り替える）。
+                img.put_pixel(x, y, image::Rgba([200, 200, 200, 0]));
+                set += 1;
+            }
+        }
+        image_rgba_to_sdf(&img, s)
+    }
+
+    /// #217 (#1): `alphaPixelCount*100 < drawnPixelCount`（1% に 1 ピクセル足りない）と
+    /// 輝度経路が選ばれる。色をフラットに揃えてあるので輝度経路 = auto-polarity が
+    /// コントラスト 0 を検知して `None` を返す。alpha 経路に倒れていれば不透明部分が
+    /// inside で `Some` になるはずなので、`None` であることが「輝度経路が選ばれた」証拠。
+    #[test]
+    fn image_rgba_to_sdf_alpha_threshold_boundary_minus_one_uses_luma() {
+        // 100x100 -> drawn=10000、1% = 100。99 個（=99*100 < 10000）で輝度経路。
+        assert!(
+            alpha_threshold_probe(100, 99).is_none(),
+            "alphaCount*100 < drawnCount must take the luma path (flat luma → None), \
+             not the alpha path (which would yield Some)"
+        );
+    }
+
+    /// #217 (#2): `alphaPixelCount*100 == drawnPixelCount`（ちょうど 1%）で alpha 経路。
+    /// Web の `hasMeaningfulAlpha = alphaPixelCount*100 >= drawnPixelCount` は `>=` なので
+    /// 同点は alpha 側。色フラットなので alpha 経路でだけ inside（不透明部分）が立ち
+    /// `Some`、輝度経路なら `None` になる。`Some` であることが「alpha 経路が選ばれた」証拠。
+    #[test]
+    fn image_rgba_to_sdf_alpha_threshold_boundary_exact_uses_alpha() {
+        // 100x100 -> drawn=10000、ちょうど 100 個（100*100 == 10000）で alpha 経路。
+        assert!(
+            alpha_threshold_probe(100, 100).is_some(),
+            "alphaCount*100 == drawnCount (exactly 1%) must take the alpha path (>= boundary) \
+             and yield Some; the luma path would return None for this flat-luma image"
+        );
+    }
+
+    /// #217 (#3): 描画矩形が**奇数ピクセル**で `dark_count == floor(drawn/2)` の同点を
+    /// 作り、D1 修正後の Web 一致挙動を固定する。Web は `darkCount < drawnPixelCount/2`
+    /// を**浮動小数除算**で評価する（`12 < 12.5` = true）ので inside=dark。整数 floor の
+    /// `dark_count < drawn/2`（`12 < 12` = false）だと極性が反転し inside=light に割れる。
+    /// よって少数派（dark）が被写体になる Web 挙動を assert する。
+    #[test]
+    fn image_rgba_to_sdf_inside_is_dark_odd_drawncount_web_parity() {
+        // 5x5 -> drawn=25（奇数、identity resize）。12 黒 + 13 白で dark_count=12=floor(25/2)。
+        let s = 5u32;
+        let mut img = image::RgbaImage::from_pixel(s, s, image::Rgba([255, 255, 255, 255]));
+        let mut set = 0usize;
+        'outer: for y in 0..s {
+            for x in 0..s {
+                if set >= 12 {
+                    break 'outer;
+                }
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+                set += 1;
+            }
+        }
+        let sdf = image_rgba_to_sdf(&img, s).expect("12 dark + 13 light → contrast → Some");
+        // (0,0) は黒（少数派 dark）。Web 一致なら inside（>128）。
+        let black = sdf[0];
+        // (4,4) は白（多数派 light）。outside（<128）。
+        let white = sdf[(4 * s + 4) as usize];
+        assert!(
+            black > 128,
+            "Web parity (2*dark_count < drawn): the minority dark pixel must be inside (>128), \
+             got {black}. Integer floor `dark_count < drawn/2` would flip this at the odd-count tie."
+        );
+        assert!(
+            white < 128,
+            "the majority light pixel must be outside (<128), got {white}"
+        );
+    }
+
+    /// #217 (#4): inside-dark 極性のとき、`Y == avgY` ちょうどのピクセルは **outside**
+    /// （Web の `yBuf[i] < avgY` は厳密不等号、`>= avgY` 側が outside）。`<` を `<=` に
+    /// 取り違えると同点ピクセルが inside に倒れる回帰を捕まえる。
+    #[test]
+    fn image_rgba_to_sdf_avg_y_tie_pixel_is_outside() {
+        // 4x4 grayscale（drawn=16、Y = グレー値）。3 黒(0) + 12 白(255) + 1 px=204。
+        // avgY = (3*0 + 12*255 + 204)/16 = 204 ちょうど → (3,3) が Y==avgY の同点。
+        // dark_count=3（黒のみ、204 も 255 も < 204 ではない）→ 2*3 < 16 で inside=dark。
+        let s = 4u32;
+        let mut img = image::RgbaImage::from_pixel(s, s, image::Rgba([255, 255, 255, 255]));
+        img.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        img.put_pixel(1, 0, image::Rgba([0, 0, 0, 255]));
+        img.put_pixel(2, 0, image::Rgba([0, 0, 0, 255]));
+        img.put_pixel(3, 3, image::Rgba([204, 204, 204, 255]));
+        let sdf = image_rgba_to_sdf(&img, s).expect("dark subject → contrast → Some");
+        let tie = sdf[(3 * s + 3) as usize];
+        let dark = sdf[0];
+        assert!(
+            tie < 128,
+            "a pixel with Y == avgY must be OUTSIDE under inside-dark polarity (strict `< avgY`), \
+             got {tie}; `<=` would wrongly count it as inside"
+        );
+        assert!(
+            dark > 128,
+            "the dark subject pixel must still be inside (>128), got {dark}"
+        );
+    }
+
+    /// #217 (#5): 「ほぼ全 inside」の境界（`inside_count == drawn` ⇒ None /
+    /// `== drawn-1` ⇒ Some、#169）。alpha 経路で作る: 描画矩形内に `alpha<255` を
+    /// 1% 以上混ぜて alpha 経路に入れつつ、その不透明度を `>=128` に保てば全 inside。
+    /// 1 ピクセルだけ `alpha<128`（背景）にすると inside が 1 つ減って Some。
+    #[test]
+    fn image_rgba_to_sdf_all_inside_one_px_diff_none_vs_some() {
+        let s = 50u32; // drawn = 2500、1% = 25。
+        let build = |one_bg: bool| -> Option<Vec<u8>> {
+            let mut img = image::RgbaImage::from_pixel(s, s, image::Rgba([180, 180, 180, 255]));
+            // 60 px (>1%) を alpha=200（[128,254]）にして alpha 経路へ。全部 inside のまま。
+            let mut set = 0usize;
+            'outer: for y in 0..s {
+                for x in 0..s {
+                    if set >= 60 {
+                        break 'outer;
+                    }
+                    img.put_pixel(x, y, image::Rgba([180, 180, 180, 200]));
+                    set += 1;
+                }
+            }
+            if one_bg {
+                // 1 px だけ alpha<128 → outside。inside_count = drawn-1。
+                img.put_pixel(s - 1, s - 1, image::Rgba([180, 180, 180, 0]));
+            }
+            image_rgba_to_sdf(&img, s)
+        };
+        assert!(
+            build(false).is_none(),
+            "inside_count == drawn_pixel_count (全 inside) must be None (#169 no-contrast)"
+        );
+        assert!(
+            build(true).is_some(),
+            "one background pixel (inside_count == drawn-1) must be Some"
+        );
+    }
+
+    /// #217 (#6): 極端アスペクト比でも、contain のレタボックス領域は必ず背景
+    /// （`< 128`）で、シルエットは矩形ではなく被写体形状になる（#174 本質回帰）。
+    #[test]
+    fn image_rgba_to_sdf_letterbox_region_excluded_from_silhouette() {
+        // 256x16 を 256 に contain → scale=1、dw=256/dh=16、dx=0/dy=120。
+        // 描画矩形は行 120..136。黒背景 + 小さな白被写体。
+        let size = 256u32;
+        let mut img = image::RgbaImage::from_pixel(256, 16, image::Rgba([0, 0, 0, 255]));
+        for y in 4..12 {
+            for x in 100..140 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = image_rgba_to_sdf(&img, size).expect("white subject on black → Some");
+
+        // レタボックス領域（描画矩形 120..136 の外）に inside は 1 つも無いこと。
+        // 旧 #174 バグでは全域評価で alpha 経路に倒れ、描画矩形 = 純矩形 inside になり
+        // レタボ部まで含めた矩形シルエットになっていた。
+        let mut inside_in_letterbox = 0usize;
+        let mut inside_in_rect = 0usize;
+        for y in 0..size {
+            for x in 0..size {
+                if sdf[(y * size + x) as usize] > 128 {
+                    if (120..136).contains(&y) {
+                        inside_in_rect += 1;
+                    } else {
+                        inside_in_letterbox += 1;
+                    }
+                }
+            }
+        }
+        let drawn_pixel_count = 256 * 16; // dw*dh
+        assert_eq!(
+            inside_in_letterbox, 0,
+            "letterbox region must contain no inside pixels (#174); got {inside_in_letterbox}"
+        );
+        assert!(
+            inside_in_rect > 0,
+            "subject silhouette must light some pixels inside the drawn rect, got 0"
+        );
+        assert!(
+            inside_in_rect < drawn_pixel_count / 2,
+            "silhouette must follow the small subject, not fill the drawn rect \
+             (a full-rectangle silhouette is the #174 bug): inside_in_rect={inside_in_rect} \
+             of drawn={drawn_pixel_count}"
+        );
+    }
+
     #[test]
     fn rotated_glyph_does_not_clip_severely() {
         let mut plain = Pixmap::new(256, 256).unwrap();

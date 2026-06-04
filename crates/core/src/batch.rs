@@ -128,6 +128,65 @@ mod tests {
         img
     }
 
+    /// #217: テスト用 `OrbShape::Image`（中央に不透明ブロックの透過画像 → SDF）。
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    /// #217 (#11): `BatchInput{ shape: Image }` で各 spec が Image として描かれ、Circle
+    /// 出力（既存 batch は Circle のみ）と PNG が一致しないこと。`input.shape.clone()` が
+    /// 各 spec に正しく行き渡り、Image が Circle に退化していないことを保証する。
+    #[test]
+    fn batch_image_shape_renders_image_not_circle() {
+        let specs = DEFAULT_VARIATIONS
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
+        let n = specs.len();
+
+        let circle = generate_batch(BatchInput {
+            source: synthetic_source(),
+            k: 4,
+            width: 64,
+            height: 64,
+            shape: OrbShape::Circle,
+            specs: specs.clone(),
+        })
+        .expect("circle batch");
+        let image = generate_batch(BatchInput {
+            source: synthetic_source(),
+            k: 4,
+            width: 64,
+            height: 64,
+            shape: test_image_shape(),
+            specs,
+        })
+        .expect("image batch");
+
+        assert_eq!(circle.len(), n);
+        assert_eq!(image.len(), n);
+        const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        for (i, (c, m)) in circle.iter().zip(image.iter()).enumerate() {
+            assert!(m.starts_with(PNG_MAGIC), "spec {i} image PNG magic");
+            assert_ne!(
+                c, m,
+                "spec {i}: Image shape must render differently from Circle (not degrade to Circle)"
+            );
+        }
+    }
+
     #[test]
     fn generate_batch_returns_one_png_per_spec() {
         let specs = DEFAULT_VARIATIONS

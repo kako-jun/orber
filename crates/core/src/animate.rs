@@ -1782,4 +1782,80 @@ mod tests {
             "Glyph and Circle animate frames must differ (Glyph adds a per-frame bleed pass)"
         );
     }
+
+    /// #217: テスト用の `OrbShape::Image`（中央に不透明ブロックの透過画像シルエット →
+    /// `image_rgba_to_sdf`）。glyph テストの作りに倣ってフォント資産に依存しない。
+    fn test_image_shape() -> OrbShape {
+        let w = 64u32;
+        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
+        OrbShape::Image {
+            sdf: std::sync::Arc::from(sdf),
+            size: 256,
+        }
+    }
+
+    /// #217 (#7): Image shape の animate frame が決定論的であること。
+    ///
+    /// 同じ clusters / opts / t で 2 回 render しても byte-equal を保つ。glyph 版
+    /// (`animate_glyph_frame_is_deterministic`) に倣う。Image アームも glyph と同じ
+    /// per-frame bleed pass（seed=0 固定）に乗るので、ここが破れていれば bleed seed が
+    /// 動的に変化している（= フレーム間チラつき）兆候になる。
+    #[test]
+    fn animate_image_frame_is_deterministic() {
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = test_image_shape();
+        let a = render_frame(&clusters, &opts, 0.37);
+        let b = render_frame(&clusters, &opts, 0.37);
+        assert!(
+            pixels_equal(&a, &b),
+            "Image animate frame must be byte-equal on repeated calls (per-frame bleed pass with fixed seed)"
+        );
+    }
+
+    /// #217 (#8): Image shape の animate frame が Circle と byte-equal にならないこと。
+    ///
+    /// 同条件で shape だけ Image / Circle に切り替えてフレームを比較し、両者が一致しない
+    /// ことを確認する。これにより animate の Image アーム（render_sdf_orb + per-frame
+    /// bleed）が実際に効いている（= Circle と別経路）ことが保たれる。
+    #[test]
+    fn animate_image_frame_differs_from_circle() {
+        let clusters = sample_clusters();
+        let mut opts_image = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts_image.shape = test_image_shape();
+        let opts_circle = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+
+        let i = render_frame(&clusters, &opts_image, 0.25);
+        let c = render_frame(&clusters, &opts_circle, 0.25);
+        assert!(
+            !pixels_equal(&i, &c),
+            "Image and Circle animate frames must differ (Image rides the SDF + bleed path)"
+        );
+    }
+
+    /// #217 (#9): glyph_rotate=true, shape=Image で render_frame(t=0) と (t=1) が
+    /// byte-equal（回転 + 一方通行コンベアのループ性）。Image アームは
+    /// `glyph_rotation_angle` を glyph と同じ整数周期に乗せるので、t=0 と t=1 で
+    /// 回転角も進行量も完全一致して閉じる。これが動画ループ性も実質カバーする。
+    #[test]
+    fn animate_image_rotation_loop_closure_t0_eq_t1() {
+        let clusters = sample_clusters();
+        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
+        opts.shape = test_image_shape();
+        opts.glyph_rotate = true;
+        // 速度倍数のばらつきを必ず起こして cycle*speed_mult の最大周期でも閉じることを見る。
+        opts.count = Some(32);
+        let a = render_frame(&clusters, &opts, 0.0);
+        let b = render_frame(&clusters, &opts, 1.0);
+        assert!(
+            pixels_equal(&a, &b),
+            "Image shape with glyph_rotate=true must close the loop (t=0 ≡ t=1)"
+        );
+    }
 }
