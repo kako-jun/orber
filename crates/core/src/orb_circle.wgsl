@@ -2,15 +2,24 @@
 //
 // `web/src/lib/orberGl.ts` の **Circle アーム** を 1:1 で WGSL に翻訳したもの。
 // per-orb データは `pack_render_data_for_webgl`（= WebGL 経路と同一）が詰めた
-// header(16 words) + per-orb(16 words × n_orbs) をそのまま GPU バッファに流す。
-// パラメータ算術は再実装せず、`gpu.rs` 側で pack 出力を vec4 にほどいて渡す。
+// header(16 words) + per-orb(16 words × n_orbs) を gpu.rs が data-texture に詰め替え、
+// このシェーダは textureLoad で読む。パラメータ算術は再実装せず、gpu.rs 側で pack
+// 出力を vec4 にほどいて texture へ upload する。
+//
+// orb 上限について（#210 Phase 1a）:
+//   - このシェーダは per-orb データを uniform 固定配列ではなく **data-texture**
+//     (Rgba32Float, textureLoad) で読むため、**64 制限を持たない**。動的 count
+//     (= params.n_orbs、≤ MAX_ORB_COUNT(1024)) までフラグメントループで描ける。
+//   - 旧 64 制限は WebGL GLSL 経路（web/src/lib/orberGl.ts::MAX_ORBS /
+//     crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS）だけのもので、この WGSL とは無関係。
+//     誤って 64 を同期させないこと。
 //
 // CPU(tiny-skia) との対応（パリティ範囲は狭い。過大主張しない）:
-//   - パリティが成り立つのは **Circle ∧ saturation 反映済 ∧ count ≤ MAX_ORBS(64)**
-//     の経路に限る。saturation は pack_render_data_for_webgl では掛けず（WebGL と共有
-//     のため）、native GPU 側 gpu.rs::render_frame が adjust_saturation_pub を後段適用
-//     して CPU と揃える。count > 64 は CLI が CPU にフォールバックする（このシェーダは
-//     64 で clamp）。video は CPU 経路、color/keyframe tracks は GPU pack 未対応。
+//   - パリティが成り立つのは **Circle ∧ saturation 反映済** の経路に限る（count は
+//     1024 まで GPU が CPU と一致する）。saturation は pack_render_data_for_webgl
+//     では掛けず（WebGL と共有のため）、native GPU 側 gpu.rs::render_frame が
+//     adjust_saturation_pub を後段適用して CPU と揃える。video は CPU 経路、
+//     color/keyframe tracks は GPU pack 未対応。
 //   - その経路では Circle アームは CPU 経路（animate::render_frame）と同式・同パラメータ
 //     で、GLSL 実装が本番で byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を
 //     忠実に写経しているので、同じ ±2/channel の許容内で一致する（実 GPU では 0）。
@@ -37,12 +46,6 @@
 const TAU: f32 = 6.28318530718;
 const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
 
-// per-orb uniform array の上限。`{{MAX_ORBS}}` は gpu.rs が include_str! 後に
-// Rust 側 `gpu::MAX_ORBS` で置換する単一ソース（リテラル二重定義を避ける）。
-// orberGl.ts の MAX_ORBS / wasm の GL_RENDERER_MAX_ORBS とも同期させること。
-// SYNC WITH web/src/lib/orberGl.ts::MAX_ORBS と crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS
-const MAX_ORBS: u32 = {{MAX_ORBS}}u;
-
 struct Params {
     resolution: vec2<f32>, // (width, height) px
     t: f32,                // [0, 1)
@@ -58,24 +61,38 @@ struct Params {
     _pad2: f32,
 };
 
-// per-orb のパック。pack_render_data_for_webgl の per-orb 16 words のうち
-// Circle 経路が使う分だけ 3 つの vec4 に詰め替える（orberGl.ts の
-// u_orb_color / u_orb_phase / u_orb_misc と同じ並び）。回転 (base_angle /
-// rot_speed) は Circle では未使用なので持ち込まない。
+// per-orb のパック（data-texture, #210）。pack_render_data_for_webgl の per-orb
+// 16 words のうち Circle 経路が使う分を 3 つの vec4 にほどき、gpu.rs が
+// **幅3 texel × 高さ N** の Rgba32Float テクスチャへ詰める。texel レイアウトは
+//   x=0: color = (r, g, b, weight)
+//   x=1: phase = (phase, phi_radius, phi_blur, phi_opacity)
+//   x=2: misc  = (cross_axis, style_bit, speed_mult, _)
+//   y  : orb index
+// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。回転
+// (base_angle / rot_speed) は Circle では未使用なので持ち込まない。
+//
+// sampler は持たず textureLoad（texelFetch 相当）のみで読むので linear filtering に
+// 依存しない（gpu.rs の sample_type は Float{ filterable: false }）。これにより
+// Rgba32Float が filtering 非対応な環境でも動き、storage buffer 不使用なので
+// wgpu の WebGL2 backend でも可搬（Phase 2）。
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var orb_tex: texture_2d<f32>;
+
+// orb i の 3 つの vec4 を data-texture から読む（mip 0、point fetch）。
 struct Orb {
     color: vec4<f32>, // (r, g, b, weight)
     phase: vec4<f32>, // (phase, phi_radius, phi_blur, phi_opacity)
     misc: vec4<f32>,  // (cross_axis, style_bit, speed_mult, _)
 };
 
-struct Orbs {
-    // WGSL は配列長に const 式を要求し、上の MAX_ORBS const は配列長に使えないため
-    // `{{MAX_ORBS}}` を gpu.rs が同じ値で置換する（const と配列長が必ず一致する）。
-    orbs: array<Orb, {{MAX_ORBS}}>,
-};
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<uniform> orb_data: Orbs;
+fn load_orb(i: u32) -> Orb {
+    let row = i32(i);
+    var o: Orb;
+    o.color = textureLoad(orb_tex, vec2<i32>(0, row), 0);
+    o.phase = textureLoad(orb_tex, vec2<i32>(1, row), 0);
+    o.misc = textureLoad(orb_tex, vec2<i32>(2, row), 0);
+    return o;
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -180,15 +197,13 @@ fn composite_premul(sample_px: vec2<f32>) -> vec4<f32> {
     var acc_b = div255(to_u8_rgb(params.bg.b) * bg_a8);
     var acc_a8 = bg_a8;
 
+    // count はヘッダ由来の動的 orb 数（gpu.rs が MAX_ORB_COUNT(1024) まで clamp 済み）。
+    // 固定上限ループではなく count まで回す（data-texture は 64 制限を持たない）。
     let count = u32(params.n_orbs + 0.5);
     let t_frac = fract(params.t);
 
-    for (var i: u32 = 0u; i < MAX_ORBS; i = i + 1u) {
-        if (i >= count) {
-            break;
-        }
-
-        let o = orb_data.orbs[i];
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let o = load_orb(i);
         let weight = o.color.w;
         let phase = o.phase.x;
         let phi_radius = o.phase.y;

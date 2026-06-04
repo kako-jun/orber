@@ -19,11 +19,13 @@
 //!   [`pack_render_data_for_webgl`] (which itself never applies saturation,
 //!   because it is shared with the WebGL path). Without that step the GPU and CPU
 //!   would diverge for `--saturation != 1.0`;
-//! - **count ≤ [`MAX_ORBS`] (64)**: the orb-array uniform is fixed at 64 entries,
-//!   so the GPU silently clamps beyond that. The CPU path scales to
-//!   [`MAX_ORB_COUNT`] (1024). The CLI therefore falls back to CPU when the
-//!   resolved count exceeds [`MAX_ORBS`] (see `FrameRenderer::select` in the CLI)
-//!   so the two never produce different images for the same flags.
+//! - **count up to [`MAX_ORB_COUNT`] (1024)**: per-orb data is uploaded as a
+//!   **data-texture** (`Rgba32Float`, read with `textureLoad`) — not a fixed-size
+//!   uniform array — so the WGSL has **no 64-orb cap** and the GPU renders the same
+//!   count the CPU does (#210 Phase 1a). The old `count > 64 → CPU` fallback in the
+//!   CLI is gone. (The 64 limit only ever applied to the WebGL GLSL path —
+//!   `web/src/lib/orberGl.ts::MAX_ORBS` / `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`
+//!   — which is untouched until Phase 3; do not re-sync a 64 cap onto this path.)
 //!
 //! Outside that path the GPU is **not** a drop-in for the CPU oracle: video is
 //! rendered on the CPU, and the per-orb `color_tracks` / `keyframe_tracks` (#7 /
@@ -42,9 +44,12 @@
 //! - feeds the shader the **exact same per-orb data** the WebGL path uses
 //!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
 //!   reused, never reimplemented, so the orb positions / radii / alphas are
-//!   identical to the proven web/CPU result;
+//!   identical to the proven web/CPU result. The per-orb data goes up as a
+//!   `Rgba32Float` data-texture (3 texels wide × N orbs tall) so float precision is
+//!   preserved exactly — no quantization happens on the orb data itself;
 //! - reads the result back accounting for wgpu's 256-byte row-alignment
-//!   requirement on `copy_texture_to_buffer`.
+//!   requirement on `copy_texture_to_buffer` (that alignment applies only to the
+//!   texture→buffer read-back; the orb data upload via `write_texture` is exempt).
 //!
 //! ## Scope
 //!
@@ -63,33 +68,31 @@ use crate::orb::adjust_saturation_pub;
 /// Bytes per pixel for `Rgba8Unorm`.
 const BYTES_PER_PIXEL: u32 = 4;
 /// wgpu requires `bytes_per_row` of a texture→buffer copy to be a multiple of
-/// this (`COPY_BYTES_PER_ROW_ALIGNMENT`).
+/// this (`COPY_BYTES_PER_ROW_ALIGNMENT`). This applies to the read-back
+/// (texture→buffer) only — `write_texture` (buffer/CPU→texture) is exempt, so the
+/// orb data-texture upload uses its tight 48-byte rows directly.
 const ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
-/// Maximum orbs the Circle shader iterates. Must match `MAX_ORBS` in
-/// `orb_circle.wgsl`, `web/src/lib/orberGl.ts::MAX_ORBS`, and
-/// `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`.
-// SYNC WITH orb_circle.wgsl::MAX_ORBS
-pub const MAX_ORBS: usize = 64;
+/// Width, in texels, of the per-orb data-texture: one texel each for the color,
+/// phase, and misc `vec4`s (see `orb_circle.wgsl::load_orb`).
+const ORB_TEX_WIDTH: u32 = 3;
+/// Bytes per texel of the `Rgba32Float` orb data-texture (4 × f32).
+const ORB_TEX_BYTES_PER_TEXEL: u32 = 16;
+/// Bytes per row of the orb data-texture (`3 × 16 = 48`). `write_texture` has no
+/// row-alignment requirement, so this tight value is used as-is.
+const ORB_TEX_BYTES_PER_ROW: u32 = ORB_TEX_WIDTH * ORB_TEX_BYTES_PER_TEXEL;
 
 /// Header words / per-orb words in the `pack_render_data_for_webgl` layout.
 /// Kept in sync with that function (header 16 words, per-orb 16 words).
 const HEADER_WORDS: usize = 16;
 const PER_ORB_WORDS: usize = 16;
 
-/// The Circle orb WGSL template (translation of `orberGl.ts` Circle arm). The
-/// `{{MAX_ORBS}}` placeholders are filled from [`MAX_ORBS`] at first use by
-/// [`orb_circle_wgsl`], so the shader's orb-array length / `MAX_ORBS` const is
-/// single-sourced from Rust instead of a hand-kept `64` literal.
-const ORB_CIRCLE_WGSL_TEMPLATE: &str = include_str!("orb_circle.wgsl");
-
-/// The resolved Circle WGSL, with `{{MAX_ORBS}}` substituted from [`MAX_ORBS`].
-/// Resolved once (the result is `&'static`) so it doubles as a stable cache key
-/// for the pipeline cache.
+/// The Circle orb WGSL (translation of `orberGl.ts` Circle arm). Per-orb data is
+/// read from a data-texture with `textureLoad`, so the shader has no fixed orb
+/// cap and needs no template substitution — it is used verbatim (#210 Phase 1a).
+/// The `&'static str` doubles as a stable cache key for the pipeline cache.
 fn orb_circle_wgsl() -> &'static str {
-    use std::sync::OnceLock;
-    static RESOLVED: OnceLock<String> = OnceLock::new();
-    RESOLVED.get_or_init(|| ORB_CIRCLE_WGSL_TEMPLATE.replace("{{MAX_ORBS}}", &MAX_ORBS.to_string()))
+    include_str!("orb_circle.wgsl")
 }
 
 /// Header uniform block handed to the Circle shader. Mirrors `struct Params` in
@@ -116,22 +119,17 @@ struct Params {
     _pad2: f32,
 }
 
-/// One orb as the Circle shader sees it: three vec4s mirroring `struct Orb` in
+/// One orb as the Circle shader sees it: three `vec4`s mirroring `struct Orb` in
 /// `orb_circle.wgsl` (color+weight, phase quartet, misc). Filled from the
-/// `pack_render_data_for_webgl` per-orb words.
+/// `pack_render_data_for_webgl` per-orb words. One `GpuOrb` packs to one row of
+/// the `Rgba32Float` orb data-texture (3 texels = 48 bytes); the shader reads it
+/// back with three `textureLoad`s.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuOrb {
     color: [f32; 4], // r, g, b, weight
     phase: [f32; 4], // phase, phi_radius, phi_blur, phi_opacity
     misc: [f32; 4],  // cross_axis, style_bit, speed_mult, _
-}
-
-/// The orb-array uniform: a fixed-size `[GpuOrb; MAX_ORBS]` (unused tail zeroed).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct OrbArray {
-    orbs: [GpuOrb; MAX_ORBS],
 }
 
 /// A render pipeline plus its bind-group layout, compiled once per distinct
@@ -152,6 +150,17 @@ struct SizedResources {
     target_view: wgpu::TextureView,
     output_buffer: wgpu::Buffer,
     padded_bytes_per_row: u32,
+}
+
+/// The per-orb data-texture (`Rgba32Float`, 3 texels wide × `capacity` orbs
+/// tall) and its view, reused across frames. `capacity` is the texture's current
+/// height in orbs; it only ever grows (a frame needing more rows reallocates to
+/// the larger size), mirroring the grow-only spirit of the other caches so a long
+/// clip allocates the orb texture at most a handful of times.
+struct OrbTexture {
+    capacity: u32,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 /// Headless wgpu renderer for the Circle orb path. Holds a device/queue plus a
@@ -176,6 +185,9 @@ pub struct GpuRenderer {
     pipeline_cache: std::sync::Mutex<HashMap<String, CachedPipeline>>,
     /// Per-size resources, keyed by `(width, height)`.
     sized_cache: std::sync::Mutex<HashMap<(u32, u32), SizedResources>>,
+    /// The grow-only per-orb data-texture (reallocated only when a frame needs
+    /// more rows than the cached capacity). `None` until the first frame.
+    orb_texture: std::sync::Mutex<Option<OrbTexture>>,
 }
 
 impl GpuRenderer {
@@ -208,6 +220,7 @@ impl GpuRenderer {
             adapter_name,
             pipeline_cache: std::sync::Mutex::new(HashMap::new()),
             sized_cache: std::sync::Mutex::new(HashMap::new()),
+            orb_texture: std::sync::Mutex::new(None),
         })
     }
 
@@ -238,14 +251,17 @@ impl GpuRenderer {
         f(entry)
     }
 
-    /// Compile the Circle pipeline (binding 0 = `Params`, binding 1 = `OrbArray`).
+    /// Compile the Circle pipeline (binding 0 = `Params` uniform, binding 1 = orb
+    /// data-texture). The orb texture is `Rgba32Float`, sampled with `filterable:
+    /// false` and read via `textureLoad` (no sampler) so the path never depends on
+    /// linear filtering and stays portable to wgpu's WebGL2 backend (#210).
     fn build_pipeline(&self, shader_wgsl: &str) -> CachedPipeline {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let bind_group_layout =
             self.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("orber-circle-bgl"),
-                    entries: &[uniform_entry(0), uniform_entry(1)],
+                    entries: &[uniform_entry(0), orb_texture_entry(1)],
                 });
         let shader = self
             .device
@@ -347,6 +363,76 @@ impl GpuRenderer {
         }
     }
 
+    /// Upload the per-orb data into the grow-only `Rgba32Float` data-texture and
+    /// return a view to bind. The texture is 3 texels wide (color / phase / misc)
+    /// × `orbs.len()` tall; it is reallocated only when the orb count exceeds the
+    /// cached capacity, then `write_texture` fills the live rows each frame.
+    ///
+    /// `write_texture` has no 256-byte row-alignment requirement (that is only for
+    /// buffer→texture copies), so the tight `ORB_TEX_BYTES_PER_ROW` (48) is used.
+    fn upload_orb_texture(&self, orbs: &[GpuOrb]) -> wgpu::TextureView {
+        let rows = orbs.len().max(1) as u32;
+        let mut guard = self.orb_texture.lock().unwrap();
+        let needs_realloc = match guard.as_ref() {
+            Some(tex) => tex.capacity < rows,
+            None => true,
+        };
+        if needs_realloc {
+            *guard = Some(self.build_orb_texture(rows));
+        }
+        let tex = guard.as_ref().expect("orb texture just ensured present");
+
+        // `write_texture` reads exactly `rows × 3 × 16` bytes from `orbs`, which is
+        // `bytemuck`-castable to a flat `&[u8]` (GpuOrb is 3 × vec4<f32> = 48 bytes,
+        // matching one texel row).
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(orbs),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ORB_TEX_BYTES_PER_ROW),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: ORB_TEX_WIDTH,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        tex.view.clone()
+    }
+
+    /// Allocate the per-orb data-texture sized for `capacity` orbs (3 texels wide).
+    /// `usage = TEXTURE_BINDING | COPY_DST` (sampled in the shader, written via
+    /// `write_texture`). No `RENDER_ATTACHMENT` / `COPY_SRC` — it is input only.
+    fn build_orb_texture(&self, capacity: u32) -> OrbTexture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("orber-circle-orb-tex"),
+            size: wgpu::Extent3d {
+                width: ORB_TEX_WIDTH,
+                height: capacity,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        OrbTexture {
+            capacity,
+            texture,
+            view,
+        }
+    }
+
     /// Render one Circle frame at time `t` from `clusters` + `opts`, matching
     /// [`crate::animate::render_frame`].
     ///
@@ -355,15 +441,13 @@ impl GpuRenderer {
     /// within ±2/channel. `opts.width` / `opts.height` give the output size; `t`
     /// is clamped to `0.0..=1.0`.
     ///
-    /// # Clamping (caller's responsibility)
+    /// # Orb count
     ///
-    /// The resolved orb count is **silently clamped to [`MAX_ORBS`] (64)** — the
-    /// orb-array uniform is fixed at 64 entries. Beyond that the GPU renders only
-    /// the first 64 orbs, which is a *different image* than the CPU oracle (which
-    /// scales to [`MAX_ORB_COUNT`]). The caller therefore owns routing `count > 64`
-    /// to the CPU renderer so the two never diverge for the same flags; the CLI's
-    /// `FrameRenderer::select` does this. A `debug_assert!` here trips in debug
-    /// builds if a future caller forgets and feeds `count > MAX_ORBS` directly.
+    /// The resolved orb count is clamped only to [`MAX_ORB_COUNT`] (1024), the same
+    /// ceiling the CPU oracle uses. Per-orb data is uploaded as a data-texture that
+    /// grows to fit, so there is no 64-orb cap and the GPU renders the same image
+    /// the CPU does for any count up to 1024 (#210 Phase 1a). No CPU fallback for
+    /// `count > 64` is needed anymore.
     ///
     /// # Panics / scope
     ///
@@ -390,21 +474,11 @@ impl GpuRenderer {
         let cycle = opts.speed.cycle_count() as f32;
         // n_orbs mirrors `precompute_orb_params`: count.unwrap_or(clusters.len())
         // clamped to MAX_ORB_COUNT, at least 1 if there are clusters.
-        let n_orbs_resolved = opts
+        let n_orbs = opts
             .count
             .unwrap_or(clusters.len())
             .min(MAX_ORB_COUNT)
             .max(if clusters.is_empty() { 0 } else { 1 });
-        // count > MAX_ORBS is the caller's responsibility to route to the CPU
-        // renderer (see the doc-comment above). Trip in debug builds if a caller
-        // forgot; release silently clamps so the GPU never reads past the uniform.
-        debug_assert!(
-            n_orbs_resolved <= MAX_ORBS,
-            "render_frame: resolved orb count {n_orbs_resolved} exceeds MAX_ORBS ({MAX_ORBS}); \
-             the caller must route count > {MAX_ORBS} to the CPU renderer (it would otherwise \
-             silently clamp and diverge from the CPU oracle)"
-        );
-        let n_orbs = n_orbs_resolved.min(MAX_ORBS);
         // shape_id / glyph_rotate / edge_softness are Phase-1 (Glyph) inputs; the
         // Circle shader ignores them. Pass Circle defaults.
         let mut pack = pack_render_data_for_webgl(
@@ -454,8 +528,10 @@ impl GpuRenderer {
         );
 
         // Header → Params. Layout per `pack_render_data_for_webgl` doc-comment.
+        // count is clamped to MAX_ORB_COUNT (1024); the data-texture grows to hold
+        // it, so there is no 64-orb cap here anymore (#210).
         let n_orbs_packed = pack[8].max(0.0) as usize;
-        let n_orbs = n_orbs_packed.min(MAX_ORBS);
+        let n_orbs = n_orbs_packed.min(MAX_ORB_COUNT);
         let params = Params {
             resolution: [width as f32, height as f32],
             t,
@@ -478,17 +554,20 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
-        // Per-orb words → fixed-size array (unused tail zeroed). Only the words
-        // the Circle shader reads are unpacked (color+weight, phase quartet,
-        // cross_axis/style/speed); rotation words are skipped.
-        let mut orb_array = OrbArray {
-            orbs: [GpuOrb {
+        // Per-orb words → one `GpuOrb` (3 vec4s) per orb. Only the words the Circle
+        // shader reads are unpacked (color+weight, phase quartet,
+        // cross_axis/style/speed); rotation words are skipped. The shader iterates
+        // `params.n_orbs` rows, so the row count must equal `n_orbs` even if an
+        // (externally hand-built) `pack` runs short — short rows stay zeroed.
+        let mut orbs = vec![
+            GpuOrb {
                 color: [0.0; 4],
                 phase: [0.0; 4],
                 misc: [0.0; 4],
-            }; MAX_ORBS],
-        };
-        for i in 0..n_orbs {
+            };
+            n_orbs.max(1)
+        ];
+        for (i, slot) in orbs.iter_mut().enumerate().take(n_orbs) {
             let off = HEADER_WORDS + PER_ORB_WORDS * i;
             // Max word read below is `pack[off + 10]`, so the guard must allow
             // `off + 10 == len - 1`, i.e. `off + 11 == len`. Using `>=` here would
@@ -497,23 +576,21 @@ impl GpuRenderer {
             if off + 11 > pack.len() {
                 break;
             }
-            orb_array.orbs[i] = GpuOrb {
+            *slot = GpuOrb {
                 color: [pack[off], pack[off + 1], pack[off + 2], pack[off + 3]],
                 phase: [pack[off + 4], pack[off + 5], pack[off + 6], pack[off + 7]],
                 misc: [pack[off + 8], pack[off + 9], pack[off + 10], 0.0],
             };
         }
-        let orb_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("orber-circle-orbs"),
-                contents: bytemuck::bytes_of(&orb_array),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+
+        // Upload the per-orb data into the grow-only data-texture and grab a
+        // (clonable) view to bind. Done before entering the pipeline/sized
+        // closures so we don't nest the orb-texture lock under them.
+        let orb_view = self.upload_orb_texture(&orbs);
 
         // Pipeline (shader compile) cached per shader source; target / read-back
-        // cached per size. Only the small uniforms / bind group are rebuilt per
-        // frame.
+        // cached per size; orb texture grows as needed. Only the small params
+        // uniform / bind group are rebuilt per frame.
         self.pipeline(orb_circle_wgsl(), |cached| {
             self.sized_resources(width, height, |res| {
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -526,7 +603,7 @@ impl GpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: orb_buffer.as_entire_binding(),
+                            resource: wgpu::BindingResource::TextureView(&orb_view),
                         },
                     ],
                 });
@@ -664,6 +741,24 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// A fragment-visible sampled-texture bind-group-layout entry for the orb
+/// data-texture. `sample_type = Float { filterable: false }` because the shader
+/// reads it with `textureLoad` (no sampler / no filtering), which is what keeps
+/// the path portable to the wgpu WebGL2 backend where `Rgba32Float` is not
+/// filterable (#210).
+fn orb_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,31 +840,6 @@ mod tests {
         }
         require_gpu_or_panic(what);
         None
-    }
-
-    /// The WGSL must be single-sourced from `gpu::MAX_ORBS`: every `{{MAX_ORBS}}`
-    /// placeholder is substituted, none survive, and the resolved orb-array length
-    /// / `MAX_ORBS` const carry the Rust value. This catches a future bump of
-    /// `MAX_ORBS` (e.g. to 128) silently leaving a stale `64` in the shader.
-    #[test]
-    fn wgsl_max_orbs_is_synced_with_rust() {
-        let resolved = orb_circle_wgsl();
-        assert!(
-            !resolved.contains("{{MAX_ORBS}}"),
-            "unsubstituted {{{{MAX_ORBS}}}} placeholder left in resolved WGSL"
-        );
-        assert!(
-            ORB_CIRCLE_WGSL_TEMPLATE.contains("{{MAX_ORBS}}"),
-            "template lost its {{{{MAX_ORBS}}}} placeholder — the literal would no longer be single-sourced"
-        );
-        assert!(
-            resolved.contains(&format!("const MAX_ORBS: u32 = {MAX_ORBS}u;")),
-            "resolved WGSL MAX_ORBS const does not carry gpu::MAX_ORBS ({MAX_ORBS})"
-        );
-        assert!(
-            resolved.contains(&format!("array<Orb, {MAX_ORBS}>")),
-            "resolved WGSL orb-array length does not carry gpu::MAX_ORBS ({MAX_ORBS})"
-        );
     }
 
     /// A small varied palette so per-pixel parity isn't trivially satisfied by a
@@ -870,6 +940,39 @@ mod tests {
             }
         }
         eprintln!("overall max per-channel diff across all cases = {overall_max}");
+    }
+
+    /// count > 64 must hold parity now that orb data is a data-texture (no 64
+    /// cap). Covers the old CPU-fallback boundary (65) plus 100 / 256 / 1024.
+    /// A size with > 64 distinct clusters so each orb is independent (not just the
+    /// weight-scattered expansion of a handful of colors); the texture must grow to
+    /// hold every row and the shader must iterate the full dynamic count. Expect
+    /// bit-exact on a real GPU; the assertion allows the ±2/channel contract.
+    #[test]
+    fn gpu_matches_cpu_high_count() {
+        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count") else {
+            return;
+        };
+        eprintln!(
+            "GPU Circle high-count parity test running on adapter: {}",
+            renderer.adapter_name()
+        );
+        let clusters = sample_clusters();
+        let mut overall_max = 0u8;
+        for &count in &[65usize, 100, 256, 1024] {
+            // A size whose width*4 is not 256-aligned, to also keep the read-back
+            // padding strip in play while the orb count grows.
+            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
+            opts.count = Some(count);
+            for &t in &[0.0_f32, 0.5] {
+                let cpu = render_frame(&clusters, &opts, t);
+                let gpu = renderer.render_frame(&clusters, &opts, t);
+                let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count={count} t={t}"));
+                overall_max = overall_max.max(max_diff);
+                eprintln!("count={count} t={t}: max per-channel diff = {max_diff}");
+            }
+        }
+        eprintln!("high-count overall max per-channel diff = {overall_max}");
     }
 
     /// `--saturation != 1.0` must hold parity: the native GPU path re-applies
