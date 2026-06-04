@@ -1077,7 +1077,7 @@ impl GpuRenderer {
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let saturation = opts.saturation.max(0.0);
 
-        let orbs = self.pack_aquarelle_orbs(
+        let orbs = Self::pack_aquarelle_orbs(
             &modulated,
             width as f32,
             height as f32,
@@ -1099,8 +1099,11 @@ impl GpuRenderer {
     ///
     /// Orbs with radius `<= 0.0` (zero weight) pack a zero-radius row, which the
     /// shader skips — matching the crate's early `return` for non-positive radius.
+    ///
+    /// Pure data transform (no `self`): an associated function so pack-only tests
+    /// can call it without a live GPU adapter (RNG/layout reproduction is verified
+    /// on every host, not just GPU CI).
     fn pack_aquarelle_orbs(
-        &self,
         clusters: &[Cluster],
         width: f32,
         height: f32,
@@ -4202,11 +4205,8 @@ mod tests {
     /// `bleed` values, plus that bloom presence tracks `bloom > 0`.
     #[test]
     fn aquarelle_pack_satellite_count_and_bloom_flag() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_satellite_count_and_bloom_flag")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this RNG/layout test runs on every host, not just GPU CI.
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
         // bleed → expected round(3*bleed): 0→0, 0.5→2 (1.5 rounds to 2), 1.0→3.
         for (bleed, expected) in [(0.0_f32, 0u32), (0.5, 2), (1.0, 3)] {
@@ -4216,8 +4216,14 @@ mod tests {
                 offset: 0.5,
                 halo: 0.5,
             };
-            let orbs =
-                renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, params.clamped());
+            let orbs = GpuRenderer::pack_aquarelle_orbs(
+                &single,
+                200.0,
+                200.0,
+                40.0,
+                1.0,
+                params.clamped(),
+            );
             assert_eq!(orbs.len(), 1);
             assert_eq!(
                 orbs[0].main[3] as u32, expected,
@@ -4237,7 +4243,7 @@ mod tests {
             offset: 0.0,
             halo: 0.0,
         };
-        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, no_bloom);
+        let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, no_bloom);
         assert!(orbs[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
     }
 
@@ -4385,11 +4391,8 @@ mod tests {
     /// exact order. Guards the RNG-reproduction contract the whole WGSL path rests on.
     #[test]
     fn aquarelle_pack_satellite_positions_match_crate() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_satellite_positions_match_crate")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this RNG-reproduction test runs on every host, not just GPU CI.
         let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
         // weight 1.0 ⇒ radius == base_radius_unit; center at (0.5,0.5) ⇒ (100,100).
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
@@ -4403,8 +4406,14 @@ mod tests {
             offset: 0.5,
             halo: 0.5,
         };
-        let orbs =
-            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, params.clamped());
+        let orbs = GpuRenderer::pack_aquarelle_orbs(
+            &single,
+            w,
+            h,
+            base_radius_unit,
+            1.0,
+            params.clamped(),
+        );
         assert_eq!(orbs.len(), 1);
         assert_eq!(
             orbs[0].main[3] as u32, 3,
@@ -4439,11 +4448,8 @@ mod tests {
     /// center *exactly* (the θ draw is still consumed but multiplied by 0).
     #[test]
     fn aquarelle_pack_offset_direction_matches_seed_angle() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_offset_direction_matches_seed_angle")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this RNG-reproduction test runs on every host, not just GPU CI.
         let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
         let radius = base_radius_unit;
@@ -4458,7 +4464,7 @@ mod tests {
             halo: 0.0,
         };
         let orbs1 =
-            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p1.clamped());
+            GpuRenderer::pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p1.clamped());
         let exp_cx = center.0 + radius * 0.25 * theta.cos();
         let exp_cy = center.1 + radius * 0.25 * theta.sin();
         assert_eq!(
@@ -4478,7 +4484,7 @@ mod tests {
             halo: 0.0,
         };
         let orbs0 =
-            renderer.pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p0.clamped());
+            GpuRenderer::pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p0.clamped());
         assert_eq!(
             orbs0[0].main[0], center.0,
             "offset=0.0 main cx must be exact center"
@@ -4494,11 +4500,8 @@ mod tests {
     /// `.floor()`/`.trunc()` regression in the satellite count is caught.
     #[test]
     fn aquarelle_pack_bleed_count_round_boundaries() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_bleed_count_round_boundaries")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this rounding-edge test runs on every host, not just GPU CI.
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
         // (bleed, expected sat_count): just below/above each .5 boundary.
         for (bleed, expected) in [
@@ -4515,8 +4518,14 @@ mod tests {
                 offset: 0.0,
                 halo: 0.0,
             };
-            let orbs =
-                renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, params.clamped());
+            let orbs = GpuRenderer::pack_aquarelle_orbs(
+                &single,
+                200.0,
+                200.0,
+                40.0,
+                1.0,
+                params.clamped(),
+            );
             assert_eq!(
                 orbs[0].main[3] as u32, expected,
                 "bleed={bleed} ⇒ round(3*bleed) must be {expected}"
@@ -4529,11 +4538,8 @@ mod tests {
     /// reject it); bloom `0.0` must clear the flag and pack a zero core radius.
     #[test]
     fn aquarelle_pack_bloom_tiny_positive_keeps_core_positive() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_bloom_tiny_positive_keeps_core_positive")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this bloom-guard test runs on every host, not just GPU CI.
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
 
         let tiny = AquarelleParams {
@@ -4542,7 +4548,8 @@ mod tests {
             offset: 0.0,
             halo: 0.0,
         };
-        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, tiny.clamped());
+        let orbs =
+            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, tiny.clamped());
         assert!(
             orbs[0].inner[3] > 0.5,
             "bloom=1e-4 (>0) must set bloom_flag"
@@ -4559,7 +4566,8 @@ mod tests {
             offset: 0.0,
             halo: 0.0,
         };
-        let orbs0 = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, zero.clamped());
+        let orbs0 =
+            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, zero.clamped());
         assert!(orbs0[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
         assert_eq!(
             orbs0[0].bloom_geom[2], 0.0,
@@ -4572,11 +4580,8 @@ mod tests {
     /// row collapses. Guards the early `radius <= 0.0` skip path and row independence.
     #[test]
     fn aquarelle_pack_zero_weight_orb_packs_skip_row() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_zero_weight_orb_packs_skip_row")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this skip-row test runs on every host, not just GPU CI.
         // Orb 0: zero weight (dead). Orb 1: positive weight (real).
         let clusters = vec![
             cluster([200, 120, 60], 0.3, 0.3, 0.0),
@@ -4584,7 +4589,7 @@ mod tests {
         ];
         let params = AquarelleParams::default();
         let orbs =
-            renderer.pack_aquarelle_orbs(&clusters, 200.0, 200.0, 40.0, 1.0, params.clamped());
+            GpuRenderer::pack_aquarelle_orbs(&clusters, 200.0, 200.0, 40.0, 1.0, params.clamped());
         assert_eq!(orbs.len(), 2);
 
         // Dead row: radius 0, sat_count 0, all layer slots zero.
@@ -4618,10 +4623,8 @@ mod tests {
     /// clear the bloom flag (clamped to 0) rather than wrapping to a huge core.
     #[test]
     fn aquarelle_pack_clamps_out_of_range_params() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_pack_clamps_out_of_range_params")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this clamp test runs on every host, not just GPU CI.
         let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
         let wild = AquarelleParams {
             bleed: 5.0,
@@ -4631,7 +4634,7 @@ mod tests {
         };
         // The renderer clamps internally; pass the raw params (matching production:
         // `pack_aquarelle_orbs` calls `params.clamped()`).
-        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, wild);
+        let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, wild);
         assert!(
             (orbs[0].main[3] as u32) <= 3,
             "bleed=5.0 must clamp to ≤3 satellites (got {})",
@@ -4653,11 +4656,8 @@ mod tests {
     /// oracle desaturated.
     #[test]
     fn aquarelle_pack_saturation_zero_desaturates_layer_colors() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_pack_saturation_zero_desaturates_layer_colors")
-        else {
-            return;
-        };
+        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
+        // needed), so this saturation test runs on every host, not just GPU CI.
         let base = [200u8, 120, 60];
         let single = vec![cluster(base, 0.5, 0.5, 1.0)];
         // bleed=1.0 ⇒ satellites exist; bloom=0.5 ⇒ bloom color packed; halo=0.5.
@@ -4667,7 +4667,8 @@ mod tests {
             offset: 0.5,
             halo: 0.5,
         };
-        let orbs = renderer.pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 0.0, params.clamped());
+        let orbs =
+            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 0.0, params.clamped());
 
         // The pack desaturates the source first (saturation 0.0 ⇒ grayscale), then
         // boost_saturation/mix_with_white operate on that gray. A boost of an
