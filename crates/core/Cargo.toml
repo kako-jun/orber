@@ -18,8 +18,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # OFF (default): レンダラを持たない「SDF 生成 + データ pack + cluster/色 + SVG/CSS」
 # だけの core。wasm32 ビルドを最小に保ち、wgpu / pollster / bytemuck を引かない。
-# ON: native CLI 向けの wgpu (Rust + WGSL) production render path (#207) を足す。
+# ON: wgpu (Rust + WGSL) production render path (#207) を足す。
 # #225 で CPU 描画は撲滅され、GPU(WGSL) が唯一のレンダラ。
+# #229 で wasm32 + gpu もビルド可能: wasm では `GpuRenderer::new_async` +
+# to_view（外部 TextureView へ present）経路だけが見え、readback 系
+# （render_frame* / render_packed → RgbaImage）と pollster は native 専用。
+# wasm のバックエンドは wgpu default feature の webgpu のみ（`webgl` は採らない =
+# #207 方針: WebGPU 必須・fallback 無し）。
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
@@ -37,10 +42,15 @@ zeno = { workspace = true }
 # OrbShape::Glyph 用のフォントパース。'static lifetime のスライスから Face::parse で
 # 読めるので、include_bytes! 経路と相性がよい。
 ttf-parser = "0.25"
-# wgpu production renderer (#207)。gpu feature 内に閉じ込め、wasm32 を汚さない。
+# wgpu production renderer (#207)。gpu feature 内に閉じ込める。wasm32 では default
+# feature の webgpu バックエンドが使われる（#229。`webgl` feature は追加しない）。
 wgpu = { workspace = true, optional = true }
-pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+
+# pollster（`GpuRenderer::new` の block_on）は wasm32 で使えないため native 専用。
+# wasm からは async の `GpuRenderer::new_async` を直接 await する（#229）。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = { workspace = true, optional = true }
 
 # wasm32: getrandom needs the `wasm_js` backend so kmeans_colors' thread_rng compiles.
 # kmeans_colors 0.7 経由で getrandom 0.2 が、rand 0.9 経由で 0.3 が引かれるため両方を明示する。

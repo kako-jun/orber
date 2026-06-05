@@ -286,7 +286,7 @@ two distinct places:
 
 Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
-- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; rendering on the web runs in WebGL2).
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; rendering on the web currently runs in WebGL2). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam for #230), while the `RgbaImage` read-back API stays native-only.
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
