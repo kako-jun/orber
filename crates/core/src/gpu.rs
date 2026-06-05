@@ -491,7 +491,10 @@ impl GpuRenderer {
     /// Headless on purpose: no surface is created here even on wasm. The caller
     /// (orber-wasm, #230) owns the canvas surface — creation, configuration and
     /// present — and hands frames to this renderer via the `*_to_view` methods,
-    /// keeping core free of any web-sys / canvas knowledge.
+    /// keeping core free of any web-sys / canvas knowledge. A caller that needs a
+    /// **surface-compatible** adapter (requested with `compatible_surface`) brings
+    /// up the instance / adapter / device itself and uses
+    /// [`Self::from_device_queue`] instead (#230).
     pub async fn new_async() -> Option<Self> {
         // Headless: no window/display handle is needed (backends still come from env).
         let instance =
@@ -508,6 +511,28 @@ impl GpuRenderer {
             })
             .await
             .ok()?;
+        Some(Self::from_device_queue(device, queue, adapter_name))
+    }
+
+    /// Build a renderer around an **externally created** device / queue (#230).
+    ///
+    /// This is the surface-compatible construction seam for the browser WebGPU
+    /// path: a canvas surface must be created from the same `wgpu::Instance` that
+    /// requests the adapter (with `compatible_surface` set), so the caller
+    /// (orber-wasm) owns the whole instance → surface → adapter → device bring-up
+    /// and only hands the resulting device / queue here. Core stays free of any
+    /// web-sys / canvas knowledge; rendering then goes through the `*_to_view`
+    /// methods against the surface's frame views.
+    ///
+    /// `wgpu::Device` / `wgpu::Queue` are cheaply cloneable handles, so the caller
+    /// can keep clones (e.g. for `Surface::configure`) while the renderer owns its
+    /// own. [`Self::new_async`] routes through here, so both constructions share
+    /// the same cache / sampler setup.
+    pub fn from_device_queue(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_name: String,
+    ) -> Self {
         // Bilinear, clamp-to-edge sampler for the glyph SDF. Clamp-to-edge gives the
         // neighbor clamp the SDF sampling convention expects (`x1 = (x0+1).min(size-1)`),
         // and linear min/mag gives the 2×2 lerp.
@@ -521,7 +546,7 @@ impl GpuRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        Some(Self {
+        Self {
             device,
             queue,
             adapter_name,
@@ -535,7 +560,7 @@ impl GpuRenderer {
             bleed_textures: std::sync::Mutex::new(HashMap::new()),
             aquarelle_texture: std::sync::Mutex::new(None),
             render_guard: std::sync::Mutex::new(()),
-        })
+        }
     }
 
     /// Name of the underlying adapter (for diagnostics / proving the GPU path ran).
