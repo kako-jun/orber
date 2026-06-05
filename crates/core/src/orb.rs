@@ -12,7 +12,11 @@
 
 use crate::glyph::GlyphFontId;
 use crate::style::SoftnessPreset;
-use aquarelle::AquarelleParams;
+// `OrbShape::Aquarelle` が内包する [`aquarelle::AquarelleParams`] を core 越しに名前で
+// 参照できるよう `pub use` で re-export する（#231）。orber-wasm は aquarelle crate を
+// 直接依存しない（tiny-skia 推移依存を wasm に張りたくない）ため、`orber_core::orb::
+// AquarelleParams` 経由で型名を得る。
+pub use aquarelle::AquarelleParams;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use std::sync::Arc;
 
