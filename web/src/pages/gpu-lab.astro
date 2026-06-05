@@ -36,7 +36,7 @@
       <div id="glyph-controls" style="display:none; flex-direction:column; gap:8px;">
         <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
           <span style="width:96px;">glyph char</span>
-          <input id="glyph-char" type="text" maxlength="2" value="☆" style="flex:1; background:#222; color:#e8e8e8; border:1px solid #555; padding:4px; font:inherit;" />
+          <input id="glyph-char" type="text" maxlength="2" value="☆" title="最初の1文字だけ使われます（maxlength=2 はサロゲートペアの絵文字1文字を入れられるようにするためで、BMP文字を2つ入れると先頭だけが採用されます）" style="flex:1; background:#222; color:#e8e8e8; border:1px solid #555; padding:4px; font:inherit;" />
         </label>
         <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
           <span style="width:96px;">glyph rotate</span>
@@ -161,8 +161,11 @@
 
       const SRC = 32;
 
-      // 現在の UI 状態から wasm 用 params を組む。shape ごとに必要なフィールドだけ
-      // 埋める（serde default が他を 0.5 / 空に補完する）。
+      // 現在の UI 状態から wasm 用 params を組む。WasmParams の必須フィールド
+      // （direction / speed / count / orb_size / blur 等）は常に送るが、resolve_frame は
+      // それらの一部を spec（random_batch_specs）由来の値で上書きするため、ここで入れた
+      // 値がそのまま使われるとは限らない。shape 依存の追加フィールド（image マスク /
+      // aquarelle 4 値）だけは shape に応じて条件付きで足す（serde default が残りを補完）。
       function buildParams(): Record<string, unknown> {
         const shape = shapeSel.value;
         const params: Record<string, unknown> = {
@@ -203,6 +206,13 @@
       // ready 以降のみ呼ぶ。shape / パラメータ変更時に再構築する。
       function applyRenderData() {
         if (!ready) return;
+        // shape=image でマスク未ロードのときは汎用 ERROR ではなく、何をすべきか
+        // 分かる案内を出して早期 return する（rAF ループは止めない。次にマスクを
+        // 選べば imageFile の change ハンドラから再び applyRenderData が走る）。
+        if (shapeSel.value === 'image' && !imageMask) {
+          setStatus('shape=image: 先に画像を選んでください（choose an image file for the mask）');
+          return;
+        }
         try {
           // n=12 / spec_idx=8: GUI バッチと同じ 12 枚構成の動画タイル先頭
           // （direction=LR / speed=VerySlow の固定割当）。入力は spec ごとに

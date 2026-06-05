@@ -264,7 +264,7 @@ fn parse_shape(s: &str, glyph_char: &str, aquarelle: AquarelleParams) -> Result<
 ///
 /// GPU(WGSL) 経路専用（wasm32 / test のみコンパイル）。
 #[cfg(any(target_arch = "wasm32", test))]
-fn resolve_orb_shape(p: &WasmParams) -> Result<OrbShape, String> {
+fn resolve_orb_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
     if p.shape == "image" {
         return resolve_image_shape(p);
     }
@@ -278,7 +278,7 @@ fn resolve_orb_shape(p: &WasmParams) -> Result<OrbShape, String> {
 ///
 /// GPU(WGSL) 経路専用（wasm32 / test のみコンパイル）。
 #[cfg(any(target_arch = "wasm32", test))]
-fn resolve_image_shape(p: &WasmParams) -> Result<OrbShape, String> {
+fn resolve_image_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
     if p.image_mask_width == 0 || p.image_mask_height == 0 {
         return Err(
             "shape 'image' requires image_mask_width / image_mask_height > 0 (the silhouette mask)"
@@ -292,10 +292,13 @@ fn resolve_image_shape(p: &WasmParams) -> Result<OrbShape, String> {
             p.image_mask_rgba.len()
         ));
     }
+    // p を所有する呼び出し元（build_gpu_render_inputs）から &mut で受けているので、
+    // mask バイト列は clone せず take で奪う（このあと resolve_frame は image_mask_rgba を
+    // 読まないので奪っても安全。レビュー指摘の余計な alloc 解消）。
     let rgba = image::RgbaImage::from_raw(
         p.image_mask_width,
         p.image_mask_height,
-        p.image_mask_rgba.clone(),
+        std::mem::take(&mut p.image_mask_rgba),
     )
     .ok_or_else(|| "image_mask_rgba could not be wrapped as an RgbaImage".to_string())?;
     let size = orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE;
@@ -494,6 +497,16 @@ fn validate_params(p: &WasmParams) -> Result<(), String> {
         return Err(format!(
             "source_width / source_height must be <= {MAX_DIM}, got {}x{}",
             p.source_width, p.source_height
+        ));
+    }
+    // #231 review: image マスク（shape == "image" のときだけ意味を持つが、フィールド
+    // 自体は常に来うる）も上限なし alloc を防ぐため source_rgb と同流儀で MAX_DIM を課す。
+    // resolve_image_shape は image_mask_width * image_mask_height * 4 で RgbaImage を
+    // 確保するので、ここで早期に弾けば過大確保を未然に防げる。
+    if p.image_mask_width > MAX_DIM || p.image_mask_height > MAX_DIM {
+        return Err(format!(
+            "image_mask_width / image_mask_height must be <= {MAX_DIM}, got {}x{}",
+            p.image_mask_width, p.image_mask_height
         ));
     }
     Ok(())
@@ -699,12 +712,14 @@ impl ResolvedFrame {
 /// orb 用に常に作っておく＝分岐は描画時 1 箇所だけにする）。
 #[cfg(any(target_arch = "wasm32", test))]
 fn build_gpu_render_inputs(
-    p: WasmParams,
+    mut p: WasmParams,
     n: u32,
     spec_idx: u32,
 ) -> Result<GpuRenderInputs, String> {
     // 形状解決は resolve_frame が p を move する前に済ませる（image は mask bytes が要る）。
-    let shape = resolve_orb_shape(&p)?;
+    // resolve_orb_shape は image マスクを clone せず take で奪うため &mut で渡す
+    // （奪われた image_mask_rgba は resolve_frame では読まれない）。
+    let shape = resolve_orb_shape(&mut p)?;
     let resolved = resolve_frame(p, n, spec_idx)?;
 
     // orb pack は WebGL と同一の pack_render_data_for_webgl（shape_id=0.0）。
@@ -1127,7 +1142,7 @@ mod tests {
         // width/height 0 は Err。
         let mut p = base_params();
         p.shape = "image".into();
-        assert!(resolve_orb_shape(&p).is_err());
+        assert!(resolve_orb_shape(&mut p).is_err());
 
         // 長さ不一致は Err。
         let mut p = base_params();
@@ -1135,7 +1150,7 @@ mod tests {
         p.image_mask_width = 2;
         p.image_mask_height = 2;
         p.image_mask_rgba = vec![0; 3]; // 2*2*4=16 ではない
-        assert!(resolve_orb_shape(&p).is_err());
+        assert!(resolve_orb_shape(&mut p).is_err());
 
         // 単色（全 0）はコントラスト無しで Err（image_rgba_to_sdf が None）。
         let mut p = base_params();
@@ -1143,7 +1158,7 @@ mod tests {
         p.image_mask_width = 4;
         p.image_mask_height = 4;
         p.image_mask_rgba = vec![0; 4 * 4 * 4];
-        assert!(resolve_orb_shape(&p).is_err());
+        assert!(resolve_orb_shape(&mut p).is_err());
 
         // 上半分不透明 / 下半分透明のマスクはシルエットがあり Image に解決する。
         let mut p = base_params();
@@ -1163,7 +1178,7 @@ mod tests {
             }
         }
         p.image_mask_rgba = rgba;
-        match resolve_orb_shape(&p) {
+        match resolve_orb_shape(&mut p) {
             Ok(OrbShape::Image { size, sdf }) => {
                 assert_eq!(size, orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE);
                 assert_eq!(sdf.len(), (size * size) as usize);
@@ -1264,6 +1279,38 @@ mod tests {
     #[test]
     fn validate_accepts_reasonable_params() {
         assert!(validate_params(&base_params()).is_ok());
+    }
+
+    /// #231 review: image マスク次元も source_rgb と同流儀で MAX_DIM を課す。
+    /// 境界（MAX_DIM ちょうど=OK / MAX_DIM+1=Err）を 1 テストで固定する。
+    /// validate_params は次元比較だけで mask bytes を確保しないため、MAX_DIM
+    /// ちょうどでも巨大 alloc は起きない（過大確保の早期遮断が狙い）。
+    #[test]
+    fn build_gpu_render_inputs_image_mask_too_large_errors() {
+        // MAX_DIM ちょうどは OK（width 側・height 側どちらも）。
+        let mut p = base_params();
+        p.image_mask_width = MAX_DIM;
+        p.image_mask_height = MAX_DIM;
+        assert!(
+            validate_params(&p).is_ok(),
+            "image_mask dims == MAX_DIM must pass"
+        );
+
+        // MAX_DIM + 1 は Err（width 側）。
+        let mut p = base_params();
+        p.image_mask_width = MAX_DIM + 1;
+        assert!(
+            validate_params(&p).is_err(),
+            "image_mask_width > MAX_DIM must error"
+        );
+
+        // MAX_DIM + 1 は Err（height 側）。
+        let mut p = base_params();
+        p.image_mask_height = MAX_DIM + 1;
+        assert!(
+            validate_params(&p).is_err(),
+            "image_mask_height > MAX_DIM must error"
+        );
     }
 
     fn synth_spec(direction: MotionDirection) -> VariationSpec {
