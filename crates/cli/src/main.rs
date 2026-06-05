@@ -1,6 +1,6 @@
+use aquarelle::AquarelleParams;
 use clap::{Parser, ValueEnum};
 use orber_core::animate::{MotionDirection, MotionSpeed};
-use orber_core::aquarelle::AquarelleParams;
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber_core::glyph::{has_glyph, GlyphFontId};
 use orber_core::orb::{OrbShape, RenderOptions};
