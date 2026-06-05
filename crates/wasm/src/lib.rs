@@ -183,6 +183,27 @@ fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
     }
 }
 
+/// WebGL fragment shader 用の shape_id を返す (#172 N2)。
+///
+/// per-orb pack は SDF を持たない（SDF は web が WebGL に直接 upload する）ので、
+/// wasm 側が形状について返すのは shape_id（0=Circle / 1=Glyph・Image）だけで足りる。
+///
+/// - `"image"` (#217): char は不要。web が画像から生成した SDF テクスチャを upload
+///   するため、wasm は SDF を持たず Glyph と同じ SDF サンプル経路に乗せるだけ。
+///   shape_id=1 を直接返す（従来 web が glyph+ダミー字で得ていた値と同一）。
+/// - それ以外: `parse_shape` に委譲して OrbShape へマップする。これにより
+///   `glyph` の glyph_char 必須バリデーションや不正 shape の reject が維持される。
+fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
+    if shape == "image" {
+        return Ok(1.0);
+    }
+    match parse_shape(shape, glyph_char)? {
+        OrbShape::Circle => Ok(0.0),
+        OrbShape::Glyph { .. } => Ok(1.0),
+        _ => Ok(0.0),
+    }
+}
+
 fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
     let rgb = std::mem::take(&mut p.source_rgb);
     image::RgbImage::from_raw(p.source_width, p.source_height, rgb).ok_or_else(|| {
@@ -397,7 +418,8 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 /// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow, 3 = Mid, 4 = Fast)
 /// - `[8]`: n_orbs (整数を f32 として)
 /// - `[9]`: softness_alpha_mul (0..1) — Phase B (#55)。Mid なら 0.55 (#205 後)
-/// - `[10]`: shape_id (0=Circle, 1=Glyph) — Phase B (#55)
+/// - `[10]`: shape_id (0=Circle, 1=Glyph/Image) — Phase B (#55) / #172 N2。
+///   Image は web が SDF を upload するため Glyph と同じ shape_id=1 に乗る。
 /// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
 /// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
 /// - `[13..16]`: 予約（0 詰め）
@@ -422,8 +444,10 @@ pub fn get_render_data(
     spec_idx: u32,
 ) -> Result<js_sys::Float32Array, JsError> {
     let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    // Phase B (#55): shape = "circle" | "glyph"。glyph_char は Glyph のときに必須。
-    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
+    // Phase B (#55) / #172 N2: shape = "circle" | "glyph" | "image"。
+    // glyph_char は Glyph のときに必須（image は char 不要）。webgl_shape_id が
+    // 形状に応じた shape_id を返しつつ glyph のバリデーションを維持する。
+    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char).map_err(err_to_js)?;
     let count_override = parse_count_preset(&p.count_preset).map_err(err_to_js)?;
     let speed_override = parse_speed_preset(&p.speed_preset).map_err(err_to_js)?;
     let softness = parse_softness_preset(&p.softness_preset).map_err(err_to_js)?;
@@ -486,15 +510,10 @@ pub fn get_render_data(
     let alpha_mul = softness.alpha_mul().clamp(0.0, 1.0);
     // #205: Glyph/image アーム smoothstep 幅を softness 連動。Circle は参照しない。
     let edge_softness = softness.edge_softness();
-    let shape_id: f32 = match shape {
-        OrbShape::Circle => 0.0,
-        OrbShape::Glyph { .. } => 1.0,
-        // Aquarelle は WebGL 経路非対応で parse_shape が弾く。Image (#217) は web が
-        // 既存の SDF 直渡し経路で描くため、この wasm 入口（parse_shape は circle/glyph
-        // のみ返す）には到達しない。いずれも念のため Circle 扱いにフォールバック
-        // （パニックさせない）。Image を wasm 入口で受けるのは将来 Phase 3。
-        _ => 0.0,
-    };
+    // shape_id は webgl_shape_id で算出済み（Circle=0 / Glyph・Image=1）。#172 N2 で
+    // image を wasm 入口へ直接受けるようになり、web 側のダミー glyph_char 受け渡しは廃止。
+    // image の SDF は web が WebGL に upload するので、wasm は Glyph と同じ shape_id=1 に
+    // 乗せて同一の SDF サンプル経路で描かせる（描画結果は従来と不変）。
 
     let buf = pack_render_data(
         &clusters,
@@ -725,6 +744,21 @@ mod tests {
         // Aquarelle は wasm 入口で受けない。
         assert!(parse_shape("aquarelle", "").is_err());
         assert!(parse_shape("", "").is_err());
+    }
+
+    /// #172 N2: webgl_shape_id が shape 文字列を直接 shape_id にマップする。
+    /// image は char 不要で 1.0、circle は 0.0、glyph は char 必須で 1.0。
+    /// 不正 shape / 空 glyph_char は parse_shape 経由で Err になる。
+    #[test]
+    fn webgl_shape_id_maps_shapes() {
+        // image は glyph_char 不要で shape_id=1（Glyph と同じ SDF サンプル経路）。
+        assert_eq!(webgl_shape_id("image", "").unwrap(), 1.0);
+        assert_eq!(webgl_shape_id("circle", "").unwrap(), 0.0);
+        assert_eq!(webgl_shape_id("glyph", "☆").unwrap(), 1.0);
+        // glyph は glyph_char 必須。空はエラー（parse_shape のバリデーション維持）。
+        assert!(webgl_shape_id("glyph", "").is_err());
+        // 不正 shape も parse_shape 経由で reject される。
+        assert!(webgl_shape_id("bogus", "").is_err());
     }
 
     #[test]
