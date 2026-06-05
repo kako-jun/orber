@@ -30,6 +30,16 @@ import type { DecodedImage } from '../lib/decodeImage';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from '../lib/orberGl';
 import { generateImageSdf, generateJsGlyphSdf } from '../lib/jsGlyphSdf';
 import { isWebGpuSupported } from '../lib/webgpu';
+import {
+  abCanStart,
+  buildAbBaseParams,
+  CANVAS_W,
+  CANVAS_H,
+  PERIOD_MS,
+  AB_N,
+  AB_SPEC_IDX,
+  type ShapeChoice,
+} from '../lib/abLogic';
 import { t } from '../lib/strings';
 import initWasm, {
   get_render_data,
@@ -40,18 +50,6 @@ import initWasm, {
   gpu_set_render_data,
 } from '../wasm/orber_wasm.js';
 
-// gpu-lab と同じ canvas サイズ / VerySlow 1cycle 周期。
-const CANVAS_W = 270;
-const CANVAS_H = 480;
-const PERIOD_MS = 8000;
-// 固定 seed（再現性優先・コメントで明記）。Studio 本番経路は毎回乱数 seed を
-// 引くが、A/B 比較は「同じ入力で新旧の見た目が一致するか」を見るので固定する。
-const AB_SEED = 42;
-// gpu-lab と同じ video spec（direction=LR / speed=VerySlow の固定割当先頭）。
-const AB_N = 12;
-const AB_SPEC_IDX = 8;
-
-type ShapeChoice = 'orb' | 'glyph' | 'image';
 type Side = 'webgl' | 'wgsl';
 
 // Studio が保持する現在状態を accessor で受け取る（A/B は読むだけ・書き込まない）。
@@ -117,32 +115,20 @@ export default function AbPanel(props: AbPanelProps) {
   const hasSource = () => props.decoded() !== null;
   // image shape のとき File 未選択なら開始不可（image_mask が組めない）。
   const canStart = () =>
-    hasSource() && !(props.shape() === 'image' && props.imageShapeFile() === null);
+    abCanStart(props.shape(), hasSource(), props.imageShapeFile() !== null);
 
   // 現在の Studio 状態から両レンダラ共通の params を組む。
   // shape 依存の追加フィールド（image_mask / glyph_sdf）は呼び出し側で足す。
   function buildBaseParams(src: DecodedImage): Record<string, unknown> {
-    return {
-      source_rgb: src.rgb,
-      source_width: src.width,
-      source_height: src.height,
-      k: 5,
-      width: CANVAS_W,
-      height: CANVAS_H,
-      seed: AB_SEED,
-      // direction/speed/count/orb_size/blur は spec で上書きされるが必須なので送る。
-      direction: 'lr',
-      speed: 'slow',
-      count: 20,
-      orb_size: 3.0,
-      blur: 0.5,
-      shape: props.shape(),
-      glyph_char: props.shape() === 'glyph' ? props.glyphChar() : '',
-      glyph_rotate: props.glyphRotate(),
-      count_preset: props.countPreset(),
-      speed_preset: props.speedPreset(),
-      softness_preset: props.softnessPreset(),
-    };
+    return buildAbBaseParams(
+      src,
+      props.shape(),
+      props.glyphChar(),
+      props.glyphRotate(),
+      props.countPreset(),
+      props.speedPreset(),
+      props.softnessPreset(),
+    );
   }
 
   // 停止処理: rAF を止め、リソースを破棄して計測をリセットする。
