@@ -782,6 +782,12 @@ pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
 mod tests {
     use super::*;
 
+    /// `source_cache()` のグローバル `RefCell` を触るテストを直列化するためのガード。
+    /// native の `cargo test` は既定でテストを並列実行するため、複数テストが同時に
+    /// `get_or_build_clusters()` → `borrow_mut()` すると `BorrowMutError` になる
+    /// (#220)。production(wasm) は single-thread なのでこの直列化はテスト専用。
+    static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parse_direction_roundtrip() {
         assert!(matches!(
@@ -1121,6 +1127,7 @@ mod tests {
 
     #[test]
     fn pack_render_data_matches_core_pack_helper() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = base_params();
         p.k = 2;
         p.source_width = 2;
@@ -1180,6 +1187,7 @@ mod tests {
     /// 入っていることを担保する。
     #[test]
     fn pack_render_data_header_includes_edge_softness() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = base_params();
         p.k = 2;
         p.source_width = 2;
