@@ -37,7 +37,7 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (circle / aquarelle bleed / glyph / image), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (orb / aquarelle bleed / glyph / image), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
 
 ```bash
 orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --softness low
@@ -62,7 +62,7 @@ one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace wit
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
 # Video input: keyframe interpolation (#33) — color + position + weight all lerp between keyframes
-# centroid drift is visible on both Aquarelle (full) and Circle (50% blended with per-orb scatter).
+# centroid drift is visible on both Aquarelle (full) and Orb (50% blended with per-orb scatter).
 orber --input video.mp4 --output orb.mp4 --input-mode keyframe --keyframes 8 --duration-ms 10000
 ```
 
@@ -79,7 +79,7 @@ blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for 
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen buffer would interfere with the
 > rendered halo). The off-screen wrap buffer described above applies to the
-> `circle`, `glyph`, and `image` shapes (`image` shares the `glyph` SDF render
+> `orb`, `glyph`, and `image` shapes (`image` shares the `glyph` SDF render
 > path).
 
 ### Orb count
@@ -122,11 +122,13 @@ embedded via `include_bytes!`) covering ASCII, digits, punctuation, arrows,
 geometric shapes, Dingbats, and supplemental symbols. Hiragana, kanji, emoji
 and other characters outside this subset are silently skipped instead of
 drawing tofu. The glyph outline is converted to a cached **signed-distance
-field**, so `--blur` and `--softness` now affect glyphs with the same visual
-meaning as circle orbs: soft edge falloff, not a hard text fill. After every
-glyph orb has been painted, a single watercolor **bleed pass** from the
-`aquarelle` crate is applied over the whole image, so the SDF outline gains a
-paper-bleed softness on top of the edge falloff (Circle renders are unaffected).
+field**, so `--blur` and `--softness` affect glyphs with the same visual
+meaning as plain orbs: soft edge falloff, not a hard text fill. Since #235 the
+glyph is fed to the **same orb mechanism** as the plain `orb` shape — the SDF is
+just a different silhouette, blurred with the orb's falloff / breath / rim-soft
+compositing. There is no separate bleed/halo pass: a `●` glyph looks like a plain
+orb, a `▲` blurs while keeping its triangular form. (Watercolor bleed is the
+`aquarelle` shape's domain only.)
 Glyphs also get a seed-derived base angle so stills are not a wall of
 identically oriented symbols; animated outputs continue rotating per orb from
 that base angle.
@@ -152,9 +154,10 @@ image is thresholded by **luminance** with auto-polarity (the minority region is
 treated as the subject, so a dark logo on a light background and a light logo on
 a dark background both work without a flip flag). The image is letterboxed to a
 square (aspect preserved) before thresholding, then converted to the same cached
-**signed-distance field** glyphs use — so `--blur` / `--softness` and the
-post-render watercolor **bleed pass** apply identically. A blank or single
-flat-color mask has no usable contrast and exits with an explicit error.
+**signed-distance field** glyphs use — so it is fed to the same orb mechanism and
+`--blur` / `--softness` apply identically (since #235, a single pass with the
+orb's edge falloff; no separate bleed pass). A blank or single flat-color mask
+has no usable contrast and exits with an explicit error.
 
 Only **raster** images are accepted (PNG / JPEG / etc.); SVG is web-only because
 the CLI decodes raster formats only.
