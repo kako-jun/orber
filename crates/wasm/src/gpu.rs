@@ -9,21 +9,26 @@
 //!   エラーで reject する。**fallback は無い**（#207 方針。wgpu の `webgl`
 //!   feature は採らない）。
 //! - [`gpu_set_render_data`]\(params_js, n, spec_idx\) — `get_render_data` と
-//!   同一経路（`build_render_pack`）で pack を構築して保持する。pack は spec
-//!   ごとに静的で、モーションは `t` がシェーダ内で駆動する（WebGL 版と同じ構造）。
-//! - [`gpu_render`]\(t\) — surface frame を acquire し、保持 pack + `t` で
-//!   `render_packed_to_view` → present。
+//!   同じ spec 解決経路（`build_gpu_render_inputs` → 共有の `resolve_frame`）で
+//!   shape 別の描画入力（clusters + opts + orb 用 pack）を構築して保持する。入力は
+//!   spec ごとに静的で、モーションは `t` がシェーダ内で駆動する（WebGL 版と同じ構造）。
+//! - [`gpu_render`]\(t\) — surface frame を acquire し、保持入力 + `t` で
+//!   `opts.shape` 別の core 経路（`render_packed_to_view` / `render_frame_*_to_view`）
+//!   → present。
 //! - [`gpu_resize`]\(w, h\) — surface を新サイズで再 configure する。
 //!
-//! ## 形状について
+//! ## 形状について（#231 で全 shape 配線）
 //!
-//! 現状 **Orb のみ**の最小経路。`gpu_set_render_data` は #231 で配線されるまで
-//! orb 以外の shape（glyph / image）を明確なエラーで reject する
-//! （`ensure_gpu_supported_shape`）。`gpu_render` は orb パイプライン
-//! （`render_packed_to_view`、SDF 無し）しか持たないため、黙って受理すると
-//! orb として誤描画される。Glyph / Image / Aquarelle（#231）は shape ごとの
-//! SDF / aquarelle pack の保持と `render_frame_*_to_view` への分岐をここに
-//! 足し、この reject を外す。
+//! `gpu_set_render_data` は orb / glyph / image / aquarelle の 4 shape を受ける。
+//! `build_gpu_render_inputs` が `build_render_pack`（WebGL）と同じ `resolve_frame`
+//! で spec / preset / kmeans を解決し、形状を `OrbShape` まで解決して
+//! [`AnimateOptions`] + clusters（+ orb 用 pack）を保持する。`gpu_render(t)` は
+//! `opts.shape` で core の公開 API へ分岐する（CLI の `FrameRenderer::render` と
+//! 同じ分岐構造 = parity）:
+//! - Orb: pack 経由 `render_packed_to_view`（#230 の見た目を一切変えないため温存）
+//! - Glyph: `render_frame_glyph_to_view`（SDF orb 単パス、#235。glyph_rotate 含む #136）
+//! - Image: `render_frame_image_to_view`（`image_rgba_to_sdf` で作った SDF を食わせる）
+//! - Aquarelle: `render_frame_aquarelle_to_view`（4 層モデル、ChaCha8 per-orb pack）
 //!
 //! ## surface format / alpha mode の選択
 //!
@@ -36,13 +41,13 @@
 
 use std::sync::OnceLock;
 
+use orber_core::animate::AnimateOptions;
+use orber_core::cluster::Cluster;
 use orber_core::gpu::GpuRenderer;
+use orber_core::orb::OrbShape;
 use wasm_bindgen::prelude::*;
 
-use crate::{
-    build_render_pack, deserialize_params, ensure_gpu_supported_shape, err_to_js,
-    WasmSingleThreadCell,
-};
+use crate::{build_gpu_render_inputs, deserialize_params, err_to_js, WasmSingleThreadCell};
 
 /// `gpu_init` で組み上がる一式。surface の configure（resize / Outdated 回復）
 /// には device が要るが、`GpuRenderer` は device を private に持つため、
@@ -52,9 +57,18 @@ struct GpuState {
     device: wgpu::Device,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    /// `gpu_set_render_data` が構築した pack（`pack_render_data_for_webgl`
-    /// レイアウト）。spec ごとに静的で、`gpu_render(t)` のたびに再利用する。
-    pack: Option<Vec<f32>>,
+    /// `gpu_set_render_data` が解決した 1 タイル分の描画入力（#231）。spec ごとに
+    /// 静的で、`gpu_render(t)` のたびに `t` だけ変えて再利用する。orb は `pack`、
+    /// glyph / image / aquarelle は `clusters` + `opts` で core 経路へ分岐する。
+    frame: Option<FrameInputs>,
+}
+
+/// `gpu_set_render_data` が保持する 1 タイル分の解決済み入力（#231）。`crate::
+/// GpuRenderInputs` をモジュール内の保持用に展開したもの。
+struct FrameInputs {
+    clusters: Vec<Cluster>,
+    opts: AnimateOptions,
+    pack: Vec<f32>,
 }
 
 /// wasm シングルスレッド前提のグローバル状態。lib.rs の `source_cache` と同じ
@@ -169,35 +183,36 @@ pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsEr
         device,
         surface,
         config,
-        pack: None,
+        frame: None,
     });
     Ok(adapter_name)
 }
 
-/// バッチ `spec_idx` 番目の pack を構築して保持する。`get_render_data` と
-/// 完全に同じ経路（[`build_render_pack`]: spec 再構築・preset 上書き・kmeans
-/// キャッシュ込み）なので、同じ params なら WebGL 版と同一の pack になる。
-/// モーションは pack に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
-///
-/// shape は #231 で配線されるまで `"orb"` のみ。glyph / image は orb として
-/// 誤描画されるため明確なエラーで reject する（モジュール doc「形状について」）。
+/// バッチ `spec_idx` 番目の描画入力を構築して保持する（#231 で全 shape 配線）。
+/// `get_render_data` と同じ spec 解決経路（[`build_gpu_render_inputs`] → 共有の
+/// `resolve_frame`: spec 再構築・preset 上書き・kmeans キャッシュ込み）なので、
+/// 同じ params なら WebGL 版と同一の spec / per-orb 解決になる。形状は
+/// `resolve_orb_shape` で全 shape（orb / glyph / image / aquarelle）に解決する。
+/// モーションは入力に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
 #[wasm_bindgen]
 pub fn gpu_set_render_data(params_js: JsValue, n: u32, spec_idx: u32) -> Result<(), JsError> {
     let p = deserialize_params(params_js).map_err(err_to_js)?;
-    // S1: gpu_render は orb パイプラインしか持たない。orb 以外は silent
-    // wrong-render になるため、pack を構築する前に reject する。
-    ensure_gpu_supported_shape(&p.shape).map_err(err_to_js)?;
-    let pack = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;
+    let inputs = build_gpu_render_inputs(p, n, spec_idx).map_err(err_to_js)?;
     let mut guard = gpu_state().borrow_mut();
     let state = guard
         .as_mut()
         .ok_or_else(|| JsError::new("gpu_set_render_data called before gpu_init"))?;
-    state.pack = Some(pack);
+    state.frame = Some(FrameInputs {
+        clusters: inputs.clusters,
+        opts: inputs.opts,
+        pack: inputs.pack,
+    });
     Ok(())
 }
 
-/// 保持 pack の時刻 `t`（0..1、シェーダ側で clamp）のフレームを canvas に描いて
-/// present する。requestAnimationFrame ごとに呼ぶ想定。
+/// 保持入力の時刻 `t`（0..1、シェーダ側で clamp）のフレームを canvas に描いて
+/// present する。requestAnimationFrame ごとに呼ぶ想定。`opts.shape` で core の
+/// 公開 API へ分岐する（#231、CLI の `FrameRenderer::render` と同じ分岐 = parity）。
 ///
 /// surface frame の取得に失敗したフレームは黙って skip する（Timeout /
 /// Occluded。次の rAF で回復する一時状態）。Outdated は保持 config で
@@ -209,10 +224,9 @@ pub fn gpu_render(t: f32) -> Result<(), JsError> {
     let state = guard
         .as_mut()
         .ok_or_else(|| JsError::new("gpu_render called before gpu_init"))?;
-    let pack = state
-        .pack
-        .as_ref()
-        .ok_or_else(|| JsError::new("gpu_render called before gpu_set_render_data"))?;
+    if state.frame.is_none() {
+        return Err(JsError::new("gpu_render called before gpu_set_render_data"));
+    }
 
     let frame = match state.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -243,14 +257,27 @@ pub fn gpu_render(t: f32) -> Result<(), JsError> {
     let view = frame
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
-    state.renderer.render_packed_to_view(
-        pack,
-        state.config.width,
-        state.config.height,
-        t,
-        &view,
-        state.config.format,
-    );
+    let width = state.config.width;
+    let height = state.config.height;
+    let format = state.config.format;
+    // `frame.is_none()` を上で弾いているので unwrap は安全（同一 borrow 内で値は変わらない）。
+    let f = state.frame.as_ref().expect("frame checked above");
+    let renderer = &state.renderer;
+    // shape 別ディスパッチ（CLI の FrameRenderer::render と同じ構造）。Orb は #230 の
+    // pack 経路を温存して見た目を一切変えない。glyph / image / aquarelle は clusters +
+    // opts を core の専用 to_view 経路へ渡す（SDF / aquarelle pack の面倒は core が見る）。
+    match &f.opts.shape {
+        OrbShape::Glyph { .. } => {
+            renderer.render_frame_glyph_to_view(&f.clusters, &f.opts, t, &view, format)
+        }
+        OrbShape::Image { .. } => {
+            renderer.render_frame_image_to_view(&f.clusters, &f.opts, t, &view, format)
+        }
+        OrbShape::Aquarelle(_) => {
+            renderer.render_frame_aquarelle_to_view(&f.clusters, &f.opts, t, &view, format)
+        }
+        OrbShape::Orb => renderer.render_packed_to_view(&f.pack, width, height, t, &view, format),
+    }
     frame.present();
     Ok(())
 }
