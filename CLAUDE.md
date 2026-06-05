@@ -86,6 +86,8 @@ orber/
                                 #   core の GpuRenderer(WGSL) が canvas surface に直接描く。
                                 #   全 shape 配線済み（#231: orb / glyph / image / aquarelle を
                                 #   opts.shape で render_packed_to_view / render_frame_*_to_view へ分岐）
+                                #   glyph は同梱フォント外の字（漢字/絵文字）を JS の generateJsGlyphSdf で
+                                #   SDF 化し WasmParams.glyph_sdf で受けて OrbShape::Image に解決（WebGL #159 と同設計）
 
 web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind

@@ -83,7 +83,12 @@
     <div id="fps" style="font-size:12px; color:#9a9a9a;"></div>
 
     <script>
-      import init, { gpu_init, gpu_set_render_data, gpu_render } from '../wasm/orber_wasm.js';
+      import init, { gpu_init, gpu_set_render_data, gpu_render, glyph_supported } from '../wasm/orber_wasm.js';
+      // #231: 同梱フォント外（ひらがな・漢字・絵文字）の glyph SDF を OS フォントスタックで
+      // 作るフォールバック（WebGL 版 #159 と同じ設計）。size は WebGL 版（orberWorker.ts が
+      // 使う orberGl.ts の GLYPH_SDF_SIZE）と同じ定数源を参照する（ハードコードしない）。
+      import { generateJsGlyphSdf } from '../lib/jsGlyphSdf';
+      import { GLYPH_SDF_SIZE } from '../lib/orberGl';
 
       const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
       const btn = document.getElementById('start') as HTMLButtonElement;
@@ -106,6 +111,9 @@
       let ready = false;
       // image マスク（File → RGBA bytes）。shape=image のとき必須。
       let imageMask: { rgba: Uint8Array; width: number; height: number } | null = null;
+      // #231: 直近の glyph で OS フォントフォールバック（同梱フォント外）を使ったか。
+      // buildParams が立て、applyRenderData が status 注記に使う。
+      let lastGlyphUsedJsFallback = false;
 
       // 各 shape のコントロール表示を切り替える。
       function syncControls() {
@@ -188,6 +196,22 @@
           speed_preset: '',
           softness_preset: '',
         };
+        lastGlyphUsedJsFallback = false;
+        if (shape === 'glyph') {
+          // #231: 先頭 1 文字を採り、同梱フォント（Noto Sans Symbols 2 サブセット）に
+          // 収録されていれば従来どおり core 経路（glyph_sdf を送らない）。収録外
+          // （ひらがな・漢字・絵文字）は generateJsGlyphSdf（OffscreenCanvas + OS フォント
+          // スタック）で SDF 化して glyph_sdf / glyph_sdf_size に乗せる（WebGL 版 #159 と
+          // 同じフォールバック。「ユーザーが入れた字を尊重して描画する」設計）。
+          const ch = glyphChar.value;
+          const firstCh = Array.from(ch)[0] ?? '';
+          if (firstCh && !glyph_supported(firstCh)) {
+            const size = GLYPH_SDF_SIZE;
+            params.glyph_sdf = generateJsGlyphSdf(firstCh, size);
+            params.glyph_sdf_size = size;
+            lastGlyphUsedJsFallback = true;
+          }
+        }
         if (shape === 'image') {
           if (!imageMask) throw new Error('shape=image requires an image mask (choose a file)');
           params.image_mask_rgba = imageMask.rgba;
@@ -218,7 +242,9 @@
           // （direction=LR / speed=VerySlow の固定割当）。入力は spec ごとに
           // 静的で、モーションは t がシェーダ内で駆動する。
           gpu_set_render_data(buildParams(), 12, 8);
-          setStatus(`shape=${shapeSel.value} — rendering`);
+          // #231: glyph が同梱フォント外で OS フォントフォールバックを使ったときは注記する。
+          const note = lastGlyphUsedJsFallback ? '（OS フォントで描画＝同梱フォント外）' : '';
+          setStatus(`shape=${shapeSel.value} — rendering${note}`);
         } catch (e) {
           console.error('[gpu-lab]', e);
           setStatus(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
