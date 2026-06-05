@@ -32,6 +32,9 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 tiny-skia = { workspace = true }
+# glyph font→SDF の fill 専用ラスタライザ（pure Rust, wasm 可）。tiny-skia 撲滅 (#223)
+# の前提スライス A として、グリフのカバレッジ生成だけ tiny-skia から zeno に移す。
+zeno = { workspace = true }
 # OrbShape::Glyph 用のフォントパース。'static lifetime のスライスから Face::parse で
 # 読めるので、include_bytes! 経路と相性がよい。
 ttf-parser = "0.25"

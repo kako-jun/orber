@@ -16,8 +16,9 @@
 //! - グリフが見つからない場合 ([`Face::glyph_index`] が `None` を返す or `outline_glyph`
 //!   が空アウトラインを返す) は **何も描画しない**。tofu は出さない。Phase A の方針として、
 //!   絵文字など Symbols 2 に無い文字は静かに無視する
-//! - フォントのアウトラインは Y 軸が上向き（font em スケール）。tiny-skia は Y 軸下向きなので、
-//!   `OutlineBuilder` 内で y を反転して積み込む
+//! - フォントのアウトラインは Y 軸が上向き（font em スケール）。ラスタライザ (zeno) は
+//!   Y 軸下向きなので、`OutlineBuilder` 内で y を反転して積み込む。SDF の fill は
+//!   tiny-skia から zeno (pure Rust, wasm 可) に置換済み (#223)
 //! - センタリングは `glyph_bounding_box` の中央を orb 中心に合わせ、半径 × 2 の正方領域に
 //!   収まるよう em-square 基準でスケールする
 
@@ -25,8 +26,9 @@ use crate::style::{falloff_curve, FalloffProfile};
 use std::collections::HashMap;
 use std::f32::consts::FRAC_1_SQRT_2;
 use std::sync::{Arc, Mutex, OnceLock};
-use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Shader, Transform};
+use tiny_skia::Pixmap;
 use ttf_parser::{Face, OutlineBuilder, Rect};
+use zeno::{Command, Mask, Point};
 
 /// WebGL / preview path で使う既定 Glyph SDF texture size。
 pub const DEFAULT_GLYPH_SDF_SIZE: u32 = 256;
@@ -77,12 +79,14 @@ fn face_for(id: GlyphFontId) -> Option<&'static Face<'static>> {
     }
 }
 
-/// `tiny_skia::PathBuilder` にアウトラインを積む `OutlineBuilder` 実装。
+/// zeno のパスコマンド列 (`Vec<zeno::Command>`) にアウトラインを積む
+/// `OutlineBuilder` 実装。
 ///
-/// フォントは Y 軸上向き、tiny-skia は Y 軸下向きなので、ここで y を反転する。
-/// 同時に em スケールから「orb 半径×2 の正方領域」スケールへの線形変換を適用する。
+/// フォントは Y 軸上向き、zeno のラスタライザは Y 軸下向き (`Origin::TopLeft`) なので、
+/// ここで y を反転する。同時に em スケールから「orb 半径×2 の正方領域」スケールへの
+/// 線形変換を適用する。`map()` の幾何は tiny-skia 時代から不変 (#223)。
 struct GlyphPathBuilder {
-    pb: PathBuilder,
+    cmds: Vec<Command>,
     /// X 方向のスケール係数（em 単位 → ピクセル）。
     scale: f32,
     /// オフセット（em 中心 → orb 中心 - bbox 半幅）。
@@ -94,38 +98,36 @@ struct GlyphPathBuilder {
 }
 
 impl GlyphPathBuilder {
-    /// em 座標 (x_em, y_em) を tiny-skia ピクセル座標に変換する。
+    /// em 座標 (x_em, y_em) を zeno ピクセル座標 (`Point`) に変換する。
     /// y は反転（フォント上向き → スクリーン下向き）。
     #[inline]
-    fn map(&self, x_em: f32, y_em: f32) -> (f32, f32) {
+    fn map(&self, x_em: f32, y_em: f32) -> Point {
         let px = self.cx + (x_em + self.offset_x) * self.scale;
         let py = self.cy - (y_em + self.offset_y) * self.scale;
-        (px, py)
+        Point::new(px, py)
     }
 }
 
 impl OutlineBuilder for GlyphPathBuilder {
     fn move_to(&mut self, x: f32, y: f32) {
-        let (px, py) = self.map(x, y);
-        self.pb.move_to(px, py);
+        self.cmds.push(Command::MoveTo(self.map(x, y)));
     }
     fn line_to(&mut self, x: f32, y: f32) {
-        let (px, py) = self.map(x, y);
-        self.pb.line_to(px, py);
+        self.cmds.push(Command::LineTo(self.map(x, y)));
     }
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        let (p1x, p1y) = self.map(x1, y1);
-        let (px, py) = self.map(x, y);
-        self.pb.quad_to(p1x, p1y, px, py);
+        self.cmds
+            .push(Command::QuadTo(self.map(x1, y1), self.map(x, y)));
     }
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        let (p1x, p1y) = self.map(x1, y1);
-        let (p2x, p2y) = self.map(x2, y2);
-        let (px, py) = self.map(x, y);
-        self.pb.cubic_to(p1x, p1y, p2x, p2y, px, py);
+        self.cmds.push(Command::CurveTo(
+            self.map(x1, y1),
+            self.map(x2, y2),
+            self.map(x, y),
+        ));
     }
     fn close(&mut self) {
-        self.pb.close();
+        self.cmds.push(Command::Close);
     }
 }
 
@@ -138,9 +140,10 @@ pub fn has_glyph(font: GlyphFontId, ch: char) -> bool {
     face_for(font).and_then(|f| f.glyph_index(ch)).is_some()
 }
 
-/// 1 文字分のグリフを `tiny_skia::Path` に焼き、orb 中心に center 揃えで返す。
+/// 1 文字分のグリフを zeno のパスコマンド列 (`Vec<zeno::Command>`) に焼き、
+/// orb 中心に center 揃えで返す。
 ///
-/// 戻り値は描画可能な `Path`（中身が空のグリフや未収録文字では `None`）。
+/// 戻り値は描画可能なコマンド列（中身が空のグリフや未収録文字では `None`）。
 /// `radius_px` は orb の見た目半径相当のピクセル長。グリフはこの 2× の正方領域に
 /// 収まるよう等比スケールされ、bbox 中心が `center` に来るよう平行移動される。
 pub fn build_glyph_path(
@@ -148,7 +151,7 @@ pub fn build_glyph_path(
     ch: char,
     center: (f32, f32),
     radius_px: f32,
-) -> Option<Path> {
+) -> Option<Vec<Command>> {
     if radius_px <= 0.0 {
         return None;
     }
@@ -173,7 +176,7 @@ pub fn build_glyph_path(
     let center_y_em = (bbox.y_min as f32 + bbox.y_max as f32) * 0.5;
 
     let mut builder = GlyphPathBuilder {
-        pb: PathBuilder::new(),
+        cmds: Vec::new(),
         scale,
         offset_x: -center_x_em,
         offset_y: -center_y_em,
@@ -183,39 +186,32 @@ pub fn build_glyph_path(
 
     // outline_glyph は描画コマンドが 1 つでもあれば bbox を返す。空なら None。
     face.outline_glyph(glyph_id, &mut builder)?;
-    builder.pb.finish()
+    if builder.cmds.is_empty() {
+        return None;
+    }
+    Some(builder.cmds)
 }
 
 fn render_glyph_binary_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     let s = size.max(1);
-    let mut pix = match Pixmap::new(s, s) {
-        Some(p) => p,
-        None => return vec![0u8; (s as usize) * (s as usize)],
-    };
+    let n = (s as usize) * (s as usize);
     let center = (s as f32 * 0.5, s as f32 * 0.5);
     let radius = (s as f32) * GLYPH_SDF_RADIUS_FACTOR * GLYPH_SDF_CONTENT_SPAN;
-    let path = match build_glyph_path(font, ch, center, radius) {
-        Some(p) => p,
-        None => return vec![0u8; (s as usize) * (s as usize)],
+    let cmds = match build_glyph_path(font, ch, center, radius) {
+        Some(c) => c,
+        None => return vec![0u8; n],
     };
-    let paint = Paint {
-        shader: Shader::SolidColor(Color::from_rgba8(255, 255, 255, 255)),
-        anti_alias: true,
-        ..Default::default()
-    };
-    pix.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
-    let raw = pix.data();
-    let mut out = Vec::with_capacity((s as usize) * (s as usize));
-    for px in raw.chunks_exact(4) {
-        out.push(px[3]);
+    // zeno: Alpha (1 byte/px) coverage を size×size に直接ラスタライズする。
+    // 既定の Fill::NonZero は旧 tiny-skia の FillRule::Winding と等価で、Origin は
+    // TopLeft (Y 下向き)。GlyphPathBuilder 側で font Y-up → screen Y-down を反転済み。
+    // 明示 size を与えると buffer は size×size、placement も同サイズになる。
+    let (coverage, placement) = Mask::new(&cmds).size(s, s).render();
+    // 念のため placement / 長さを確認。想定外（zeno の size 契約違反）なら全 0 で
+    // 返して描画スキップ（tofu を出さない契約を保つ）。
+    if placement.width != s || placement.height != s || coverage.len() != n {
+        return vec![0u8; n];
     }
-    out
+    coverage
 }
 
 fn edt_1d(f: &[f32]) -> Vec<f32> {
@@ -798,6 +794,57 @@ mod tests {
         assert!(
             bytes.iter().all(|&b| b == 0),
             "unknown char must produce all-zero sdf"
+        );
+    }
+
+    /// #223: zeno ラスタライザが**非退化なシルエット**を出すことの構造アサート。
+    /// ☆ を 256×256 で SDF 化したとき、(1) inside (SDF byte > 128) 数が「0 でなく
+    /// 全面でもない」妥当範囲にあること、(2) inside ピクセルの**重心が画像中央付近**に
+    /// あること（グリフが中央揃えで適正サイズに焼けている証拠）を確認する。
+    /// トートロジーを避けるため固定 byte 値は見ず、空 SDF・全面塗り・偏った配置を弾く。
+    /// 中央 1 点ではなく重心を見るのは、☆ の幾何中心は星形の hollow で空くため。
+    #[test]
+    fn glyph_sdf_zeno_silhouette_is_non_degenerate() {
+        let size = 256usize;
+        let bytes = render_glyph_sdf(GlyphFontId::NotoSymbols2, '☆', size as u32);
+        assert_eq!(bytes.len(), size * size);
+        let total = size * size;
+
+        let mut inside = 0usize;
+        let mut sum_x = 0usize;
+        let mut sum_y = 0usize;
+        for y in 0..size {
+            for x in 0..size {
+                if bytes[y * size + x] > 128 {
+                    inside += 1;
+                    sum_x += x;
+                    sum_y += y;
+                }
+            }
+        }
+
+        // (1a) 0 でないこと（描画されている）。経験的下限 2%（適正サイズで焼けている）。
+        assert!(
+            inside > total / 50,
+            "silhouette too sparse ({inside}/{total}); glyph likely shrank away or empty"
+        );
+        // (1b) 全面でないこと（背景が残りシルエットになっている）。星形は大半が外側。
+        assert!(
+            inside < total / 2,
+            "silhouette must not fill the whole field (got {inside}/{total}); \
+             a full fill would mean the glyph degenerated to a solid block"
+        );
+
+        // (2) inside の重心が画像中央 (128,128) の ±10% (≈±25px) 以内。中央揃え +
+        // 等比スケールが効いている証拠。偏って焼けると重心がずれて落ちる。
+        let cx = sum_x / inside;
+        let cy = sum_y / inside;
+        let tol = size / 10;
+        let center = size / 2;
+        assert!(
+            cx.abs_diff(center) <= tol && cy.abs_diff(center) <= tol,
+            "glyph silhouette must be centered: centroid=({cx},{cy}), \
+             expected near ({center},{center}) within ±{tol}px"
         );
     }
 
