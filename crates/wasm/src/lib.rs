@@ -14,6 +14,14 @@
 //!   1 本にパックして返す。WebGL fragment shader が各 t のフレームを描く。
 //! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
 //! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
+//!
+//! ## WebGPU canvas present 経路（#230）
+//!
+//! [`gpu`] モジュール（wasm32 専用）が `gpu_init` / `gpu_set_render_data` /
+//! `gpu_render` / `gpu_resize` を公開する。pack の構築は `get_render_data` と
+//! 同一経路（[`build_render_pack`]）を共有し、描画は orber-core の
+//! `GpuRenderer`（WGSL）が canvas surface の frame view に直接行う。
+//! WebGPU 必須・fallback 無し（#207 方針）。
 
 const MAX_DIM: u32 = 8192;
 
@@ -31,6 +39,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
+
+/// #230: ブラウザ WebGPU canvas present 経路。wasm32 専用 cfg なので native の
+/// `cargo test -p orber-wasm` ではコンパイルされない（web-sys / wgpu も
+/// target dependency で wasm32 にしか張られていない）。
+#[cfg(target_arch = "wasm32")]
+pub mod gpu;
 
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
 const MAX_ORB_COUNT: usize = 1024;
@@ -201,6 +215,24 @@ fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
         OrbShape::Circle => Ok(0.0),
         OrbShape::Glyph { .. } => Ok(1.0),
         _ => Ok(0.0),
+    }
+}
+
+/// #230 レビュー S1: WebGPU canvas present 経路（[`gpu`] モジュール）が現時点で
+/// 描ける shape かを検証する。glyph / image の SDF upload と aquarelle pack の
+/// 配線は #231 の領分で、それまで `gpu_render` は orb パイプライン
+/// （`render_packed_to_view`、SDF 無し）しか持たない。circle 以外を黙って受理
+/// すると orb として誤描画される（silent wrong-render）ため、明確なエラーで
+/// reject する。wasm32 専用の gpu.rs から呼ぶが、エラー文言を native テストで
+/// 固定するため `cfg(any(wasm32, test))` で共有部に置く。
+#[cfg(any(target_arch = "wasm32", test))]
+fn ensure_gpu_supported_shape(shape: &str) -> Result<(), String> {
+    if shape == "circle" {
+        Ok(())
+    } else {
+        Err(format!(
+            "gpu renderer: shape '{shape}' is not wired yet (#231); only 'circle' is supported"
+        ))
     }
 }
 
@@ -395,8 +427,9 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 ///
 /// core で per-orb の決定論パラメータと clusters / 背景色を計算し、Float32Array
 /// 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）で各 t における
-/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅され、
-/// wasm はこのデータ供給と `get_glyph_sdf` だけを担う）。
+/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅。
+/// wasm の担務はこのデータ供給と `get_glyph_sdf`、および #230 の WebGPU canvas
+/// present 経路（[`gpu`] モジュール。pack 構築は [`build_render_pack`] を共有））。
 ///
 /// `random_batch_specs(seed, total, still_count)` で spec 列を再構築するので、
 /// `spec_idx` 番目の spec / direction / speed / count / orb_size / blur / seed は
@@ -443,28 +476,39 @@ pub fn get_render_data(
     n: u32,
     spec_idx: u32,
 ) -> Result<js_sys::Float32Array, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let p = deserialize_params(params_js).map_err(err_to_js)?;
+    let buf = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;
+    Ok(js_sys::Float32Array::from(buf.as_slice()))
+}
+
+/// [`get_render_data`] の本体（JS 型変換を除いた純粋部分）。#230 で WebGPU
+/// canvas present 経路（[`gpu`] モジュールの `gpu_set_render_data`）と共有する
+/// ために切り出した。挙動は従来の `get_render_data` と完全同一: spec 列の
+/// 決定論的再構築・preset 上書き・kmeans キャッシュ・`GL_RENDERER_MAX_ORBS`
+/// の早期エラーまで全部ここにある（WebGL / WebGPU で同じ pack・同じ制限を
+/// 共有する。WGSL 側はデータテクスチャ経路で 64 上限が不要だが、GUI の
+/// count 上限 30 を大きく下回るため、Phase 3 で WebGL を撤去するまでは
+/// 同一バリデーションで揃えておく）。
+fn build_render_pack(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, String> {
     // Phase B (#55) / #172 N2: shape = "circle" | "glyph" | "image"。
     // glyph_char は Glyph のときに必須（image は char 不要）。webgl_shape_id が
     // 形状に応じた shape_id を返しつつ glyph のバリデーションを維持する。
-    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char).map_err(err_to_js)?;
-    let count_override = parse_count_preset(&p.count_preset).map_err(err_to_js)?;
-    let speed_override = parse_speed_preset(&p.speed_preset).map_err(err_to_js)?;
-    let softness = parse_softness_preset(&p.softness_preset).map_err(err_to_js)?;
+    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char)?;
+    let count_override = parse_count_preset(&p.count_preset)?;
+    let speed_override = parse_speed_preset(&p.speed_preset)?;
+    let softness = parse_softness_preset(&p.softness_preset)?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
     if spec_idx >= total {
-        return Err(JsError::new(&format!(
-            "spec_idx {spec_idx} is out of range [0, {total})"
-        )));
+        return Err(format!("spec_idx {spec_idx} is out of range [0, {total})"));
     }
     let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
 
     // kmeans は同じソース画像なら同じ結果になるのでキャッシュする。
     // Android では kmeans が ~3 秒かかり、これがタイル毎に走ることで
     // 12 stills + 4 mp4 = 16 呼び出しで合計 ~50 秒の律速になっていた。
-    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p).map_err(err_to_js)?;
+    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p)?;
     let _ = clusters_full; // 現在は未使用だが将来 spec に diversity 等で使う可能性
 
     let specs = random_batch_specs(p.seed as u64, total, still_count);
@@ -498,9 +542,9 @@ pub fn get_render_data(
     // 早期 throw する。Phase B でも GL_RENDERER_MAX_ORBS=64 を超えうる
     // count_preset (high=30) は未満。将来 high を 64 超に上げるならここを更新。
     if n_orbs > GL_RENDERER_MAX_ORBS {
-        return Err(JsError::new(&format!(
+        return Err(format!(
             "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
-        )));
+        ));
     }
 
     let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
@@ -530,7 +574,7 @@ pub fn get_render_data(
         edge_softness,
     );
 
-    Ok(js_sys::Float32Array::from(buf.as_slice()))
+    Ok(buf)
 }
 
 /// core 側と共有の `generate_orb_params` 出力を使って、ヘッダ + per-orb
@@ -759,6 +803,22 @@ mod tests {
         assert!(webgl_shape_id("glyph", "").is_err());
         // 不正 shape も parse_shape 経由で reject される。
         assert!(webgl_shape_id("bogus", "").is_err());
+    }
+
+    /// #230 レビュー S1: WebGPU 経路（gpu_set_render_data）は #231 で配線される
+    /// まで circle のみ。glyph / image を黙って orb として誤描画しないよう、
+    /// reject とそのエラー文言をここで固定する。
+    #[test]
+    fn ensure_gpu_supported_shape_rejects_unwired_shapes() {
+        assert!(ensure_gpu_supported_shape("circle").is_ok());
+        assert_eq!(
+            ensure_gpu_supported_shape("glyph").unwrap_err(),
+            "gpu renderer: shape 'glyph' is not wired yet (#231); only 'circle' is supported"
+        );
+        assert_eq!(
+            ensure_gpu_supported_shape("image").unwrap_err(),
+            "gpu renderer: shape 'image' is not wired yet (#231); only 'circle' is supported"
+        );
     }
 
     #[test]
@@ -1061,5 +1121,94 @@ mod tests {
             );
             assert!((buf[12] - preset.edge_softness()).abs() < 1e-6);
         }
+    }
+
+    // ---- #230: build_render_pack（WebGL / WebGPU 共有の pack 構築経路） ----
+
+    /// #230 のテスト共通: kmeans が決定的に 2 クラスタへ収束する 2x2 赤/青
+    /// ソース（`pack_render_data_matches_core_pack_helper` と同じソース）。
+    /// 呼ぶたびに同一値を新規構築する（`WasmParams` は Clone ではないため、
+    /// 「同一 params で 2 回呼ぶ」テストはこのヘルパを 2 回呼んで実現する）。
+    fn small_source_params() -> WasmParams {
+        let mut p = base_params();
+        p.k = 2;
+        p.source_width = 2;
+        p.source_height = 2;
+        p.source_rgb = vec![
+            255, 0, 0, 255, 0, 0, //
+            0, 0, 255, 0, 0, 255,
+        ];
+        p
+    }
+
+    /// #230 (A1): `build_render_pack` は同一 params + n + spec_idx に対して
+    /// 完全に決定論的（2 回呼んで `Vec<f32>` が要素単位で完全一致する）。
+    /// WebGL (`get_render_data`) と WebGPU (`gpu_set_render_data`) が同一の
+    /// pack を共有する前提（#232 の A/B 照合の土台）をここで固定する。
+    #[test]
+    fn build_render_pack_is_deterministic_for_same_inputs() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let a = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        // 注: 2 回目は cluster キャッシュヒット。kmeans 再計算の決定論は実証範囲外
+        // （spec 再構築 / per-orb RNG / pack エンコードの leg は真に再実行される）。
+        let b = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        assert!(!a.is_empty(), "pack must not be empty");
+        assert_eq!(
+            a, b,
+            "same params + n + spec_idx must yield an identical pack"
+        );
+    }
+
+    /// #230 (A2): spec_idx の範囲チェック境界。n=12（total=12）で 0 / 11 は
+    /// Ok、12 / 100 は Err。エラー文言は旧 `get_render_data`（JsError 時代）と
+    /// 同一の `"spec_idx {i} is out of range [0, {total})"` を一字一句維持する
+    /// （JsError → String 化リファクタで文言が変わっていないことの固定）。
+    #[test]
+    fn build_render_pack_spec_idx_boundary_and_error_wording() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Ok 側境界: 0（先頭）と 11（total - 1）。
+        assert!(build_render_pack(small_source_params(), 12, 0).is_ok());
+        assert!(build_render_pack(small_source_params(), 12, 11).is_ok());
+        // Err 側境界: 12（== total）と範囲外 100。文言まで一致すること。
+        assert_eq!(
+            build_render_pack(small_source_params(), 12, 12).unwrap_err(),
+            "spec_idx 12 is out of range [0, 12)"
+        );
+        assert_eq!(
+            build_render_pack(small_source_params(), 12, 100).unwrap_err(),
+            "spec_idx 100 is out of range [0, 12)"
+        );
+    }
+
+    /// #230 (A4): still/video タイル境界（still_count = total -
+    /// GUI_VIDEO_COUNT_DEFAULT）。n=12 なら spec_idx 7 が最後の still、8 が
+    /// 最初の video。両方 pack が生成でき、count_preset="low" で n_orbs を
+    /// 両者 10 に固定すれば長さは同一・内容は異なる（video 側は direction /
+    /// speed が GUI_VIDEO_* 固定割当に切り替わり、spec 自体の seed も違う）。
+    #[test]
+    fn build_render_pack_still_video_boundary_same_len_different_content() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let total = 12u32;
+        let still_count = total as usize - GUI_VIDEO_COUNT_DEFAULT; // 8
+        let params_low = || {
+            let mut p = small_source_params();
+            // n_orbs を spec.count（10..=50 抽選）でなく 10 に固定し、
+            // 「長さ同一」の比較を per-orb 数の偶然に依存させない。
+            p.count_preset = "low".into();
+            p
+        };
+        let last_still = build_render_pack(params_low(), total, (still_count - 1) as u32)
+            .expect("last still tile pack should build");
+        let first_video = build_render_pack(params_low(), total, still_count as u32)
+            .expect("first video tile pack should build");
+        assert_eq!(
+            last_still.len(),
+            first_video.len(),
+            "count_preset=low pins both tiles to n_orbs=10, so pack lengths must match"
+        );
+        assert_ne!(
+            last_still, first_video,
+            "still/video boundary tiles must differ in content (direction/speed/seed)"
+        );
     }
 }

@@ -75,11 +75,15 @@ orber/
     │       ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
     │       └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
     └── wasm/               # orber-wasm: ブラウザ向け wasm-bindgen ラッパー（#36）
-        ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
+        ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]。wasm32 専用 target dependency で
+        │                   #   gpu 経路（orber-core gpu feature + wgpu + web-sys）を常時有効化（#230）
         └── src/
-            └── lib.rs          # データ供給のみ（#225 で CPU 描画 generate_* は撲滅）。
-                                #   get_render_data（per-orb パラメータの pack）/
-                                #   get_glyph_sdf（フォント文字 → SDF）。実描画は WebGL2 fragment shader 側
+            ├── lib.rs          # データ供給（#225 で CPU 描画 generate_* は撲滅）。
+            │                   #   get_render_data（per-orb パラメータの pack）/
+            │                   #   get_glyph_sdf（フォント文字 → SDF）。実描画は WebGL2 fragment shader 側
+            └── gpu.rs          # WebGPU canvas present 経路（#230、wasm32 専用 cfg）。
+                                #   gpu_init / gpu_set_render_data / gpu_render / gpu_resize。
+                                #   core の GpuRenderer(WGSL) が canvas surface に直接描く。Orb のみ（#231 で拡張）
 
 web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind
@@ -87,6 +91,7 @@ web/                        # Web フロントエンド (#37, #38)
 ├── wrangler.toml           #   Cloudflare Pages 設定（pages_build_output_dir = "dist"）
 └── src/
     ├── pages/index.astro       # トップページ（ロゴ + Subtitle + Studio）
+    ├── pages/gpu-lab.astro     # WebGPU(WGSL) 検証ページ（#230、開発用・本番導線からリンクしない）
     ├── layouts/Base.astro      # 共通レイアウト（Space Grotesk + lang 自動切替, #62 /
     │                           # skeleton & skeleton-soft shimmer #71 #80）
     ├── components/Studio.tsx   # Solid アイランド。バッチ生成 GUI
