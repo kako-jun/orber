@@ -1754,6 +1754,36 @@ mod tests {
         assert!(build_render_pack(p, 12, 0).is_err());
     }
 
+    /// #231: WebGL 経路（`build_render_pack`）は `glyph_sdf` を一切読まない（回帰ガード）。
+    /// shape="glyph" + 有効な `glyph_sdf`（非空・16..=1024 サイズ・len 整合）を与えても、
+    /// glyph_sdf を空にした場合と pack が byte-identical であることを固定する。WebGL は
+    /// `webgl_shape_id`（shape + glyph_char のみ参照）と `resolve_frame`（glyph_sdf 非読）
+    /// で組み立てるため、JS フォールバック SDF は WGSL 経路（`build_gpu_render_inputs`）
+    /// 専用であり、WebGL 経路に漏れてはならない。漏れれば pack が変わってこのテストが落ちる。
+    #[test]
+    fn build_render_pack_ignores_glyph_sdf() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // glyph_sdf 無し（従来の WebGL glyph 経路）。
+        let mut without = small_source_params();
+        without.shape = "glyph".into();
+        without.glyph_char = "☆".into();
+        let pack_without = build_render_pack(without, 12, 0).expect("pack (no glyph_sdf)");
+
+        // glyph_sdf 有り（WGSL 専用の JS フォールバック SDF を載せても WebGL は無視する）。
+        let mut with = small_source_params();
+        with.shape = "glyph".into();
+        with.glyph_char = "☆".into();
+        let size = 256u32;
+        with.glyph_sdf_size = size;
+        with.glyph_sdf = vec![128u8; (size * size) as usize];
+        let pack_with = build_render_pack(with, 12, 0).expect("pack (with glyph_sdf)");
+
+        assert_eq!(
+            pack_without, pack_with,
+            "build_render_pack (WebGL) must be byte-identical with or without glyph_sdf"
+        );
+    }
+
     /// shape="image" の有効マスク（上半分不透明 / 下半分透明 16×16 RGBA）が
     /// WGSL 入口を通って `opts.shape == OrbShape::Image` に解決し、SDF サイズが
     /// DEFAULT_GLYPH_SDF_SIZE(256)・`sdf.len() == size * size` であることを固定する
@@ -1963,6 +1993,33 @@ mod tests {
             build_gpu_render_inputs(p, 12, 0).is_err(),
             "glyph with an empty glyph_char must error"
         );
+    }
+
+    /// #231（仕様確定）: shape="glyph" + glyph_char="" でも、非空で有効な `glyph_sdf` が
+    /// 供給されていれば char 検証をスキップして SDF を真とする（SDF がシルエットの真。
+    /// char は不要、#235 の core 統一機構）。`resolve_orb_shape` は glyph_sdf 非空時に
+    /// `resolve_glyph_sdf_shape` へ分岐し、`first_char_of` を一切呼ばないため、空 char でも
+    /// `OrbShape::Image` に解決して Ok になる。`build_gpu_render_inputs_glyph_empty_char_errors`
+    /// （glyph_sdf 空のとき空 char は Err）の対になる仕様固定。
+    #[test]
+    fn build_gpu_render_inputs_glyph_sdf_skips_char_validation() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        // char は空。SDF 供給時は char を見ないので、これでも解決する。
+        p.glyph_char = "".into();
+        let size = 256u32;
+        p.glyph_sdf_size = size;
+        p.glyph_sdf = vec![128u8; (size * size) as usize];
+        let gpu = build_gpu_render_inputs(p, 12, 0)
+            .expect("empty glyph_char + valid glyph_sdf must resolve (char skipped)");
+        match gpu.opts.shape {
+            OrbShape::Image { size: got, sdf } => {
+                assert_eq!(got, size, "resolved SDF size must match glyph_sdf_size");
+                assert_eq!(sdf.len(), (size * size) as usize);
+            }
+            other => panic!("expected OrbShape::Image (SDF is the truth), got {other:?}"),
+        }
     }
 
     /// #231: aquarelle の 4 パラメータは raw のまま OrbShape::Aquarelle に伝播する

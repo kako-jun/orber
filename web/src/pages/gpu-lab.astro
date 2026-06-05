@@ -114,6 +114,10 @@
       // #231: 直近の glyph で OS フォントフォールバック（同梱フォント外）を使ったか。
       // buildParams が立て、applyRenderData が status 注記に使う。
       let lastGlyphUsedJsFallback = false;
+      // #231: OS フォントにも無い字（generateJsGlyphSdf が全 0 SDF を返した）か。
+      // 全 0 だと空描画になるので、status を「OS フォントで描画」ではなく
+      // 「OS フォントにも見つからない」注記に切り替えるための判定。
+      let lastGlyphSdfEmpty = false;
 
       // 各 shape のコントロール表示を切り替える。
       function syncControls() {
@@ -197,6 +201,7 @@
           softness_preset: '',
         };
         lastGlyphUsedJsFallback = false;
+        lastGlyphSdfEmpty = false;
         if (shape === 'glyph') {
           // #231: 先頭 1 文字を採り、同梱フォント（Noto Sans Symbols 2 サブセット）に
           // 収録されていれば従来どおり core 経路（glyph_sdf を送らない）。収録外
@@ -207,9 +212,13 @@
           const firstCh = Array.from(ch)[0] ?? '';
           if (firstCh && !glyph_supported(firstCh)) {
             const size = GLYPH_SDF_SIZE;
-            params.glyph_sdf = generateJsGlyphSdf(firstCh, size);
+            const sdf = generateJsGlyphSdf(firstCh, size);
+            params.glyph_sdf = sdf;
             params.glyph_sdf_size = size;
             lastGlyphUsedJsFallback = true;
+            // OS フォントにも無い字だと generateJsGlyphSdf は全 0 SDF を返す（空描画）。
+            // 256*256=64KB の every は一瞬なので毎回判定してよい。
+            lastGlyphSdfEmpty = sdf.every((b) => b === 0);
           }
         }
         if (shape === 'image') {
@@ -243,7 +252,14 @@
           // 静的で、モーションは t がシェーダ内で駆動する。
           gpu_set_render_data(buildParams(), 12, 8);
           // #231: glyph が同梱フォント外で OS フォントフォールバックを使ったときは注記する。
-          const note = lastGlyphUsedJsFallback ? '（OS フォントで描画＝同梱フォント外）' : '';
+          // ただし OS フォントにも無い字（全 0 SDF）は空描画になるので、誤解を招く
+          // 「OS フォントで描画」ではなく見つからなかった旨を出す。
+          let note = '';
+          if (lastGlyphUsedJsFallback) {
+            note = lastGlyphSdfEmpty
+              ? '（この文字はOSフォントにも見つからず描画されません）'
+              : '（OS フォントで描画＝同梱フォント外）';
+          }
           setStatus(`shape=${shapeSel.value} — rendering${note}`);
         } catch (e) {
           console.error('[gpu-lab]', e);
