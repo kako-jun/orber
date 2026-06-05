@@ -10,7 +10,7 @@
     "stamp:sw": "node -e \"const f=require('fs'),p='dist/sw.js',d=new Date(Date.now()+9*36e5).toISOString().slice(0,10);f.writeFileSync(p,f.readFileSync(p,'utf-8').replaceAll('__BUILD_DATE__',d))\"",
     "dev": "npm run wasm:build && astro dev",
     "build": "npm run wasm:build && astro build && npm run stamp:sw",
-    "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && astro build && npm run stamp:sw",
+    "build:cf": "npm run wasm:ensure-rust && . $HOME/.cargo/env 2>/dev/null; npm run wasm:install && npm run wasm:build && npm test && astro build && npm run stamp:sw",
     "preview": "astro preview",
     "deploy": "wrangler pages deploy dist",
     "test": "vitest run",

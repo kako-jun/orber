@@ -184,8 +184,9 @@ export const STRINGS = {
     ja: '画像はブラウザ内で処理されます。サーバーへの送信はありません。',
     en: 'All processing happens in your browser — no images leave your device.',
   },
-  // #128 / #146: ja は「閲覧数: {n}」、en は「{n} views」で語順を言語ごとに分ける。
-  // {n} は <nostalgic-counter> がレンダリングする数値で置換する。
+  // #128 / #146: <nostalgic-counter> の数値 {n} を prefix/suffix で挟む設計。
+  // 当初は ja「閲覧数: {n}」/ en「{n} views」の非対称だったが、9e0306b で
+  // ja/en とも suffix の ' views' に統一した。
   viewsLabelPrefix: { ja: '', en: '' },
   viewsLabelSuffix: { ja: ' views', en: ' views' },
   // #146 review S2: Footer 全体の aria-label を i18n 化。
