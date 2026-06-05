@@ -22,9 +22,16 @@
 //!   per-frame acquire and present — so core never touches web-sys. Pipelines are
 //!   cached per `(shader, target format)`; the Glyph bleed intermediates stay
 //!   `Rgba8Unorm` in both paths and only the final pass targets the caller's
-//!   format (surfaces are typically `Bgra8Unorm`). Construction on wasm uses the
-//!   async [`GpuRenderer::new_async`] (the sync [`GpuRenderer::new`] wraps it in
-//!   `pollster::block_on`, native only).
+//!   format (surfaces are typically `Bgra8Unorm`). Two caller contracts:
+//!   `format` must be **non-sRGB** (`Bgra8Unorm`, not `Bgra8UnormSrgb`) — the
+//!   shaders emit already-sRGB-encoded values and write them raw, so an sRGB
+//!   format would apply the encoding twice (guarded by a `debug_assert`) — and
+//!   the `view` must match the requested width × height: a mismatch is **not** a
+//!   wgpu validation error (the Glyph compose pass reads its intermediates with
+//!   clamped `textureLoad`s, so the edges would silently smear instead of
+//!   failing). Construction on wasm uses the async [`GpuRenderer::new_async`]
+//!   (the sync [`GpuRenderer::new`] wraps it in `pollster::block_on`, native
+//!   only).
 //!
 //! ## Per-orb data path
 //!
@@ -285,18 +292,23 @@ struct BleedParams {
 }
 
 /// A render pipeline plus its bind-group layout, compiled once per distinct
-/// shader source. Caching keeps shader compilation / pipeline creation off the
-/// per-frame path: a long video renders the same shader for every frame.
+/// `(shader source, target format)` key (#229: the to_view path made the target
+/// format vary, so it joined the cache key). Caching keeps shader compilation /
+/// pipeline creation off the per-frame path: a long video renders the same
+/// shader for every frame.
 struct CachedPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
-/// The four bleed-pass pipelines (one per `orb_glyph_bleed.wgsl` fragment entry
-/// point), plus the shared bind-group layout. Built once per renderer; the
-/// vertex-only-varying pipelines differ solely in their fragment entry point, so
-/// they all reuse the same layout (uniform 0 + `src` 1 + `blurred` 2). Cached so a
-/// long glyph clip compiles the bleed shader and its pipelines only once.
+/// The bleed-pass pipelines (`orb_glyph_bleed.wgsl`), plus the shared bind-group
+/// layout: the three fixed `Rgba8Unorm`-target pipelines (`blur_h` / `blur_v` /
+/// `halo`), built once with the shader, and the `compose` map, grown lazily with
+/// one pipeline per distinct final-target format (#229 — the only bleed pass
+/// whose target varies). The pipelines differ solely in their fragment entry
+/// point / target format, so they all reuse the same layout (uniform 0 +
+/// `src` 1 + `blurred` 2). Cached so a long glyph clip compiles the bleed
+/// shader once and each pipeline at most once.
 struct BleedPipelines {
     bind_group_layout: wgpu::BindGroupLayout,
     /// The compiled bleed shader module + pipeline layout, kept to build
@@ -620,9 +632,11 @@ impl GpuRenderer {
             .map_or(0, |bp| bp.compose.len())
     }
 
-    /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
-    /// pipeline only on first use. The closure runs at most once per distinct
-    /// shader source for the life of the renderer.
+    /// Get-or-build the orb pipeline for `(shader_wgsl, format)`, compiling the
+    /// shader and pipeline only on first use. The build runs at most once per
+    /// distinct `(shader source, target format)` key for the life of the renderer
+    /// (#229: the read-back path always passes `Rgba8Unorm`; the to_view path
+    /// passes the caller's view format).
     fn pipeline<R>(
         &self,
         shader_wgsl: &str,
@@ -965,6 +979,19 @@ impl GpuRenderer {
     /// (orber-wasm) acquires the surface frame, hands its view + format here, and
     /// presents after this returns. Same packing / saturation arithmetic as
     /// [`Self::render_frame`]; only the final color target differs.
+    ///
+    /// # `view` / `format` contract (#229)
+    ///
+    /// - `format` must be **non-sRGB** (`Bgra8Unorm`, not `Bgra8UnormSrgb`): the
+    ///   shaders emit already-sRGB-encoded values and write them raw into a Unorm
+    ///   target (see the module's compositing contract), so an sRGB format would
+    ///   apply the sRGB encoding a second time. Guarded by a `debug_assert`.
+    /// - `view` must be exactly `opts.width × opts.height` texels. A mismatch is
+    ///   **not** a wgpu validation error — the Glyph compose pass reads its
+    ///   intermediates with clamped `textureLoad`s, so an oversized view silently
+    ///   renders a frame with smeared edges instead of failing.
+    ///
+    /// Every `*_to_view` entry point shares this contract.
     pub fn render_frame_to_view(
         &self,
         clusters: &[Cluster],
@@ -1099,6 +1126,12 @@ impl GpuRenderer {
     /// The bleed 2nd pass runs exactly as in the read-back path (its
     /// intermediates stay `Rgba8Unorm`); only the final compose pass targets
     /// `format`. The Circle / background fallbacks mirror the read-back variant.
+    ///
+    /// Same `view` / `format` contract as [`Self::render_frame_to_view`]:
+    /// `format` non-sRGB (the shader output is already sRGB-encoded; an sRGB
+    /// format would encode twice), `view` exactly `opts.width × opts.height`
+    /// texels (a mismatch is no validation error — the compose pass clamps its
+    /// `textureLoad`s, so the edges silently smear).
     pub fn render_frame_glyph_to_view(
         &self,
         clusters: &[Cluster],
@@ -1245,7 +1278,10 @@ impl GpuRenderer {
     /// [`Self::render_frame_image`], but drawing into an externally supplied
     /// `view` of `format` instead of the offscreen read-back target (#229).
     /// Mirrors [`Self::render_frame_glyph_to_view`] (the two shapes share the SDF
-    /// pipeline + bleed pass).
+    /// pipeline + bleed pass), including the `view` / `format` contract of
+    /// [`Self::render_frame_to_view`]: `format` non-sRGB (the output is already
+    /// sRGB-encoded), `view` exactly `opts.width × opts.height` texels (a
+    /// mismatch silently smears the edges instead of failing validation).
     pub fn render_frame_image_to_view(
         &self,
         clusters: &[Cluster],
@@ -1408,6 +1444,11 @@ impl GpuRenderer {
     /// [`Self::render_frame_aquarelle`], but drawing into an externally supplied
     /// `view` of `format` instead of the offscreen read-back target (#229). Same
     /// CPU-side ChaCha8 / HSL pack; only the final color target differs.
+    ///
+    /// Same `view` / `format` contract as [`Self::render_frame_to_view`]:
+    /// `format` non-sRGB (the shader output is already sRGB-encoded; an sRGB
+    /// format would encode twice), `view` exactly `opts.width × opts.height`
+    /// texels.
     pub fn render_frame_aquarelle_to_view(
         &self,
         clusters: &[Cluster],
@@ -1646,6 +1687,8 @@ impl GpuRenderer {
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
     ) {
+        debug_assert_view_format_not_srgb(format);
+
         let _render_guard = self
             .render_guard
             .lock()
@@ -1809,6 +1852,10 @@ impl GpuRenderer {
     /// pack-level surface-present seam the browser WebGPU path shares: the caller
     /// owns the surface (creation / configure / present); core only draws into the
     /// frame's view.
+    ///
+    /// Same `view` / `format` contract as [`Self::render_frame_to_view`]:
+    /// `format` non-sRGB (the shader output is already sRGB-encoded; an sRGB
+    /// format would encode twice), `view` exactly `width × height` texels.
     pub fn render_packed_to_view(
         &self,
         pack: &[f32],
@@ -1912,6 +1959,8 @@ impl GpuRenderer {
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
     ) {
+        debug_assert_view_format_not_srgb(format);
+
         let _render_guard = self
             .render_guard
             .lock()
@@ -2214,21 +2263,26 @@ impl GpuRenderer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pipelines = guard.get_or_insert_with(|| self.build_bleed_pipelines());
-        if !pipelines.compose.contains_key(&compose_format) {
-            let compose = Self::build_bleed_pipeline(
+        // Split the borrow: `compose` grows through the entry API while `shader`
+        // / `pipeline_layout` stay borrowed for the lazy build closure.
+        let BleedPipelines {
+            compose,
+            shader,
+            pipeline_layout,
+            ..
+        } = &mut *pipelines;
+        compose.entry(compose_format).or_insert_with(|| {
+            Self::build_bleed_pipeline(
                 &self.device,
-                &pipelines.shader,
-                &pipelines.pipeline_layout,
+                shader,
+                pipeline_layout,
                 "fs_compose",
                 compose_format,
-            );
-            pipelines.compose.insert(compose_format, compose);
-        }
-        let compose = pipelines
-            .compose
-            .get(&compose_format)
-            .expect("compose pipeline just ensured present");
-        f(pipelines, compose)
+            )
+        });
+        // Reborrow shared for the caller; the entry above guarantees presence.
+        let pipelines = &*pipelines;
+        f(pipelines, &pipelines.compose[&compose_format])
     }
 
     /// Compile the bleed shader once and build its fragment-entry pipelines, all
@@ -2702,6 +2756,21 @@ fn mix_with_white(rgb: [u8; 3], amount: f32) -> [u8; 3] {
         (rgb[1] as f32 * (1.0 - a) + 255.0 * a).round() as u8,
         (rgb[2] as f32 * (1.0 - a) + 255.0 * a).round() as u8,
     ]
+}
+
+/// Debug-guard for the to_view paths (#229): the shaders emit already-sRGB-encoded
+/// values and write them raw into a Unorm target (see the module's compositing
+/// contract), so an sRGB view format would apply the sRGB encoding a second time.
+/// `debug_assert` so the release/browser hot path pays nothing; called from the
+/// two internal to_view funnels (`render_packed_inner_to_view` /
+/// `render_aquarelle_packed_to_view`) that every `*_to_view` entry point routes
+/// through.
+fn debug_assert_view_format_not_srgb(format: wgpu::TextureFormat) {
+    debug_assert!(
+        !format.is_srgb(),
+        "to_view format must be non-sRGB (e.g. Bgra8Unorm, not Bgra8UnormSrgb): the shader \
+         output is already sRGB-encoded, so an sRGB format would encode twice (got {format:?})"
+    );
 }
 
 /// A fragment-visible uniform-buffer bind-group-layout entry.
@@ -5561,7 +5630,7 @@ mod tests {
         let img = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_frame_image_to_view(&clusters, &opts, 0.0, view, format);
         });
-        let lit = lit_vs_bg(&img, opts.background, 8);
+        let lit = lit_vs_bg(&img, opts.background, 1);
         assert_eq!(
             lit, 0,
             "empty image SDF via to_view must paint no foreground pixels"
