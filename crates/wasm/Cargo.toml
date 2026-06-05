@@ -25,6 +25,22 @@ console_error_panic_hook = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 
+# #230: ブラウザ WebGPU canvas present 経路（src/gpu.rs）は wasm32 専用の
+# target dependency で張る。`gpu` feature を別途切らない理由:
+# - wasm-pack（web/package.json の wasm:build）も CI の
+#   `cargo build --target wasm32-unknown-unknown -p orber-wasm` も、フラグ追加なしで
+#   自動的に gpu 経路込みになる（feature 指定の伝搬漏れが構造的に起きない）
+# - native の `cargo test -p orber-wasm` は wgpu / web-sys を一切ビルドしない
+#   （target が合わないので依存ごと落ちる）
+# orber-core はここで features = ["gpu"] を追加指定する（cargo は同一 dep の
+# feature を target 有効時にユニオンする）。wgpu はデフォルト feature のまま =
+# wasm32 では webgpu バックエンドのみ（`webgl` feature は追加しない = #207 方針）。
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
+wgpu = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
+
 # 注意: per-crate `[profile.release]` は workspace member では指定できない
 # （root の `[profile.release]` が継承される）。
 # wasm 専用の opt-level = "s" 等が必要になったら、root に

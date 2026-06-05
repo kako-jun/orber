@@ -14,6 +14,14 @@
 //!   1 本にパックして返す。WebGL fragment shader が各 t のフレームを描く。
 //! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
 //! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
+//!
+//! ## WebGPU canvas present 経路（#230）
+//!
+//! [`gpu`] モジュール（wasm32 専用）が `gpu_init` / `gpu_set_render_data` /
+//! `gpu_render` / `gpu_resize` を公開する。pack の構築は `get_render_data` と
+//! 同一経路（[`build_render_pack`]）を共有し、描画は orber-core の
+//! `GpuRenderer`（WGSL）が canvas surface の frame view に直接行う。
+//! WebGPU 必須・fallback 無し（#207 方針）。
 
 const MAX_DIM: u32 = 8192;
 
@@ -31,6 +39,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
+
+/// #230: ブラウザ WebGPU canvas present 経路。wasm32 専用 cfg なので native の
+/// `cargo test -p orber-wasm` ではコンパイルされない（web-sys / wgpu も
+/// target dependency で wasm32 にしか張られていない）。
+#[cfg(target_arch = "wasm32")]
+pub mod gpu;
 
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
 const MAX_ORB_COUNT: usize = 1024;
@@ -443,28 +457,39 @@ pub fn get_render_data(
     n: u32,
     spec_idx: u32,
 ) -> Result<js_sys::Float32Array, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
+    let p = deserialize_params(params_js).map_err(err_to_js)?;
+    let buf = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;
+    Ok(js_sys::Float32Array::from(buf.as_slice()))
+}
+
+/// [`get_render_data`] の本体（JS 型変換を除いた純粋部分）。#230 で WebGPU
+/// canvas present 経路（[`gpu`] モジュールの `gpu_set_render_data`）と共有する
+/// ために切り出した。挙動は従来の `get_render_data` と完全同一: spec 列の
+/// 決定論的再構築・preset 上書き・kmeans キャッシュ・`GL_RENDERER_MAX_ORBS`
+/// の早期エラーまで全部ここにある（WebGL / WebGPU で同じ pack・同じ制限を
+/// 共有する。WGSL 側はデータテクスチャ経路で 64 上限が不要だが、GUI の
+/// count 上限 30 を大きく下回るため、Phase 3 で WebGL を撤去するまでは
+/// 同一バリデーションで揃えておく）。
+fn build_render_pack(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, String> {
     // Phase B (#55) / #172 N2: shape = "circle" | "glyph" | "image"。
     // glyph_char は Glyph のときに必須（image は char 不要）。webgl_shape_id が
     // 形状に応じた shape_id を返しつつ glyph のバリデーションを維持する。
-    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char).map_err(err_to_js)?;
-    let count_override = parse_count_preset(&p.count_preset).map_err(err_to_js)?;
-    let speed_override = parse_speed_preset(&p.speed_preset).map_err(err_to_js)?;
-    let softness = parse_softness_preset(&p.softness_preset).map_err(err_to_js)?;
+    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char)?;
+    let count_override = parse_count_preset(&p.count_preset)?;
+    let speed_override = parse_speed_preset(&p.speed_preset)?;
+    let softness = parse_softness_preset(&p.softness_preset)?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
     if spec_idx >= total {
-        return Err(JsError::new(&format!(
-            "spec_idx {spec_idx} is out of range [0, {total})"
-        )));
+        return Err(format!("spec_idx {spec_idx} is out of range [0, {total})"));
     }
     let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
 
     // kmeans は同じソース画像なら同じ結果になるのでキャッシュする。
     // Android では kmeans が ~3 秒かかり、これがタイル毎に走ることで
     // 12 stills + 4 mp4 = 16 呼び出しで合計 ~50 秒の律速になっていた。
-    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p).map_err(err_to_js)?;
+    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p)?;
     let _ = clusters_full; // 現在は未使用だが将来 spec に diversity 等で使う可能性
 
     let specs = random_batch_specs(p.seed as u64, total, still_count);
@@ -498,9 +523,9 @@ pub fn get_render_data(
     // 早期 throw する。Phase B でも GL_RENDERER_MAX_ORBS=64 を超えうる
     // count_preset (high=30) は未満。将来 high を 64 超に上げるならここを更新。
     if n_orbs > GL_RENDERER_MAX_ORBS {
-        return Err(JsError::new(&format!(
+        return Err(format!(
             "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
-        )));
+        ));
     }
 
     let base_radius_unit = (p.width.min(p.height) as f32) * 0.25 * spec.orb_size.max(0.0);
@@ -530,7 +555,7 @@ pub fn get_render_data(
         edge_softness,
     );
 
-    Ok(js_sys::Float32Array::from(buf.as_slice()))
+    Ok(buf)
 }
 
 /// core 側と共有の `generate_orb_params` 出力を使って、ヘッダ + per-orb
