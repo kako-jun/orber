@@ -218,6 +218,24 @@ fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
     }
 }
 
+/// #230 レビュー S1: WebGPU canvas present 経路（[`gpu`] モジュール）が現時点で
+/// 描ける shape かを検証する。glyph / image の SDF upload と aquarelle pack の
+/// 配線は #231 の領分で、それまで `gpu_render` は orb パイプライン
+/// （`render_packed_to_view`、SDF 無し）しか持たない。circle 以外を黙って受理
+/// すると orb として誤描画される（silent wrong-render）ため、明確なエラーで
+/// reject する。wasm32 専用の gpu.rs から呼ぶが、エラー文言を native テストで
+/// 固定するため `cfg(any(wasm32, test))` で共有部に置く。
+#[cfg(any(target_arch = "wasm32", test))]
+fn ensure_gpu_supported_shape(shape: &str) -> Result<(), String> {
+    if shape == "circle" {
+        Ok(())
+    } else {
+        Err(format!(
+            "gpu renderer: shape '{shape}' is not wired yet (#231); only 'circle' is supported"
+        ))
+    }
+}
+
 fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
     let rgb = std::mem::take(&mut p.source_rgb);
     image::RgbImage::from_raw(p.source_width, p.source_height, rgb).ok_or_else(|| {
@@ -409,8 +427,9 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 ///
 /// core で per-orb の決定論パラメータと clusters / 背景色を計算し、Float32Array
 /// 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）で各 t における
-/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅され、
-/// wasm はこのデータ供給と `get_glyph_sdf` だけを担う）。
+/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅。
+/// wasm の担務はこのデータ供給と `get_glyph_sdf`、および #230 の WebGPU canvas
+/// present 経路（[`gpu`] モジュール。pack 構築は [`build_render_pack`] を共有））。
 ///
 /// `random_batch_specs(seed, total, still_count)` で spec 列を再構築するので、
 /// `spec_idx` 番目の spec / direction / speed / count / orb_size / blur / seed は
@@ -786,6 +805,22 @@ mod tests {
         assert!(webgl_shape_id("bogus", "").is_err());
     }
 
+    /// #230 レビュー S1: WebGPU 経路（gpu_set_render_data）は #231 で配線される
+    /// まで circle のみ。glyph / image を黙って orb として誤描画しないよう、
+    /// reject とそのエラー文言をここで固定する。
+    #[test]
+    fn ensure_gpu_supported_shape_rejects_unwired_shapes() {
+        assert!(ensure_gpu_supported_shape("circle").is_ok());
+        assert_eq!(
+            ensure_gpu_supported_shape("glyph").unwrap_err(),
+            "gpu renderer: shape 'glyph' is not wired yet (#231); only 'circle' is supported"
+        );
+        assert_eq!(
+            ensure_gpu_supported_shape("image").unwrap_err(),
+            "gpu renderer: shape 'image' is not wired yet (#231); only 'circle' is supported"
+        );
+    }
+
     #[test]
     fn glyph_sdf_paints_known_char() {
         // ☆ は同梱 NotoSansSymbols2 にある。inside 側サンプルが一定数以上あること
@@ -1114,6 +1149,8 @@ mod tests {
     fn build_render_pack_is_deterministic_for_same_inputs() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let a = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        // 注: 2 回目は cluster キャッシュヒット。kmeans 再計算の決定論は実証範囲外
+        // （spec 再構築 / per-orb RNG / pack エンコードの leg は真に再実行される）。
         let b = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
         assert!(!a.is_empty(), "pack must not be empty");
         assert_eq!(

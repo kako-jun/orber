@@ -111,7 +111,16 @@
           let frames = 0;
           let lastFps = performance.now();
           const loop = (now: number) => {
-            gpu_render((now % PERIOD_MS) / PERIOD_MS);
+            // rAF コールバック内の例外は誰も catch しない（ループが無言で
+            // 死ぬ）ので、ここで status に流して停止する（レビュー S2）。
+            try {
+              gpu_render((now % PERIOD_MS) / PERIOD_MS);
+            } catch (e) {
+              console.error('[gpu-lab]', e);
+              setStatus(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
+              btn.disabled = false;
+              return; // 次の rAF を予約せずループ停止
+            }
             frames += 1;
             if (now - lastFps >= 1000) {
               fpsEl.textContent = `${((frames * 1000) / (now - lastFps)).toFixed(1)} fps`;
@@ -124,6 +133,8 @@
         } catch (e) {
           console.error('[gpu-lab]', e);
           setStatus(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
+          // エラー後にリロード不要で再試行できるよう復帰させる（レビュー N1）。
+          btn.disabled = false;
         }
       });
     </script>

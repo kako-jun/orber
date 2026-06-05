@@ -17,11 +17,13 @@
 //!
 //! ## 形状について
 //!
-//! 現状 **Orb のみ**の最小経路だが、API は形状に閉じていない:
-//! `gpu_set_render_data` は `params.shape` をそのまま `build_render_pack` に
-//! 通す（shape_id が pack に入る）ので、Glyph / Image / Aquarelle（#231）は
-//! shape ごとの SDF / aquarelle pack の保持と `render_frame_*_to_view` への
-//! 分岐をここに足すだけでよい。
+//! 現状 **Orb のみ**の最小経路。`gpu_set_render_data` は #231 で配線されるまで
+//! circle 以外の shape（glyph / image）を明確なエラーで reject する
+//! （`ensure_gpu_supported_shape`）。`gpu_render` は orb パイプライン
+//! （`render_packed_to_view`、SDF 無し）しか持たないため、黙って受理すると
+//! orb として誤描画される。Glyph / Image / Aquarelle（#231）は shape ごとの
+//! SDF / aquarelle pack の保持と `render_frame_*_to_view` への分岐をここに
+//! 足し、この reject を外す。
 //!
 //! ## surface format / alpha mode の選択
 //!
@@ -37,7 +39,10 @@ use std::sync::OnceLock;
 use orber_core::gpu::GpuRenderer;
 use wasm_bindgen::prelude::*;
 
-use crate::{build_render_pack, deserialize_params, err_to_js, WasmSingleThreadCell};
+use crate::{
+    build_render_pack, deserialize_params, ensure_gpu_supported_shape, err_to_js,
+    WasmSingleThreadCell,
+};
 
 /// `gpu_init` で組み上がる一式。surface の configure（resize / Outdated 回復）
 /// には device が要るが、`GpuRenderer` は device を private に持つため、
@@ -69,8 +74,17 @@ fn gpu_state() -> &'static WasmSingleThreadCell<Option<GpuState>> {
 ///
 /// WebGPU 不在（`navigator.gpu` 無し / adapter 拒否）は明確なエラーで reject
 /// する。fallback は無い（#207 方針）。
+///
+/// 同時二重呼び出し（先行 init の await 完了前に再度呼ぶ）は last-writer-wins
+/// で、先勝ち調停は意図的に持たない。呼び出し側でガードすること（dev ページ
+/// /gpu-lab は start ボタンの disable でガード済み）。
 #[wasm_bindgen]
 pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsError> {
+    // 再 init 時は、新しい surface を作る前に旧 GpuState（旧 surface）を先に
+    // drop する。同一 canvas の GPUCanvasContext を包む新旧 surface の共存を
+    // 避けるため（旧 surface が configure 済みのまま新 surface を作らない）。
+    *gpu_state().borrow_mut() = None;
+
     // BROWSER_WEBGPU のみ = WebGPU 必須を instance レベルでも明示する。
     // （wgpu の `webgl` feature は積んでいないので、どのみち他バックエンドは無い）
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -164,9 +178,15 @@ pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsEr
 /// 完全に同じ経路（[`build_render_pack`]: spec 再構築・preset 上書き・kmeans
 /// キャッシュ込み）なので、同じ params なら WebGL 版と同一の pack になる。
 /// モーションは pack に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
+///
+/// shape は #231 で配線されるまで `"circle"` のみ。glyph / image は orb として
+/// 誤描画されるため明確なエラーで reject する（モジュール doc「形状について」）。
 #[wasm_bindgen]
 pub fn gpu_set_render_data(params_js: JsValue, n: u32, spec_idx: u32) -> Result<(), JsError> {
     let p = deserialize_params(params_js).map_err(err_to_js)?;
+    // S1: gpu_render は orb パイプラインしか持たない。circle 以外は silent
+    // wrong-render になるため、pack を構築する前に reject する。
+    ensure_gpu_supported_shape(&p.shape).map_err(err_to_js)?;
     let pack = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;
     let mut guard = gpu_state().borrow_mut();
     let state = guard
