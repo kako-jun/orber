@@ -4611,12 +4611,12 @@ mod tests {
         });
         assert!(
             lit_vs_bg(&reference, opts.background, 8) > 0,
-            "circle reference must have lit pixels"
+            "orb reference must have lit pixels"
         );
         assert_eq!(
             reference.as_raw(),
             via_view.as_raw(),
-            "circle to_view bytes must match the read-back path"
+            "orb to_view bytes must match the read-back path"
         );
 
         // Glyph (bleed 2nd pass included), via the frame-level seam.
@@ -4848,7 +4848,7 @@ mod tests {
         });
         assert!(
             lit_vs_bg(&via_orb, opts.background, 8) > 0,
-            "circle fallback reference must have lit pixels"
+            "orb fallback reference must have lit pixels"
         );
         assert_eq!(
             via_glyph_entry.as_raw(),
@@ -4986,13 +4986,13 @@ mod tests {
         let (w, h) = (72u32, 56u32);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
-        let circle = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let orb = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
 
         // Solo (uncontended) oracles on the shared renderer. to_view ↔ read-back
         // byte identity at Rgba8Unorm is pinned separately, so the read-back
         // frames also serve as the to_view threads' oracles.
-        let oracle_circle = renderer.render_frame(&clusters, &circle, 0.3);
+        let oracle_orb = renderer.render_frame(&clusters, &orb, 0.3);
         let oracle_glyph = renderer.render_frame_glyph(&clusters, &glyph, 0.3);
 
         std::thread::scope(|scope| {
@@ -5000,11 +5000,11 @@ mod tests {
             // Read-back legs.
             handles.push(scope.spawn(|| {
                 for _ in 0..3 {
-                    let img = renderer.render_frame(&clusters, &circle, 0.3);
+                    let img = renderer.render_frame(&clusters, &orb, 0.3);
                     assert_eq!(
-                        oracle_circle.as_raw(),
+                        oracle_orb.as_raw(),
                         img.as_raw(),
-                        "concurrent circle read-back must match its solo render"
+                        "concurrent orb read-back must match its solo render"
                     );
                 }
             }));
@@ -5022,12 +5022,12 @@ mod tests {
             handles.push(scope.spawn(|| {
                 for _ in 0..3 {
                     let img = readback_via_view(renderer, w, h, format, |view| {
-                        renderer.render_frame_to_view(&clusters, &circle, 0.3, view, format);
+                        renderer.render_frame_to_view(&clusters, &orb, 0.3, view, format);
                     });
                     assert_eq!(
-                        oracle_circle.as_raw(),
+                        oracle_orb.as_raw(),
                         img.as_raw(),
-                        "concurrent circle to_view must match the solo read-back render"
+                        "concurrent orb to_view must match the solo read-back render"
                     );
                 }
             }));
