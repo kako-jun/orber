@@ -24,8 +24,21 @@
 //   - orb: 新旧で同一見た目のはず → パリティ確認（ゲート）
 //   - glyph / image: 新（WGSL=orb 質感）と旧（WebGL=旧 bleed 質感）は一致しないのが正
 //   - aquarelle: 対象外（Studio に入らない）
+//
+// 合成条件の非対称（orb ゲートで微差を見たときの一次容疑者リスト）:
+//   - WGSL surface は alpha_mode=Opaque、WebGL canvas は
+//     `{alpha:true, premultipliedAlpha:false}` で構成される（非対称）。
+//   - orber の bg は通常不透明（u_bg.a=1）なので、合成結果に実害はほぼ無い。
+//   - ただしリムの反 alias（半透明エッジ）では合成式の違いで微差が出得る。
+//     orb パリティで「縁だけわずかに違う」を見たら、まずこの非対称を疑う。
+//   - これは認識の明文化であり、コード挙動（surface/canvas の構成）は変えない。
+//
+// running 中の props 変更:
+//   - 実行中に Studio 側の shape / source / image File / glyph / 各プリセットが
+//     変わったら、createEffect（defer）で stop → start を自動でやり直す（後述）。
+//   - start は async なので世代カウンタで「最新の start のみ有効」を保証する。
 
-import { createSignal, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createSignal, on, onCleanup, onMount, Show } from 'solid-js';
 import type { DecodedImage } from '../lib/decodeImage';
 import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from '../lib/orberGl';
 import { generateImageSdf, generateJsGlyphSdf } from '../lib/jsGlyphSdf';
@@ -107,10 +120,29 @@ export default function AbPanel(props: AbPanelProps) {
   const [fps, setFps] = createSignal<number | null>(null);
   const [errorMsg, setErrorMsg] = createSignal('');
 
-  // 起動済みリソース。stop / re-start で作り直す。
+  // 起動済みリソース。stop / re-start で作り直す（props 変更時の自動再初期化、
+  // および手動 Stop ボタンで dispose → 再 setup する）。
   let glRenderer: GlRenderer | null = null;
   let wgslReady = false;
   let rafId: number | undefined;
+
+  // start 再入ガード（世代カウンタ）。start は await を含む async なので、
+  // 連続トリガ（props が立て続けに変わる等）で複数の start が並走し得る。
+  // start 冒頭で generation を ++ して captured し、各 await 後に
+  // generation !== captured なら「より新しい start が走った」とみなして中断する。
+  // これで「最新の start のみ有効」を保証し、古い setup が後勝ちで残るのを防ぐ。
+  let generation = 0;
+
+  // FPS 計測用カウンタ（rAF ループと共用）。トグル切替時にリセットして、
+  // 切替直後の 1 秒が両側（webgl / wgsl）の混合 FPS にならないようにする。
+  let frames = 0;
+  let lastFps = 0;
+  // FPS 計測をリセットする（active 切替直後・start 直後に呼ぶ）。
+  function resetFps() {
+    frames = 0;
+    lastFps = performance.now();
+    setFps(null);
+  }
 
   const hasSource = () => props.decoded() !== null;
   // image shape のとき File 未選択なら開始不可（image_mask が組めない）。
@@ -149,6 +181,32 @@ export default function AbPanel(props: AbPanelProps) {
   }
 
   onCleanup(() => stop());
+
+  // running 中に Studio 側の入力（shape / source / image File / glyph / 各プリセット）が
+  // 変わったら、stop → start で作り直して新しい入力を反映する。
+  //   - on(..., { defer: true }): マウント時の初回 run は走らせない（手動 Start を待つ）。
+  //   - start は内部で stop() を呼んでから作り直すので、ここでは start() だけ呼ぶ。
+  //   - start は async + 世代カウンタなので、props が立て続けに変わっても
+  //     最新の start のみが有効になる（古い setup が後勝ちで残らない）。
+  createEffect(
+    on(
+      () => [
+        props.shape(),
+        props.decoded(),
+        props.imageShapeFile(),
+        props.glyphChar(),
+        props.glyphRotate(),
+        props.countPreset(),
+        props.speedPreset(),
+        props.softnessPreset(),
+      ],
+      () => {
+        if (!running()) return; // 停止中は無視（手動 Start でのみ起動する）。
+        void start();
+      },
+      { defer: true },
+    ),
+  );
 
   // WebGL 側を初期化する（createGlRenderer + get_render_data → setRenderData、
   // glyph/image は #159 ロジックを main thread で再現）。戻り値 = init ms。
@@ -209,8 +267,7 @@ export default function AbPanel(props: AbPanelProps) {
   // rAF ループ（FPS は 1 秒毎に更新）。例外は status に流してループ停止する
   // （gpu-lab と同じく無言で死なせない）。
   function startLoop() {
-    let frames = 0;
-    let lastFps = performance.now();
+    resetFps();
     const loop = (now: number) => {
       try {
         renderActive(now);
@@ -232,12 +289,19 @@ export default function AbPanel(props: AbPanelProps) {
   }
 
   const start = async () => {
-    if (running()) return;
+    // 世代を進めて自分を captured する。これ以降に新しい start が走ると
+    // generation が変わるので、各 await の後で「自分が最新か」を確認できる。
+    const myGen = ++generation;
+    // 既存リソースを必ず畳んでから作り直す（自動再初期化の stop→start 経路でも、
+    // 手動 Start の二度押し抑止が外れた経路でも、二重 setup を起こさない）。
+    stop();
+    // stop() は generation を触らないので myGen はそのまま有効。
     const src = props.decoded();
     if (!src) return;
     setErrorMsg('');
     try {
       await ensureWasm();
+      if (myGen !== generation) return; // より新しい start が走った → 中断
 
       const params = buildBaseParams(src);
 
@@ -247,6 +311,7 @@ export default function AbPanel(props: AbPanelProps) {
         const file = props.imageShapeFile();
         if (!file) throw new Error('image shape requires a file');
         const dec = await decodeImageFile(file);
+        if (myGen !== generation) return; // より新しい start が走った → 中断
         params.image_mask_rgba = dec.rgba;
         params.image_mask_width = dec.width;
         params.image_mask_height = dec.height;
@@ -265,7 +330,13 @@ export default function AbPanel(props: AbPanelProps) {
       // WebGL は常に立てる。WGSL は非対応ブラウザでは立てない（active も webgl 固定）。
       setWebglInitMs(Number(setupWebgl(params, imageBitmap).toFixed(1)));
       if (webgpuOk) {
-        setWgslInitMs(Number((await setupWgsl(params)).toFixed(1)));
+        const ms = await setupWgsl(params);
+        if (myGen !== generation) {
+          // await 中に新しい start が走った。setupWgsl が立てた wgslReady を畳む。
+          stop();
+          return;
+        }
+        setWgslInitMs(Number(ms.toFixed(1)));
       }
 
       setRunning(true);
@@ -284,7 +355,20 @@ export default function AbPanel(props: AbPanelProps) {
     if (!webgpuOk) setActive('webgl');
   });
 
+  // レンダラ切替。切替直後の 1 秒が両側混合 FPS にならないよう FPS をリセットする
+  // （t は wall-clock 由来で同位相なので描画位相は連続。リセットするのは計測のみ）。
+  function toggleTo(side: Side) {
+    if (active() === side) return;
+    setActive(side);
+    resetFps();
+  }
+
   // glass / segmented control の流儀（DESIGN.md §4）に倣う。検証パネルなので最小限。
+  // DESIGN.md §4 の正式実装 SEG_GROUP / SEG_BTN は Studio() 内のローカル定数で
+  // export されていない（共有 API になっていない）。本パネルは Phase 3 で
+  // orberGl.ts ごと削除する足場であり、Studio.tsx の private 実装を export して
+  // 公開面を広げるより、足場側で最小の segBtn を再実装する方が実務上妥当と判断した
+  // （コードは共有しない）。Phase 3 でパネルごとこの再実装も消える。
   const segBtn = (selected: boolean, disabled: boolean) =>
     [
       'flex-1 h-9 px-2 text-sm flex items-center justify-center transition-colors duration-200 ease-out',
@@ -296,6 +380,15 @@ export default function AbPanel(props: AbPanelProps) {
     ]
       .filter(Boolean)
       .join(' ');
+
+  // Start / Stop 共通の glass button クラス（DESIGN.md §4 Button の流儀。検証足場
+  // なので最小限・共有 API には依存しない。Phase 3 でパネルごと削除する）。
+  const CTRL_BTN =
+    'px-3.5 py-2 rounded inline-flex items-center justify-center ' +
+    'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
+    'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
+    'transition-colors duration-200 ease-out text-sm ' +
+    'disabled:opacity-40 disabled:cursor-not-allowed';
 
   return (
     <section class="mx-auto mt-8 max-w-md rounded-xl border border-glassBorder bg-glassBg p-4 backdrop-blur-glass space-y-3">
@@ -309,7 +402,7 @@ export default function AbPanel(props: AbPanelProps) {
         <button
           type="button"
           aria-pressed={active() === 'webgl'}
-          onClick={() => setActive('webgl')}
+          onClick={() => toggleTo('webgl')}
           disabled={!running()}
           class={segBtn(active() === 'webgl', !running())}
         >
@@ -318,7 +411,7 @@ export default function AbPanel(props: AbPanelProps) {
         <button
           type="button"
           aria-pressed={active() === 'wgsl'}
-          onClick={() => setActive('wgsl')}
+          onClick={() => toggleTo('wgsl')}
           disabled={!running() || !webgpuOk}
           title={!webgpuOk ? t('abWebGpuUnavailable') : undefined}
           class={'border-l border-glassBorder ' + segBtn(active() === 'wgsl', !running() || !webgpuOk)}
@@ -379,15 +472,17 @@ export default function AbPanel(props: AbPanelProps) {
           onClick={() => void start()}
           disabled={running() || !canStart()}
           title={!canStart() ? t('abNeedSource') : undefined}
-          class={
-            'px-3.5 py-2 rounded inline-flex items-center justify-center ' +
-            'bg-glassBg backdrop-blur-glass border border-glassBorder text-fg ' +
-            'hover:bg-glassBgHover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-focusRing ' +
-            'transition-colors duration-200 ease-out text-sm ' +
-            'disabled:opacity-40 disabled:cursor-not-allowed'
-          }
+          class={CTRL_BTN}
         >
           {t('abStart')}
+        </button>
+        <button
+          type="button"
+          onClick={() => stop()}
+          disabled={!running()}
+          class={CTRL_BTN}
+        >
+          {t('abStop')}
         </button>
         <Show when={!canStart()}>
           <span class="text-xs text-fgMuted">{t('abNeedSource')}</span>

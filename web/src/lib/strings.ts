@@ -227,6 +227,7 @@ export const STRINGS = {
     en: 'Load an image first',
   },
   abStart: { ja: '開始', en: 'Start' },
+  abStop: { ja: '停止', en: 'Stop' },
   abInitMs: { ja: 'init {ms} ms', en: 'init {ms} ms' },
   abFps: { ja: '{fps} fps', en: '{fps} fps' },
   abError: { ja: 'エラー: {msg}', en: 'Error: {msg}' },

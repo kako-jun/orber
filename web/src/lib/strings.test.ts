@@ -175,7 +175,7 @@ describe('lang signal + t()', () => {
 // 命名流儀（camelCase キー / ja・en 対称 / vars 補間）に揃っているかを押さえる。
 // Phase 3 で WebGL を撤去するときにパネルごと削除されるため、その時このブロックも消す。
 describe('ab* 文言 (#232 A/B パネル)', () => {
-  // 実物の strings.ts に追加された ab* キーを列挙（10 件）。
+  // 実物の strings.ts に追加された ab* キーを列挙（11 件）。
   const AB_KEYS = [
     'abPanelTitle',
     'abPanelNote',
@@ -184,6 +184,7 @@ describe('ab* 文言 (#232 A/B パネル)', () => {
     'abWebGpuUnavailable',
     'abNeedSource',
     'abStart',
+    'abStop',
     'abInitMs',
     'abFps',
     'abError',
