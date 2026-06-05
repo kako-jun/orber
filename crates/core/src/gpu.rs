@@ -3039,6 +3039,14 @@ mod tests {
             wgsl.contains("let r = 1.0 - signed_unit;"),
             "SDF variant must convert the signed SDF sample to r = 1 - signed_unit"
         );
+        // Mirror of the orb variant's residue check: every template marker must be
+        // substituted away in the SDF variant too. A marker typo (e.g. `//!ORB_LOAD`
+        // misspelled in the template or in `orb_sdf_wgsl()`) would silently leave the
+        // marker in the compiled shader instead of breaking loudly — guard against it.
+        assert!(
+            !wgsl.contains("//!ORB"),
+            "every template marker must be substituted away in the SDF variant"
+        );
     }
 
     /// #235 境界取り違え狙い撃ち: the SDF distance source's CONTENT_SPAN UV clip must
@@ -4713,18 +4721,18 @@ mod tests {
         let clusters = sample_clusters();
 
         // (name, reference read-back render, to_view render) per shape.
-        let circle = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let orb = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
         let image = image_opts(w, h);
         let aqua = aquarelle_opts(w, h, AquarelleParams::default());
         type ToView<'a> = Box<dyn Fn(&wgpu::TextureView) + 'a>;
         let cases: Vec<(&str, [u8; 4], RgbaImage, ToView<'_>)> = vec![
             (
-                "circle",
-                circle.background,
-                renderer.render_frame(&clusters, &circle, 0.3),
+                "orb",
+                orb.background,
+                renderer.render_frame(&clusters, &orb, 0.3),
                 Box::new(|view: &wgpu::TextureView| {
-                    renderer.render_frame_to_view(&clusters, &circle, 0.3, view, format);
+                    renderer.render_frame_to_view(&clusters, &orb, 0.3, view, format);
                 }),
             ),
             (
