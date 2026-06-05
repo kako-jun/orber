@@ -205,6 +205,31 @@ export const STRINGS = {
   },
   installBtn: { ja: 'インストール', en: 'Install' },
   installDismiss: { ja: '閉じる', en: 'Dismiss' },
+  // #232: WebGL↔WGSL A/B 比較パネル（?ab=1 でのみ表示する検証足場）。
+  // Phase 3 で WebGL を撤去するときにパネルごと削除する。文言は検証用なので
+  // 最小限。本番 UI には出ないが、命名流儀（camelCase キー / ja・en 対称）に揃える。
+  abPanelTitle: {
+    ja: 'A/B 比較（WebGL ↔ WGSL）',
+    en: 'A/B compare (WebGL ↔ WGSL)',
+  },
+  abPanelNote: {
+    ja: '同じ入力で新旧レンダラを切替えてブリンク比較する検証用パネルです。',
+    en: 'Blink-compare the old/new renderers on identical input (dev only).',
+  },
+  abRendererWebGL: { ja: 'WebGL（旧）', en: 'WebGL (old)' },
+  abRendererWGSL: { ja: 'WGSL（新）', en: 'WGSL (new)' },
+  abWebGpuUnavailable: {
+    ja: 'このブラウザは WebGPU 非対応です（WGSL 側は使えません）',
+    en: 'WebGPU is unavailable in this browser (WGSL side disabled)',
+  },
+  abNeedSource: {
+    ja: '先に画像を読み込んでください',
+    en: 'Load an image first',
+  },
+  abStart: { ja: '開始', en: 'Start' },
+  abInitMs: { ja: 'init {ms} ms', en: 'init {ms} ms' },
+  abFps: { ja: '{fps} fps', en: '{fps} fps' },
+  abError: { ja: 'エラー: {msg}', en: 'Error: {msg}' },
 } as const;
 
 export function detectLang(): Lang {
