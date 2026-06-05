@@ -14,9 +14,7 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use orber_core::animate::{
-    precompute_orb_params, render_frame_with_params, AnimateOptions, MotionDirection, MotionSpeed,
-};
+use orber_core::animate::{AnimateOptions, MotionDirection, MotionSpeed};
 use orber_core::cluster::Cluster;
 use orber_core::orb::OrbShape;
 use orber_core::output_mode::OutputMode;
@@ -201,6 +199,7 @@ pub fn calc_frame_count(duration_ms: u64) -> Result<usize, VideoError> {
 /// CLI バイナリ向けの便宜であり、サイレントに動かしたい場合は呼び出し側で
 /// stderr を捨てること。
 pub fn render_video(
+    renderer: &crate::FrameRenderer,
     clusters: &[Cluster],
     opts: &VideoOptions,
     output: &Path,
@@ -232,16 +231,12 @@ pub fn render_video(
 
     let temp_dir = tempfile::TempDir::new()?;
 
-    // OrbParams は seed / count / clusters のみに依存し t は不変なので、ループ前に
-    // 1 回だけ計算してフレーム間で使い回す。240 frame なら 240 回の Vec 割当 +
-    // RNG 走行を 1 回に圧縮できる。
-    let cache = precompute_orb_params(&frame_opts, clusters);
-
-    // フレーム書き出し（逐次）。10% 刻みで stderr に進捗を出す。
+    // フレーム書き出し（逐次）。10% 刻みで stderr に進捗を出す。GPU レンダラ (#225) は
+    // device / queue / cache を内部に持ち、フレーム間で使い回す（per-orb pack は各 t で算出）。
     let progress_step = (total / 10).max(1);
     for i in 0..total {
         let t = i as f32 / total as f32;
-        let frame = render_frame_with_params(clusters, &frame_opts, &cache, t);
+        let frame = renderer.render(clusters, &frame_opts, t);
         let path = temp_dir.path().join(format!("frame_{i:05}.png"));
         frame.save(&path).map_err(VideoError::FrameSave)?;
         if i > 0 && i % progress_step == 0 {
@@ -314,8 +309,6 @@ pub fn render_video(
 mod tests {
     use super::*;
 
-    use orber_core::cluster::{Centroid, Cluster};
-
     /// #217: テスト用 `OrbShape::Image`（中央に不透明ブロックの透過画像 → SDF）。
     fn test_image_shape() -> OrbShape {
         let w = 64u32;
@@ -356,25 +349,14 @@ mod tests {
         }
     }
 
-    /// #217 (#10): `shape = Image` の `VideoOptions` が `render_video` のフレーム描画
-    /// 経路（AnimateOptions 構築 + `render_frame_with_params`）を通っても Image として
-    /// 描かれ、Circle に退化しないこと。`OrbShape` が `Copy` → `Clone` 化された際に
-    /// `shape: opts.shape.clone()` の clone を入れ忘れるとビルドが通らない / shape が
-    /// 落ちる回帰を、ここで Circle 出力との差分で検出する（ffmpeg 不要）。
+    /// #217 (#10) / #225: `shape = Image` の `VideoOptions` が `render_video` のフレーム
+    /// 描画経路（AnimateOptions 構築）を通っても Image として伝播し、Circle に退化しない
+    /// こと。`OrbShape` が `Copy` → `Clone` 化された際に `shape: opts.shape.clone()` の
+    /// clone を入れ忘れると shape が落ちる回帰を、構築した AnimateOptions の shape 判定で
+    /// 検出する。#225 で CPU 描画を撲滅したため、実描画差分の検証は gpu.rs の GPU 構造
+    /// テスト（`gpu_image_renders_lit_pixels` 等）が担う。
     #[test]
     fn video_options_image_shape_survives_render_video_clone() {
-        let clusters = vec![
-            Cluster {
-                color: [240, 60, 60],
-                centroid: Centroid { x: 0.4, y: 0.5 },
-                weight: 0.6,
-            },
-            Cluster {
-                color: [60, 120, 240],
-                centroid: Centroid { x: 0.6, y: 0.4 },
-                weight: 0.4,
-            },
-        ];
         let (w, h) = (96u32, 96u32);
 
         let image_opts = VideoOptions {
@@ -396,16 +378,10 @@ mod tests {
             matches!(img_frame_opts.shape, OrbShape::Image { .. }),
             "VideoOptions Image shape must survive into the render_video frame AnimateOptions"
         );
-
-        let img_cache = precompute_orb_params(&img_frame_opts, &clusters);
-        let circle_cache = precompute_orb_params(&circle_frame_opts, &clusters);
-        let image_frame = render_frame_with_params(&clusters, &img_frame_opts, &img_cache, 0.0);
-        let circle_frame =
-            render_frame_with_params(&clusters, &circle_frame_opts, &circle_cache, 0.0);
-        assert_ne!(
-            image_frame.as_raw(),
-            circle_frame.as_raw(),
-            "Image video frame must differ from Circle (shape must not degrade to Circle)"
+        // Circle 側は Circle のまま（取り違えていないこと）。
+        assert!(
+            matches!(circle_frame_opts.shape, OrbShape::Circle),
+            "VideoOptions Circle shape must stay Circle"
         );
     }
 
