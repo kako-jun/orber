@@ -142,16 +142,17 @@ describe('lang signal + t()', () => {
     expect('includeAlphaDisabledTitle' in STRINGS).toBe(false);
   });
 
-  test('viewsLabelPrefix / Suffix の語順が言語ごとに切り替わる (Footer counter)', async () => {
-    // ja は「閲覧数: {n}」(prefix のみ)、en は「{n} views」(suffix のみ) の
-    // 非対称構成。Footer の <nostalgic-counter> をこの 2 キーで挟む設計
-    // (#128 / #146) のため、語順切替を直接押さえる。
+  test('viewsLabelPrefix / Suffix は ja/en とも「{n} views」(suffix 統一) (Footer counter)', async () => {
+    // #128 の初期設計は ja「閲覧数: {n}」/ en「{n} views」の非対称構成だったが、
+    // 9e0306b「Counter ラベルを ja/en 両方 views で統一」で suffix の ' views' に
+    // 一本化された。Footer の <nostalgic-counter> をこの 2 キーで挟む設計
+    // (#128 / #146) のため、現行の統一仕様を直接押さえる。
     vi.stubGlobal('navigator', { language: 'en-US' });
     const { setLang, t } = await import('./strings');
     await Promise.resolve();
     setLang('ja');
-    expect(t('viewsLabelPrefix')).toBe('閲覧数: ');
-    expect(t('viewsLabelSuffix')).toBe('');
+    expect(t('viewsLabelPrefix')).toBe('');
+    expect(t('viewsLabelSuffix')).toBe(' views');
     setLang('en');
     expect(t('viewsLabelPrefix')).toBe('');
     expect(t('viewsLabelSuffix')).toBe(' views');

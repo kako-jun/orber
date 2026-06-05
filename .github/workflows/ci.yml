@@ -167,3 +167,27 @@ jobs:
 
       - name: Build orber-wasm for wasm32
         run: cargo build --target wasm32-unknown-unknown -p orber-wasm
+
+  web-test:
+    name: Web test
+    # web に導入済みの vitest を CI で走らせる (#165)。strings / glyph SDF /
+    # encoder ロジック等の純粋 TS テストのみで、生成 wasm pkg はロードしない
+    # (worker は test 側で mock される) ため wasm ビルド step は前置しない。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Run vitest
+        run: npm test
+        working-directory: web
