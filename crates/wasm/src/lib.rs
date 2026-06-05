@@ -1640,4 +1640,172 @@ mod tests {
         p.shape = "aquarelle".into();
         assert!(build_render_pack(p, 12, 0).is_err());
     }
+
+    /// shape="image" の有効マスク（上半分不透明 / 下半分透明 16×16 RGBA）が
+    /// WGSL 入口を通って `opts.shape == OrbShape::Image` に解決し、SDF サイズが
+    /// DEFAULT_GLYPH_SDF_SIZE(256)・`sdf.len() == size * size` であることを固定する
+    /// （resolve_orb_shape の image 解決が build_gpu_render_inputs 経由でも生きること）。
+    ///
+    /// 併せて `inputs.clusters` が非空であることを assert する。`clusters` は
+    /// `gpu_set_render_data`（wasm32 専用）からしか読まれず native の test target では
+    /// dead_code になるため、ここでテストが実際に読むことで
+    /// `cargo clippy --all-targets -- -D warnings` を通す（allow(dead_code) で誤魔化さない）。
+    #[test]
+    fn build_gpu_render_inputs_image_resolves_shape() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        let (w, h) = (16u32, 16u32);
+        p.image_mask_width = w;
+        p.image_mask_height = h;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let a = if y < h / 2 { 255 } else { 0 };
+                rgba[i] = 255;
+                rgba[i + 1] = 255;
+                rgba[i + 2] = 255;
+                rgba[i + 3] = a;
+            }
+        }
+        p.image_mask_rgba = rgba;
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("image GPU inputs should build");
+        match gpu.opts.shape {
+            OrbShape::Image { size, sdf } => {
+                assert_eq!(size, orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE);
+                assert_eq!(sdf.len(), (size * size) as usize);
+            }
+            other => panic!("expected OrbShape::Image, got {other:?}"),
+        }
+        // clusters は render_frame_image_to_view（wasm32）へ渡る本物のデータ。
+        // native test がこのフィールドを読むことで dead_code 警告を解消する。
+        assert!(
+            !gpu.clusters.is_empty(),
+            "kmeans should yield at least one cluster for the source image"
+        );
+    }
+
+    /// shape="image" の無効マスクは WGSL 入口で Err になる（resolve_image_shape の
+    /// 検証が build_gpu_render_inputs 経由でも生きること）。(a) w/h=0・(b) rgba 長さ
+    /// 不一致・(c) 単色（無コントラスト）の 3 ケース。
+    #[test]
+    fn build_gpu_render_inputs_image_rejects_invalid_mask() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // (a) width / height = 0（small_source_params 既定のまま shape だけ image）。
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "image with width/height=0 must error"
+        );
+
+        // (b) rgba 長さが width * height * 4 と一致しない。
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        p.image_mask_width = 2;
+        p.image_mask_height = 2;
+        p.image_mask_rgba = vec![0; 3]; // 2*2*4=16 ではない
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "image with mismatched rgba length must error"
+        );
+
+        // (c) 単色（全 0）はコントラストが取れず image_rgba_to_sdf が None。
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        p.image_mask_width = 4;
+        p.image_mask_height = 4;
+        p.image_mask_rgba = vec![0; 4 * 4 * 4];
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "image with a single flat color (no contrast) must error"
+        );
+    }
+
+    /// 未知 shape は WGSL 入口で Err になる（resolve_orb_shape → parse_shape の
+    /// 不正 shape reject が生きること）。"bogus" と "" の両方。
+    #[test]
+    fn build_gpu_render_inputs_rejects_unknown_shape() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "bogus".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "shape='bogus' must error"
+        );
+
+        let mut p = small_source_params();
+        p.shape = "".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "shape='' must error"
+        );
+    }
+
+    /// shape="glyph" + glyph_char="" は WGSL 入口で Err になる（first_char_of の
+    /// 空文字 reject が resolve_orb_shape 経由でも維持されること）。
+    #[test]
+    fn build_gpu_render_inputs_glyph_empty_char_errors() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "glyph with an empty glyph_char must error"
+        );
+    }
+
+    /// #231: aquarelle の 4 パラメータは raw のまま OrbShape::Aquarelle に伝播する
+    /// （クランプは core の AquarelleParams::clamped() の領分という契約固定）。
+    /// 0..1 を外れる値 {-0.5, 0.0, 0.5, 1.0, 1.5} を 4 フィールドに割り当て、
+    /// build_gpu_render_inputs が clamp せずそのまま運ぶことを assert する。
+    #[test]
+    fn build_gpu_render_inputs_aquarelle_passes_raw_out_of_range() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "aquarelle".into();
+        p.aquarelle_bleed = -0.5;
+        p.aquarelle_bloom = 0.0;
+        p.aquarelle_offset = 1.0;
+        p.aquarelle_halo = 1.5;
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle GPU inputs should build");
+        match gpu.opts.shape {
+            OrbShape::Aquarelle(params) => {
+                assert_eq!(params.bleed, -0.5, "bleed must pass through un-clamped");
+                assert_eq!(params.bloom, 0.0, "bloom must pass through un-clamped");
+                assert_eq!(params.offset, 1.0, "offset must pass through un-clamped");
+                assert_eq!(params.halo, 1.5, "halo must pass through un-clamped");
+            }
+            other => panic!("expected OrbShape::Aquarelle, got {other:?}"),
+        }
+    }
+
+    /// #231: aquarelle 4 フィールドの serde default 値は 0.5（CLI の
+    /// `--bleed/--bloom/--offset/--halo` および AquarelleParams::default() と同値）。
+    ///
+    /// 観点 6 は本来「serde で 4 フィールド省略時に 0.5 になる」を検証したいが、
+    /// serde_wasm_bindgen は native test では組めず、serde_json はワークスペース・
+    /// Cargo.lock のどちらにも存在しない（追加には workspace.dependencies +
+    /// crates/wasm の dev-dependencies + lock 更新が必要で、default 値 1 つの確認の
+    /// ためには重い）。`#[serde(default = "default_aquarelle_param")]` はこの関数を
+    /// 指す compile-time の配線なので、戻り値 0.5 の単体確認に格下げした（報告済み）。
+    #[test]
+    fn default_aquarelle_param_is_half() {
+        assert_eq!(default_aquarelle_param(), 0.5);
+    }
+
+    /// #55 / i18n: first_char_of は文字列の先頭 Unicode スカラを 1 つ採用する。
+    /// "☆★" → '☆'、"🍕"（サロゲートペアになる絵文字）→ '🍕'、結合文字列でも
+    /// 先頭スカラ（基底文字）を採る。マルチバイト境界をバイトでなく char で割ること。
+    #[test]
+    fn first_char_of_takes_first_scalar_multibyte() {
+        assert_eq!(first_char_of("☆★").unwrap(), '☆');
+        // 🍕 は U+1F355（BMP 外、UTF-16 ではサロゲートペア）。Rust char は
+        // 単一スカラなので先頭で正しく取れること。
+        assert_eq!(first_char_of("🍕").unwrap(), '🍕');
+        // 結合文字列 "e" + U+0301（combining acute）は 2 スカラ。先頭は基底 'e'。
+        assert_eq!(first_char_of("e\u{0301}").unwrap(), 'e');
+    }
 }
