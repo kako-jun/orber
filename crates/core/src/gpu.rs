@@ -1,11 +1,14 @@
-//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c, #225, #229.
+//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c, #225, #229,
+//! #235.
 //!
 //! [`GpuRenderer`] is the headless renderer and — since #225 — the **only**
-//! renderer (the CPU pixel path and the CPU↔GPU parity oracle were purged). It
-//! runs the Circle orb WGSL
-//! ([`orb_circle.wgsl`](../src/orb_circle.wgsl)), the glyph / image SDF WGSL
-//! ([`orb_glyph.wgsl`](../src/orb_glyph.wgsl)) and the aquarelle WGSL
-//! ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Circle,
+//! renderer (the CPU pixel path and the CPU↔GPU parity oracle were purged). Since
+//! #235 the orb mechanism is the **only** mechanism for orb / glyph / image: one
+//! unified WGSL template ([`orb.wgsl`](../src/orb.wgsl)) is compiled into two
+//! variants — the plain orb (analytic circle distance, byte-exact with the old
+//! `orb_circle.wgsl`) and the SDF orb (glyph / image: the same orb math fed a
+//! different silhouette via an SDF sample; no bleed/halo). Aquarelle keeps its own
+//! WGSL ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Orb,
 //! Glyph, Image, Aquarelle) render on the GPU; the CLI renders every PNG / video /
 //! variation frame through it.
 //!
@@ -20,18 +23,15 @@
 //!   submit, without read-back. This is the browser WebGPU present seam: the
 //!   caller (orber-wasm, #230) owns the canvas surface — creation, configure,
 //!   per-frame acquire and present — so core never touches web-sys. Pipelines are
-//!   cached per `(shader, target format)`; the Glyph bleed intermediates stay
-//!   `Rgba8Unorm` in both paths and only the final pass targets the caller's
-//!   format (surfaces are typically `Bgra8Unorm`). Two caller contracts:
-//!   `format` must be **non-sRGB** (`Bgra8Unorm`, not `Bgra8UnormSrgb`) — the
-//!   shaders emit already-sRGB-encoded values and write them raw, so an sRGB
-//!   format would apply the encoding twice (guarded by a `debug_assert`) — and
-//!   the `view` must match the requested width × height: a mismatch is **not** a
-//!   wgpu validation error (the Glyph compose pass reads its intermediates with
-//!   clamped `textureLoad`s, so the edges would silently smear instead of
-//!   failing). Construction on wasm uses the async [`GpuRenderer::new_async`]
-//!   (the sync [`GpuRenderer::new`] wraps it in `pollster::block_on`, native
-//!   only).
+//!   cached per `(shader, target format)`; both the orb and SDF variants draw a
+//!   single pass straight into the caller's view (surfaces are typically
+//!   `Bgra8Unorm`). Two caller contracts: `format` must be **non-sRGB**
+//!   (`Bgra8Unorm`, not `Bgra8UnormSrgb`) — the shaders emit already-sRGB-encoded
+//!   values and write them raw, so an sRGB format would apply the encoding twice
+//!   (guarded by a `debug_assert`) — and the `view` must match the requested
+//!   width × height (a smaller / larger view silently smears or clips). Construction
+//!   on wasm uses the async [`GpuRenderer::new_async`] (the sync
+//!   [`GpuRenderer::new`] wraps it in `pollster::block_on`, native only).
 //!
 //! ## Per-orb data path
 //!
@@ -104,10 +104,10 @@ const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
 const ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
 /// Width, in texels, of the per-orb data-texture: one texel each for the color,
-/// phase, misc, and rotation `vec4`s (see `orb_circle.wgsl::load_orb` /
-/// `orb_glyph.wgsl::load_orb`). Widened 3→4 in Phase 1b (#212) so the Glyph
-/// shader can read the per-orb rotation (`base_angle`, `rot_speed_signed`); the
-/// Circle shader ignores texel x=3 and stays bit-exact.
+/// phase, misc, and rotation `vec4`s (see `orb.wgsl`'s `load_orb`). Widened 3→4 in
+/// Phase 1b (#212) so the SDF orb variant can read the per-orb rotation
+/// (`base_angle`, `rot_speed_signed`); the plain orb variant ignores texel x=3
+/// (its `load_orb` does not even read it) and stays bit-exact.
 const ORB_TEX_WIDTH: u32 = 4;
 /// Bytes per texel of the `Rgba32Float` orb data-texture (4 × f32).
 const ORB_TEX_BYTES_PER_TEXEL: u32 = 16;
@@ -117,7 +117,7 @@ const ORB_TEX_BYTES_PER_ROW: u32 = ORB_TEX_WIDTH * ORB_TEX_BYTES_PER_TEXEL;
 
 /// Width, in texels, of the per-orb **aquarelle** data-texture (#216). Nine texels
 /// per orb hold the four `render_aquarelle_orb` layers' geometry + u8 colors; see
-/// `orb_aquarelle.wgsl`'s header for the slot map. Independent of the Circle/Glyph
+/// `orb_aquarelle.wgsl`'s header for the slot map. Independent of the orb / SDF
 /// `ORB_TEX_WIDTH` (4) — aquarelle binds its own texture so the two never alias.
 const AQUARELLE_TEX_WIDTH: u32 = 9;
 /// Bytes per row of the aquarelle data-texture (`9 × 16 = 144`). `write_texture` is
@@ -129,38 +129,171 @@ const AQUARELLE_TEX_BYTES_PER_ROW: u32 = AQUARELLE_TEX_WIDTH * ORB_TEX_BYTES_PER
 const HEADER_WORDS: usize = 16;
 const PER_ORB_WORDS: usize = 16;
 
-/// The Circle orb WGSL (translation of `orberGl.ts` Circle arm). Per-orb data is
-/// read from a data-texture with `textureLoad`, so the shader has no fixed orb
-/// cap and needs no template substitution — it is used verbatim (#210 Phase 1a).
-/// The `&'static str` doubles as a stable cache key for the pipeline cache.
-fn orb_circle_wgsl() -> &'static str {
-    include_str!("orb_circle.wgsl")
+/// The unified orb WGSL template (`orb.wgsl`, #235). The orb mechanism is now the
+/// **only** mechanism for orb / glyph / image: each pixel's normalized "distance
+/// from the shape" feeds the same 3-axis breath, `falloff_curve`, and Skia-lowp
+/// premultiply compositing. Only the **DISTANCE SOURCE** block differs per shape,
+/// so "feeding the orb a different silhouette" is the literal implementation.
+///
+/// The template carries `//!ORB_*` markers that [`orb_wgsl`] / [`orb_sdf_wgsl`]
+/// substitute to generate the two variants (Rust-side string composition, as the
+/// plan recommends): the orb variant injects the analytic circle distance and
+/// **no** SDF bindings, so its compiled shader is byte-for-byte the old
+/// `orb_circle.wgsl` body (the orb output stays bit-exact); the SDF variant adds
+/// the `R8Unorm` SDF texture + bilinear sampler (bindings 2/3), reads the per-orb
+/// rotation texel (x=3), and computes `r` from the SDF sample.
+const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
+
+/// The orb (analytic circle) variant of [`ORB_WGSL_TEMPLATE`]. No SDF bindings,
+/// no rotation; the DISTANCE SOURCE block inlines the same two lines the old
+/// `orb_circle.wgsl` had (`dist = distance(...); r = dist / radius`), so the
+/// compiled shader is identical and the orb output is unchanged (byte-exact).
+/// Built once (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the resulting
+/// `&'static str` doubles as the stable pipeline-cache key.
+fn orb_wgsl() -> &'static str {
+    use std::sync::OnceLock;
+    static ORB: OnceLock<String> = OnceLock::new();
+    ORB.get_or_init(|| {
+        ORB_WGSL_TEMPLATE
+            .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_NONE)
+            .replace("//!ORB_LOAD", ORB_LOAD_ORB)
+            .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
+            .replace("//!ORB_DISTANCE_SOURCE", ORB_DISTANCE_SOURCE_CIRCLE)
+    })
 }
 
-/// The Glyph orb WGSL (#212 Phase 1b). Same data-texture orb layout as the Circle
-/// shader, plus an `R8Unorm` glyph SDF texture + bilinear sampler (bindings 2/3),
-/// and reads the per-orb rotation texel (x=3). It draws the glyph SDF fill
-/// (pre-bleed) via the Circle Rim/Soft `falloff_curve`, not the WebGL mask×profile arm.
-fn orb_glyph_wgsl() -> &'static str {
-    include_str!("orb_glyph.wgsl")
+/// The SDF (glyph / image, #235) variant of [`ORB_WGSL_TEMPLATE`]. Adds the
+/// `R8Unorm` SDF texture + bilinear sampler (bindings 2/3) and the rotation
+/// helper, reads the rotation texel, and computes `r` from the SDF sample
+/// (rotation applied **before** sampling; `CONTENT_SPAN` clip + `sdf_size` texel
+/// remap preserved). The DISTANCE SOURCE is the only difference from the orb
+/// variant; the falloff / breath / compositing are the **same** orb math, so
+/// glyph / image now blur exactly like orb (no bleed/halo). Built once (`OnceLock`).
+fn orb_sdf_wgsl() -> &'static str {
+    use std::sync::OnceLock;
+    static SDF: OnceLock<String> = OnceLock::new();
+    SDF.get_or_init(|| {
+        ORB_WGSL_TEMPLATE
+            .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_SDF)
+            .replace("//!ORB_LOAD", ORB_LOAD_ORB_WITH_ROT)
+            .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
+            .replace("//!ORB_DISTANCE_SOURCE", ORB_DISTANCE_SOURCE_SDF)
+    })
 }
 
-/// The Glyph **bleed/halo** WGSL (#214 Phase 1b.5). The 2nd-pass group that writes
-/// the aquarelle paper-bleed over the glyph fill: premultiply + separable box-blur
-/// (H/V), halo saturation boost, and the intensity compose + finalize. Translated
-/// from `aquarelle::render_aquarelle_bleed_pass` (default params, seed=0); see the
-/// shader header and [`BLEED_BOX_RADIUS`] / [`BLEED_HALO_FACTOR`] /
-/// [`BLEED_INTENSITY`] for the constant provenance. The paper-grain noise (step 4)
-/// is **omitted** on the GPU (loose-parity decision documented there).
-fn orb_glyph_bleed_wgsl() -> &'static str {
-    include_str!("orb_glyph_bleed.wgsl")
-}
+/// No extra bindings (orb variant): the analytic circle needs only the params
+/// uniform (0) and the orb data-texture (1) the template already declares.
+const ORB_EXTRA_BINDINGS_NONE: &str = "";
+
+/// SDF variant bindings: the glyph / image SDF (`R8Unorm`, bilinear-filterable)
+/// at binding 2 and a filtering sampler at binding 3.
+const ORB_EXTRA_BINDINGS_SDF: &str = "\
+// glyph/image SDF（R8Unorm, 単一文字 / 単一シルエット）と bilinear sampler。\n\
+@group(0) @binding(2) var sdf_tex: texture_2d<f32>;\n\
+@group(0) @binding(3) var sdf_samp: sampler;";
+
+/// Orb variant `load_orb`: reads only color / phase / misc (3 texels), exactly as
+/// the old `orb_circle.wgsl` did (no `rot` read), keeping the orb shader identical.
+const ORB_LOAD_ORB: &str = "\
+struct Orb {\n\
+    color: vec4<f32>, // (r, g, b, weight)\n\
+    phase: vec4<f32>, // (phase, phi_radius, phi_blur, phi_opacity)\n\
+    misc: vec4<f32>,  // (cross_axis, style_bit, speed_mult, _)\n\
+};\n\
+\n\
+fn load_orb(i: u32) -> Orb {\n\
+    let row = i32(i);\n\
+    var o: Orb;\n\
+    o.color = textureLoad(orb_tex, vec2<i32>(0, row), 0);\n\
+    o.phase = textureLoad(orb_tex, vec2<i32>(1, row), 0);\n\
+    o.misc = textureLoad(orb_tex, vec2<i32>(2, row), 0);\n\
+    return o;\n\
+}";
+
+/// SDF variant `load_orb`: the orb fields plus the rotation texel (x=3) the SDF
+/// DISTANCE SOURCE rotates by (`base_angle`, `rot_speed_signed`).
+const ORB_LOAD_ORB_WITH_ROT: &str = "\
+struct Orb {\n\
+    color: vec4<f32>, // (r, g, b, weight)\n\
+    phase: vec4<f32>, // (phase, phi_radius, phi_blur, phi_opacity)\n\
+    misc: vec4<f32>,  // (cross_axis, style_bit, speed_mult, _)\n\
+    rot: vec4<f32>,   // (base_angle, rot_speed_signed, _, _)\n\
+};\n\
+\n\
+fn load_orb(i: u32) -> Orb {\n\
+    let row = i32(i);\n\
+    var o: Orb;\n\
+    o.color = textureLoad(orb_tex, vec2<i32>(0, row), 0);\n\
+    o.phase = textureLoad(orb_tex, vec2<i32>(1, row), 0);\n\
+    o.misc = textureLoad(orb_tex, vec2<i32>(2, row), 0);\n\
+    o.rot = textureLoad(orb_tex, vec2<i32>(3, row), 0);\n\
+    return o;\n\
+}";
+
+/// No extra helpers (orb variant).
+const ORB_HELPERS_NONE: &str = "";
+
+/// SDF variant helper: `glyph_rotation_angle`, identical to
+/// `crate::animate::glyph_rotation_angle` (rotation applied before SDF sampling).
+const ORB_HELPERS_SDF: &str = "\
+// `crate::animate::glyph_rotation_angle`(cycle, t, base_angle, rot_speed_signed, glyph_rotate)\n\
+// と同式。glyph_rotate=false → base_angle 静止。それ以外 → base_angle +\n\
+// rem_euclid(cycle * rot_speed_signed * t, 1.0) * TAU。cycle * rot_speed_signed が整数\n\
+// なので t=1 で turns=0 に閉じる（loop closure）。\n\
+fn glyph_rotation_angle(base_angle: f32, rot_speed_signed: f32) -> f32 {\n\
+    if (params.glyph_rotate < 0.5) {\n\
+        return base_angle;\n\
+    }\n\
+    let x = params.cycle * rot_speed_signed * params.t;\n\
+    let turns = x - floor(x);\n\
+    return base_angle + turns * TAU;\n\
+}";
+
+/// Orb DISTANCE SOURCE: the analytic circle distance, inlined into the loop body
+/// **verbatim** from the old `orb_circle.wgsl` (so the orb shader is byte-exact).
+/// Defines `r` for the shared `falloff_curve` downstream; no rotation, no discard.
+const ORB_DISTANCE_SOURCE_CIRCLE: &str = "\
+        let dist = distance(sample_px, vec2<f32>(cx, cy));\n\
+        let r = dist / radius;";
+
+/// SDF DISTANCE SOURCE (glyph / image, #235): rotate the offset by the per-orb
+/// angle **before** sampling, map to the SDF UV (CONTENT_SPAN clip + the
+/// `sdf_size` texel remap that cancels the sampler's half-texel offset), bilinear
+/// sample the signed distance, and convert to `r = 1 - signed_unit`. Out-of-range
+/// UVs `continue` (the orb does not cover this pixel). `r` then feeds the **same**
+/// `falloff_curve` / compositing the orb uses — the form is the only difference.
+const ORB_DISTANCE_SOURCE_SDF: &str = "\
+        // 座標変換: orb 中心からの差分を +angle で回し、(2*radius) で割って\n\
+        // CONTENT_SPAN を掛けて 0.5 中心の UV にする（回転は SDF サンプル前）。\n\
+        let angle = glyph_rotation_angle(o.rot.x, o.rot.y);\n\
+        let cos_a = cos(angle);\n\
+        let sin_a = sin(angle);\n\
+        let dx = sample_px.x - cx;\n\
+        let dy = sample_px.y - cy;\n\
+        let rx = cos_a * dx - sin_a * dy;\n\
+        let ry = sin_a * dx + cos_a * dy;\n\
+        let u = rx / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;\n\
+        let v = ry / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;\n\
+        if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {\n\
+            continue;\n\
+        }\n\
+        // SDF bilinear サンプルの規約に合わせる: coord = clamp(u,0,1)*(size-1) の格子点を\n\
+        // 線形補間。GPU sampler は uv*size-0.5 の texel 空間で補間するので、\n\
+        //   uv_gpu = (u*(size-1) + 0.5) / size\n\
+        // と remap すると同じ格子点・同じ重みで補間し、半 texel ずれを消せる。\n\
+        let s = params.sdf_size;\n\
+        let uu = (clampf(u, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
+        let vv = (clampf(v, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
+        // bilinear sample（sampler が線形補間）。R8Unorm なので .r に SDF が入る。\n\
+        let sdf01 = textureSampleLevel(sdf_tex, sdf_samp, vec2<f32>(uu, vv), 0.0).r;\n\
+        let signed_unit = sdf01 * 2.0 - 1.0;\n\
+        let r = 1.0 - signed_unit;";
 
 /// The Aquarelle orb WGSL (#216 Phase 1c). A dedicated pipeline + data-texture
-/// (separate from the Circle/Glyph orb texture) that evaluates the four
+/// (separate from the orb data-texture) that evaluates the four
 /// `aquarelle::render_aquarelle_orb` layers analytically: offset main 3-stop
 /// radial, 0..3 bleed satellites, and the bloom core, composited SourceOver in
-/// the same u8-quantize → premultiply → source_over lowp流儀 as `orb_circle.wgsl`.
+/// the same u8-quantize → premultiply → source_over lowp流儀 as `orb.wgsl`.
 /// The ChaCha8 RNG / HSL color math is **not** ported to WGSL; `pack_aquarelle_orbs`
 /// runs it on the CPU (bit-identical to the crate) and uploads the resulting
 /// centers / radii / u8 colors.
@@ -168,25 +301,10 @@ fn orb_aquarelle_wgsl() -> &'static str {
     include_str!("orb_aquarelle.wgsl")
 }
 
-/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()`
-/// (`radius = 3.0, intensity = 0.5, halo = 0.3`) so the GPU 2nd pass matches the
-/// `aquarelle::render_aquarelle_bleed_pass` paper-bleed.
-///
-/// `BLEED_BOX_RADIUS` is `round(radius * 1.15).max(1)` = `round(3.45)` = `3`, the
-/// box-blur half-window the crate derives from `radius` (see
-/// `aquarelle::render_aquarelle_bleed_pass`). `BLEED_HALO_FACTOR` is
-/// `1.0 + 0.6 * halo` = `1.18` (the saturation multiplier
-/// `boost_saturation_buffer` applies). `BLEED_INTENSITY` is the compose mix
-/// (`dst = original * (1 - t) + blurred * t`). `BLEED_BLUR_ITERATIONS` is the
-/// crate's 3-pass (H→V) box-blur loop.
-const BLEED_BOX_RADIUS: f32 = 3.0;
-const BLEED_HALO_FACTOR: f32 = 1.18;
-const BLEED_INTENSITY: f32 = 0.5;
-const BLEED_BLUR_ITERATIONS: usize = 3;
-
-/// Header uniform block handed to the Circle shader. Mirrors `struct Params` in
-/// `orb_circle.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
-/// uniform layout (vec2 then scalars packed into 16-byte rows).
+/// Header uniform block handed to the orb / SDF shader. Mirrors `struct Params` in
+/// `orb.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
+/// uniform layout (vec2 then scalars packed into 16-byte rows). The same struct
+/// drives both variants (the orb variant simply ignores the SDF-only slots).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
@@ -201,34 +319,32 @@ struct Params {
     direction: f32,
     cycle: f32,
     n_orbs: f32,
-    // row 3: alpha_mul, glyph_rotate, edge_softness, padding
+    // row 3: alpha_mul, glyph_rotate, edge_softness, sdf_size
     alpha_mul: f32,
-    /// Glyph rotation toggle (#136): `1.0` = animate per-orb rotation, `0.0` =
-    /// hold `base_angle`. Circle ignores this. Lives in the former padding so the
-    /// uniform buffer size is unchanged (Circle's WGSL `Params` struct stays
-    /// valid; it simply names the slots `_pad0`/`_pad1`).
+    /// Per-orb rotation toggle (#136): `1.0` = animate per-orb rotation, `0.0` =
+    /// hold `base_angle`. Read only by the SDF variant (glyph / image); the plain
+    /// orb variant never references it. `0.0` is harmless for the orb path.
     glyph_rotate: f32,
-    /// Glyph edge softness (#205): unused by the current Glyph fill (it uses
-    /// the Circle `falloff_curve`), reserved for the future SDF-mask path; kept so
+    /// Edge softness (#205): reserved (currently unread by either variant); kept so
     /// the header layout mirrors the WebGL one.
     edge_softness: f32,
-    /// Glyph SDF square side in texels. The Glyph shader uses it for the SDF
-    /// bilinear sampling convention (`coord = u*(size-1)`) when remapping
-    /// UVs to the wgpu sampler's texel space. Circle ignores this slot (its WGSL
-    /// `Params` names it `_pad2`). `0.0` for the Circle path.
+    /// SDF square side in texels. The SDF variant uses it for the SDF bilinear
+    /// sampling convention (`coord = u*(size-1)`) when remapping UVs to the wgpu
+    /// sampler's texel space. The orb variant ignores this slot; `0.0` for the orb
+    /// path.
     sdf_size: f32,
 }
 
 /// One orb as the shaders see it: four `vec4`s mirroring `struct Orb` in
-/// `orb_circle.wgsl` / `orb_glyph.wgsl` (color+weight, phase quartet, misc,
-/// rotation). Filled from the `pack_render_data_for_webgl` per-orb words. One
-/// `GpuOrb` packs to one row of the `Rgba32Float` orb data-texture (4 texels =
-/// 64 bytes); the shader reads it back with `textureLoad`s.
+/// `orb.wgsl` (color+weight, phase quartet, misc, rotation). Filled from the
+/// `pack_render_data_for_webgl` per-orb words. One `GpuOrb` packs to one row of
+/// the `Rgba32Float` orb data-texture (4 texels = 64 bytes); the shader reads it
+/// back with `textureLoad`s.
 ///
-/// The Circle shader reads only `color` / `phase` / `misc` (texels x=0..2) and
-/// ignores `rot` (x=3), so widening the row to 4 texels leaves Circle output
-/// bit-exact. The Glyph shader additionally reads `rot = (base_angle,
-/// rot_speed_signed, _, _)` for #136 rotation.
+/// The plain orb variant's `load_orb` reads only `color` / `phase` / `misc`
+/// (texels x=0..2) and never touches `rot` (x=3), so widening the row to 4 texels
+/// leaves the orb output bit-exact. The SDF variant additionally reads
+/// `rot = (base_angle, rot_speed_signed, _, _)` for #136 rotation.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuOrb {
@@ -240,7 +356,7 @@ struct GpuOrb {
 
 /// Header uniform block for the Aquarelle shader. Mirrors `struct Params` in
 /// `orb_aquarelle.wgsl` (resolution, orb count, background). `#[repr(C)]` + padding
-/// to 16-byte rows. Separate from the Circle [`Params`] because the aquarelle pack
+/// to 16-byte rows. Separate from the orb [`Params`] because the aquarelle pack
 /// needs no motion scalars (positions are baked per orb on the CPU).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -272,25 +388,6 @@ struct GpuAquaOrb {
     sat2: [f32; 4],       // sat2_cx, sat2_cy, sat2_radius, _
 }
 
-/// Uniform block for the Glyph bleed pass shader (`orb_glyph_bleed.wgsl`).
-/// Mirrors `struct BleedParams` there. `#[repr(C)]` + padding to a 32-byte (two
-/// 16-byte rows) uniform layout. One of these is built per bleed sub-pass with the
-/// per-pass `radius` / `premultiply` set; `halo_factor` / `intensity` are constant
-/// across passes but live here so every pass shares one uniform/bind-group layout.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct BleedParams {
-    // row 0: resolution.xy, radius, premultiply
-    resolution: [f32; 2],
-    radius: f32,
-    premultiply: f32,
-    // row 1: halo_factor, intensity, pad, pad
-    halo_factor: f32,
-    intensity: f32,
-    _pad0: f32,
-    _pad1: f32,
-}
-
 /// A render pipeline plus its bind-group layout, compiled once per distinct
 /// `(shader source, target format)` key (#229: the to_view path made the target
 /// format vary, so it joined the cache key). Caching keeps shader compilation /
@@ -299,48 +396,6 @@ struct BleedParams {
 struct CachedPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-}
-
-/// The bleed-pass pipelines (`orb_glyph_bleed.wgsl`), plus the shared bind-group
-/// layout: the three fixed `Rgba8Unorm`-target pipelines (`blur_h` / `blur_v` /
-/// `halo`), built once with the shader, and the `compose` map, grown lazily with
-/// one pipeline per distinct final-target format (#229 — the only bleed pass
-/// whose target varies). The pipelines differ solely in their fragment entry
-/// point / target format, so they all reuse the same layout (uniform 0 +
-/// `src` 1 + `blurred` 2). Cached so a long glyph clip compiles the bleed
-/// shader once and each pipeline at most once.
-struct BleedPipelines {
-    bind_group_layout: wgpu::BindGroupLayout,
-    /// The compiled bleed shader module + pipeline layout, kept to build
-    /// additional per-format `compose` pipelines lazily (#229).
-    shader: wgpu::ShaderModule,
-    pipeline_layout: wgpu::PipelineLayout,
-    /// Horizontal box-blur (`fs_blur_h`); the `premultiply` uniform flag turns the
-    /// straight-RGBA glyph fill into premultiplied on the first iteration only.
-    /// Always targets the `Rgba8Unorm` blur intermediates (both paths).
-    blur_h: wgpu::RenderPipeline,
-    /// Vertical box-blur (`fs_blur_v`). `Rgba8Unorm` intermediates only.
-    blur_v: wgpu::RenderPipeline,
-    /// Halo saturation boost (`fs_halo`). `Rgba8Unorm` intermediates only.
-    halo: wgpu::RenderPipeline,
-    /// Intensity compose + finalize to straight RGBA (`fs_compose`), keyed by the
-    /// **final-target format** — the only bleed pass whose target varies (#229):
-    /// `Rgba8Unorm` for the offscreen read-back path, the caller's view format for
-    /// the to_view (surface present) path. Grow-only like the other caches.
-    compose: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-}
-
-/// Per-size intermediate textures for the Glyph bleed pass, reused across
-/// same-sized frames (mirrors [`SizedResources`]). The glyph fill renders into
-/// `fill` (straight RGBA, as the glyph shader emits); the box-blur ping-pongs
-/// between `ping` / `pong` (premultiplied); the compose pass reads `fill` +
-/// the final blurred texture and writes straight RGBA to the `SizedResources`
-/// `target`. All three are `Rgba8Unorm` so each box-blur pass quantizes to u8 the
-/// way the `aquarelle` crate does between its H/V passes.
-struct BleedTextures {
-    fill_view: wgpu::TextureView,
-    ping_view: wgpu::TextureView,
-    pong_view: wgpu::TextureView,
 }
 
 /// Per-dimension GPU resources reused across same-sized frames: the render
@@ -372,33 +427,33 @@ struct OrbTexture {
 /// A single glyph's SDF uploaded as an `R8Unorm` texture (square `size × size`),
 /// cached per `(char, size)` so a video reuses the upload across frames. `R8Unorm`
 /// is chosen because it is **linear-filterable on the wgpu WebGL2 backend**
-/// (unlike `Rgba32Float`), so the Glyph shader can read it with a real bilinear
+/// (unlike `Rgba32Float`), so the SDF orb shader can read it with a real bilinear
 /// `sampler` and stay portable to Phase 2 (#212).
 struct GlyphSdfTexture {
     view: wgpu::TextureView,
 }
 
-/// The glyph SDF binding passed into `render_packed_inner` for the Glyph path:
+/// The SDF binding passed into `render_packed_inner` for the glyph / image path:
 /// the (cached) SDF texture view and its square side in texels. `None` selects
-/// the Circle path instead.
+/// the orb (analytic circle) path instead.
 struct GlyphBindings<'a> {
     sdf_view: &'a wgpu::TextureView,
     size: u32,
 }
 
-/// One prepared SDF (Glyph / Image, #229) frame, shared by the read-back and
+/// One prepared SDF (glyph / image, #229) frame, shared by the read-back and
 /// to_view paths: the pack buffer plus the uploaded SDF binding, or one of the
 /// two degenerate outcomes the SDF entry points must keep handling.
 enum SdfFramePack {
     /// `opts.shape` was not the expected SDF shape: the caller falls back to the
-    /// Circle path so the call stays total.
+    /// orb path so the call stays total.
     NotSdfShape,
     /// No drawable SDF (radius 0 / unknown char / empty SDF): a zero-orb pack
-    /// that renders the background only through the Circle pipeline (no bleed
+    /// that renders the background only through the orb pipeline (the same single
     /// pass) — the "draw nothing for tofu" contract.
     BackgroundOnly(Vec<f32>),
     /// A drawable frame: the pack plus the (cached) uploaded SDF texture view
-    /// and its square side in texels, to bind on the Glyph pipeline.
+    /// and its square side in texels, to bind on the SDF orb pipeline.
     Sdf {
         pack: Vec<f32>,
         sdf_view: wgpu::TextureView,
@@ -406,10 +461,11 @@ enum SdfFramePack {
     },
 }
 
-/// Headless wgpu renderer for the Circle orb path. Holds a device/queue plus a
-/// per-shader pipeline cache and a per-size resource cache, so a multi-frame
-/// render (a long `--duration-ms` video) compiles the shader and allocates the
-/// target/read-back buffer only once instead of every frame.
+/// Headless wgpu renderer for the unified orb path (orb / glyph / image / #235).
+/// Holds a device/queue plus a per-shader pipeline cache and a per-size resource
+/// cache, so a multi-frame render (a long `--duration-ms` video) compiles the
+/// shader and allocates the target/read-back buffer only once instead of every
+/// frame.
 ///
 /// The caches are unbounded and never evict; for the single-resolution clip use
 /// case this is intentional. A caller streaming arbitrarily many sizes through
@@ -440,22 +496,14 @@ pub struct GpuRenderer {
     /// evicts): a clip renders one glyph at one size, so this holds a single
     /// entry; supporting several glyphs in one clip just adds entries.
     glyph_sdf_cache: std::sync::Mutex<HashMap<(u32, u32), GlyphSdfTexture>>,
-    /// The bilinear (linear/linear, clamp-to-edge) sampler the Glyph shader uses
-    /// to read the `R8Unorm` SDF. Built once; reused for every glyph frame.
+    /// The bilinear (linear/linear, clamp-to-edge) sampler the SDF orb shader uses
+    /// to read the `R8Unorm` SDF. Built once; reused for every glyph / image frame.
     glyph_sampler: wgpu::Sampler,
-    /// The four Glyph bleed-pass pipelines (#214), compiled lazily once. `None`
-    /// until the first glyph frame (Circle never touches the bleed path, so a
-    /// Circle-only run never compiles the bleed shader).
-    bleed_pipelines: std::sync::Mutex<Option<BleedPipelines>>,
-    /// Per-size bleed intermediate textures (`fill` + blur ping-pong), keyed by
-    /// `(width, height)`. Grow-only / never-evicts like `sized_cache`: a glyph clip
-    /// at one size keeps a single entry.
-    bleed_textures: std::sync::Mutex<HashMap<(u32, u32), BleedTextures>>,
     /// The grow-only per-orb **aquarelle** data-texture (#216), reallocated only
     /// when a frame needs more rows than the cached capacity. `None` until the first
-    /// aquarelle frame (Circle/Glyph-only runs never allocate it). Separate from
+    /// aquarelle frame (orb/glyph/image-only runs never allocate it). Separate from
     /// `orb_texture` so the 9-texel aquarelle layout never aliases the 4-texel
-    /// Circle/Glyph one, keeping Circle bit-exact.
+    /// orb/glyph/image one, keeping the orb output bit-exact.
     aquarelle_texture: std::sync::Mutex<Option<OrbTexture>>,
     /// Serializes the whole GPU side of [`Self::render_packed`] (orb/params
     /// upload → pass record → `queue.submit` → map/readback) so concurrent
@@ -556,8 +604,6 @@ impl GpuRenderer {
             orb_texture: std::sync::Mutex::new(None),
             glyph_sdf_cache: std::sync::Mutex::new(HashMap::new()),
             glyph_sampler,
-            bleed_pipelines: std::sync::Mutex::new(None),
-            bleed_textures: std::sync::Mutex::new(HashMap::new()),
             aquarelle_texture: std::sync::Mutex::new(None),
             render_guard: std::sync::Mutex::new(()),
         }
@@ -613,50 +659,6 @@ impl GpuRenderer {
             .len()
     }
 
-    /// Number of live entries in the grow-only per-size bleed-texture cache (one
-    /// `BleedTextures` per distinct `(width, height)`). Exposed for the #214
-    /// bleed-cache tests (`gpu_glyph_bleed_textures_reuse_same_size` /
-    /// `gpu_glyph_bleed_textures_grow_on_new_size`): re-rendering a glyph at the
-    /// same size must keep this at 1, while a new size must add an entry. Mirrors
-    /// the `cache_sizes` / `glyph_sdf_cache_len` hooks (poison recovery via
-    /// `into_inner`, `#[cfg(test)]` so the production API stays clean).
-    #[cfg(test)]
-    fn bleed_textures_len(&self) -> usize {
-        self.bleed_textures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-
-    /// Whether the lazy bleed pipelines have been compiled yet (`Some`). Exposed
-    /// for `gpu_bleed_pipelines_lazy_not_built_for_circle_only`: a Circle-only run
-    /// must leave this `false` (the bleed shader never compiles), and the first
-    /// glyph frame must flip it to `true`. Mirrors the `cache_sizes` /
-    /// `glyph_sdf_cache_len` hooks (poison recovery via `into_inner`).
-    #[cfg(test)]
-    fn bleed_pipelines_built(&self) -> bool {
-        self.bleed_pipelines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    /// Number of per-format `compose` pipelines in the bleed cache (one per
-    /// distinct final-target format, #229), `0` while the bleed pipelines are not
-    /// built yet. Exposed for the to_view format-cache test
-    /// (`glyph_to_view_compose_pipeline_cached_per_format`): a new target format
-    /// must add exactly one entry; a repeated format must not (grow-only).
-    /// Mirrors the `cache_sizes` / `bleed_pipelines_built` hooks (poison recovery
-    /// via `into_inner`, `#[cfg(test)]` so the production API stays clean).
-    #[cfg(test)]
-    fn bleed_compose_len(&self) -> usize {
-        self.bleed_pipelines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or(0, |bp| bp.compose.len())
-    }
-
     /// Get-or-build the orb pipeline for `(shader_wgsl, format)`, compiling the
     /// shader and pipeline only on first use. The build runs at most once per
     /// distinct `(shader source, target format)` key for the life of the renderer
@@ -679,12 +681,12 @@ impl GpuRenderer {
         f(entry)
     }
 
-    /// Compile a pipeline for `shader_wgsl` targeting `format`. The Circle
+    /// Compile a pipeline for `shader_wgsl` targeting `format`. The orb
     /// pipeline has binding 0 = `Params` uniform, binding 1 = orb data-texture
-    /// (`Rgba32Float`, read via `textureLoad`, `filterable: false`). The Glyph
-    /// pipeline (`glyph = true`) additionally has binding 2 = glyph SDF
-    /// (`R8Unorm`, `filterable: true`) and binding 3 = a filtering sampler, so the
-    /// shader can bilinear-sample the SDF. The orb texture stays
+    /// (`Rgba32Float`, read via `textureLoad`, `filterable: false`). The SDF
+    /// pipeline (`glyph = true`, glyph / image) additionally has binding 2 = the
+    /// SDF (`R8Unorm`, `filterable: true`) and binding 3 = a filtering sampler, so
+    /// the shader can bilinear-sample the SDF. The orb texture stays
     /// `textureLoad`-only either way, keeping the path portable to wgpu's WebGL2
     /// backend (#210/#212). `format` is the color-target format: `Rgba8Unorm` for
     /// the offscreen read-back path, the caller's view format for the to_view
@@ -782,7 +784,7 @@ impl GpuRenderer {
             depth_or_array_layers: 1,
         };
         let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("orber-circle-target"),
+            label: Some("orber-orb-target"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -796,7 +798,7 @@ impl GpuRenderer {
         let unpadded_bytes_per_row = width * BYTES_PER_PIXEL;
         let padded_bytes_per_row = align_up(unpadded_bytes_per_row, ROW_ALIGNMENT);
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orber-circle-readback"),
+            label: Some("orber-orb-readback"),
             size: (padded_bytes_per_row * height) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -964,7 +966,7 @@ impl GpuRenderer {
         view
     }
 
-    /// Render one Circle frame at time `t` from `clusters` + `opts`.
+    /// Render one plain orb frame at time `t` from `clusters` + `opts`.
     ///
     /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
     /// arithmetic the WebGL path (`orberGl.ts`) uses — so the orb positions /
@@ -979,7 +981,7 @@ impl GpuRenderer {
     ///
     /// # Scope
     ///
-    /// This is the **Circle** path only. The shape in `opts.shape` is ignored
+    /// This is the **plain orb** path only. The shape in `opts.shape` is ignored
     /// here; the caller routes `Glyph` to `render_frame_glyph`, `Image` to
     /// `render_frame_image`, and `Aquarelle` to `render_frame_aquarelle` (all GPU).
     /// GPU is the only renderer (#225) — no CPU fallback exists; when no adapter is
@@ -994,7 +996,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        let pack = Self::pack_circle_frame(clusters, opts, width, height);
+        let pack = Self::pack_orb_frame(clusters, opts, width, height);
         self.render_packed(&pack, width, height, t)
     }
 
@@ -1012,9 +1014,9 @@ impl GpuRenderer {
     ///   target (see the module's compositing contract), so an sRGB format would
     ///   apply the sRGB encoding a second time. Guarded by a `debug_assert`.
     /// - `view` must be exactly `opts.width × opts.height` texels. A mismatch is
-    ///   **not** a wgpu validation error — the Glyph compose pass reads its
-    ///   intermediates with clamped `textureLoad`s, so an oversized view silently
-    ///   renders a frame with smeared edges instead of failing.
+    ///   **not** a wgpu validation error — the shader samples its inputs with
+    ///   clamped fetches, so an oversized view silently renders a frame with
+    ///   smeared / clipped edges instead of failing.
     ///
     /// Every `*_to_view` entry point shares this contract.
     pub fn render_frame_to_view(
@@ -1028,16 +1030,16 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        let pack = Self::pack_circle_frame(clusters, opts, width, height);
+        let pack = Self::pack_orb_frame(clusters, opts, width, height);
         self.render_packed_to_view(&pack, width, height, t, view, format);
     }
 
-    /// Build the Circle pack buffer for one frame: derive the WebGL pack-buffer
+    /// Build the plain orb pack buffer for one frame: derive the WebGL pack-buffer
     /// scalars exactly as `get_render_data` (the wasm/WebGL entry) does, reuse
     /// [`pack_render_data_for_webgl`] (so the per-orb arithmetic is never
     /// reimplemented), then re-apply per-orb saturation. Shared by the read-back
     /// ([`Self::render_frame`]) and to_view ([`Self::render_frame_to_view`]) paths.
-    fn pack_circle_frame(
+    fn pack_orb_frame(
         clusters: &[Cluster],
         opts: &AnimateOptions,
         width: u32,
@@ -1054,8 +1056,8 @@ impl GpuRenderer {
         };
         let cycle = opts.speed.cycle_count() as f32;
         let n_orbs = Self::resolved_orb_count(clusters, opts);
-        // shape_id / glyph_rotate / edge_softness are Phase-1 (Glyph) inputs; the
-        // Circle shader ignores them. Pass Circle defaults.
+        // shape_id / glyph_rotate / edge_softness are SDF (glyph / image) inputs; the
+        // plain orb shader ignores them. Pass orb defaults.
         let mut pack = pack_render_data_for_webgl(
             clusters,
             opts.background,
@@ -1066,8 +1068,8 @@ impl GpuRenderer {
             opts.seed,
             n_orbs,
             alpha_mul,
-            0.0,  // shape_id = Circle
-            true, // glyph_rotate (unused by Circle)
+            0.0,  // shape_id = Orb
+            true, // glyph_rotate (unused by Orb)
             opts.softness.edge_softness(),
         );
 
@@ -1084,28 +1086,24 @@ impl GpuRenderer {
         pack
     }
 
-    /// Render one **Glyph** frame at time `t` from `clusters` + `opts` (#212 Phase 1b).
+    /// Render one **Glyph** frame at time `t` from `clusters` + `opts` (#212 Phase 1b,
+    /// #235).
     ///
     /// `opts.shape` must be [`OrbShape::Glyph`]; the glyph `ch` / `font` select the
     /// SDF. The per-orb arithmetic reuses [`pack_render_data_for_webgl`] (so
     /// positions / radii / rotation match the WebGL path), saturation is re-applied
     /// per orb (the native CLI has no separate saturation knob), the glyph SDF is
-    /// uploaded as an `R8Unorm` texture, and the Glyph shader bilinear-samples it
-    /// and fills with `falloff_curve(1 - signed_unit)`.
+    /// uploaded as an `R8Unorm` texture, and the SDF orb shader bilinear-samples it.
     ///
-    /// # Bleed pass
+    /// # Unified orb mechanism (#235)
     ///
-    /// After the glyph fill, an aquarelle **bleed pass** (#195, reference algorithm
-    /// `aquarelle::render_aquarelle_bleed_pass`) is applied as a 2nd pass group
-    /// (#214): the glyph fill renders into an intermediate texture, then a WGSL
-    /// premultiply → separable box-blur ×3 → halo saturation → intensity compose +
-    /// finalize writes the backbuffer (see [`Self::run_glyph_fill_bleed_readback`]
-    /// / `orb_glyph_bleed.wgsl`). The box-blur structure / halo / intensity match
-    /// the crate, but the aquarelle paper-grain noise (a faint ±0.05 seed-derived
-    /// jitter) is **omitted** on the GPU because its ChaCha8 per-pixel-order
-    /// consumption cannot be bit-reproduced in parallel; that small per-pixel
-    /// difference vs. the crate algorithm is **expected and allowed** (a future
-    /// WGSL hash could approximate the noise).
+    /// Since #235 the glyph is just a different silhouette fed to the orb mechanism:
+    /// the SDF sample becomes the normalized distance `r = 1 - signed_unit`, which
+    /// feeds the **same** `falloff_curve` / 3-axis breath / Skia-lowp premultiply
+    /// compositing the plain orb uses (`orb.wgsl`, SDF variant). It is **one** pass —
+    /// the old aquarelle-derived bleed/halo 2nd pass group is removed, so glyph now
+    /// blurs exactly like an orb (a `●` glyph looks like an orb; a `▲` blurs while
+    /// keeping its triangular form). "Bleed" is now the領分 of the Aquarelle shape only.
     ///
     /// Returns a background-only frame (no glyph fill) when the glyph is unknown /
     /// empty in the bundled font — the "draw nothing for tofu" contract (never
@@ -1124,10 +1122,10 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match self.prepare_glyph_frame(clusters, opts, width, height) {
-            // Not a glyph shape: fall back to the Circle path so the call is total.
+            // Not a glyph shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame(clusters, opts, t),
-            // Background-only routes through `render_packed` (the Circle path), so
-            // the bleed 2nd pass is skipped — see `prepare_glyph_frame`.
+            // Background-only routes through `render_packed` (the plain orb path),
+            // which paints only the background — see `prepare_glyph_frame`.
             SdfFramePack::BackgroundOnly(pack) => self.render_packed(&pack, width, height, t),
             SdfFramePack::Sdf {
                 pack,
@@ -1147,16 +1145,15 @@ impl GpuRenderer {
     }
 
     /// [`Self::render_frame_glyph`], but drawing into an externally supplied
-    /// `view` of `format` instead of the offscreen read-back target (#229).
-    /// The bleed 2nd pass runs exactly as in the read-back path (its
-    /// intermediates stay `Rgba8Unorm`); only the final compose pass targets
-    /// `format`. The Circle / background fallbacks mirror the read-back variant.
+    /// `view` of `format` instead of the offscreen read-back target (#229 / #235).
+    /// One pass straight into `view` (the SDF orb variant; no bleed 2nd pass since
+    /// #235). The orb / background fallbacks mirror the read-back variant.
     ///
     /// Same `view` / `format` contract as [`Self::render_frame_to_view`]:
     /// `format` non-sRGB (the shader output is already sRGB-encoded; an sRGB
     /// format would encode twice), `view` exactly `opts.width × opts.height`
-    /// texels (a mismatch is no validation error — the compose pass clamps its
-    /// `textureLoad`s, so the edges silently smear).
+    /// texels (a mismatch is no validation error — the shader clamps its
+    /// fetches, so the edges silently smear / clip).
     pub fn render_frame_glyph_to_view(
         &self,
         clusters: &[Cluster],
@@ -1169,7 +1166,7 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match self.prepare_glyph_frame(clusters, opts, width, height) {
-            // Not a glyph shape: fall back to the Circle path so the call is total.
+            // Not a glyph shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame_to_view(clusters, opts, t, view, format),
             SdfFramePack::BackgroundOnly(pack) => {
                 self.render_packed_to_view(&pack, width, height, t, view, format)
@@ -1203,13 +1200,8 @@ impl GpuRenderer {
     ///
     /// No glyph (radius 0 / unknown char / empty SDF) ⇒ `BackgroundOnly`, the
     /// "draw nothing" contract: a glyph-shaped pack with zero orbs so only the
-    /// background paints. The caller routes it through the Circle pipeline, so
-    /// the bleed 2nd pass is skipped — intentional: the bleed pass
-    /// (`aquarelle::render_aquarelle_bleed_pass`) would run for Glyph, but blurring
-    /// orber's uniform opaque background is a no-op *up to the omitted paper-grain
-    /// noise* (the crate algorithm would jitter that flat background by ±0.05; the
-    /// GPU leaves it flat). Either way the result is a background-only frame, within
-    /// the same noise-omitted behavior this pass already documents.
+    /// background paints. The caller routes it through the plain orb pipeline (a
+    /// zero-orb single pass), which paints just the background.
     ///
     /// The SDF upload happens here (outside `render_guard`): the SDF texture is
     /// keyed per `(ch, size)` and immutable once created, so (unlike the shared,
@@ -1253,19 +1245,19 @@ impl GpuRenderer {
         }
     }
 
-    /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217),
-    /// using the same SDF fill as [`Self::render_frame_glyph`].
+    /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217,
+    /// #235), using the same SDF orb path as [`Self::render_frame_glyph`].
     ///
     /// `opts.shape` must be [`OrbShape::Image`]; its `sdf` / `size` are uploaded as
-    /// an `R8Unorm` texture and bound to the **same** Glyph pipeline + bleed 2nd pass
-    /// (`orb_glyph.wgsl` / `orb_glyph_bleed.wgsl`). The only difference from
+    /// an `R8Unorm` texture and bound to the **same** SDF orb pipeline
+    /// (`orb.wgsl`, SDF variant). The only difference from
     /// [`Self::render_frame_glyph`] is the SDF source: an image silhouette (supplied
     /// from outside, one fixed texture for the whole frame) instead of a per-radius
     /// cached font glyph. Per-orb positions / radii / rotation reuse
     /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
-    /// like the glyph path, so the same bleed-pass behavior (box-blur / halo /
-    /// intensity match the crate, paper-grain noise omitted on the GPU) applies.
-    /// Non-Image shapes fall back to the Circle path so the call is total.
+    /// like the glyph path. Since #235 it is a single pass that feeds the SDF to
+    /// the orb mechanism — the image silhouette blurs like an orb (no bleed/halo).
+    /// Non-Image shapes fall back to the plain orb path so the call is total.
     ///
     /// Native only (#229): read-back path; the wasm/browser path uses
     /// [`Self::render_frame_image_to_view`] instead.
@@ -1280,7 +1272,7 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match self.prepare_image_frame(clusters, opts, width, height) {
-            // Not an image shape: fall back to the Circle path so the call is total.
+            // Not an image shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame(clusters, opts, t),
             SdfFramePack::BackgroundOnly(pack) => self.render_packed(&pack, width, height, t),
             SdfFramePack::Sdf {
@@ -1301,9 +1293,9 @@ impl GpuRenderer {
     }
 
     /// [`Self::render_frame_image`], but drawing into an externally supplied
-    /// `view` of `format` instead of the offscreen read-back target (#229).
+    /// `view` of `format` instead of the offscreen read-back target (#229 / #235).
     /// Mirrors [`Self::render_frame_glyph_to_view`] (the two shapes share the SDF
-    /// pipeline + bleed pass), including the `view` / `format` contract of
+    /// orb pipeline, single pass), including the `view` / `format` contract of
     /// [`Self::render_frame_to_view`]: `format` non-sRGB (the output is already
     /// sRGB-encoded), `view` exactly `opts.width × opts.height` texels (a
     /// mismatch silently smears the edges instead of failing validation).
@@ -1319,7 +1311,7 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match self.prepare_image_frame(clusters, opts, width, height) {
-            // Not an image shape: fall back to the Circle path so the call is total.
+            // Not an image shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame_to_view(clusters, opts, t, view, format),
             SdfFramePack::BackgroundOnly(pack) => {
                 self.render_packed_to_view(&pack, width, height, t, view, format)
@@ -1391,7 +1383,7 @@ impl GpuRenderer {
 
     /// Build the SDF (Glyph / Image, `shape_id = 1`) pack buffer for one frame
     /// with `n_orbs` orbs (`0` = background only), then re-apply per-orb
-    /// saturation, same as the Circle path: the shared WebGL pack never bakes it
+    /// saturation, same as the plain orb path: the shared WebGL pack never bakes it
     /// in, so the native side runs `adjust_saturation_pub` here.
     fn pack_sdf_frame(
         clusters: &[Cluster],
@@ -1444,8 +1436,8 @@ impl GpuRenderer {
     /// The RNG / color math reuse the crate's exact arithmetic (host-side), so those
     /// are byte-identical to the crate; only the radial fill is analytic where Skia
     /// lowp anti-aliases `fill_path`, so the residual is an AA-only difference at orb
-    /// edges (the same kind Circle has). Non-Aquarelle shapes fall back to the Circle
-    /// path so the call is total.
+    /// edges (the same kind the orb has). Non-Aquarelle shapes fall back to the plain
+    /// orb path so the call is total.
     ///
     /// Native only (#229): read-back path; the wasm/browser path uses
     /// [`Self::render_frame_aquarelle_to_view`] instead.
@@ -1460,7 +1452,7 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match Self::prepare_aquarelle_frame(clusters, opts, t, width, height) {
-            // Not an aquarelle shape: fall back to the Circle path so the call is total.
+            // Not an aquarelle shape: fall back to the plain orb path so the call is total.
             None => self.render_frame(clusters, opts, t),
             Some(orbs) => self.render_aquarelle_packed(&orbs, width, height, opts.background),
         }
@@ -1486,7 +1478,7 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         match Self::prepare_aquarelle_frame(clusters, opts, t, width, height) {
-            // Not an aquarelle shape: fall back to the Circle path so the call is total.
+            // Not an aquarelle shape: fall back to the plain orb path so the call is total.
             None => self.render_frame_to_view(clusters, opts, t, view, format),
             Some(orbs) => self.render_aquarelle_packed_to_view(
                 &orbs,
@@ -1500,7 +1492,7 @@ impl GpuRenderer {
     }
 
     /// Build one Aquarelle frame's packed orbs, or `None` when `opts.shape` is not
-    /// Aquarelle (the caller falls back to the Circle path). Shared by the
+    /// Aquarelle (the caller falls back to the plain orb path). Shared by the
     /// read-back and to_view entry points.
     ///
     /// Runs the shared per-orb modulation (position wrap, radius breath, #33/#7
@@ -1660,7 +1652,7 @@ impl GpuRenderer {
 
     /// Upload the packed aquarelle orbs into the grow-only aquarelle data-texture,
     /// build the header uniform, run the aquarelle pass, and read back. Serialized
-    /// under `render_guard` (like the Circle/Glyph path) so concurrent renders on a
+    /// under `render_guard` (like the orb / glyph / image path) so concurrent renders on a
     /// shared renderer cannot alias the one shared aquarelle texture / per-size
     /// target / read-back buffer (the #210 concurrency contract).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1791,7 +1783,7 @@ impl GpuRenderer {
     /// Upload the packed aquarelle orbs into the grow-only `Rgba32Float` aquarelle
     /// data-texture (9 texels wide × `orbs.len()` tall) and return a view to bind.
     /// Mirrors [`Self::upload_orb_texture`] but for the separate aquarelle texture so
-    /// the Circle/Glyph orb texture is never resized to the wider aquarelle layout.
+    /// the orb / glyph / image data-texture is never resized to the wider aquarelle layout.
     fn upload_aquarelle_texture(&self, orbs: &[GpuAquaOrb]) -> wgpu::TextureView {
         let rows = orbs.len().max(1) as u32;
         let mut guard = self
@@ -1858,12 +1850,12 @@ impl GpuRenderer {
         }
     }
 
-    /// Render one **Circle** frame from a raw `pack_render_data_for_webgl` buffer.
+    /// Render one **plain orb** frame from a raw `pack_render_data_for_webgl` buffer.
     ///
     /// `pack` must be the header(16) + per-orb(16 × n_orbs) layout produced by
     /// [`pack_render_data_for_webgl`]. `t` is the normalized time written into the
-    /// shader's `u_t`; it is clamped to `0.0..=1.0`. Glyph rendering uses the
-    /// private `render_packed_inner` with a glyph SDF binding instead.
+    /// shader's `u_t`; it is clamped to `0.0..=1.0`. Glyph / image rendering uses the
+    /// private `render_packed_inner` with an SDF binding instead.
     ///
     /// Native only (#229): read-back path; the wasm/browser path uses
     /// [`Self::render_packed_to_view`] instead.
@@ -1872,7 +1864,7 @@ impl GpuRenderer {
         self.render_packed_inner(pack, width, height, t, None)
     }
 
-    /// Render one **Circle** frame from a raw `pack_render_data_for_webgl` buffer
+    /// Render one **plain orb** frame from a raw `pack_render_data_for_webgl` buffer
     /// into an externally supplied `view` of `format` (#229). This is the
     /// pack-level surface-present seam the browser WebGPU path shares: the caller
     /// owns the surface (creation / configure / present); core only draws into the
@@ -1893,9 +1885,12 @@ impl GpuRenderer {
         self.render_packed_inner_to_view(pack, width, height, t, None, view, format);
     }
 
-    /// Shared core of the Circle / Glyph read-back paths. `glyph = Some(_)` selects
-    /// the Glyph pipeline (`orb_glyph.wgsl`) and binds the SDF texture + sampler;
-    /// `None` is the Circle pipeline. The orb data-texture, per-size resources, the
+    /// Shared core of the orb / glyph / image read-back paths (#235). `glyph =
+    /// Some(_)` selects the SDF orb pipeline (`orb_sdf_wgsl`) and binds the SDF
+    /// texture + sampler; `None` is the plain orb pipeline (`orb_wgsl`). Either way
+    /// it is **one** full-screen pass — glyph / image now go through the same orb
+    /// mechanism (the SDF is just a different silhouette fed to it), with no
+    /// bleed/halo 2nd pass (#235). The orb data-texture, per-size resources, the
     /// `render_guard` serialization, and the read-back are all shared.
     #[cfg(not(target_arch = "wasm32"))]
     fn render_packed_inner(
@@ -1929,13 +1924,13 @@ impl GpuRenderer {
 
         // Pipeline (shader compile) cached per (shader source, target format);
         // target / read-back cached per size; orb texture grows as needed. Only the
-        // small params uniform / bind group are rebuilt per frame. Glyph selects a
-        // different shader + adds the SDF texture / sampler bindings (2/3). The
-        // read-back path always targets `Rgba8Unorm` (the Glyph fill also goes to
-        // the `Rgba8Unorm` bleed `fill` intermediate, never to the final target).
+        // small params uniform / bind group are rebuilt per frame. The SDF variant
+        // selects a different shader source + adds the SDF texture / sampler
+        // bindings (2/3) but draws the same single pass. The read-back path always
+        // targets `Rgba8Unorm`.
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_glyph_wgsl(), true),
-            None => (orb_circle_wgsl(), false),
+            Some(_) => (orb_sdf_wgsl(), true),
+            None => (orb_wgsl(), false),
         };
         self.pipeline(
             shader,
@@ -1949,30 +1944,19 @@ impl GpuRenderer {
                         &orb_view,
                         &glyph,
                     );
-                    if glyph.is_some() {
-                        // Glyph (#214): render the fill into the bleed `fill` texture,
-                        // then run the aquarelle bleed pass group (premult → box-blur×3
-                        // → halo → compose) into `res.target`, then read `res.target`
-                        // back. The bleed pipelines / intermediate textures are taken
-                        // here, nested under the (already-held) render_guard → pipeline
-                        // → sized locks; this is the only path that touches them, so the
-                        // ordering stays consistent and cannot deadlock.
-                        self.run_glyph_fill_bleed_readback(&cached.pipeline, &bind_group, res)
-                    } else {
-                        self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
-                    }
+                    self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
                 })
             },
         )
     }
 
-    /// Shared core of the Circle / Glyph **to_view** paths (#229): same upload /
-    /// bind-group / pass structure as [`Self::render_packed_inner`], but the final
-    /// pass targets the externally supplied `view` of `format` and nothing is read
-    /// back. For Glyph, the fill + bleed intermediates stay `Rgba8Unorm` (matching
-    /// the read-back path byte-for-byte); only the final compose pass targets
-    /// `format`. Serialized under `render_guard` because this path shares the same
-    /// grow-only orb texture and bleed intermediates (the #210 contract).
+    /// Shared core of the orb / glyph / image **to_view** paths (#229 / #235): same
+    /// upload / bind-group / single-pass structure as [`Self::render_packed_inner`],
+    /// but the pass targets the externally supplied `view` of `format` and nothing
+    /// is read back. The SDF variant draws the same one pass as the orb variant
+    /// (no bleed 2nd pass since #235); both target `format` directly. Serialized
+    /// under `render_guard` because this path shares the same grow-only orb texture
+    /// (the #210 contract).
     #[allow(clippy::too_many_arguments)]
     fn render_packed_inner_to_view(
         &self,
@@ -1997,28 +1981,17 @@ impl GpuRenderer {
 
         let (params_buffer, orb_view) = self.upload_packed_frame(pack, width, height, t, &glyph);
 
-        // Circle draws straight into the caller's view, so its pipeline targets
-        // `format`. The Glyph *fill* still goes to the `Rgba8Unorm` bleed `fill`
-        // intermediate; only the bleed compose pass targets `format`.
-        let (shader, is_glyph, fill_format) = match &glyph {
-            Some(_) => (orb_glyph_wgsl(), true, wgpu::TextureFormat::Rgba8Unorm),
-            None => (orb_circle_wgsl(), false, format),
+        // Both orb and SDF draw straight into the caller's view, so the pipeline
+        // targets `format` either way (the SDF variant just binds the SDF
+        // texture / sampler and runs a different shader source).
+        let (shader, is_glyph) = match &glyph {
+            Some(_) => (orb_sdf_wgsl(), true),
+            None => (orb_wgsl(), false),
         };
-        self.pipeline(shader, is_glyph, fill_format, |cached| {
+        self.pipeline(shader, is_glyph, format, |cached| {
             let bind_group =
                 self.orb_bind_group(&cached.bind_group_layout, &params_buffer, &orb_view, &glyph);
-            if glyph.is_some() {
-                self.run_glyph_fill_bleed_to_view(
-                    &cached.pipeline,
-                    &bind_group,
-                    width,
-                    height,
-                    view,
-                    format,
-                );
-            } else {
-                self.run_pass_to_view(&cached.pipeline, &bind_group, view);
-            }
+            self.run_pass_to_view(&cached.pipeline, &bind_group, view);
         });
     }
 
@@ -2057,9 +2030,9 @@ impl GpuRenderer {
             n_orbs: n_orbs as f32,
             alpha_mul: pack[9],
             // header[11] = glyph_rotate (#136), header[12] = edge_softness (#205).
-            // Both are Glyph-only; the Circle shader never reads them. `sdf_size`
-            // comes from the Glyph binding (the shader uses it for the SDF bilinear
-            // sampling convention); Circle leaves it 0.
+            // Both are SDF-only; the plain orb variant never reads them. `sdf_size`
+            // comes from the SDF binding (the shader uses it for the SDF bilinear
+            // sampling convention); the orb path leaves it 0.
             glyph_rotate: pack[11],
             edge_softness: pack[12],
             sdf_size: glyph.as_ref().map_or(0.0, |g| g.size as f32),
@@ -2067,14 +2040,15 @@ impl GpuRenderer {
         let params_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("orber-circle-params"),
+                label: Some("orber-orb-params"),
                 contents: bytemuck::bytes_of(&params),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
         // Per-orb words → one `GpuOrb` (4 vec4s) per orb: color+weight, phase
         // quartet, cross_axis/style/speed, and rotation (base_angle,
-        // rot_speed_signed). Circle ignores the rot texel; Glyph reads it for #136.
+        // rot_speed_signed). The orb variant ignores the rot texel; the SDF variant
+        // reads it for #136.
         // The shader iterates `params.n_orbs` rows, so the row count must equal
         // `n_orbs` even if an (externally hand-built) `pack` runs short — short rows
         // stay zeroed.
@@ -2093,9 +2067,9 @@ impl GpuRenderer {
             // guard must allow `off + 12 == len - 1`, i.e. `off + 13 == len`. Using
             // `>=` here would wrongly break one orb early when an externally
             // hand-built buffer is sized to exactly `off + 13`; the correct
-            // cut-off is `off + 13 > len`. (Circle only reads up to `off + 10`, but
-            // requiring the full 13 words is safe: the production packer always
-            // emits 16 per-orb words. The Circle parity tests feed full packs.)
+            // cut-off is `off + 13 > len`. (The orb variant only reads up to
+            // `off + 10`, but requiring the full 13 words is safe: the production
+            // packer always emits 16 per-orb words. The orb parity tests feed full packs.)
             if off + 13 > pack.len() {
                 break;
             }
@@ -2104,7 +2078,7 @@ impl GpuRenderer {
                 phase: [pack[off + 4], pack[off + 5], pack[off + 6], pack[off + 7]],
                 misc: [pack[off + 8], pack[off + 9], pack[off + 10], 0.0],
                 // off + 11 = base_angle, off + 12 = rot_speed_signed (#136).
-                // Glyph reads these; Circle ignores the rot texel.
+                // The SDF variant reads these; the orb variant ignores the rot texel.
                 rot: [pack[off + 11], pack[off + 12], 0.0, 0.0],
             };
         }
@@ -2187,11 +2161,11 @@ impl GpuRenderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("orber-circle-encoder"),
+                label: Some("orber-orb-encoder"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("orber-circle-pass"),
+                label: Some("orber-orb-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &res.target_view,
                     resolve_target: None,
@@ -2214,11 +2188,9 @@ impl GpuRenderer {
     }
 
     /// Copy `res.target` into the padded read-back buffer, submit, map, and strip
-    /// wgpu's row padding into a tight `RgbaImage`. Shared by the Circle path
-    /// ([`run_pass_and_readback`](Self::run_pass_and_readback)) and the Glyph bleed
-    /// path ([`run_glyph_fill_bleed_readback`](Self::run_glyph_fill_bleed_readback)),
-    /// which both end by reading `res.target` back the same way; `encoder` already
-    /// holds the render pass(es) that wrote `res.target`.
+    /// wgpu's row padding into a tight `RgbaImage`. Used by the single-pass read-back
+    /// ([`run_pass_and_readback`](Self::run_pass_and_readback)) for every shape;
+    /// `encoder` already holds the render pass that wrote `res.target`.
     ///
     /// Native only (#229): buffer mapping needs the blocking
     /// `device.poll(wait_indefinitely)`, which does not exist on wasm32 (the
@@ -2272,369 +2244,8 @@ impl GpuRenderer {
             .expect("read-back buffer matches image dimensions")
     }
 
-    /// Get-or-build the Glyph bleed-pass pipelines (#214), compiling the bleed
-    /// shader and the three fixed-target pipelines at most once for the renderer's
-    /// life, plus (lazily, grow-only) one `compose` pipeline per distinct
-    /// final-target `compose_format` (#229). Returns the caller's `f` applied to
-    /// the cached `BleedPipelines` and the compose pipeline for `compose_format`.
-    /// Lazy: a Circle-only run never compiles the bleed shader.
-    fn bleed_pipelines<R>(
-        &self,
-        compose_format: wgpu::TextureFormat,
-        f: impl FnOnce(&BleedPipelines, &wgpu::RenderPipeline) -> R,
-    ) -> R {
-        let mut guard = self
-            .bleed_pipelines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pipelines = guard.get_or_insert_with(|| self.build_bleed_pipelines());
-        // Split the borrow: `compose` grows through the entry API while `shader`
-        // / `pipeline_layout` stay borrowed for the lazy build closure.
-        let BleedPipelines {
-            compose,
-            shader,
-            pipeline_layout,
-            ..
-        } = &mut *pipelines;
-        compose.entry(compose_format).or_insert_with(|| {
-            Self::build_bleed_pipeline(
-                &self.device,
-                shader,
-                pipeline_layout,
-                "fs_compose",
-                compose_format,
-            )
-        });
-        // Reborrow shared for the caller; the entry above guarantees presence.
-        let pipelines = &*pipelines;
-        f(pipelines, &pipelines.compose[&compose_format])
-    }
-
-    /// Compile the bleed shader once and build its fragment-entry pipelines, all
-    /// sharing one bind-group layout (uniform 0 + `src` texture 1 + `blurred`
-    /// texture 2; both textures `filterable: false` because the shader reads them
-    /// with `textureLoad`, keeping the box-blur on exact texel centers like the
-    /// `aquarelle` crate). The blur/halo targets are the `Rgba8Unorm`
-    /// intermediates, `blend: None`; the `compose` pipelines (whose target format
-    /// varies, #229) are built lazily by [`Self::bleed_pipelines`].
-    fn build_bleed_pipelines(&self) -> BleedPipelines {
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("orber-bleed-bgl"),
-                    entries: &[
-                        uniform_entry(0),
-                        // `src` / `blurred` read via textureLoad (no sampler).
-                        orb_texture_entry(1),
-                        orb_texture_entry(2),
-                    ],
-                });
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("orber-bleed-shader"),
-                source: wgpu::ShaderSource::Wgsl(orb_glyph_bleed_wgsl().into()),
-            });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("orber-bleed-pl"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
-        BleedPipelines {
-            blur_h: Self::build_bleed_pipeline(
-                &self.device,
-                &shader,
-                &pipeline_layout,
-                "fs_blur_h",
-                format,
-            ),
-            blur_v: Self::build_bleed_pipeline(
-                &self.device,
-                &shader,
-                &pipeline_layout,
-                "fs_blur_v",
-                format,
-            ),
-            halo: Self::build_bleed_pipeline(
-                &self.device,
-                &shader,
-                &pipeline_layout,
-                "fs_halo",
-                format,
-            ),
-            compose: HashMap::new(),
-            bind_group_layout,
-            shader,
-            pipeline_layout,
-        }
-    }
-
-    /// Build one bleed pipeline for `fs_entry` targeting `format`. Associated fn
-    /// (no `&self` beyond `device`) so [`Self::bleed_pipelines`] can call it while
-    /// holding the `bleed_pipelines` lock without borrow conflicts.
-    fn build_bleed_pipeline(
-        device: &wgpu::Device,
-        shader: &wgpu::ShaderModule,
-        pipeline_layout: &wgpu::PipelineLayout,
-        fs_entry: &str,
-        format: wgpu::TextureFormat,
-    ) -> wgpu::RenderPipeline {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("orber-bleed-pipeline"),
-            layout: Some(pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(fs_entry),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        })
-    }
-
-    /// Get-or-build the per-size bleed intermediate textures (`fill` + blur
-    /// ping-pong), allocating only on first use of a `(width, height)`. Grow-only
-    /// like `sized_cache`.
-    fn bleed_textures<R>(&self, width: u32, height: u32, f: impl FnOnce(&BleedTextures) -> R) -> R {
-        let mut map = self
-            .bleed_textures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map
-            .entry((width, height))
-            .or_insert_with(|| Self::build_bleed_textures(&self.device, width, height));
-        f(entry)
-    }
-
-    /// Allocate the three `Rgba8Unorm` bleed intermediates for a size: `fill` (the
-    /// glyph fill target, sampled by the bleed passes) and the `ping` / `pong`
-    /// blur ping-pong. Each is `RENDER_ATTACHMENT | TEXTURE_BINDING` (written by one
-    /// pass, read by the next); none needs `COPY_SRC` (only `res.target` is read
-    /// back).
-    fn build_bleed_textures(device: &wgpu::Device, width: u32, height: u32) -> BleedTextures {
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let make = |label: &str| {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            });
-            tex.create_view(&wgpu::TextureViewDescriptor::default())
-        };
-        BleedTextures {
-            fill_view: make("orber-bleed-fill"),
-            ping_view: make("orber-bleed-ping"),
-            pong_view: make("orber-bleed-pong"),
-        }
-    }
-
-    /// The Glyph (#214) read-back render: record the fill + bleed pass group via
-    /// [`Self::record_glyph_fill_bleed`] with `res.target` as the final compose
-    /// target, then read `res.target` back.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn run_glyph_fill_bleed_readback(
-        &self,
-        fill_pipeline: &wgpu::RenderPipeline,
-        fill_bind_group: &wgpu::BindGroup,
-        res: &SizedResources,
-    ) -> RgbaImage {
-        let (width, height) = (res.width, res.height);
-        let extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        self.bleed_pipelines(wgpu::TextureFormat::Rgba8Unorm, |bp, compose| {
-            self.bleed_textures(width, height, |bt| {
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("orber-glyph-bleed-encoder"),
-                        });
-                self.record_glyph_fill_bleed(
-                    &mut encoder,
-                    bp,
-                    compose,
-                    bt,
-                    fill_pipeline,
-                    fill_bind_group,
-                    width,
-                    height,
-                    &res.target_view,
-                );
-                self.copy_target_and_readback(encoder, extent, res)
-            })
-        })
-    }
-
-    /// The Glyph (#229) to_view render: record the fill + bleed pass group with
-    /// the externally supplied `view` as the final compose target (the compose
-    /// pipeline is the per-`format` one) and submit. No read-back; the caller
-    /// presents the surface frame after this returns.
-    fn run_glyph_fill_bleed_to_view(
-        &self,
-        fill_pipeline: &wgpu::RenderPipeline,
-        fill_bind_group: &wgpu::BindGroup,
-        width: u32,
-        height: u32,
-        view: &wgpu::TextureView,
-        format: wgpu::TextureFormat,
-    ) {
-        self.bleed_pipelines(format, |bp, compose| {
-            self.bleed_textures(width, height, |bt| {
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("orber-glyph-bleed-encoder"),
-                        });
-                self.record_glyph_fill_bleed(
-                    &mut encoder,
-                    bp,
-                    compose,
-                    bt,
-                    fill_pipeline,
-                    fill_bind_group,
-                    width,
-                    height,
-                    view,
-                );
-                self.queue.submit(Some(encoder.finish()));
-            })
-        });
-    }
-
-    /// The Glyph (#214) pass group, shared by the read-back and to_view paths:
-    /// draw the glyph fill into the `fill` intermediate, run the aquarelle bleed
-    /// pass group over it (premultiply → separable box-blur
-    /// ×[`BLEED_BLUR_ITERATIONS`] → halo saturation → intensity compose +
-    /// finalize) into `final_target`. `fill_pipeline` / `fill_bind_group` are the
-    /// already-built Glyph fill pipeline + bind group; `compose` is the per-format
-    /// compose pipeline matching `final_target`'s format (#229).
-    ///
-    /// One command encoder records every pass in order; wgpu serializes passes that
-    /// read a texture a prior pass wrote, so the box-blur ping-pong is correct
-    /// without manual barriers. All work runs under the outer `render_guard`, so
-    /// concurrent `render_frame` calls cannot alias these shared intermediates.
-    #[allow(clippy::too_many_arguments)]
-    fn record_glyph_fill_bleed(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        bp: &BleedPipelines,
-        compose: &wgpu::RenderPipeline,
-        bt: &BleedTextures,
-        fill_pipeline: &wgpu::RenderPipeline,
-        fill_bind_group: &wgpu::BindGroup,
-        width: u32,
-        height: u32,
-        final_target: &wgpu::TextureView,
-    ) {
-        // 1) Glyph fill → `fill` (straight RGBA, as the glyph shader emits).
-        self.record_fullscreen_pass(
-            encoder,
-            "orber-glyph-fill-pass",
-            &bt.fill_view,
-            fill_pipeline,
-            fill_bind_group,
-        );
-
-        // 2) Bleed pass group. Two blur textures ping-pong: H always writes
-        // `ping` (reading the previous V output, or `fill` on iter 0), V
-        // always reads `ping` and writes `pong`. After every iteration the
-        // blurred layer is in `pong`; the next H reads `pong`. No pass ever
-        // reads and writes the same texture. The first H pass sets
-        // `premultiply = 1` to turn the straight fill into premultiplied;
-        // every later pass reads already-premultiplied data.
-        let base = |radius: f32, premultiply: f32| BleedParams {
-            resolution: [width as f32, height as f32],
-            radius,
-            premultiply,
-            halo_factor: BLEED_HALO_FACTOR,
-            intensity: BLEED_INTENSITY,
-            _pad0: 0.0,
-            _pad1: 0.0,
-        };
-        for i in 0..BLEED_BLUR_ITERATIONS {
-            // H: (fill | pong) → ping. premultiply only on the first pass.
-            let h_src = if i == 0 { &bt.fill_view } else { &bt.pong_view };
-            self.record_bleed_pass(
-                encoder,
-                bp,
-                &bp.blur_h,
-                &bt.ping_view,
-                h_src,
-                None,
-                base(BLEED_BOX_RADIUS, if i == 0 { 1.0 } else { 0.0 }),
-            );
-            // V: ping → pong.
-            self.record_bleed_pass(
-                encoder,
-                bp,
-                &bp.blur_v,
-                &bt.pong_view,
-                &bt.ping_view,
-                None,
-                base(BLEED_BOX_RADIUS, 0.0),
-            );
-        }
-        // The 3×(H,V) blurred premult layer is now in `pong`.
-
-        // 3) Halo saturation boost: pong → ping (ping is free again).
-        self.record_bleed_pass(
-            encoder,
-            bp,
-            &bp.halo,
-            &bt.ping_view,
-            &bt.pong_view,
-            None,
-            base(BLEED_BOX_RADIUS, 0.0),
-        );
-
-        // 4) Compose + finalize: original = `fill` (premultiplied inline),
-        // blurred = halo output (`ping`) → `final_target` (straight RGBA: the
-        // offscreen read-back target, or the caller's surface view in the
-        // to_view path).
-        self.record_bleed_pass(
-            encoder,
-            bp,
-            compose,
-            final_target,
-            &bt.fill_view,
-            Some(&bt.ping_view),
-            base(BLEED_BOX_RADIUS, 0.0),
-        );
-    }
-
     /// Record a single full-screen triangle pass into `target` with `pipeline` +
-    /// `bind_group` (clear-to-transparent load). Shared by the glyph fill pass and
-    /// indirectly by the bleed passes.
+    /// `bind_group` (clear-to-transparent load). Used by the to_view present path.
     fn record_fullscreen_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -2662,52 +2273,6 @@ impl GpuRenderer {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
-    }
-
-    /// Record one bleed sub-pass: build the per-pass uniform + bind group (uniform
-    /// 0, `src` texture 1, `blurred` texture 2 — bound to `src` itself when the pass
-    /// does not use a second input), then draw the full-screen triangle into
-    /// `target`. `pipeline` selects which `orb_glyph_bleed.wgsl` fragment entry runs.
-    #[allow(clippy::too_many_arguments)]
-    fn record_bleed_pass(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        bp: &BleedPipelines,
-        pipeline: &wgpu::RenderPipeline,
-        target: &wgpu::TextureView,
-        src: &wgpu::TextureView,
-        blurred: Option<&wgpu::TextureView>,
-        params: BleedParams,
-    ) {
-        let params_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("orber-bleed-params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        // Binding 2 (`blurred`) is only read by the compose pass; for the other
-        // passes bind `src` to it so the one bind-group layout is always satisfied.
-        let blurred_view = blurred.unwrap_or(src);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("orber-bleed-bg"),
-            layout: &bp.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(src),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(blurred_view),
-                },
-            ],
-        });
-        self.record_fullscreen_pass(encoder, "orber-bleed-pass", target, pipeline, &bind_group);
     }
 }
 
@@ -2952,12 +2517,7 @@ mod tests {
         ]
     }
 
-    fn circle_opts(
-        w: u32,
-        h: u32,
-        direction: MotionDirection,
-        speed: MotionSpeed,
-    ) -> AnimateOptions {
+    fn orb_opts(w: u32, h: u32, direction: MotionDirection, speed: MotionSpeed) -> AnimateOptions {
         AnimateOptions {
             width: w,
             height: h,
@@ -2969,7 +2529,7 @@ mod tests {
             seed: 12345,
             count: Some(12),
             background: [12, 18, 28, 255],
-            shape: OrbShape::Circle,
+            shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
@@ -3017,7 +2577,7 @@ mod tests {
             return;
         };
         let clusters = sample_clusters();
-        let opts = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let opts = orb_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Slow);
         for k in 0..16 {
             let t = k as f32 / 15.0;
             let _ = renderer.render_frame(&clusters, &opts, t);
@@ -3026,7 +2586,7 @@ mod tests {
         assert_eq!(pipes, 1, "shader must compile exactly once");
         assert_eq!(sizes, 1, "size must allocate exactly once");
 
-        let opts2 = circle_opts(24, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let opts2 = orb_opts(24, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let _ = renderer.render_frame(&clusters, &opts2, 0.5);
         let (pipes, sizes) = renderer.cache_sizes();
         assert_eq!(pipes, 1, "second size must not recompile the shader");
@@ -3047,8 +2607,8 @@ mod tests {
             return;
         };
         let clusters = sample_clusters();
-        let opts_a = circle_opts(40, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let mut opts_b = circle_opts(40, 24, MotionDirection::TopToBottom, MotionSpeed::Mid);
+        let opts_a = orb_opts(40, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut opts_b = orb_opts(40, 24, MotionDirection::TopToBottom, MotionSpeed::Mid);
         opts_b.seed = 999;
         opts_b.background = [40, 5, 50, 255];
 
@@ -3107,7 +2667,7 @@ mod tests {
             return;
         };
         let clusters = sample_clusters();
-        let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut opts = orb_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
 
         assert_eq!(renderer.orb_capacity(), 0, "no frame yet → capacity 0");
 
@@ -3161,7 +2721,7 @@ mod tests {
             return;
         };
         let clusters = distinct_clusters(256);
-        let mut opts = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        let mut opts = orb_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Mid);
 
         // Grow the texture to 256 rows first, then render the same renderer at 100.
         opts.count = Some(256);
@@ -3211,9 +2771,9 @@ mod tests {
             12345,
             real_orbs,
             1.0,
-            0.0,  // shape_id (Circle)
-            true, // glyph_rotate (ignored by Circle)
-            0.5,  // edge_softness (ignored by Circle)
+            0.0,  // shape_id (Orb)
+            true, // glyph_rotate (ignored by Orb)
+            0.5,  // edge_softness (ignored by Orb)
         );
         // Lie in the header: claim more orbs than the buffer actually carries.
         // The buffer still only has `real_orbs` per-orb rows, so rows
@@ -3331,7 +2891,7 @@ mod tests {
         let mut oracles = Vec::new();
         for &c in &counts {
             let clusters = distinct_clusters(c);
-            let mut opts = circle_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
+            let mut opts = orb_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
             opts.count = Some(c);
             let Some(fresh) = require_or_skip_fresh_renderer(
                 "shared_gpu_concurrent_high_count_render (oracle leg)",
@@ -3347,8 +2907,7 @@ mod tests {
                 let oracle = &oracles[idx];
                 handles.push(scope.spawn(move || {
                     let clusters = distinct_clusters(c);
-                    let mut opts =
-                        circle_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
+                    let mut opts = orb_opts(44, 30, MotionDirection::LeftToRight, MotionSpeed::Mid);
                     opts.count = Some(c);
                     // Each thread renders a few times to maximize grow/clone overlap.
                     for _ in 0..3 {
@@ -3370,13 +2929,13 @@ mod tests {
 
     // ---- Glyph (#212 Phase 1b) ----------------------------------------------
 
-    /// The `GLYPH_SDF_CONTENT_SPAN` constant hardcoded in `orb_glyph.wgsl` must
-    /// match the Rust `crate::glyph::GLYPH_SDF_CONTENT_SPAN_PUB` (= 1/√2). If the
-    /// CPU constant ever changes, this guards against the WGSL drifting out of sync
-    /// (which would shift the glyph UV mapping and break parity).
+    /// The `GLYPH_SDF_CONTENT_SPAN` constant hardcoded in `orb.wgsl` (the SDF
+    /// variant) must match the Rust `crate::glyph::GLYPH_SDF_CONTENT_SPAN_PUB`
+    /// (= 1/√2). If the CPU constant ever changes, this guards against the WGSL
+    /// drifting out of sync (which would shift the glyph UV mapping and break parity).
     #[test]
     fn glyph_wgsl_content_span_matches_rust() {
-        let wgsl = orb_glyph_wgsl();
+        let wgsl = orb_sdf_wgsl();
         // Find the literal after `GLYPH_SDF_CONTENT_SPAN: f32 = ` in the shader.
         let needle = "GLYPH_SDF_CONTENT_SPAN: f32 = ";
         let start = wgsl
@@ -3388,7 +2947,7 @@ mod tests {
         let lit: f32 = rest[..end].trim().parse().expect("span literal must parse");
         assert!(
             (lit - crate::glyph::GLYPH_SDF_CONTENT_SPAN_PUB).abs() < 1e-6,
-            "orb_glyph.wgsl GLYPH_SDF_CONTENT_SPAN ({lit}) must match Rust ({})",
+            "orb.wgsl GLYPH_SDF_CONTENT_SPAN ({lit}) must match Rust ({})",
             crate::glyph::GLYPH_SDF_CONTENT_SPAN_PUB
         );
     }
@@ -3457,8 +3016,11 @@ mod tests {
         let img = renderer.render_frame_glyph(&clusters, &opts, 0.0);
         assert_eq!(img.dimensions(), (120, 90));
         let lit = lit_vs_bg(&img, opts.background, 8);
+        // #235: glyph now goes through the unified orb mechanism (one pass, no
+        // bleed/halo spread), so the lit count is lower than the old bleed-pass
+        // render (~150 here vs >200 before) but the star is still clearly painted.
         assert!(
-            lit > 200,
+            lit > 100,
             "glyph fill must paint a non-trivial number of lit pixels, got {lit}"
         );
         eprintln!("glyph lit pixels = {lit}");
@@ -3550,24 +3112,24 @@ mod tests {
         assert_eq!(lit, 0, "empty image SDF must paint no foreground pixels");
     }
 
-    /// #217: `render_frame_image` on a non-Image shape falls back to the Circle path
+    /// #217: `render_frame_image` on a non-Image shape falls back to the plain orb path
     /// (the call is total). It must still produce a valid frame.
     #[test]
-    fn gpu_image_entry_non_image_falls_back_to_circle() {
+    fn gpu_image_entry_non_image_falls_back_to_orb() {
         let Some(renderer) =
-            require_or_skip_renderer("gpu_image_entry_non_image_falls_back_to_circle")
+            require_or_skip_renderer("gpu_image_entry_non_image_falls_back_to_orb")
         else {
             return;
         };
         let clusters = sample_clusters();
         let mut opts = image_opts(80, 80);
-        opts.shape = OrbShape::Circle;
+        opts.shape = OrbShape::Orb;
         let via_image_entry = renderer.render_frame_image(&clusters, &opts, 0.5);
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
         assert_eq!(
             via_image_entry.as_raw(),
-            via_circle.as_raw(),
-            "render_frame_image on Circle must equal render_frame (Circle path)"
+            via_orb.as_raw(),
+            "render_frame_image on Orb must equal render_frame (plain orb path)"
         );
     }
 
@@ -3739,45 +3301,45 @@ mod tests {
         );
     }
 
-    /// `render_frame_glyph` on a non-Glyph shape falls back to the Circle path
-    /// (the call is total). A Circle-shaped opts through the glyph entry must match
-    /// the dedicated Circle `render_frame` within the ±2/channel contract.
+    /// `render_frame_glyph` on a non-Glyph shape falls back to the plain orb path
+    /// (the call is total). An Orb-shaped opts through the glyph entry must match
+    /// the dedicated orb `render_frame` within the ±2/channel contract.
     #[test]
-    fn gpu_glyph_entry_circle_shape_falls_back() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_entry_circle_shape_falls_back")
+    fn gpu_glyph_entry_orb_shape_falls_back() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_entry_orb_shape_falls_back")
         else {
             return;
         };
         let clusters = sample_clusters();
-        let opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let opts = orb_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
         let via_glyph_entry = renderer.render_frame_glyph(&clusters, &opts, 0.5);
         let max_diff = assert_within_tolerance(
-            &via_circle,
+            &via_orb,
             &via_glyph_entry,
-            "circle-shape through glyph entry vs render_frame",
+            "orb-shape through glyph entry vs render_frame",
         );
-        eprintln!("glyph-entry circle fallback: max per-channel diff = {max_diff}");
+        eprintln!("glyph-entry orb fallback: max per-channel diff = {max_diff}");
     }
 
     // ---- #212 Phase 1b: 4-texel widening / glyph dispatch regression guards ----
 
     /// #212 (#2): the `render_packed_inner` short-row guard changed from a per-orb
     /// `off + 11` cut-off to `off + 13` (so the new rotation words at `off+11` /
-    /// `off+12` are read). A hand-built single-orb Circle pack sized to **exactly**
+    /// `off+12` are read). A hand-built single-orb pack sized to **exactly**
     /// `off + 13` words must render that orb — it must NOT be cut one orb early.
     /// This is the regression guard for the boundary change: with the old `off+11`
     /// (or a `>=` form) the last orb would have been dropped at this exact length.
     ///
-    /// Build a real 1-orb Circle pack via the production packer (so the per-orb
+    /// Build a real 1-orb pack via the production packer (so the per-orb
     /// arithmetic is correct), truncate it to `HEADER_WORDS + 13` (dropping only the
     /// 3 trailing unused padding words of the 16-word slot), render it, and assert
     /// (a) it equals the full untruncated pack bit-exact, and (b) the orb is
     /// actually drawn (output is not background-only).
     #[test]
-    fn render_packed_short_pack_circle_unaffected_by_13word_guard() {
+    fn render_packed_short_pack_orb_unaffected_by_13word_guard() {
         let Some(renderer) =
-            require_or_skip_renderer("render_packed_short_pack_circle_unaffected_by_13word_guard")
+            require_or_skip_renderer("render_packed_short_pack_orb_unaffected_by_13word_guard")
         else {
             return;
         };
@@ -3795,9 +3357,9 @@ mod tests {
             12345,
             1,    // n_orbs = 1
             1.0,  // alpha_mul
-            0.0,  // shape_id = Circle
-            true, // glyph_rotate (ignored by Circle)
-            0.5,  // edge_softness (ignored by Circle)
+            0.0,  // shape_id = Orb
+            true, // glyph_rotate (ignored by Orb)
+            0.5,  // edge_softness (ignored by Orb)
         );
         // The single orb lives at off = HEADER_WORDS. The shader reads up to
         // pack[off + 12] (rot_speed_signed), so off + 13 words is the minimal length
@@ -3848,7 +3410,7 @@ mod tests {
 
     /// #212 (#3): the Glyph path must handle orb counts straddling the orb-texture
     /// grow boundary (64). For {1, 64, 65, 1024} the glyph fill must light pixels,
-    /// the output dims must be correct, and there must be no panic / OOB. (Circle
+    /// the output dims must be correct, and there must be no panic / OOB. (orb
     /// covers count parity numerically; here the concern is the Glyph dispatch +
     /// data-texture growth, not bit-exactness.)
     #[test]
@@ -3883,7 +3445,7 @@ mod tests {
 
     /// #212 (#4): empty clusters on the Glyph path → background-only frame, correct
     /// dims, no panic. The glyph fill has nothing to draw, so only the background
-    /// paints (mirrors the Circle empty-clusters test for the glyph dispatch).
+    /// paints (mirrors the orb empty-clusters test for the glyph dispatch).
     #[test]
     fn gpu_glyph_empty_clusters_background_only() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_empty_clusters_background_only")
@@ -4119,7 +3681,7 @@ mod tests {
     /// their solo oracle — no panic / poison, no cross-thread aliasing of the shared
     /// orb texture / per-size resources. Several threads render glyph frames with
     /// mixed char / t on the *same* renderer; each thread's output must equal that
-    /// same input rendered alone (a fresh renderer). Mirrors the Circle concurrent
+    /// same input rendered alone (a fresh renderer). Mirrors the orb concurrent
     /// test (`shared_gpu_concurrent_high_count_render`) for the glyph path.
     #[test]
     fn shared_gpu_concurrent_glyph_render() {
@@ -4210,373 +3772,6 @@ mod tests {
             "same opts/seed/t must render byte-identical glyph frames (rotation ON)"
         );
         eprintln!("glyph determinism: two renders byte-identical");
-    }
-
-    // ---- #214 Phase 1b.5: Glyph bleed/halo 2nd pass (WGSL) ----
-
-    /// A Glyph `AnimateOptions` for the bleed-pass tests: a single white centered
-    /// cluster, `orb_size = 1.0`, `softness = Low` (the sharp pre-#205 baseline, so
-    /// the halo R survives the blur), no flow advance / rotation so the glyph sits
-    /// at the canvas center.
-    fn glyph_bleed_opts(w: u32, h: u32) -> AnimateOptions {
-        AnimateOptions {
-            width: w,
-            height: h,
-            orb_size: 1.0,
-            blur: 0.5,
-            saturation: 1.0,
-            direction: MotionDirection::LeftToRight,
-            speed: MotionSpeed::Slow,
-            seed: 0,
-            count: Some(1),
-            background: [0, 0, 0, 255],
-            shape: OrbShape::Glyph {
-                ch: '☆',
-                font: crate::glyph::GlyphFontId::NotoSymbols2,
-            },
-            softness: SoftnessPreset::Low,
-            glyph_rotate: false,
-            color_tracks: None,
-            keyframe_tracks: None,
-        }
-    }
-
-    /// #214 (A): the GPU bleed pass must leak a **halo ring** outside the glyph
-    /// body — the direct evidence the box-blur/compose 2nd pass ran. A single
-    /// white ☆ at 64×64, `orb_size = 1.0` (radius ≈ 16 px, center (32,32)). The
-    /// star body is essentially complete by r ≈ 16; the ring 18..21 px from the
-    /// center is outside the body, so any lit (R>0) pixel there must come from the
-    /// bleed pass spreading the fill outward. Without the 2nd pass that ring would
-    /// be pure background black. The count threshold is loose (`>= 10`) because the
-    /// paper-grain noise is omitted on the GPU, so an exact pixel count is not pinned.
-    #[test]
-    fn gpu_glyph_bleed_produces_halo_ring() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_produces_halo_ring") else {
-            return;
-        };
-        eprintln!(
-            "GPU Glyph bleed halo test running on adapter: {}",
-            renderer.adapter_name()
-        );
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let opts = glyph_bleed_opts(64, 64);
-        let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
-        assert_eq!(img.dimensions(), (64, 64));
-        let (cx, cy) = (32.0f32, 32.0f32);
-        let mut halo_count = 0usize;
-        let mut halo_max_r = 0u8;
-        for y in 0..64u32 {
-            for x in 0..64u32 {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                let d = (dx * dx + dy * dy).sqrt();
-                if (18.0..21.0).contains(&d) {
-                    let px = img.get_pixel(x, y);
-                    if px[0] > 0 {
-                        halo_count += 1;
-                        halo_max_r = halo_max_r.max(px[0]);
-                    }
-                }
-            }
-        }
-        assert!(
-            halo_count >= 10,
-            "GPU bleed pass must leak a halo (R>0) into the ring 18..21px from the \
-             glyph center; found {halo_count} halo pixels (max R = {halo_max_r}). \
-             A missing 2nd pass would leave this ring pure background black."
-        );
-        eprintln!("gpu bleed halo ring: {halo_count} lit pixels (max R = {halo_max_r})");
-    }
-
-    /// #214 (A): the bleed pass must not wash the glyph fill out — the lit body
-    /// pixels must survive the box-blur/compose (softness Low ☆, `lit > 32`
-    /// counted as R > 32). If the compose `intensity` over-weighted the (dimmer)
-    /// blurred layer the bright body would collapse below this threshold.
-    #[test]
-    fn gpu_glyph_lit_pixels_remain_visible_after_bleed() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_lit_pixels_remain_visible_after_bleed")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let opts = glyph_bleed_opts(100, 100);
-        let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
-        let lit = img.pixels().filter(|p| p[0] > 32).count();
-        assert!(
-            lit > 32,
-            "glyph lit pixels must survive the GPU bleed pass (R>32), got lit={lit}"
-        );
-        eprintln!("gpu lit-after-bleed: lit={lit}");
-    }
-
-    /// #214 (A): empty clusters routed explicitly through `render_frame_glyph`
-    /// must stay background-only after the bleed contract — a blur of nothing is
-    /// still nothing. (The empty path early-outs before the fill, so this also
-    /// pins that the bleed orchestration is never asked to halo a blank canvas.)
-    /// Named for the bleed intent even though `gpu_glyph_empty_clusters_background_only`
-    /// covers the plain glyph dispatch.
-    #[test]
-    fn gpu_glyph_bleed_empty_clusters_stays_background() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_bleed_empty_clusters_stays_background")
-        else {
-            return;
-        };
-        let opts = glyph_bleed_opts(48, 40);
-        let img = renderer.render_frame_glyph(&[], &opts, 0.3);
-        assert_eq!(img.dimensions(), (48, 40));
-        let lit = lit_vs_bg(&img, opts.background, 1);
-        assert_eq!(
-            lit, 0,
-            "empty clusters + glyph bleed path must stay background-only, got {lit} non-bg pixels"
-        );
-    }
-
-    /// #214 (A): a weight-0 cluster yields zero orbs (radius 0 → skipped), so the
-    /// glyph fill is empty and the bleed pass has nothing to spread. The frame
-    /// must stay background-only.
-    #[test]
-    fn gpu_glyph_bleed_weight_zero_stays_background() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_bleed_weight_zero_stays_background")
-        else {
-            return;
-        };
-        let opts = glyph_bleed_opts(48, 40);
-        let img =
-            renderer.render_frame_glyph(&[cluster([255, 255, 255], 0.5, 0.5, 0.0)], &opts, 0.3);
-        let lit = lit_vs_bg(&img, opts.background, 1);
-        assert_eq!(
-            lit, 0,
-            "weight=0 cluster + glyph bleed path must stay background-only, got {lit} non-bg pixels"
-        );
-    }
-
-    /// #214 (A): an unknown glyph (pizza emoji, absent from the bundled Symbols 2
-    /// subset) produces no SDF, so the fill is empty and the bleed pass spreads
-    /// nothing — the frame must stay background-only. The "draw nothing for tofu"
-    /// contract must hold through the bleed path too.
-    #[test]
-    fn gpu_glyph_bleed_unknown_char_stays_background() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_bleed_unknown_char_stays_background")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let mut opts = glyph_bleed_opts(48, 40);
-        opts.shape = OrbShape::Glyph {
-            ch: '\u{1F355}', // pizza — not in Noto Sans Symbols 2
-            font: crate::glyph::GlyphFontId::NotoSymbols2,
-        };
-        let img = renderer.render_frame_glyph(&[c], &opts, 0.3);
-        let lit = lit_vs_bg(&img, opts.background, 1);
-        assert_eq!(
-            lit, 0,
-            "unknown glyph + bleed path must stay background-only, got {lit} non-bg pixels"
-        );
-    }
-
-    /// #214 (A): the whole glyph + bleed pipeline is fully deterministic. The
-    /// paper-grain noise (the one nondeterministic-looking step) is omitted on the
-    /// GPU, so the same opts/seed/t rendered twice must be **byte-identical** — no
-    /// jitter from the box-blur ping-pong, the halo HSL transform, or the compose.
-    /// Stronger than `gpu_glyph_determinism_same_seed_same_output` because it pins
-    /// determinism specifically over the bleed pass (single centered glyph, the
-    /// halo well clear of the body).
-    #[test]
-    fn gpu_glyph_bleed_determinism_byte_identical() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_determinism_byte_identical")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let opts = glyph_bleed_opts(64, 64);
-        let a = renderer.render_frame_glyph(&[c], &opts, 0.42);
-        let b = renderer.render_frame_glyph(&[c], &opts, 0.42);
-        assert_eq!(
-            a, b,
-            "glyph bleed pass must be byte-identical on repeat (noise omitted → full determinism)"
-        );
-        eprintln!("gpu glyph bleed determinism: two renders byte-identical");
-    }
-
-    /// #214 (B): the box-blur radius clamp (`r = min(radius, w-1)` / `min(radius,
-    /// h-1)` in `orb_glyph_bleed.wgsl`) must keep tiny canvases from sampling out
-    /// of bounds. Several sub-`2r+1` sizes (1×1, 2×2, 5×4, where the box radius 3
-    /// exceeds the dimension) must render without panic / device loss and produce a
-    /// correctly-sized image. A missing clamp would read negative / past-edge
-    /// texels.
-    #[test]
-    fn gpu_glyph_bleed_tiny_canvas_no_panic() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_tiny_canvas_no_panic")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        for &(w, h) in &[(1u32, 1u32), (2, 2), (5, 4)] {
-            let opts = glyph_bleed_opts(w, h);
-            let img = renderer.render_frame_glyph(&[c], &opts, 0.0);
-            assert_eq!(
-                img.dimensions(),
-                (w, h),
-                "tiny {w}x{h} glyph bleed frame must have correct dims (radius clamp held)"
-            );
-        }
-        eprintln!("gpu glyph bleed tiny canvas: 1x1 / 2x2 / 5x4 rendered without panic");
-    }
-
-    /// #214 (B): re-rendering a glyph at the **same size** must reuse the cached
-    /// `BleedTextures` (fill + ping/pong), leaving the per-size bleed cache at
-    /// exactly one entry — mirrors `caches_resources_across_a_clip` for the bleed
-    /// intermediates. Uses a *fresh* renderer so the count is observable in
-    /// isolation (the shared renderer accumulates sizes from other tests).
-    #[test]
-    fn gpu_glyph_bleed_textures_reuse_same_size() {
-        let Some(renderer) =
-            require_or_skip_fresh_renderer("gpu_glyph_bleed_textures_reuse_same_size")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let opts = glyph_bleed_opts(64, 48);
-        assert_eq!(
-            renderer.bleed_textures_len(),
-            0,
-            "no glyph frame yet → 0 bleed entries"
-        );
-        let _ = renderer.render_frame_glyph(&[c], &opts, 0.0);
-        assert_eq!(
-            renderer.bleed_textures_len(),
-            1,
-            "first glyph frame must allocate exactly one bleed-texture entry"
-        );
-        let _ = renderer.render_frame_glyph(&[c], &opts, 0.5);
-        assert_eq!(
-            renderer.bleed_textures_len(),
-            1,
-            "same-size second glyph frame must reuse the cached bleed textures (still 1)"
-        );
-    }
-
-    /// #214 (B): a glyph frame at a **new size** must add one bleed-texture entry
-    /// (grow-only, like `sized_cache`). Uses a *fresh* renderer so the exact entry
-    /// count is observable. Two distinct sizes → exactly two entries.
-    #[test]
-    fn gpu_glyph_bleed_textures_grow_on_new_size() {
-        let Some(renderer) =
-            require_or_skip_fresh_renderer("gpu_glyph_bleed_textures_grow_on_new_size")
-        else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(64, 48), 0.0);
-        assert_eq!(
-            renderer.bleed_textures_len(),
-            1,
-            "first size → 1 bleed entry"
-        );
-        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(40, 32), 0.0);
-        assert_eq!(
-            renderer.bleed_textures_len(),
-            2,
-            "a second distinct size must add one bleed-texture entry (grow-only)"
-        );
-    }
-
-    /// #214 (B): the bleed pipelines are **lazy** — a renderer that only ever drew
-    /// Circle frames must never compile the bleed shader (`bleed_pipelines_built()`
-    /// stays `false`), and the first glyph (lit) frame must compile them (flips to
-    /// `true`). A fresh renderer isolates the lazy state. Uses a real ☆ so the
-    /// glyph path actually enters `run_glyph_fill_bleed_readback` (an empty/unknown
-    /// glyph early-outs through the Circle pipeline and would *not* build them).
-    #[test]
-    fn gpu_bleed_pipelines_lazy_not_built_for_circle_only() {
-        let Some(renderer) =
-            require_or_skip_fresh_renderer("gpu_bleed_pipelines_lazy_not_built_for_circle_only")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        assert!(
-            !renderer.bleed_pipelines_built(),
-            "fresh renderer must not have compiled the bleed pipelines yet"
-        );
-        // Several Circle frames: still no bleed shader.
-        let circle = circle_opts(48, 32, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        for k in 0..4 {
-            let _ = renderer.render_frame(&clusters, &circle, k as f32 / 4.0);
-        }
-        assert!(
-            !renderer.bleed_pipelines_built(),
-            "Circle-only rendering must never compile the bleed pipelines"
-        );
-        // First glyph frame with a real fill compiles them.
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let _ = renderer.render_frame_glyph(&[c], &glyph_bleed_opts(48, 32), 0.0);
-        assert!(
-            renderer.bleed_pipelines_built(),
-            "the first glyph (lit) frame must compile the bleed pipelines"
-        );
-    }
-
-    /// #214 (C): concurrent glyph+bleed renders on the shared renderer at the
-    /// **same size** must each match their solo oracle within ±2/channel — i.e. the
-    /// bleed intermediates (`fill` / `ping` / `pong`) are never aliased across
-    /// threads. The per-size bleed textures are shared mutable state behind the
-    /// `render_guard`; if a second thread's box-blur overwrote `ping` mid-pass for
-    /// the first thread the halo would corrupt. Several threads hammer the *same*
-    /// size + char + t (collision maximized), each output compared to a fresh solo
-    /// render. Strengthens `shared_gpu_concurrent_glyph_render` by explicitly
-    /// stressing the bleed mid-pass textures (Phase 1a's #210 aliasing class).
-    #[test]
-    fn shared_gpu_concurrent_glyph_bleed_no_aliasing() {
-        let Some(renderer) =
-            require_or_skip_renderer("shared_gpu_concurrent_glyph_bleed_no_aliasing")
-        else {
-            return;
-        };
-        // Same size for every thread so they all contend the one cached
-        // `(w,h)` BleedTextures entry — that is the aliasing surface under test.
-        let (w, h) = (72u32, 56u32);
-        let make_opts = || glyph_bleed_opts(w, h);
-
-        // Solo oracle on a fresh renderer (its own bleed textures, uncontended).
-        let Some(oracle_renderer) = require_or_skip_fresh_renderer(
-            "shared_gpu_concurrent_glyph_bleed_no_aliasing (oracle)",
-        ) else {
-            return;
-        };
-        let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-        let oracle = oracle_renderer.render_frame_glyph(&[c], &make_opts(), 0.3);
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for _ in 0..4 {
-                let oracle = &oracle;
-                handles.push(scope.spawn(move || {
-                    let c = cluster([255, 255, 255], 0.5, 0.5, 1.0);
-                    let opts = make_opts();
-                    // Reuse the same char/size/t so all threads collide on the one
-                    // shared BleedTextures entry as hard as possible.
-                    for _ in 0..4 {
-                        let img = renderer.render_frame_glyph(&[c], &opts, 0.3);
-                        assert_within_tolerance(
-                            oracle,
-                            &img,
-                            "concurrent glyph bleed vs solo render (no intermediate aliasing)",
-                        );
-                    }
-                }));
-            }
-            for handle in handles {
-                handle
-                    .join()
-                    .expect("concurrent glyph bleed thread panicked");
-            }
-        });
-        eprintln!("concurrent glyph bleed: all threads matched solo oracle (no mid-pass aliasing)");
     }
 
     // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
@@ -4707,7 +3902,7 @@ mod tests {
     /// aquarelle data-texture / per-size target / read-back buffer (the #210
     /// serialization contract). Several threads render different aquarelle frames
     /// (mixed params + t) on the *same* renderer; each thread's output must equal
-    /// that same input rendered alone (a fresh renderer). Mirrors the Circle
+    /// that same input rendered alone (a fresh renderer). Mirrors the orb
     /// (`shared_gpu_concurrent_high_count_render`) and Glyph
     /// (`shared_gpu_concurrent_glyph_render`) concurrent tests for the aquarelle
     /// path. Aquarelle is deterministic (per-orb-index ChaCha8 seed, no thread_rng),
@@ -4797,23 +3992,23 @@ mod tests {
     }
 
     /// A non-Aquarelle shape passed to `render_frame_aquarelle` must fall back to the
-    /// Circle path (the call is total), matching the Glyph-entry fallback contract.
+    /// plain orb path (the call is total), matching the Glyph-entry fallback contract.
     #[test]
-    fn aquarelle_entry_circle_shape_falls_back() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_entry_circle_shape_falls_back")
+    fn aquarelle_entry_orb_shape_falls_back() {
+        let Some(renderer) = require_or_skip_renderer("aquarelle_entry_orb_shape_falls_back")
         else {
             return;
         };
         let clusters = vec![cluster([200, 100, 50], 0.5, 0.5, 1.0)];
         let mut opts = aquarelle_opts(64, 64, AquarelleParams::default());
-        opts.shape = OrbShape::Circle;
-        // Should not panic and should produce the same image as the Circle path.
+        opts.shape = OrbShape::Orb;
+        // Should not panic and should produce the same image as the plain orb path.
         let via_aqua = renderer.render_frame_aquarelle(&clusters, &opts, 0.0);
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.0);
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.0);
         assert_eq!(
             via_aqua.as_raw(),
-            via_circle.as_raw(),
-            "non-aquarelle shape must fall back to the Circle path byte-for-byte"
+            via_orb.as_raw(),
+            "non-aquarelle shape must fall back to the plain orb path byte-for-byte"
         );
     }
 
@@ -5255,15 +4450,15 @@ mod tests {
     }
 
     /// #229: the to_view path must draw the same bytes the read-back path draws.
-    /// Circle (`render_packed_to_view`, the pack-level browser seam) and Glyph
+    /// Orb (`render_packed_to_view`, the pack-level browser seam) and Glyph
     /// including the bleed 2nd pass (`render_frame_glyph_to_view`) are rendered
     /// into a fresh offscreen `Rgba8Unorm` texture via to_view, read back
     /// manually, and required byte-identical to `render_packed` /
     /// `render_frame_glyph`. Lit pixels are asserted first so the identity is not
     /// trivially satisfied by an empty frame.
     #[test]
-    fn to_view_matches_readback_circle_and_glyph() {
-        let Some(renderer) = require_or_skip_renderer("to_view_matches_readback_circle_and_glyph")
+    fn to_view_matches_readback_orb_and_glyph() {
+        let Some(renderer) = require_or_skip_renderer("to_view_matches_readback_orb_and_glyph")
         else {
             return;
         };
@@ -5271,9 +4466,9 @@ mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
 
-        // Circle, via the pack-level seam shared with the browser path.
-        let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let pack = GpuRenderer::pack_circle_frame(&clusters, &opts, w, h);
+        // Orb, via the pack-level seam shared with the browser path.
+        let opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h);
         let reference = renderer.render_packed(&pack, w, h, 0.3);
         let via_view = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_packed_to_view(&pack, w, h, 0.3, view, format);
@@ -5309,7 +4504,7 @@ mod tests {
     /// for the two remaining SDF/aquarelle shapes — Image (the Glyph-shared SDF
     /// pipeline + bleed via `render_frame_image_to_view`) and Aquarelle
     /// (`render_frame_aquarelle_to_view`). Completes the per-shape to_view ↔
-    /// read-back identity started by `to_view_matches_readback_circle_and_glyph`.
+    /// read-back identity started by `to_view_matches_readback_orb_and_glyph`.
     /// Lit pixels are asserted first so the identity is not trivially satisfied
     /// by an empty frame.
     #[test]
@@ -5390,7 +4585,7 @@ mod tests {
         let clusters = sample_clusters();
 
         // (name, reference read-back render, to_view render) per shape.
-        let circle = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let circle = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
         let image = image_opts(w, h);
         let aqua = aquarelle_opts(w, h, AquarelleParams::default());
@@ -5446,55 +4641,8 @@ mod tests {
         }
     }
 
-    /// #229 (C1+C2): the bleed `compose` pipeline cache is keyed by the
-    /// final-target format and is grow-only. On a *private* renderer (exact entry
-    /// counts), glyph to_view at `Rgba8Unorm` → 1 entry, then `Bgra8Unorm` → 2,
-    /// then each format again → still 2 (cache hit, no rebuild). The blur / halo
-    /// pipelines are format-fixed, so only `compose` may grow.
-    #[test]
-    fn glyph_to_view_compose_pipeline_cached_per_format() {
-        let Some(renderer) =
-            require_or_skip_fresh_renderer("glyph_to_view_compose_pipeline_cached_per_format")
-        else {
-            return;
-        };
-        let (w, h) = (48u32, 32u32);
-        let clusters = sample_clusters();
-        let opts = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
-        let draw = |format: wgpu::TextureFormat| {
-            let _ = readback_via_view(&renderer, w, h, format, |view| {
-                renderer.render_frame_glyph_to_view(&clusters, &opts, 0.3, view, format);
-            });
-        };
-
-        assert_eq!(
-            renderer.bleed_compose_len(),
-            0,
-            "fresh renderer must have no compose pipelines yet"
-        );
-        draw(wgpu::TextureFormat::Rgba8Unorm);
-        assert_eq!(
-            renderer.bleed_compose_len(),
-            1,
-            "first format must add exactly one compose entry"
-        );
-        draw(wgpu::TextureFormat::Bgra8Unorm);
-        assert_eq!(
-            renderer.bleed_compose_len(),
-            2,
-            "a second format must add exactly one more compose entry"
-        );
-        draw(wgpu::TextureFormat::Rgba8Unorm);
-        draw(wgpu::TextureFormat::Bgra8Unorm);
-        assert_eq!(
-            renderer.bleed_compose_len(),
-            2,
-            "repeated formats must hit the cache (grow-only, 2 entries stable)"
-        );
-    }
-
     /// #229 (F1): the orb pipeline cache is keyed by `(shader, target format)`.
-    /// On a *private* renderer (exact entry counts), the same Circle shader
+    /// On a *private* renderer (exact entry counts), the same orb shader
     /// rendered to_view at `Rgba8Unorm` then `Bgra8Unorm` must hold exactly two
     /// pipeline entries, and re-rendering both formats must not add more (cache
     /// hit). The sized (read-back) cache must stay empty throughout — the to_view
@@ -5509,8 +4657,8 @@ mod tests {
         };
         let (w, h) = (32u32, 24u32);
         let clusters = sample_clusters();
-        let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let pack = GpuRenderer::pack_circle_frame(&clusters, &opts, w, h);
+        let opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h);
         let draw = |format: wgpu::TextureFormat| {
             let _ = readback_via_view(&renderer, w, h, format, |view| {
                 renderer.render_packed_to_view(&pack, w, h, 0.3, view, format);
@@ -5544,44 +4692,43 @@ mod tests {
     }
 
     /// #229 (B1): `render_frame_glyph_to_view` on a non-Glyph shape must fall back
-    /// to the Circle to_view path (the call is total), matching the read-back
+    /// to the orb to_view path (the call is total), matching the read-back
     /// variant's fallback contract — byte-identical to `render_frame` at
     /// `Rgba8Unorm` (the to_view ↔ read-back identity is pinned separately).
     #[test]
-    fn glyph_to_view_non_glyph_shape_falls_back_to_circle() {
+    fn glyph_to_view_non_glyph_shape_falls_back_to_orb() {
         let Some(renderer) =
-            require_or_skip_renderer("glyph_to_view_non_glyph_shape_falls_back_to_circle")
+            require_or_skip_renderer("glyph_to_view_non_glyph_shape_falls_back_to_orb")
         else {
             return;
         };
         let (w, h) = (40u32, 28u32);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
-        let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
         let via_glyph_entry = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_frame_glyph_to_view(&clusters, &opts, 0.5, view, format);
         });
         assert!(
-            lit_vs_bg(&via_circle, opts.background, 8) > 0,
+            lit_vs_bg(&via_orb, opts.background, 8) > 0,
             "circle fallback reference must have lit pixels"
         );
         assert_eq!(
             via_glyph_entry.as_raw(),
-            via_circle.as_raw(),
-            "glyph to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+            via_orb.as_raw(),
+            "glyph to_view on an Orb shape must fall back to the plain orb path byte-for-byte"
         );
     }
 
-    /// #229 (B2): `render_frame_glyph_to_view` with an unknown char (no SDF) must
-    /// draw the background only — the "draw nothing for tofu" contract — **and**
-    /// skip the bleed 2nd pass entirely: on a *private* renderer the bleed
-    /// pipelines must never compile (the background-only pack routes through the
-    /// Circle pipeline, exactly like the read-back variant).
+    /// #229 (B2) / #235: `render_frame_glyph_to_view` with an unknown char (no SDF)
+    /// must draw the background only — the "draw nothing for tofu" contract. The
+    /// background-only pack routes through the plain orb pipeline (a zero-orb single
+    /// pass), exactly like the read-back variant.
     #[test]
-    fn glyph_to_view_unknown_char_background_only_no_bleed() {
+    fn glyph_to_view_unknown_char_background_only() {
         let Some(renderer) =
-            require_or_skip_fresh_renderer("glyph_to_view_unknown_char_background_only_no_bleed")
+            require_or_skip_fresh_renderer("glyph_to_view_unknown_char_background_only")
         else {
             return;
         };
@@ -5601,19 +4748,15 @@ mod tests {
             lit, 0,
             "unknown glyph via to_view must paint background only, got {lit} non-bg pixels"
         );
-        assert!(
-            !renderer.bleed_pipelines_built(),
-            "background-only to_view frame must skip the bleed pass (no bleed pipelines)"
-        );
     }
 
     /// #229 (B3): `render_frame_image_to_view` on a non-Image shape must fall back
-    /// to the Circle to_view path (the call is total) — byte-identical to
+    /// to the orb to_view path (the call is total) — byte-identical to
     /// `render_frame` at `Rgba8Unorm`, mirroring the read-back variant's contract.
     #[test]
-    fn image_to_view_non_image_shape_falls_back_to_circle() {
+    fn image_to_view_non_image_shape_falls_back_to_orb() {
         let Some(renderer) =
-            require_or_skip_renderer("image_to_view_non_image_shape_falls_back_to_circle")
+            require_or_skip_renderer("image_to_view_non_image_shape_falls_back_to_orb")
         else {
             return;
         };
@@ -5621,15 +4764,15 @@ mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
         let mut opts = image_opts(w, h);
-        opts.shape = OrbShape::Circle;
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        opts.shape = OrbShape::Orb;
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
         let via_image_entry = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_frame_image_to_view(&clusters, &opts, 0.5, view, format);
         });
         assert_eq!(
             via_image_entry.as_raw(),
-            via_circle.as_raw(),
-            "image to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+            via_orb.as_raw(),
+            "image to_view on an Orb shape must fall back to the plain orb path byte-for-byte"
         );
     }
 
@@ -5663,12 +4806,12 @@ mod tests {
     }
 
     /// #229 (B5): `render_frame_aquarelle_to_view` on a non-Aquarelle shape must
-    /// fall back to the Circle to_view path (the call is total) — byte-identical
+    /// fall back to the orb to_view path (the call is total) — byte-identical
     /// to `render_frame` at `Rgba8Unorm`, mirroring the read-back variant.
     #[test]
-    fn aquarelle_to_view_non_aquarelle_shape_falls_back_to_circle() {
+    fn aquarelle_to_view_non_aquarelle_shape_falls_back_to_orb() {
         let Some(renderer) =
-            require_or_skip_renderer("aquarelle_to_view_non_aquarelle_shape_falls_back_to_circle")
+            require_or_skip_renderer("aquarelle_to_view_non_aquarelle_shape_falls_back_to_orb")
         else {
             return;
         };
@@ -5676,15 +4819,15 @@ mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
         let mut opts = aquarelle_opts(w, h, AquarelleParams::default());
-        opts.shape = OrbShape::Circle;
-        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        opts.shape = OrbShape::Orb;
+        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
         let via_aqua_entry = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_frame_aquarelle_to_view(&clusters, &opts, 0.5, view, format);
         });
         assert_eq!(
             via_aqua_entry.as_raw(),
-            via_circle.as_raw(),
-            "aquarelle to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+            via_orb.as_raw(),
+            "aquarelle to_view on an Orb shape must fall back to the plain orb path byte-for-byte"
         );
     }
 
@@ -5692,7 +4835,7 @@ mod tests {
     /// must each match their solo render byte-for-byte — the `render_guard`
     /// serialization covers both paths (they share the grow-only orb texture and
     /// the bleed intermediates), so no panic / validation error / cross-thread
-    /// aliasing may occur. Two threads use the read-back entry points (Circle /
+    /// aliasing may occur. Two threads use the read-back entry points (orb /
     /// Glyph) and two use the to_view entry points at `Rgba8Unorm`; oracles are
     /// uncontended solo renders on the same renderer (rendering is deterministic
     /// regardless of cache state, pinned by the determinism / leak tests, so any
@@ -5707,7 +4850,7 @@ mod tests {
         let (w, h) = (72u32, 56u32);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
-        let circle = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let circle = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
 
         // Solo (uncontended) oracles on the shared renderer. to_view ↔ read-back
@@ -5899,7 +5042,7 @@ mod tests {
         };
         let via_external = GpuRenderer::from_device_queue(device, queue, adapter_name);
         let clusters = sample_clusters();
-        let opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let opts = orb_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let frame_new = via_new.render_frame(&clusters, &opts, 0.4);
         let frame_external = via_external.render_frame(&clusters, &opts, 0.4);
         let max_diff = assert_within_tolerance(

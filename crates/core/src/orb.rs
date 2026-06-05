@@ -30,10 +30,16 @@ pub enum OrbStyle {
     Soft,
 }
 
-/// orb 描画形式。`Circle` は単一の radial gradient、`Aquarelle` はセル画夜景の
-/// 質感セット（[`aquarelle`] crate）、`Glyph` は同梱フォント 1 文字のアウトライン
-/// 塗りを有効にする。`Image` (#217) は外部から供給された画像シルエット SDF を
-/// glyph と同じ SDF レンダリング経路で描く。
+/// orb 描画形式。`Orb` は単一の radial gradient（解析的な円距離 → falloff）、
+/// `Aquarelle` はセル画夜景の質感セット（[`aquarelle`] crate）、`Glyph` は同梱フォント
+/// 1 文字のアウトライン塗りを有効にする。`Image` (#217) は外部から供給された画像
+/// シルエット SDF を描く。
+///
+/// #235 で `Glyph` / `Image` は orb と同じ機構に統一された: orb の WGSL に「別の
+/// シルエット（SDF）を食わせる」だけで、ぼやけ方・呼吸・rim/soft・合成は orb と完全に
+/// 共通になり、独自のにじみ（bleed/halo）は撲滅した。形（SDF が表す "形からの距離"）
+/// だけが違い、三角の記号は三角のまま orb のぼやけ方で描かれる。にじみは `Aquarelle`
+/// shape だけの領分。
 ///
 /// `Image` が `Arc<[u8]>`（画像シルエットの SDF テクスチャ）を持つため、`OrbShape`
 /// は `Copy` ではなく `Clone`（`Arc` の参照カウント複製は安価）。`Glyph` のフォントは
@@ -43,7 +49,7 @@ pub enum OrbStyle {
 #[derive(Debug, Clone, Default)]
 pub enum OrbShape {
     #[default]
-    Circle,
+    Orb,
     Aquarelle(AquarelleParams),
     /// 1 文字のグリフを orb として描く。`ch` は描画する文字、`font` は同梱フォント識別子。
     Glyph {
@@ -68,7 +74,7 @@ impl PartialEq for OrbShape {
     // 完全一致まで問わない（バリエーション選別等で同一 shape 判定に使うだけ）方針に揃える。
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (OrbShape::Circle, OrbShape::Circle) => true,
+            (OrbShape::Orb, OrbShape::Orb) => true,
             (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_)) => true,
             (OrbShape::Glyph { ch: a, font: fa }, OrbShape::Glyph { ch: b, font: fb }) => {
                 a == b && fa == fb
@@ -96,7 +102,7 @@ pub struct RenderOptions {
     pub saturation: f32,
     /// 背景 RGBA。alpha=0 で透過。デフォルトは黒不透明。
     pub background: [u8; 4],
-    /// orb の描画形式。Circle なら現状互換、Aquarelle ならセル画夜景の質感セット。
+    /// orb の描画形式。Orb なら単一 radial gradient、Aquarelle ならセル画夜景の質感セット。
     pub shape: OrbShape,
     /// ぼかし (Softness) preset（#55, #131 で改名）。Mid で既存挙動と完全同値。
     pub softness: SoftnessPreset,
@@ -111,7 +117,7 @@ impl Default for RenderOptions {
             blur: 0.5,
             saturation: 1.0,
             background: [0, 0, 0, 255],
-            shape: OrbShape::Circle,
+            shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
         }
     }
@@ -205,7 +211,7 @@ mod tests {
             size: 256,
         };
         assert_eq!(a, b, "Image == Image must be true regardless of SDF bytes");
-        assert_ne!(a, OrbShape::Circle);
+        assert_ne!(a, OrbShape::Orb);
         assert_eq!(
             OrbShape::Aquarelle(AquarelleParams::default()),
             OrbShape::Aquarelle(AquarelleParams {

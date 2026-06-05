@@ -155,7 +155,7 @@ impl Default for AnimateOptions {
             seed: 0,
             count: None,
             background: [0, 0, 0, 255],
-            shape: OrbShape::Circle,
+            shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
