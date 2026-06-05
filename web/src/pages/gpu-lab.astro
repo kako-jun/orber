@@ -1,0 +1,131 @@
+---
+// orber#230 — WebGPU (wgpu/WGSL) 検証ページ。開発用で本番導線（ナビ・トップ）
+// からはリンクしない。wasm の gpu_init / gpu_set_render_data / gpu_render を
+// main thread で叩き、canvas に Circle アニメーションを rAF で回す。
+// WebGPU 不在時は明確なエラーを表示する（fallback 無し = #207 方針）。
+// #232 で Studio に WebGL↔WGSL A/B トグルが入ったら、このページは比較基準として
+// 残すか撤去するかを判断する。
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>orber gpu-lab (#230 dev)</title>
+  </head>
+  <body style="margin:0; min-height:100vh; background:#040404; color:#e8e8e8; font-family:ui-monospace, monospace; display:flex; flex-direction:column; align-items:center; gap:12px; padding:24px;">
+    <h1 style="font-size:14px; font-weight:500; margin:0;">orber gpu-lab — WebGPU circle (#230)</h1>
+    <canvas id="gpu-canvas" width="270" height="480" style="border:1px solid #333; width:270px; height:480px;"></canvas>
+    <button id="start" style="background:#222; color:#e8e8e8; border:1px solid #555; padding:8px 24px; cursor:pointer; font:inherit;">start</button>
+    <div id="status" style="font-size:12px; color:#9a9a9a; max-width:480px; text-align:center;">idle</div>
+    <div id="fps" style="font-size:12px; color:#9a9a9a;"></div>
+
+    <script>
+      import init, { gpu_init, gpu_set_render_data, gpu_render } from '../wasm/orber_wasm.js';
+
+      const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
+      const btn = document.getElementById('start') as HTMLButtonElement;
+      const statusEl = document.getElementById('status') as HTMLDivElement;
+      const fpsEl = document.getElementById('fps') as HTMLDivElement;
+
+      const setStatus = (s: string) => {
+        statusEl.textContent = s;
+      };
+
+      // ソース画像は小さなハードコードのグラデーション。kmeans が拾える程度に
+      // 色相が散っていれば十分（実画像アップロードは本番 Studio の領分）。
+      function makeSourceRgb(w: number, h: number): Uint8Array {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d')!;
+        const g = ctx.createLinearGradient(0, 0, w, h);
+        g.addColorStop(0, '#ff6a00');
+        g.addColorStop(0.35, '#ff2f6d');
+        g.addColorStop(0.7, '#7a2fff');
+        g.addColorStop(1, '#00d4ff');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, w, h);
+        const data = ctx.getImageData(0, 0, w, h).data;
+        const rgb = new Uint8Array(w * h * 3);
+        for (let i = 0, j = 0; i < data.length; i += 4) {
+          rgb[j++] = data[i];
+          rgb[j++] = data[i + 1];
+          rgb[j++] = data[i + 2];
+        }
+        return rgb;
+      }
+
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          // WebGPU 不在の明確なエラー（fallback 無し = #207 方針）。
+          // navigator.gpu があっても adapter が取れない環境は gpu_init 側が
+          // reject するので、そちらのメッセージも setStatus に流れる。
+          if (!('gpu' in navigator)) {
+            throw new Error(
+              'WebGPU is not available in this browser (navigator.gpu is undefined). orber requires WebGPU — no WebGL fallback on this path (#207).',
+            );
+          }
+          setStatus('loading wasm...');
+          await init();
+
+          // adapter/device init 時間の計測（CLI 実測 ~0.55s との比較用、#230）。
+          setStatus('gpu_init...');
+          const t0 = performance.now();
+          const adapterName = await gpu_init(canvas);
+          const initMs = performance.now() - t0;
+          console.log(`[gpu-lab] gpu_init: ${initMs.toFixed(1)} ms, adapter = ${adapterName}`);
+          setStatus(`init ${initMs.toFixed(1)} ms — ${adapterName}`);
+
+          const SRC = 32;
+          const params = {
+            source_rgb: makeSourceRgb(SRC, SRC),
+            source_width: SRC,
+            source_height: SRC,
+            k: 5,
+            width: canvas.width,
+            height: canvas.height,
+            seed: 42,
+            direction: 'lr',
+            speed: 'slow',
+            count: 20,
+            orb_size: 1.0,
+            blur: 0.5,
+            shape: 'circle',
+            glyph_char: '',
+            count_preset: '',
+            speed_preset: '',
+            softness_preset: '',
+            glyph_rotate: true,
+          };
+          // n=12 / spec_idx=8: GUI バッチと同じ 12 枚構成の動画タイル先頭
+          // （direction=LR / speed=VerySlow の固定割当）。pack は spec ごとに
+          // 静的で、モーションは t がシェーダ内で駆動する。
+          gpu_set_render_data(params, 12, 8);
+
+          // t は 0..1 ループ。8 秒で 1 周（VerySlow の 1 cycle）。
+          const PERIOD_MS = 8000;
+          let frames = 0;
+          let lastFps = performance.now();
+          const loop = (now: number) => {
+            gpu_render((now % PERIOD_MS) / PERIOD_MS);
+            frames += 1;
+            if (now - lastFps >= 1000) {
+              fpsEl.textContent = `${((frames * 1000) / (now - lastFps)).toFixed(1)} fps`;
+              frames = 0;
+              lastFps = now;
+            }
+            requestAnimationFrame(loop);
+          };
+          requestAnimationFrame(loop);
+        } catch (e) {
+          console.error('[gpu-lab]', e);
+          setStatus(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      });
+    </script>
+  </body>
+</html>
