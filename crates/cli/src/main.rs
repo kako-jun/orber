@@ -511,9 +511,7 @@ impl FrameRenderer {
             "orber: using gpu renderer (adapter: {})",
             gpu.adapter_name()
         );
-        Some(FrameRenderer {
-            gpu: Box::new(gpu),
-        })
+        Some(FrameRenderer { gpu: Box::new(gpu) })
     }
 
     /// 1 フレームを GPU で描画する。shape ごとに専用 WGSL 経路へ dispatch する。
@@ -711,7 +709,14 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         Ok(r) => r,
         Err(code) => return code,
     };
-    if let Err(e) = render_video(&renderer, &orb_clusters, &opts, output, cli.duration_ms, codec) {
+    if let Err(e) = render_video(
+        &renderer,
+        &orb_clusters,
+        &opts,
+        output,
+        cli.duration_ms,
+        codec,
+    ) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
     }
@@ -895,8 +900,14 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
             color_tracks: Some(orb_tracks),
             keyframe_tracks: None,
         };
-        if let Err(e) = render_video(&renderer, &orb_clusters, &opts, output, cli.duration_ms, codec)
-        {
+        if let Err(e) = render_video(
+            &renderer,
+            &orb_clusters,
+            &opts,
+            output,
+            cli.duration_ms,
+            codec,
+        ) {
             eprintln!("orber: video render failed: {e}");
             return ExitCode::from(2);
         }
@@ -1033,8 +1044,14 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
             color_tracks: None,
             keyframe_tracks: Some(orb_kf_tracks),
         };
-        if let Err(e) = render_video(&renderer, &orb_clusters, &opts, output, cli.duration_ms, codec)
-        {
+        if let Err(e) = render_video(
+            &renderer,
+            &orb_clusters,
+            &opts,
+            output,
+            cli.duration_ms,
+            codec,
+        ) {
             eprintln!("orber: video render failed: {e}");
             return ExitCode::from(2);
         }

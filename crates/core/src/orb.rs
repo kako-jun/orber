@@ -1,6 +1,6 @@
 //! orb 形状・スタイルの型定義と彩度調整。
 //!
-//! #225 で CPU(tiny-skia) のピクセル描画（`render_static` / `render_one_orb`）は撲滅され、
+//! #225 で CPU のピクセル描画（`render_static` / `render_one_orb`）は撲滅され、
 //! 実描画は GPU(WGSL, [`crate::gpu`]) が担う。このモジュールに残るのは GPU / pack /
 //! SVG・CSS が共有する型と純粋な色変換だけ:
 //!

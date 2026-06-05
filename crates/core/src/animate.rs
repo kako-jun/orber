@@ -1,8 +1,10 @@
-//! orb の一方通行コンベアベルト型アニメーションモジュール。
+//! orb の一方通行コンベアベルト型アニメーションの **per-orb パラメータ計算**モジュール。
 //!
-//! 時間 `t ∈ [0, 1]` を受け取り、その時刻における 1 フレーム
-//! ([`image::RgbaImage`]) を返す関数 [`render_frame`] を提供する。
-//! `t = 0` と `t = 1` は同一フレームに収束する完全ループ。
+//! 時間 `t ∈ [0, 1]` における各 orb の位置・呼吸・回転・色割当を決定論的に算出する。
+//! `t = 0` と `t = 1` は同一状態に収束する完全ループ。#225 で CPU のピクセル
+//! 描画は撲滅され、実描画は GPU(WGSL, [`crate::gpu`]) と web(WebGL) が担う。本モジュールは
+//! 両者が共有する **算術と pack** だけを提供する（[`pack_render_data_for_webgl`] /
+//! [`precompute_orb_params`] / [`aquarelle_modulated_clusters`]）。
 //!
 //! # コンセプト
 //!
@@ -13,34 +15,22 @@
 //!   （wrap = `rem_euclid` による永続ループ）
 //! - orb ごとに初期位相 (phase) を 0..1 でばらけさせ、配置と「同期しない」感を作る
 //! - 移動中は orb ごとに 3 軸独立の位相で半径・blur・opacity が呼吸的に微揺らぎ
-//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立。
-//!   独立モードではなく、常に薄く乗る自動効果）
-//! - 静止画は流れの一瞬。t=0 のフレームを切り取った絵で、phase 由来で
-//!   orb が散らばっており、画面端で半分欠けるのが普通の状態
+//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立）
+//! - 静止画は流れの一瞬。t=0 の状態で、phase 由来で orb が散らばる
 //!
 //! # 設計メモ
 //!
-//! - 軌道はもはやリサジュー曲線ではなく、**進行方向への線形運動 +
-//!   画面外バッファ付き `rem_euclid` による wrap**。直交軸の位置は初期位置から動かない。
-//! - 各 orb の進行範囲は `[-r, 1+r]`（`r` = orb 半径を進行軸長で正規化した値）。
-//!   wrap 境界の出現/消失が画面の縁で起こるのではなく、orb が完全に画面外に
-//!   出てから入れ替わるので、視覚的にシームレスにつながる。
+//! - 軌道は**進行方向への線形運動 + 画面外バッファ付き `rem_euclid` による wrap**。
+//!   直交軸の位置は初期位置から動かない。
 //! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
 //!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
-//!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
-//! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
-//!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
-//!   全部整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
-//!   Slow (cycle_count = 1 / 2) と組み合わせると実効周回数は {1, 2, 3, 4, 6} の
-//!   5 段階に分散し、1 動画内のリズムが豊かになる（#53）。
-//! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
-//!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
+//!   t=1.0 で fract が 0 になり、t=0 と完全一致するループが成り立つ。
+//! - 速度ジッタは **整数倍** (1x / 2x / 3x)。VerySlow / Slow (cycle_count = 1 / 2) と
+//!   組み合わせると実効周回数は {1, 2, 3, 4, 6} の 5 段階に分散する（#53）。
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
-//!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
-//! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
-//!   t で 100% 同一フレームが返る。
-//! - 描画は [`crate::orb::render_one_orb`] / [`crate::glyph::render_glyph_orb`] を
-//!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
+//!   それぞれ別位相。動画全体で各 1 周。
+//! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・count で
+//!   100% 同一の per-orb 列が返る（GPU / WebGL の決定論性の根拠）。
 
 use crate::cluster::{Centroid, Cluster};
 use crate::color_track::interpolate_color_track;
@@ -562,7 +552,6 @@ pub fn aquarelle_modulated_clusters(
     let cache = precompute_orb_params(opts, clusters);
     modulate_aquarelle_clusters(clusters, opts, &cache.params, t)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -6,8 +6,8 @@ pub mod color_track;
 pub mod glyph;
 /// wgpu (Rust + WGSL) production render path (#207). Native CLI only; behind the
 /// `gpu` feature so the wasm32 build stays minimal. Since #225 this is the **only**
-/// renderer (CPU/tiny-skia was purged); it draws all four shapes (Circle / Glyph /
-/// Aquarelle / Image) in WGSL.
+/// renderer (the CPU pixel renderer was purged); it draws all four shapes
+/// (Circle / Glyph / Aquarelle / Image) in WGSL.
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod keyframe_track;

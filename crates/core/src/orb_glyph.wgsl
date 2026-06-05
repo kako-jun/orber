@@ -15,7 +15,7 @@
 //     エッジ位置 / softness 連動 / 回転角は CPU と緩い許容で一致するが、bleed 由来の
 //     滲み差は期待値として許容する（別 slice 2.5 で実装予定）。
 //   - falloff_curve は style.rs の raw-float 版（u8 量子化なし）を写す。Circle の
-//     orb_circle.wgsl の falloff（tiny-skia lowp の u8 量子化版）とは別物なので
+//     orb_circle.wgsl の falloff（Skia lowp の u8 量子化版）とは別物なので
 //     共有しない。
 //   - blend は CPU の blend_source_over（straight rgba を per-orb で u8 量子化しながら
 //     source-over）を写し、finalize（a<255 で rgb を a で割って straight 化）まで

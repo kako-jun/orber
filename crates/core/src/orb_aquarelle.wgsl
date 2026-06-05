@@ -2,7 +2,7 @@
 //
 // `aquarelle::render_aquarelle_orb`（per-orb・seed = orb index で決定論的）の 4 層
 // （offset / main 3-stop radial / 0..3 bleed satellites / bloom core）を WGSL で評価し、
-// tiny-skia と同じ流儀（u8 量子化 → premultiply(div255) → source_over(div255)）で
+// Skia lowp と同じ流儀（u8 量子化 → premultiply(div255) → source_over(div255)）で
 // SourceOver 合成する。描画順は main → satellites → bloom。
 //
 // ChaCha8 はシェーダに持ち込まない（#216 方針 Option A）:
@@ -14,10 +14,10 @@
 //   - よってこのシェーダは「積まれた中心・半径・色で 3-stop radial を最大 5 回
 //     （main + ≤3 satellites + bloom）評価して SourceOver 合成する」だけ。
 //
-// CPU(tiny-skia) との対応（パリティ範囲は狭い。過大主張しない）:
-//   - 残差は tiny-skia の anti-alias 塗り(fill_path)と WGSL の解析的 radial の差のみ
+// Skia lowp との対応（パリティ範囲は狭い。過大主張しない）:
+//   - 残差は Skia lowp の anti-alias 塗り(fill_path)と WGSL の解析的 radial の差のみ
 //     = 構造完全一致・AA だけ緩い許容（Circle と同じ性質。Circle は ±2/ch）。
-//   - 3-stop radial 各 stop の straight 色は tiny-skia `Color::from_rgba8` の u8
+//   - 3-stop radial 各 stop の straight 色は Skia lowp `Color::from_rgba8` の u8
 //     量子化に合わせて pack 段で算出済み（このシェーダは 0..1 float をそのまま補間）。
 //
 // data-texture レイアウト（Rgba32Float, 幅 AQUARELLE_TEX_WIDTH=9 texel × 高さ N orbs、
@@ -95,13 +95,13 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
     return min(max(x, a), b);
 }
 
-// tiny-skia lowp の div255: (v + 255) >> 8 == floor((v + 255) / 256)。
+// Skia lowp の div255: (v + 255) >> 8 == floor((v + 255) / 256)。
 // 入力 v は u8*u8 積（0..65025 程度）を float で持つ。orb_circle.wgsl と同一。
 fn div255(v: f32) -> f32 {
     return floor((v + 255.0) / 256.0);
 }
 
-// straight float (0..1) を tiny-skia の lowp 量子化で u8 (0..255 float) にする。
+// straight float (0..1) を Skia lowp の lowp 量子化で u8 (0..255 float) にする。
 // rgb は normalize(clamp 0..1) 後に *255+0.5 を floor。alpha は clamp 無し。
 // orb_circle.wgsl の to_u8_rgb / to_u8_a と完全に同一（aquarelle の alpha は
 // すべて N/255 の定数を mix した [0,1] 値なので clamp は元から no-op）。
@@ -117,7 +117,7 @@ fn to_u8_a(c: f32) -> f32 {
 // 描かない（draw_radial は半径×1.5 の円を fill するため）。`.a == 0` で「無描画」。
 //
 // stop は [0→(inner_rgb, inner_a), mid_stop→(mid_rgb, mid_a), 1→(edge_rgb, edge_a)]。
-// tiny-skia (SpreadMode::Pad) は半径外（r>=1）では edge stop の色で clamp する。
+// Skia lowp (SpreadMode::Pad) は半径外（r>=1）では edge stop の色で clamp する。
 // straight 色 / alpha とも線形補間する（aquarelle は inner→mid→edge で rgb も変わる）。
 fn eval_radial(
     px: vec2<f32>,
@@ -141,7 +141,7 @@ fn eval_radial(
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
     let r = dist / radius;
-    // mid_stop は tiny-skia 同様 0.05..0.95 にクランプ（GradientStop の clamp）。
+    // mid_stop は Skia lowp 同様 0.05..0.95 にクランプ（GradientStop の clamp）。
     let mid_stop = clampf(mid_stop_in, 0.05, 0.95);
 
     var rgb: vec3<f32>;
@@ -170,7 +170,7 @@ fn eval_radial(
 }
 
 // straight rgba (0..1) の src を premultiplied u8 アキュムレータ acc へ SourceOver 合成。
-// tiny-skia lowp パイプラインを bit-exact に再現:
+// Skia lowp パイプラインを bit-exact に再現:
 //   1. gradient straight color = (rgb, a) を u8 量子化
 //   2. premultiply: pr = div255(sr_u8 * sa_u8)
 //   3. source_over: out = src_premul + div255(dst_premul * (255 - sa_u8))
@@ -286,7 +286,7 @@ fn composite_premul(px: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // @builtin(position) は既に top-left のピクセル座標（中心 +0.5）。
-    // tiny-skia の radial gradient は pixel 中心で point sampling される。
+    // Skia lowp の radial gradient は pixel 中心で point sampling される。
     let pm = composite_premul(in.pos.xy); // premultiplied 0..1
     let acc_rgb8 = pm.rgb * 255.0;
     let acc_a8 = pm.a * 255.0;

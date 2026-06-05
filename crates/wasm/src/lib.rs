@@ -6,7 +6,7 @@
 //!
 //! ## API の責務分離（#225 以降）
 //!
-//! CPU(tiny-skia) 描画は撲滅され、wasm は **データ供給だけ**を担う。実描画は
+//! CPU 描画は撲滅され、wasm は **データ供給だけ**を担う。実描画は
 //! ブラウザ側の WebGL2/WebGPU が行う:
 //!
 //! - `get_render_data`: バッチ `spec_idx` 番目の per-orb 決定論データ（色 / phase /

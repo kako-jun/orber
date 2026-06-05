@@ -14,25 +14,22 @@
 //     crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS）だけのもので、この WGSL とは無関係。
 //     誤って 64 を同期させないこと。
 //
-// CPU(tiny-skia) との対応（パリティ範囲は狭い。過大主張しない）:
-//   - パリティが成り立つのは **Circle ∧ saturation 反映済** の経路に限る（count は
-//     1024 まで GPU が CPU と一致する）。saturation は pack_render_data_for_webgl
-//     では掛けず（WebGL と共有のため）、native GPU 側 gpu.rs::render_frame が
-//     adjust_saturation_pub を後段適用して CPU と揃える。video は CPU 経路、
-//     color/keyframe tracks は GPU pack 未対応。
-//   - その経路では Circle アームは CPU 経路（animate::render_frame）と同式・同パラメータ
-//     で、GLSL 実装が本番で byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を
-//     忠実に写経しているので、同じ ±2/channel の許容内で一致する（実 GPU では 0）。
-//   - falloff_curve は raw float のまま blend する（CPU 側は alpha を 1/255 に
-//     量子化してから tiny-skia に渡すが、その差は Circle で ≤1/255）。
+// WebGL (orberGl.ts) との対応:
+//   - Circle アームは WebGL GLSL 経路と同式・同パラメータで、GLSL 実装が本番で
+//     byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を忠実に写経しているので、
+//     ±2/channel の許容内で一致する（実 GPU では 0）。saturation は
+//     pack_render_data_for_webgl では掛けず（WebGL と共有のため）、native GPU 側
+//     gpu.rs::render_frame が adjust_saturation_pub を後段適用して揃える。
+//     color/keyframe tracks は GPU pack 未対応で cluster 列経由。
+//   - falloff_curve は raw float のまま blend する。
 //
 // 座標系:
 //   GLSL は gl_FragCoord(bottom-left) を `px.y = H - px.y` で top-left に直してから
-//   CPU(image::RgbaImage, top-left) と合わせていた。WGSL の @builtin(position) は
+//   出力（image::RgbaImage, top-left）と合わせていた。WGSL の @builtin(position) は
 //   既に top-left（pixel 中心 +0.5）で、読み戻しも top-left のままなので **flip 不要**。
 //   よって `in.pos.xy` をそのまま GLSL の flip 後 `px` として使う。
 //
-// 仕様の数式（CPU / GLSL と一致）:
+// 仕様の数式（GLSL と一致）:
 //   - r_pixels_max = base_radius * sqrt(weight) * 1.10
 //   - r_normalized = r_pixels_max / progress_axis_pixels
 //   - extent = 1 + 2 * r_normalized
@@ -116,23 +113,23 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
     return min(max(x, a), b);
 }
 
-// tiny-skia の RadialGradient stop 補間を **bit-exact** に再現する falloff。
+// Skia lowp の RadialGradient stop 補間を **bit-exact** に再現する falloff。
 //
 // 返り値 `.x` = straight alpha (0..1)、`.y` = orb 色に掛ける rgb スケール (0..1)。
-// 呼び出し側で straight color = (orb_rgb * .y, .x) を作り、tiny-skia の lowp
+// 呼び出し側で straight color = (orb_rgb * .y, .x) を作り、Skia lowp の lowp
 // パイプライン（u8 量子化 → premultiply(div255) → source_over(div255)）で合成する。
 //
-// tiny-skia (lowp) の gradient は **straight color** を stop 間で線形補間し、
+// Skia lowp の gradient は **straight color** を stop 間で線形補間し、
 // edge stop が `Color::TRANSPARENT = (0,0,0,0)` なので最外周セグメントでは rgb も
 // alpha も 0 へフェードする。GLSL(orberGl.ts) は rgb 一定の近似だったが、CPU
-// パリティ（±2）には straight-color 補間の再現が必要なので tiny-skia に合わせる。
+// パリティ（±2）には straight-color 補間の再現が必要なので Skia lowp に合わせる。
 //
 //   Rim  stops: [0→(c,center_a), mid_stop→(c,mid_a), 1→(0,0,0,0)]
 //   Soft stops: [0→(c,hold_a),   hold_stop→(c,hold_a), 1→(0,0,0,0)]
 //   - 内側セグメント: rgb 一定（両端 stop の色が同じ orb 色）、alpha のみ補間。
 //   - 最外周セグメント: rgb も alpha も終端へ線形フェード ⇒ rgb_scale=(1-u)。
 //
-// stop alpha は tiny-skia の `Color::from_rgba8` が u8 に量子化する値
+// stop alpha は Skia lowp の `Color::from_rgba8` が u8 に量子化する値
 // （center_a = round(opacity*255)/255, mid_a = round(opacity*80)/255）。
 // style_bit < 0.5 が Rim、それ以外が Soft。
 fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32> {
@@ -165,13 +162,13 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32
     return vec2<f32>(hold_a * (1.0 - u), 1.0 - u);
 }
 
-// tiny-skia lowp の div255: (v + 255) >> 8 == floor((v + 255) / 256)。
+// Skia lowp の div255: (v + 255) >> 8 == floor((v + 255) / 256)。
 // 入力 v は u8*u8 積（0..65025 程度）を float で持つ。
 fn div255(v: f32) -> f32 {
     return floor((v + 255.0) / 256.0);
 }
 
-// straight float (0..1) を tiny-skia の lowp 量子化で u8 (0..255 float) にする。
+// straight float (0..1) を Skia lowp の lowp 量子化で u8 (0..255 float) にする。
 // rgb は normalize(clamp 0..1) 後に *255+0.5 を floor。alpha は clamp 無し。
 fn to_u8_rgb(c: f32) -> f32 {
     return floor(clampf(c, 0.0, 1.0) * 255.0 + 0.5);
@@ -189,7 +186,7 @@ fn composite_premul(sample_px: vec2<f32>) -> vec4<f32> {
         progress_axis = params.resolution.x;
     }
 
-    // アキュムレータは tiny-skia Pixmap と同じ **premultiplied u8 (0..255 float)**。
+    // アキュムレータは Skia lowp Pixmap と同じ **premultiplied u8 (0..255 float)**。
     // 背景塗り Pixmap::fill(Color::from_rgba8(...)) は straight 入力を
     // premultiply(div255(c_u8 * a_u8)) で格納する。
     let bg_a8 = to_u8_a(params.bg.a);
@@ -265,7 +262,7 @@ fn composite_premul(sample_px: vec2<f32>) -> vec4<f32> {
         let alpha = fall.x;
 
         if (alpha > 0.0) {
-            // tiny-skia lowp パイプラインを bit-exact に再現:
+            // Skia lowp パイプラインを bit-exact に再現:
             //   1. gradient straight color = (orb_rgb * rgb_scale, alpha) を u8 量子化
             //   2. premultiply: pr = div255(sr_u8 * sa_u8)
             //   3. source_over: out = src_premul + div255(dst_premul * (255 - sa_u8))
@@ -291,7 +288,7 @@ fn composite_premul(sample_px: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // @builtin(position) は既に top-left のピクセル座標（中心 +0.5）。
-    // GLSL の `px.y = H - px.y` 後の px と同じ意味なので flip しない。tiny-skia の
+    // GLSL の `px.y = H - px.y` 後の px と同じ意味なので flip しない。Skia lowp の
     // radial gradient は pixel 中心で point sampling される（解析グラデなので
     // supersample しない方が CPU と一致する）。
     let pm = composite_premul(in.pos.xy); // premultiplied 0..1

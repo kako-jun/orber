@@ -18,7 +18,7 @@
 //!   絵文字など Symbols 2 に無い文字は静かに無視する
 //! - フォントのアウトラインは Y 軸が上向き（font em スケール）。ラスタライザ (zeno) は
 //!   Y 軸下向きなので、`OutlineBuilder` 内で y を反転して積み込む。SDF の fill は
-//!   tiny-skia から zeno (pure Rust, wasm 可) に置換済み (#223)
+//!   Skia lowp から zeno (pure Rust, wasm 可) に置換済み (#223)
 //! - センタリングは `glyph_bounding_box` の中央を orb 中心に合わせ、半径 × 2 の正方領域に
 //!   収まるよう em-square 基準でスケールする
 
@@ -82,7 +82,7 @@ fn face_for(id: GlyphFontId) -> Option<&'static Face<'static>> {
 ///
 /// フォントは Y 軸上向き、zeno のラスタライザは Y 軸下向き (`Origin::TopLeft`) なので、
 /// ここで y を反転する。同時に em スケールから「orb 半径×2 の正方領域」スケールへの
-/// 線形変換を適用する。`map()` の幾何は tiny-skia 時代から不変 (#223)。
+/// 線形変換を適用する。`map()` の幾何は Skia lowp 時代から不変 (#223)。
 struct GlyphPathBuilder {
     cmds: Vec<Command>,
     /// X 方向のスケール係数（em 単位 → ピクセル）。
@@ -200,7 +200,7 @@ fn render_glyph_binary_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
         None => return vec![0u8; n],
     };
     // zeno: Alpha (1 byte/px) coverage を size×size に直接ラスタライズする。
-    // 既定の Fill::NonZero は旧 tiny-skia の FillRule::Winding と等価で、Origin は
+    // 既定の Fill::NonZero は旧 Skia lowp の FillRule::Winding と等価で、Origin は
     // TopLeft (Y 下向き)。GlyphPathBuilder 側で font Y-up → screen Y-down を反転済み。
     // 明示 size を与えると buffer は size×size、placement も同サイズになる。
     let (coverage, placement) = Mask::new(&cmds).size(s, s).render();

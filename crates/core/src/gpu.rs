@@ -1,8 +1,8 @@
 //! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c, #225.
 //!
 //! [`GpuRenderer`] is the headless, native side of the renderer and — since #225 —
-//! the **only** renderer (the CPU / tiny-skia path and the CPU↔GPU parity oracle
-//! were purged). It runs the Circle orb WGSL
+//! the **only** renderer (the CPU pixel path and the CPU↔GPU parity oracle were
+//! purged). It runs the Circle orb WGSL
 //! ([`orb_circle.wgsl`](../src/orb_circle.wgsl)), the glyph / image SDF WGSL
 //! ([`orb_glyph.wgsl`](../src/orb_glyph.wgsl)) and the aquarelle WGSL
 //! ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Circle,
@@ -1158,7 +1158,7 @@ impl GpuRenderer {
     /// # Parity scope (loose — structural + tolerant)
     ///
     /// Bit-exact in the RNG / color math (it reuses the crate's exact arithmetic),
-    /// but the radial fill is analytic where tiny-skia anti-aliases `fill_path`, so
+    /// but the radial fill is analytic where Skia lowp anti-aliases `fill_path`, so
     /// the residual is the same AA-only difference Circle accepts (±2/channel on
     /// most hardware, 0 on the real GPU for interior pixels). Non-Aquarelle shapes
     /// fall back to the Circle path so the call is total.
@@ -2074,7 +2074,7 @@ fn apply_saturation_to_pack(pack: &mut [f32], saturation: f32, n_orbs: usize) {
 }
 
 /// `boost_saturation` from `aquarelle::render_aquarelle_orb`, reproduced verbatim
-/// so the CPU pack produces the **same u8 color** the crate feeds tiny-skia. The
+/// so the CPU pack produces the **same u8 color** the crate feeds Skia lowp. The
 /// HSL transform runs through `palette` at the exact version aquarelle pins
 /// (`palette 0.7`, the workspace dep), so the result is bit-identical and never
 /// reimplemented in WGSL. A factor within an ULP of 1.0 short-circuits like the
@@ -2315,12 +2315,6 @@ mod tests {
         max_diff
     }
 
-
-
-
-
-
-
     /// Pipeline + sized caches must each hold exactly one entry after a clip of
     /// many same-size frames, and a second size must grow only the sized cache.
     ///
@@ -2411,7 +2405,6 @@ mod tests {
             })
             .collect()
     }
-
 
     /// C4 (#210): the orb data-texture grows **only on increase**. A higher count
     /// must grow `capacity`; a lower or equal count must leave it unchanged (no
@@ -2569,8 +2562,6 @@ mod tests {
         eprintln!("short-row zero-fill: max per-channel diff = {max_diff}");
     }
 
-
-
     /// C9 (#210): the internal `render_packed` contract clamps a header `n_orbs`
     /// above [`MAX_ORB_COUNT`] (1024) down to 1024 — no panic, no out-of-bounds
     /// texture read. This bypasses the CLI (which can't request > 1024 via
@@ -2623,7 +2614,6 @@ mod tests {
         );
         eprintln!("over-max clamp: max per-channel diff = {max_diff}");
     }
-
 
     /// C11 (#210): after the lock fix, concurrent `render_frame` on a shared
     /// renderer must each match its solo render. Several threads render **different**
@@ -2892,7 +2882,6 @@ mod tests {
         );
     }
 
-
     /// #217 (#14): rotation loop closure for the GPU image path. With
     /// `glyph_rotate=true`, `render_frame_image(t=0)` and `(t=1)` must render the
     /// same frame within tolerance (the per-orb rotation + one-way conveyor both
@@ -3083,7 +3072,6 @@ mod tests {
     }
 
     // ---- #212 Phase 1b: 4-texel widening / glyph dispatch regression guards ----
-
 
     /// #212 (#2): the `render_packed_inner` short-row guard changed from a per-orb
     /// `off + 11` cut-off to `off + 13` (so the new rotation words at `off+11` /
@@ -3728,7 +3716,6 @@ mod tests {
         eprintln!("gpu glyph bleed determinism: two renders byte-identical");
     }
 
-
     /// #214 (B): the box-blur radius clamp (`r = min(radius, w-1)` / `min(radius,
     /// h-1)` in `orb_glyph_bleed.wgsl`) must keep tiny canvases from sampling out
     /// of bounds. Several sub-`2r+1` sizes (1×1, 2×2, 5×4, where the box radius 3
@@ -3906,7 +3893,6 @@ mod tests {
         eprintln!("concurrent glyph bleed: all threads matched solo oracle (no mid-pass aliasing)");
     }
 
-
     // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
 
     use aquarelle::AquarelleParams;
@@ -4007,7 +3993,6 @@ mod tests {
         let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, no_bloom);
         assert!(orbs[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
     }
-
 
     /// Aquarelle GPU determinism: the same `(clusters, opts, t)` must render
     /// byte-identical twice (the pack RNG is seeded per orb index, no thread_rng).
@@ -4500,9 +4485,4 @@ mod tests {
             "inner layer must be the desaturated base color"
         );
     }
-
-
-
-
-
 }
