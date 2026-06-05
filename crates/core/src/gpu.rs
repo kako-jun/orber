@@ -604,6 +604,22 @@ impl GpuRenderer {
             .is_some()
     }
 
+    /// Number of per-format `compose` pipelines in the bleed cache (one per
+    /// distinct final-target format, #229), `0` while the bleed pipelines are not
+    /// built yet. Exposed for the to_view format-cache test
+    /// (`glyph_to_view_compose_pipeline_cached_per_format`): a new target format
+    /// must add exactly one entry; a repeated format must not (grow-only).
+    /// Mirrors the `cache_sizes` / `bleed_pipelines_built` hooks (poison recovery
+    /// via `into_inner`, `#[cfg(test)]` so the production API stays clean).
+    #[cfg(test)]
+    fn bleed_compose_len(&self) -> usize {
+        self.bleed_pipelines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |bp| bp.compose.len())
+    }
+
     /// Get-or-build the Circle pipeline for `shader_wgsl`, compiling the shader and
     /// pipeline only on first use. The closure runs at most once per distinct
     /// shader source for the life of the renderer.
@@ -5193,5 +5209,538 @@ mod tests {
             via_view.as_raw(),
             "glyph to_view bytes must match the read-back path"
         );
+    }
+
+    /// #229: the to_view path must draw the same bytes the read-back path draws
+    /// for the two remaining SDF/aquarelle shapes — Image (the Glyph-shared SDF
+    /// pipeline + bleed via `render_frame_image_to_view`) and Aquarelle
+    /// (`render_frame_aquarelle_to_view`). Completes the per-shape to_view ↔
+    /// read-back identity started by `to_view_matches_readback_circle_and_glyph`.
+    /// Lit pixels are asserted first so the identity is not trivially satisfied
+    /// by an empty frame.
+    #[test]
+    fn to_view_matches_readback_image_and_aquarelle() {
+        let Some(renderer) =
+            require_or_skip_renderer("to_view_matches_readback_image_and_aquarelle")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 64u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+
+        // Image, via the frame-level seam (shares the Glyph SDF pipeline + bleed).
+        let image = image_opts(w, h);
+        let reference = renderer.render_frame_image(&clusters, &image, 0.3);
+        let via_view = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_image_to_view(&clusters, &image, 0.3, view, format);
+        });
+        assert!(
+            lit_vs_bg(&reference, image.background, 8) > 0,
+            "image reference must have lit pixels"
+        );
+        assert_eq!(
+            reference.as_raw(),
+            via_view.as_raw(),
+            "image to_view bytes must match the read-back path"
+        );
+
+        // Aquarelle, via the frame-level seam (single-pass aquarelle WGSL).
+        let aqua = aquarelle_opts(w, h, AquarelleParams::default());
+        let reference = renderer.render_frame_aquarelle(&clusters, &aqua, 0.3);
+        let via_view = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_aquarelle_to_view(&clusters, &aqua, 0.3, view, format);
+        });
+        assert!(
+            lit_vs_bg(&reference, aqua.background, 8) > 0,
+            "aquarelle reference must have lit pixels"
+        );
+        assert_eq!(
+            reference.as_raw(),
+            via_view.as_raw(),
+            "aquarelle to_view bytes must match the read-back path"
+        );
+    }
+
+    /// Swap the R/B channels of every pixel: reinterprets a raw read-back of a
+    /// `Bgra8Unorm` texture (which `readback_via_view` returns without channel
+    /// reordering) as a true RGBA image.
+    fn swap_rb(img: &RgbaImage) -> RgbaImage {
+        let mut out = img.clone();
+        for p in out.pixels_mut() {
+            p.0.swap(0, 2);
+        }
+        out
+    }
+
+    /// #229: the `(shader, format)` pipeline-cache key must produce a *working*
+    /// non-`Rgba8Unorm` pipeline for every shape's to_view entry point. Each shape
+    /// is rendered to_view into a `Bgra8Unorm` texture (the typical browser
+    /// surface format) and, after the R/B swap, must match its own read-back
+    /// (`Rgba8Unorm`) reference within the ±2/channel contract — a format-key
+    /// collision (reusing the Rgba8 pipeline for the Bgra8 target) would either
+    /// fail validation or come back channel-swapped, far outside tolerance. For
+    /// Glyph / Image this also pins the #229 format split: the fill + blur
+    /// intermediates stay `Rgba8Unorm` while only the final compose pass targets
+    /// `Bgra8Unorm`. Lit pixels are asserted per shape so the parity is never
+    /// satisfied by an empty frame.
+    #[test]
+    fn to_view_bgra8_matches_readback_after_swap_for_all_shapes() {
+        let Some(renderer) =
+            require_or_skip_renderer("to_view_bgra8_matches_readback_after_swap_for_all_shapes")
+        else {
+            return;
+        };
+        let (w, h) = (64u32, 48u32);
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let clusters = sample_clusters();
+
+        // (name, reference read-back render, to_view render) per shape.
+        let circle = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
+        let image = image_opts(w, h);
+        let aqua = aquarelle_opts(w, h, AquarelleParams::default());
+        type ToView<'a> = Box<dyn Fn(&wgpu::TextureView) + 'a>;
+        let cases: Vec<(&str, [u8; 4], RgbaImage, ToView<'_>)> = vec![
+            (
+                "circle",
+                circle.background,
+                renderer.render_frame(&clusters, &circle, 0.3),
+                Box::new(|view: &wgpu::TextureView| {
+                    renderer.render_frame_to_view(&clusters, &circle, 0.3, view, format);
+                }),
+            ),
+            (
+                "glyph",
+                glyph.background,
+                renderer.render_frame_glyph(&clusters, &glyph, 0.3),
+                Box::new(|view: &wgpu::TextureView| {
+                    renderer.render_frame_glyph_to_view(&clusters, &glyph, 0.3, view, format);
+                }),
+            ),
+            (
+                "image",
+                image.background,
+                renderer.render_frame_image(&clusters, &image, 0.3),
+                Box::new(|view: &wgpu::TextureView| {
+                    renderer.render_frame_image_to_view(&clusters, &image, 0.3, view, format);
+                }),
+            ),
+            (
+                "aquarelle",
+                aqua.background,
+                renderer.render_frame_aquarelle(&clusters, &aqua, 0.3),
+                Box::new(|view: &wgpu::TextureView| {
+                    renderer.render_frame_aquarelle_to_view(&clusters, &aqua, 0.3, view, format);
+                }),
+            ),
+        ];
+
+        for (name, bg, reference, draw) in &cases {
+            assert!(
+                lit_vs_bg(reference, *bg, 8) > 0,
+                "{name}: reference must have lit pixels"
+            );
+            let raw_bgra = readback_via_view(renderer, w, h, format, draw);
+            let as_rgba = swap_rb(&raw_bgra);
+            let max_diff = assert_within_tolerance(
+                reference,
+                &as_rgba,
+                &format!("{name} Bgra8 to_view (after R/B swap) vs Rgba8 read-back"),
+            );
+            eprintln!("{name} Bgra8 to_view vs read-back: max per-channel diff = {max_diff}");
+        }
+    }
+
+    /// #229 (C1+C2): the bleed `compose` pipeline cache is keyed by the
+    /// final-target format and is grow-only. On a *private* renderer (exact entry
+    /// counts), glyph to_view at `Rgba8Unorm` → 1 entry, then `Bgra8Unorm` → 2,
+    /// then each format again → still 2 (cache hit, no rebuild). The blur / halo
+    /// pipelines are format-fixed, so only `compose` may grow.
+    #[test]
+    fn glyph_to_view_compose_pipeline_cached_per_format() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("glyph_to_view_compose_pipeline_cached_per_format")
+        else {
+            return;
+        };
+        let (w, h) = (48u32, 32u32);
+        let clusters = sample_clusters();
+        let opts = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
+        let draw = |format: wgpu::TextureFormat| {
+            let _ = readback_via_view(&renderer, w, h, format, |view| {
+                renderer.render_frame_glyph_to_view(&clusters, &opts, 0.3, view, format);
+            });
+        };
+
+        assert_eq!(
+            renderer.bleed_compose_len(),
+            0,
+            "fresh renderer must have no compose pipelines yet"
+        );
+        draw(wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(
+            renderer.bleed_compose_len(),
+            1,
+            "first format must add exactly one compose entry"
+        );
+        draw(wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(
+            renderer.bleed_compose_len(),
+            2,
+            "a second format must add exactly one more compose entry"
+        );
+        draw(wgpu::TextureFormat::Rgba8Unorm);
+        draw(wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(
+            renderer.bleed_compose_len(),
+            2,
+            "repeated formats must hit the cache (grow-only, 2 entries stable)"
+        );
+    }
+
+    /// #229 (F1): the orb pipeline cache is keyed by `(shader, target format)`.
+    /// On a *private* renderer (exact entry counts), the same Circle shader
+    /// rendered to_view at `Rgba8Unorm` then `Bgra8Unorm` must hold exactly two
+    /// pipeline entries, and re-rendering both formats must not add more (cache
+    /// hit). The sized (read-back) cache must stay empty throughout — the to_view
+    /// path never allocates an offscreen target / read-back buffer (on wasm32
+    /// that cache does not even exist).
+    #[test]
+    fn to_view_pipeline_cache_keyed_by_format() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("to_view_pipeline_cache_keyed_by_format")
+        else {
+            return;
+        };
+        let (w, h) = (32u32, 24u32);
+        let clusters = sample_clusters();
+        let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let pack = GpuRenderer::pack_circle_frame(&clusters, &opts, w, h);
+        let draw = |format: wgpu::TextureFormat| {
+            let _ = readback_via_view(&renderer, w, h, format, |view| {
+                renderer.render_packed_to_view(&pack, w, h, 0.3, view, format);
+            });
+        };
+
+        assert_eq!(
+            renderer.cache_sizes(),
+            (0, 0),
+            "fresh renderer: empty caches"
+        );
+        draw(wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(
+            renderer.cache_sizes(),
+            (1, 0),
+            "first format compiles one pipeline; to_view must not allocate sized resources"
+        );
+        draw(wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(
+            renderer.cache_sizes(),
+            (2, 0),
+            "same shader at a second format must add exactly one pipeline entry"
+        );
+        draw(wgpu::TextureFormat::Rgba8Unorm);
+        draw(wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(
+            renderer.cache_sizes(),
+            (2, 0),
+            "repeated formats must hit the pipeline cache (2 entries stable)"
+        );
+    }
+
+    /// #229 (B1): `render_frame_glyph_to_view` on a non-Glyph shape must fall back
+    /// to the Circle to_view path (the call is total), matching the read-back
+    /// variant's fallback contract — byte-identical to `render_frame` at
+    /// `Rgba8Unorm` (the to_view ↔ read-back identity is pinned separately).
+    #[test]
+    fn glyph_to_view_non_glyph_shape_falls_back_to_circle() {
+        let Some(renderer) =
+            require_or_skip_renderer("glyph_to_view_non_glyph_shape_falls_back_to_circle")
+        else {
+            return;
+        };
+        let (w, h) = (40u32, 28u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let via_glyph_entry = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_glyph_to_view(&clusters, &opts, 0.5, view, format);
+        });
+        assert!(
+            lit_vs_bg(&via_circle, opts.background, 8) > 0,
+            "circle fallback reference must have lit pixels"
+        );
+        assert_eq!(
+            via_glyph_entry.as_raw(),
+            via_circle.as_raw(),
+            "glyph to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+        );
+    }
+
+    /// #229 (B2): `render_frame_glyph_to_view` with an unknown char (no SDF) must
+    /// draw the background only — the "draw nothing for tofu" contract — **and**
+    /// skip the bleed 2nd pass entirely: on a *private* renderer the bleed
+    /// pipelines must never compile (the background-only pack routes through the
+    /// Circle pipeline, exactly like the read-back variant).
+    #[test]
+    fn glyph_to_view_unknown_char_background_only_no_bleed() {
+        let Some(renderer) =
+            require_or_skip_fresh_renderer("glyph_to_view_unknown_char_background_only_no_bleed")
+        else {
+            return;
+        };
+        let (w, h) = (48u32, 40u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let mut opts = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
+        opts.shape = OrbShape::Glyph {
+            ch: '\u{1F355}', // pizza — not in Noto Sans Symbols 2
+            font: crate::glyph::GlyphFontId::NotoSymbols2,
+        };
+        let img = readback_via_view(&renderer, w, h, format, |view| {
+            renderer.render_frame_glyph_to_view(&clusters, &opts, 0.3, view, format);
+        });
+        let lit = lit_vs_bg(&img, opts.background, 1);
+        assert_eq!(
+            lit, 0,
+            "unknown glyph via to_view must paint background only, got {lit} non-bg pixels"
+        );
+        assert!(
+            !renderer.bleed_pipelines_built(),
+            "background-only to_view frame must skip the bleed pass (no bleed pipelines)"
+        );
+    }
+
+    /// #229 (B3): `render_frame_image_to_view` on a non-Image shape must fall back
+    /// to the Circle to_view path (the call is total) — byte-identical to
+    /// `render_frame` at `Rgba8Unorm`, mirroring the read-back variant's contract.
+    #[test]
+    fn image_to_view_non_image_shape_falls_back_to_circle() {
+        let Some(renderer) =
+            require_or_skip_renderer("image_to_view_non_image_shape_falls_back_to_circle")
+        else {
+            return;
+        };
+        let (w, h) = (40u32, 28u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let mut opts = image_opts(w, h);
+        opts.shape = OrbShape::Circle;
+        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let via_image_entry = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_image_to_view(&clusters, &opts, 0.5, view, format);
+        });
+        assert_eq!(
+            via_image_entry.as_raw(),
+            via_circle.as_raw(),
+            "image to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+        );
+    }
+
+    /// #229 (B4): an empty (all-zero) image SDF through
+    /// `render_frame_image_to_view` must yield a background-only frame
+    /// ("draw nothing" contract, no panic), like the read-back variant.
+    #[test]
+    fn image_to_view_empty_sdf_background_only() {
+        let Some(renderer) = require_or_skip_renderer("image_to_view_empty_sdf_background_only")
+        else {
+            return;
+        };
+        let (w, h) = (64u32, 64u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let opts = AnimateOptions {
+            shape: OrbShape::Image {
+                sdf: std::sync::Arc::from(vec![0u8; 256 * 256]),
+                size: 256,
+            },
+            ..glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true)
+        };
+        let img = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_image_to_view(&clusters, &opts, 0.0, view, format);
+        });
+        let lit = lit_vs_bg(&img, opts.background, 8);
+        assert_eq!(
+            lit, 0,
+            "empty image SDF via to_view must paint no foreground pixels"
+        );
+    }
+
+    /// #229 (B5): `render_frame_aquarelle_to_view` on a non-Aquarelle shape must
+    /// fall back to the Circle to_view path (the call is total) — byte-identical
+    /// to `render_frame` at `Rgba8Unorm`, mirroring the read-back variant.
+    #[test]
+    fn aquarelle_to_view_non_aquarelle_shape_falls_back_to_circle() {
+        let Some(renderer) =
+            require_or_skip_renderer("aquarelle_to_view_non_aquarelle_shape_falls_back_to_circle")
+        else {
+            return;
+        };
+        let (w, h) = (40u32, 28u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let mut opts = aquarelle_opts(w, h, AquarelleParams::default());
+        opts.shape = OrbShape::Circle;
+        let via_circle = renderer.render_frame(&clusters, &opts, 0.5);
+        let via_aqua_entry = readback_via_view(renderer, w, h, format, |view| {
+            renderer.render_frame_aquarelle_to_view(&clusters, &opts, 0.5, view, format);
+        });
+        assert_eq!(
+            via_aqua_entry.as_raw(),
+            via_circle.as_raw(),
+            "aquarelle to_view on a Circle shape must fall back to the Circle path byte-for-byte"
+        );
+    }
+
+    /// #229 (D1): read-back and to_view renders racing on the *shared* renderer
+    /// must each match their solo render byte-for-byte — the `render_guard`
+    /// serialization covers both paths (they share the grow-only orb texture and
+    /// the bleed intermediates), so no panic / validation error / cross-thread
+    /// aliasing may occur. Two threads use the read-back entry points (Circle /
+    /// Glyph) and two use the to_view entry points at `Rgba8Unorm`; oracles are
+    /// uncontended solo renders on the same renderer (rendering is deterministic
+    /// regardless of cache state, pinned by the determinism / leak tests, so any
+    /// mismatch here is a concurrency artifact).
+    #[test]
+    fn shared_gpu_concurrent_readback_and_to_view_no_aliasing() {
+        let Some(renderer) =
+            require_or_skip_renderer("shared_gpu_concurrent_readback_and_to_view_no_aliasing")
+        else {
+            return;
+        };
+        let (w, h) = (72u32, 56u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let clusters = sample_clusters();
+        let circle = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
+
+        // Solo (uncontended) oracles on the shared renderer. to_view ↔ read-back
+        // byte identity at Rgba8Unorm is pinned separately, so the read-back
+        // frames also serve as the to_view threads' oracles.
+        let oracle_circle = renderer.render_frame(&clusters, &circle, 0.3);
+        let oracle_glyph = renderer.render_frame_glyph(&clusters, &glyph, 0.3);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            // Read-back legs.
+            handles.push(scope.spawn(|| {
+                for _ in 0..3 {
+                    let img = renderer.render_frame(&clusters, &circle, 0.3);
+                    assert_eq!(
+                        oracle_circle.as_raw(),
+                        img.as_raw(),
+                        "concurrent circle read-back must match its solo render"
+                    );
+                }
+            }));
+            handles.push(scope.spawn(|| {
+                for _ in 0..3 {
+                    let img = renderer.render_frame_glyph(&clusters, &glyph, 0.3);
+                    assert_eq!(
+                        oracle_glyph.as_raw(),
+                        img.as_raw(),
+                        "concurrent glyph read-back must match its solo render"
+                    );
+                }
+            }));
+            // to_view legs (each iteration draws into its own private texture).
+            handles.push(scope.spawn(|| {
+                for _ in 0..3 {
+                    let img = readback_via_view(renderer, w, h, format, |view| {
+                        renderer.render_frame_to_view(&clusters, &circle, 0.3, view, format);
+                    });
+                    assert_eq!(
+                        oracle_circle.as_raw(),
+                        img.as_raw(),
+                        "concurrent circle to_view must match the solo read-back render"
+                    );
+                }
+            }));
+            handles.push(scope.spawn(|| {
+                for _ in 0..3 {
+                    let img = readback_via_view(renderer, w, h, format, |view| {
+                        renderer.render_frame_glyph_to_view(&clusters, &glyph, 0.3, view, format);
+                    });
+                    assert_eq!(
+                        oracle_glyph.as_raw(),
+                        img.as_raw(),
+                        "concurrent glyph to_view must match the solo read-back render"
+                    );
+                }
+            }));
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("concurrent read-back/to_view thread panicked");
+            }
+        });
+        eprintln!("concurrent read-back + to_view: all threads matched their solo oracle");
+    }
+
+    /// #229 (D2): concurrent glyph to_view renders with *mixed target formats*
+    /// (`Rgba8Unorm` and `Bgra8Unorm` racing on the shared renderer) must each
+    /// match their same-format solo render byte-for-byte — the per-format
+    /// `(shader, format)` pipeline-cache and compose-cache grows race here, and a
+    /// wrong-format pipeline pick would fail validation or come back
+    /// channel-swapped. Oracles are uncontended solo to_view renders on the same
+    /// renderer, one per format.
+    #[test]
+    fn shared_gpu_concurrent_glyph_to_view_mixed_formats() {
+        let Some(renderer) =
+            require_or_skip_renderer("shared_gpu_concurrent_glyph_to_view_mixed_formats")
+        else {
+            return;
+        };
+        let (w, h) = (72u32, 56u32);
+        let clusters = sample_clusters();
+        let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
+
+        let render_to = |format: wgpu::TextureFormat| {
+            readback_via_view(renderer, w, h, format, |view| {
+                renderer.render_frame_glyph_to_view(&clusters, &glyph, 0.3, view, format);
+            })
+        };
+        // Solo (uncontended) per-format oracles; raw bytes (no channel reorder),
+        // so each thread compares within its own format's byte order.
+        let oracle_rgba = render_to(wgpu::TextureFormat::Rgba8Unorm);
+        let oracle_bgra = render_to(wgpu::TextureFormat::Bgra8Unorm);
+        assert!(
+            lit_vs_bg(&oracle_rgba, glyph.background, 8) > 0,
+            "glyph oracle must have lit pixels"
+        );
+
+        let formats = [
+            (wgpu::TextureFormat::Rgba8Unorm, &oracle_rgba),
+            (wgpu::TextureFormat::Bgra8Unorm, &oracle_bgra),
+            (wgpu::TextureFormat::Rgba8Unorm, &oracle_rgba),
+            (wgpu::TextureFormat::Bgra8Unorm, &oracle_bgra),
+        ];
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for &(format, oracle) in &formats {
+                let clusters = &clusters;
+                let glyph = &glyph;
+                handles.push(scope.spawn(move || {
+                    for _ in 0..3 {
+                        let img = readback_via_view(renderer, w, h, format, |view| {
+                            renderer.render_frame_glyph_to_view(clusters, glyph, 0.3, view, format);
+                        });
+                        assert_eq!(
+                            oracle.as_raw(),
+                            img.as_raw(),
+                            "concurrent glyph to_view ({format:?}) must match its same-format solo render"
+                        );
+                    }
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("concurrent mixed-format to_view thread panicked");
+            }
+        });
+        eprintln!("concurrent mixed-format glyph to_view: all threads matched their solo oracle");
     }
 }
