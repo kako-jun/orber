@@ -148,30 +148,16 @@ function ensureImageSdfUploaded(renderer: GlRenderer): void {
   cachedGlyph = { kind: 'image', size };
 }
 
-// #160 / #172 N2: shape='image' のとき wasm 側に渡すダミー glyph_char。
-// wasm は SDF テクスチャをそのまま使うので glyph_char の値は読まないが、
-// 内部バリデーションが「非空」を要求しているケースを想定して安全な記号を
-// 当てる。将来 wasm 側で glyph_char バリデーションが厳格化された場合
-// (例: 同梱フォントに収録されている字のみ受け付ける) でも、`☆` (Noto Sans
-// Symbols 2 同梱・glyph_supported(☆)=true) を選ぶことで silent fail しにくい。
-// 真の解決は crates/wasm 側で shape='image' を直接受け付ける API を生やす
-// ことだが、現状はテクスチャ上書きの仕組みで充分なため UI レイヤで吸収する。
-const IMAGE_SHAPE_DUMMY_GLYPH = '☆';
-
 function mergeParams(p: BaseParams) {
   if (!cachedSource) {
     throw new Error('source not set — call setSource before generate/animate');
   }
-  // UI shape='image' は wasm からは shape='glyph' (= SDF テクスチャを
-  // サンプルする) として見せる。`IMAGE_SHAPE_DUMMY_GLYPH` を渡す理由は
-  // 上の定数コメントを参照。
-  const wasmShape = p.shape === 'image' ? 'glyph' : p.shape;
-  const wasmGlyphChar =
-    p.shape === 'image' ? IMAGE_SHAPE_DUMMY_GLYPH : p.glyph_char;
+  // #172 N2: shape='image' はそのまま wasm へ渡す。wasm 側 get_render_data が
+  // shape='image' を直接受け付け (webgl_shape_id)、Glyph と同じ shape_id=1 に
+  // 乗せる。SDF テクスチャは web が別途 upload する (ensureImageSdfUploaded)。
+  // 以前はダミー glyph_char を当てて 'glyph' に化けさせていたが、その特例は撤去。
   return {
     ...p,
-    shape: wasmShape,
-    glyph_char: wasmGlyphChar,
     source_rgb: cachedSource.rgb,
     source_width: cachedSource.width,
     source_height: cachedSource.height,
