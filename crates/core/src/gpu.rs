@@ -2952,6 +2952,134 @@ mod tests {
         );
     }
 
+    // ---- #235: orb / SDF WGSL variant composition (no GPU needed) -------------
+
+    /// #235 byte-exact土台: the orb variant's loop body must inline the **analytic
+    /// circle distance** — the same two lines the old `orb_circle.wgsl` had —
+    /// `let dist = distance(...);` then `let r = dist / radius;`, and must NOT carry
+    /// any SDF binding, rotation read, or rotation helper. If this drifts, the orb
+    /// variant's compiled shader is no longer the old circle body and the orb output
+    /// is no longer bit-exact. Locks the DISTANCE SOURCE inlining + the absence of
+    /// SDF-only machinery in one place.
+    #[test]
+    fn orb_variant_wgsl_is_byte_exact_with_old_circle_body() {
+        let wgsl = orb_wgsl();
+        assert!(
+            wgsl.contains("let dist = distance(sample_px, vec2<f32>(cx, cy));"),
+            "orb variant must inline the analytic circle distance line"
+        );
+        assert!(
+            wgsl.contains("let r = dist / radius;"),
+            "orb variant must inline `r = dist / radius` (the old circle body)"
+        );
+        // The orb variant must not carry any SDF machinery.
+        assert!(
+            !wgsl.contains("sdf_tex") && !wgsl.contains("sdf_samp"),
+            "orb variant must not declare the SDF texture / sampler bindings"
+        );
+        assert!(
+            !wgsl.contains("o.rot") && !wgsl.contains("glyph_rotation_angle"),
+            "orb variant must not read the rotation texel or the rotation helper"
+        );
+        assert!(
+            !wgsl.contains("//!ORB_DISTANCE_SOURCE")
+                && !wgsl.contains("//!ORB_LOAD")
+                && !wgsl.contains("//!ORB_EXTRA_BINDINGS")
+                && !wgsl.contains("//!ORB_HELPERS"),
+            "every template marker must be substituted away in the orb variant"
+        );
+    }
+
+    /// #235: the orb variant must contain no SDF binding, no per-orb rotation read,
+    /// and no texture sample call — proving it is the SDF-free path (a stray
+    /// `textureSampleLevel` would mean an SDF leaked into the orb shader and the
+    /// byte-exact guarantee is gone).
+    #[test]
+    fn orb_variant_has_no_sdf_bindings_or_rot() {
+        let wgsl = orb_wgsl();
+        assert!(
+            !wgsl.contains("@binding(2)") && !wgsl.contains("@binding(3)"),
+            "orb variant must declare only bindings 0 (params) and 1 (orb_tex)"
+        );
+        assert!(
+            !wgsl.contains("o.rot"),
+            "orb variant must not read the per-orb rotation texel"
+        );
+        assert!(
+            !wgsl.contains("textureSampleLevel"),
+            "orb variant must not sample any SDF texture"
+        );
+    }
+
+    /// #235: the SDF variant (glyph / image) must carry the SDF texture + sampler
+    /// bindings, read the per-orb rotation texel, apply the rotation helper before
+    /// sampling, and convert the signed SDF sample to `r = 1.0 - signed_unit`. This
+    /// is the positive counterpart of `orb_variant_has_no_sdf_bindings_or_rot`:
+    /// together they pin that the two variants differ exactly by the SDF source.
+    #[test]
+    fn sdf_variant_has_sdf_bindings_and_rot() {
+        let wgsl = orb_sdf_wgsl();
+        assert!(
+            wgsl.contains("sdf_tex") && wgsl.contains("sdf_samp"),
+            "SDF variant must declare the SDF texture + sampler bindings"
+        );
+        assert!(
+            wgsl.contains("@binding(2)") && wgsl.contains("@binding(3)"),
+            "SDF variant must bind the SDF texture (2) and sampler (3)"
+        );
+        assert!(
+            wgsl.contains("o.rot") && wgsl.contains("glyph_rotation_angle"),
+            "SDF variant must read the rotation texel and apply glyph_rotation_angle"
+        );
+        assert!(
+            wgsl.contains("textureSampleLevel"),
+            "SDF variant must bilinear-sample the SDF texture"
+        );
+        assert!(
+            wgsl.contains("let r = 1.0 - signed_unit;"),
+            "SDF variant must convert the signed SDF sample to r = 1 - signed_unit"
+        );
+    }
+
+    /// #235 境界取り違え狙い撃ち: the SDF distance source's CONTENT_SPAN UV clip must
+    /// use **strict** inequalities (`u < 0.0 || u > 1.0`), not `<=` / `>=`. A `<=`
+    /// at 0.0 / `>=` at 1.0 would `continue` on the exact edge texel and drop the
+    /// silhouette's outermost row/column. Asserts the strict form is present and the
+    /// inclusive forms are absent.
+    #[test]
+    fn wgsl_clip_uses_strict_inequality() {
+        let wgsl = orb_sdf_wgsl();
+        assert!(
+            wgsl.contains("if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {"),
+            "SDF UV clip must use strict < 0.0 / > 1.0 inequalities"
+        );
+        assert!(
+            !wgsl.contains("u <= 0.0")
+                && !wgsl.contains("u >= 1.0")
+                && !wgsl.contains("v <= 0.0")
+                && !wgsl.contains("v >= 1.0"),
+            "SDF UV clip must NOT use inclusive <= / >= (would drop the edge texel)"
+        );
+    }
+
+    /// #235 エッジ消失の死守: the shared `falloff_curve` early-out must fire on
+    /// `r_in >= 1.0` (inclusive), not `> 1.0`. At exactly r = 1.0 (the silhouette
+    /// edge) the fill must already be transparent; a `>` would keep the edge faintly
+    /// lit and re-introduce a hairline ring. Checked on the template (shared by both
+    /// variants).
+    #[test]
+    fn falloff_early_out_uses_ge_one() {
+        let wgsl = ORB_WGSL_TEMPLATE;
+        assert!(
+            wgsl.contains("if (opacity <= 0.0 || r_in >= 1.0) {"),
+            "falloff_curve early-out must use r_in >= 1.0 (inclusive edge transparency)"
+        );
+        assert!(
+            !wgsl.contains("r_in > 1.0"),
+            "falloff_curve must NOT use a strict r_in > 1.0 (would keep the edge lit)"
+        );
+    }
+
     /// A Glyph `AnimateOptions` for ☆ (U+2606), large orbs on a dark opaque bg so
     /// the glyph fill is well-separated from the background.
     fn glyph_opts(
@@ -5082,5 +5210,317 @@ mod tests {
             expected,
             "adapter_name() must return the exact string passed to from_device_queue"
         );
+    }
+
+    /// Build a deterministic single-orb pack centered at (0.5, 0.5) for a
+    /// `dim × dim` LR frame, with neutral breath (phi_* = 0 → factors = 1 at t=0),
+    /// no rotation (base_angle / rot_speed = 0, header glyph_rotate = 0), Soft
+    /// style, white. `shape_id` selects orb (0.0) vs SDF (1.0). The position math
+    /// is exact for direction LR at t=0, so the silhouette lands centered
+    /// regardless of seed — making the SDF-shape geometry tests position-stable.
+    fn centered_single_orb_pack(dim: u32, bg: [u8; 4], shape_id: f32) -> Vec<f32> {
+        let base_radius_unit = (dim as f32) * 0.25; // orb_size = 1.0
+        let weight = 1.0f32;
+        let r_pixels_max = base_radius_unit * weight.sqrt() * BREATH_RADIUS_MAX_FACTOR;
+        let r_norm = r_pixels_max / dim as f32; // progress_axis = width for LR
+        let extent = 1.0 + 2.0 * r_norm;
+        // nx = phase*extent - r_norm = 0.5  ⇒ phase = (0.5 + r_norm) / extent.
+        let phase = (0.5 + r_norm) / extent;
+        let mut pack = pack_render_data_for_webgl(
+            &[cluster([255, 255, 255], 0.5, 0.5, weight)],
+            bg,
+            base_radius_unit,
+            0.5, // base_blur
+            0.0, // direction = LR
+            MotionSpeed::Slow.cycle_count() as f32,
+            7,
+            1,   // n_orbs
+            1.0, // alpha_mul
+            shape_id,
+            false, // glyph_rotate OFF → angle = base_angle = 0
+            0.5,
+        );
+        pack[11] = 0.0; // header glyph_rotate OFF (defensive)
+        let off = HEADER_WORDS;
+        pack[off + 4] = phase; // phase → centers nx at 0.5
+        pack[off + 5] = 0.0; // phi_radius → radius_factor = 1
+        pack[off + 6] = 0.0; // phi_blur
+        pack[off + 7] = 0.0; // phi_opacity
+        pack[off + 8] = 0.5; // cross_axis → ny = 0.5
+        pack[off + 9] = 1.0; // style_bit = Soft
+        pack[off + 11] = 0.0; // base_angle = 0 (upright)
+        pack[off + 12] = 0.0; // rot_speed_signed = 0
+        pack
+    }
+
+    /// Render a centered single-orb SDF frame for `ch` (glyph) on a `dim × dim`
+    /// frame, sharing [`centered_single_orb_pack`] so the silhouette lands centered
+    /// regardless of seed. Used by the #235 silhouette-geometry tests.
+    fn render_centered_glyph(renderer: &GpuRenderer, ch: char, dim: u32, bg: [u8; 4]) -> RgbaImage {
+        let frame_radius = (dim as f32) * 0.25 * BREATH_RADIUS_MAX_FACTOR;
+        let (sdf, sdf_size) = crate::glyph::cached_glyph_sdf_for_radius(
+            crate::glyph::GlyphFontId::NotoSymbols2,
+            ch,
+            frame_radius,
+        )
+        .expect("bundled NotoSansSymbols2 must have a real SDF for this char");
+        let sdf_view = renderer.upload_glyph_sdf(ch, sdf_size, &sdf);
+        renderer.render_packed_inner(
+            &centered_single_orb_pack(dim, bg, 1.0),
+            dim,
+            dim,
+            0.0,
+            Some(GlyphBindings {
+                sdf_view: &sdf_view,
+                size: sdf_size,
+            }),
+        )
+    }
+
+    /// True when pixel `(x,y)` differs from the (opaque) background by > 8 on any
+    /// RGB channel — "this pixel carries silhouette fill".
+    fn px_lit(img: &RgbaImage, bg: [u8; 4], x: u32, y: u32) -> bool {
+        (0..3).any(|c| img.get_pixel(x, y).0[c].abs_diff(bg[c]) > 8)
+    }
+
+    // ---- #235: unified orb mechanism — silhouette geometry (no bleed/halo) ----
+
+    /// #235: a glyph silhouette must **not** leave a halo ring outside the orb body.
+    /// This is the direct inverse of the deleted `gpu_glyph_bleed_produces_halo_ring`
+    /// test: the old bleed/halo 2nd pass spread fill into a ring several px outside
+    /// the body; the unified orb mechanism has no such pass, so a `●` glyph (the
+    /// densest silhouette) rendered at the **same** centered position as a plain orb
+    /// must never light a pixel more than a few px outside the orb's footprint.
+    ///
+    /// The position is pinned by [`centered_single_orb_pack`] (not RNG), so orb and
+    /// glyph share an exact center; any glyph-lit pixel far from every orb-lit pixel
+    /// would be halo leakage. Measured on Apple A18 Pro: 0 such pixels even at the
+    /// strict 2 px radius, so the loose 5 px threshold here has wide headroom while
+    /// staying robust to per-GPU edge antialiasing.
+    #[test]
+    fn gpu_glyph_no_halo_ring_around_silhouette() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_no_halo_ring_around_silhouette")
+        else {
+            return;
+        };
+        let dim = 96u32;
+        let bg = [10u8, 12, 20, 255];
+        let bullet = render_centered_glyph(renderer, '\u{25CF}', dim, bg);
+        let orb = renderer.render_packed_inner(
+            &centered_single_orb_pack(dim, bg, 0.0),
+            dim,
+            dim,
+            0.0,
+            None,
+        );
+        let orb_lit: Vec<(i32, i32)> = (0..dim)
+            .flat_map(|y| (0..dim).map(move |x| (x, y)))
+            .filter(|&(x, y)| px_lit(&orb, bg, x, y))
+            .map(|(x, y)| (x as i32, y as i32))
+            .collect();
+        assert!(
+            !orb_lit.is_empty(),
+            "the centered orb must actually paint (otherwise the halo check is vacuous)"
+        );
+        // Chebyshev distance > 5 px from EVERY orb-lit pixel ⇒ detached/expanded
+        // halo. The unified mechanism must produce zero such glyph pixels.
+        let k = 5i32;
+        let halo = (0..dim)
+            .flat_map(|y| (0..dim).map(move |x| (x, y)))
+            .filter(|&(x, y)| px_lit(&bullet, bg, x, y))
+            .filter(|&(x, y)| {
+                !orb_lit
+                    .iter()
+                    .any(|&(ox, oy)| (ox - x as i32).abs() <= k && (oy - y as i32).abs() <= k)
+            })
+            .count();
+        assert_eq!(
+            halo, 0,
+            "● glyph must not light pixels more than {k}px from the orb body \
+             (no bleed/halo since #235); found {halo} halo pixels"
+        );
+        eprintln!("gpu glyph no-halo: 0 halo pixels beyond {k}px of the orb body");
+    }
+
+    /// #235 acceptance: a `●` glyph "looks like an orb". Rendered at the **same**
+    /// centered position as a plain orb (via [`centered_single_orb_pack`]), the two
+    /// lit footprints must overlap heavily.
+    ///
+    /// A per-channel pixel diff is **not** a faithful metric here: the `●` glyph is
+    /// a font silhouette scaled to fit the em-square, so it is a few pixels larger /
+    /// softer at the edge than the analytic circle, giving a large max per-channel
+    /// diff (≈146 on A18 Pro) concentrated in the soft edge band — that would force
+    /// a meaningless threshold near 255. Instead we assert the footprints'
+    /// intersection-over-union, which captures "same blob, same place" directly.
+    /// Measured IoU on A18 Pro = 0.957; the `>= 0.85` floor leaves ample headroom
+    /// for per-GPU edge antialiasing without going slack.
+    #[test]
+    fn gpu_glyph_bullet_approx_equals_orb() {
+        let Some(renderer) = require_or_skip_renderer("gpu_glyph_bullet_approx_equals_orb") else {
+            return;
+        };
+        let dim = 96u32;
+        let bg = [10u8, 12, 20, 255];
+        let bullet = render_centered_glyph(renderer, '\u{25CF}', dim, bg);
+        let orb = renderer.render_packed_inner(
+            &centered_single_orb_pack(dim, bg, 0.0),
+            dim,
+            dim,
+            0.0,
+            None,
+        );
+        let (mut inter, mut uni) = (0usize, 0usize);
+        for (x, y) in (0..dim).flat_map(|y| (0..dim).map(move |x| (x, y))) {
+            let (la, lb) = (px_lit(&orb, bg, x, y), px_lit(&bullet, bg, x, y));
+            if la || lb {
+                uni += 1;
+            }
+            if la && lb {
+                inter += 1;
+            }
+        }
+        assert!(uni > 0, "neither orb nor glyph painted — vacuous IoU");
+        let iou = inter as f32 / uni as f32;
+        assert!(
+            iou >= 0.85,
+            "● glyph and orb footprints must overlap heavily (IoU >= 0.85); got {iou:.3} \
+             (inter={inter}, union={uni})"
+        );
+        eprintln!("gpu bullet≈orb: IoU = {iou:.3} (inter={inter}, union={uni})");
+    }
+
+    /// #235 acceptance: a `▲` glyph keeps its **triangular** silhouette through the
+    /// orb blur — it does not round into a disk. Rendered centered (apex up) via
+    /// [`centered_single_orb_pack`], the lit silhouette must be narrow at the top
+    /// (apex) and widest near the bottom (base): the widest scan row lies below the
+    /// vertical center, and the apex row is far narrower than the base.
+    ///
+    /// A disk would be widest at its vertical center and symmetric top↔bottom, so
+    /// the "widest row below center" + "apex ≪ base" pair is what a round-off
+    /// regression (e.g. accidentally feeding the analytic circle distance) would
+    /// break. Measured on A18 Pro: ybbox 31..66 (mid 48), widest row y=66, apex
+    /// width 2, base width 40.
+    #[test]
+    fn gpu_triangle_silhouette_preserved_not_round() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_triangle_silhouette_preserved_not_round")
+        else {
+            return;
+        };
+        let dim = 96u32;
+        let bg = [10u8, 12, 20, 255];
+        let img = render_centered_glyph(renderer, '\u{25B2}', dim, bg);
+        let row_w = |y: u32| -> usize { (0..dim).filter(|&x| px_lit(&img, bg, x, y)).count() };
+        let (mut miny, mut maxy) = (dim, 0u32);
+        for y in 0..dim {
+            if row_w(y) > 0 {
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+        assert!(
+            maxy > miny,
+            "▲ glyph must paint a non-degenerate silhouette"
+        );
+        // Widest scan row.
+        let (mut widest_y, mut widest_w) = (miny, 0usize);
+        for y in miny..=maxy {
+            let w = row_w(y);
+            if w > widest_w {
+                widest_w = w;
+                widest_y = y;
+            }
+        }
+        let mid = (miny + maxy) / 2;
+        assert!(
+            widest_y > mid,
+            "▲ (apex up) must be widest below its vertical center, not at it (a disk \
+             would be widest at center): widest row y={widest_y}, bbox {miny}..{maxy} (mid {mid})"
+        );
+        // Apex (top) must be far narrower than the base (bottom).
+        let apex = row_w(miny + 1).max(row_w(miny));
+        let base = row_w(maxy - 1).max(row_w(maxy));
+        assert!(
+            base >= apex * 3 && apex < widest_w / 2,
+            "▲ apex must be far narrower than its base (apex={apex}, base={base}, widest={widest_w}) \
+             — a rounded silhouette would have apex ≈ base"
+        );
+        eprintln!(
+            "gpu triangle preserved: bbox {miny}..{maxy}, widest y={widest_y} (w={widest_w}), apex={apex}, base={base}"
+        );
+    }
+
+    /// #235: the SDF distance source maps an exact silhouette edge to `r = 1.0`,
+    /// which `falloff_curve` makes transparent — so a known image silhouette must be
+    /// lit **inside**, transparent **well outside**, and have a clear lit→unlit
+    /// boundary (the edge), not a frame-wide smear. Uses the synthetic centered
+    /// square [`test_image_shape`] (a 32 px white square in a 64 px field) so the
+    /// test does not depend on font assets, rendered centered via
+    /// [`centered_single_orb_pack`].
+    ///
+    /// Measured on A18 Pro: the center pixel and a band around it are lit; the frame
+    /// corners are transparent; a center horizontal scan has a single bounded lit
+    /// run (≈31..64 on a 96 px frame), proving the edge is honored rather than the
+    /// fill bleeding to the borders.
+    #[test]
+    fn gpu_sdf_edge_r_eq_one_is_transparent() {
+        let Some(renderer) = require_or_skip_renderer("gpu_sdf_edge_r_eq_one_is_transparent")
+        else {
+            return;
+        };
+        let dim = 96u32;
+        let bg = [10u8, 12, 20, 255];
+        let shape = test_image_shape();
+        let (sdf, sdf_size) = match &shape {
+            OrbShape::Image { sdf, size } => (sdf.clone(), *size),
+            _ => unreachable!("test_image_shape is always an Image"),
+        };
+        let sdf_view = renderer.upload_image_sdf(sdf_size, &sdf);
+        let img = renderer.render_packed_inner(
+            &centered_single_orb_pack(dim, bg, 1.0),
+            dim,
+            dim,
+            0.0,
+            Some(GlyphBindings {
+                sdf_view: &sdf_view,
+                size: sdf_size,
+            }),
+        );
+        let cx = dim / 2;
+        let cy = dim / 2;
+        // Inside the silhouette (center) must be lit.
+        assert!(
+            px_lit(&img, bg, cx, cy),
+            "the silhouette interior (center) must be lit"
+        );
+        // Well outside (every corner) must be transparent — the edge (r >= 1) is not
+        // smeared to the frame borders.
+        for (x, y) in [(2u32, 2u32), (dim - 3, 2), (2, dim - 3), (dim - 3, dim - 3)] {
+            assert!(
+                !px_lit(&img, bg, x, y),
+                "the frame corner ({x},{y}) must be transparent (background only) — \
+                 the SDF edge must clip the fill, not bleed to the borders"
+            );
+        }
+        // The center horizontal scan must have a single bounded lit run with a clear
+        // lit→unlit edge on both sides (not a frame-wide fill).
+        let lit_xs: Vec<u32> = (0..dim).filter(|&x| px_lit(&img, bg, x, cy)).collect();
+        let (first, last) = (
+            *lit_xs.first().expect("center row must have lit pixels"),
+            *lit_xs.last().unwrap(),
+        );
+        assert!(
+            first > 0 && last < dim - 1,
+            "the center row must have a transparent margin on both sides (edge honored): \
+             lit run {first}..{last} on a {dim}px frame"
+        );
+        assert_eq!(
+            lit_xs.len(),
+            (last - first + 1) as usize,
+            "the center row's lit pixels must form one contiguous run (a solid \
+             silhouette interior, not scattered specks): {first}..{last} with {} lit",
+            lit_xs.len()
+        );
+        eprintln!("gpu sdf edge: center lit, corners transparent, center run {first}..{last}");
     }
 }
