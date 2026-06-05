@@ -5837,4 +5837,107 @@ mod tests {
         });
         eprintln!("concurrent mixed-format glyph to_view: all threads matched their solo oracle");
     }
+
+    // ---- #230: from_device_queue construction seam ----
+
+    /// Bring up a wgpu device / queue *outside* `GpuRenderer`, the way the
+    /// browser path (orber-wasm `gpu_init`, #230) does for its surface-compatible
+    /// adapter. Mirrors `new_async`'s descriptor choices so `from_device_queue`
+    /// is the only variable under test. Retries like
+    /// `require_or_skip_fresh_renderer` because this single-instance bring-up can
+    /// transiently race the shared context's; a missing adapter then panics under
+    /// `ORBER_REQUIRE_GPU=1` / skips otherwise.
+    fn require_or_skip_external_device_queue(
+        what: &str,
+    ) -> Option<(wgpu::Device, wgpu::Queue, String)> {
+        async fn bring_up() -> Option<(wgpu::Device, wgpu::Queue, String)> {
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .ok()?;
+            let adapter_name = adapter.get_info().name;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("orber-gpu-device-test-external"),
+                    ..Default::default()
+                })
+                .await
+                .ok()?;
+            Some((device, queue, adapter_name))
+        }
+        for _ in 0..3 {
+            if let Some(t) = pollster::block_on(bring_up()) {
+                return Some(t);
+            }
+        }
+        require_gpu_or_panic(what);
+        None
+    }
+
+    /// #230 (B1): a renderer built around an *externally created* device / queue
+    /// via `from_device_queue` must render identically to one built through the
+    /// pre-existing `new()` bring-up. The refactor extracted the shared setup
+    /// (glyph sampler, caches) out of `new_async` into `from_device_queue`, so
+    /// both constructions must be the same renderer behaviorally — compared
+    /// within the suite-wide ±2/channel contract (same default adapter on one
+    /// machine, so byte equality is expected, but the parity tolerance is the
+    /// established convention).
+    #[test]
+    fn from_device_queue_renderer_matches_new_bring_up() {
+        let Some(via_new) =
+            require_or_skip_renderer("from_device_queue_renderer_matches_new_bring_up")
+        else {
+            return;
+        };
+        let Some((device, queue, adapter_name)) = require_or_skip_external_device_queue(
+            "from_device_queue_renderer_matches_new_bring_up (external leg)",
+        ) else {
+            return;
+        };
+        let via_external = GpuRenderer::from_device_queue(device, queue, adapter_name);
+        let clusters = sample_clusters();
+        let opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let frame_new = via_new.render_frame(&clusters, &opts, 0.4);
+        let frame_external = via_external.render_frame(&clusters, &opts, 0.4);
+        let max_diff = assert_within_tolerance(
+            &frame_new,
+            &frame_external,
+            "from_device_queue construction vs new() bring-up",
+        );
+        // The frame must actually contain orbs, so the parity isn't trivially
+        // satisfied by two background-only frames.
+        let lit = lit_vs_bg(&frame_external, opts.background, 2);
+        assert!(
+            lit > 0,
+            "from_device_queue renderer must draw orbs (not a background-only frame)"
+        );
+        eprintln!("from_device_queue vs new(): max per-channel diff = {max_diff}, lit = {lit}");
+    }
+
+    /// #230 (B2): `from_device_queue` must hand the caller-supplied adapter name
+    /// through to `adapter_name()` verbatim — the browser path surfaces it as the
+    /// `gpu_init` diagnostic (proof the WebGPU path ran), so construction must
+    /// not lose or rewrite it.
+    #[test]
+    fn from_device_queue_passes_adapter_name_through() {
+        let Some((device, queue, adapter_name)) =
+            require_or_skip_external_device_queue("from_device_queue_passes_adapter_name_through")
+        else {
+            return;
+        };
+        assert!(
+            !adapter_name.is_empty(),
+            "real adapter must report a non-empty name (otherwise the check is vacuous)"
+        );
+        let expected = adapter_name.clone();
+        let renderer = GpuRenderer::from_device_queue(device, queue, adapter_name);
+        assert_eq!(
+            renderer.adapter_name(),
+            expected,
+            "adapter_name() must return the exact string passed to from_device_queue"
+        );
+    }
 }

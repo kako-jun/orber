@@ -1087,4 +1087,91 @@ mod tests {
             assert!((buf[12] - preset.edge_softness()).abs() < 1e-6);
         }
     }
+
+    // ---- #230: build_render_pack（WebGL / WebGPU 共有の pack 構築経路） ----
+
+    /// #230 のテスト共通: kmeans が決定的に 2 クラスタへ収束する 2x2 赤/青
+    /// ソース（`pack_render_data_matches_core_pack_helper` と同じソース）。
+    /// 呼ぶたびに同一値を新規構築する（`WasmParams` は Clone ではないため、
+    /// 「同一 params で 2 回呼ぶ」テストはこのヘルパを 2 回呼んで実現する）。
+    fn small_source_params() -> WasmParams {
+        let mut p = base_params();
+        p.k = 2;
+        p.source_width = 2;
+        p.source_height = 2;
+        p.source_rgb = vec![
+            255, 0, 0, 255, 0, 0, //
+            0, 0, 255, 0, 0, 255,
+        ];
+        p
+    }
+
+    /// #230 (A1): `build_render_pack` は同一 params + n + spec_idx に対して
+    /// 完全に決定論的（2 回呼んで `Vec<f32>` が要素単位で完全一致する）。
+    /// WebGL (`get_render_data`) と WebGPU (`gpu_set_render_data`) が同一の
+    /// pack を共有する前提（#232 の A/B 照合の土台）をここで固定する。
+    #[test]
+    fn build_render_pack_is_deterministic_for_same_inputs() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let a = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        let b = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        assert!(!a.is_empty(), "pack must not be empty");
+        assert_eq!(
+            a, b,
+            "same params + n + spec_idx must yield an identical pack"
+        );
+    }
+
+    /// #230 (A2): spec_idx の範囲チェック境界。n=12（total=12）で 0 / 11 は
+    /// Ok、12 / 100 は Err。エラー文言は旧 `get_render_data`（JsError 時代）と
+    /// 同一の `"spec_idx {i} is out of range [0, {total})"` を一字一句維持する
+    /// （JsError → String 化リファクタで文言が変わっていないことの固定）。
+    #[test]
+    fn build_render_pack_spec_idx_boundary_and_error_wording() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Ok 側境界: 0（先頭）と 11（total - 1）。
+        assert!(build_render_pack(small_source_params(), 12, 0).is_ok());
+        assert!(build_render_pack(small_source_params(), 12, 11).is_ok());
+        // Err 側境界: 12（== total）と範囲外 100。文言まで一致すること。
+        assert_eq!(
+            build_render_pack(small_source_params(), 12, 12).unwrap_err(),
+            "spec_idx 12 is out of range [0, 12)"
+        );
+        assert_eq!(
+            build_render_pack(small_source_params(), 12, 100).unwrap_err(),
+            "spec_idx 100 is out of range [0, 12)"
+        );
+    }
+
+    /// #230 (A4): still/video タイル境界（still_count = total -
+    /// GUI_VIDEO_COUNT_DEFAULT）。n=12 なら spec_idx 7 が最後の still、8 が
+    /// 最初の video。両方 pack が生成でき、count_preset="low" で n_orbs を
+    /// 両者 10 に固定すれば長さは同一・内容は異なる（video 側は direction /
+    /// speed が GUI_VIDEO_* 固定割当に切り替わり、spec 自体の seed も違う）。
+    #[test]
+    fn build_render_pack_still_video_boundary_same_len_different_content() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let total = 12u32;
+        let still_count = total as usize - GUI_VIDEO_COUNT_DEFAULT; // 8
+        let params_low = || {
+            let mut p = small_source_params();
+            // n_orbs を spec.count（10..=50 抽選）でなく 10 に固定し、
+            // 「長さ同一」の比較を per-orb 数の偶然に依存させない。
+            p.count_preset = "low".into();
+            p
+        };
+        let last_still = build_render_pack(params_low(), total, (still_count - 1) as u32)
+            .expect("last still tile pack should build");
+        let first_video = build_render_pack(params_low(), total, still_count as u32)
+            .expect("first video tile pack should build");
+        assert_eq!(
+            last_still.len(),
+            first_video.len(),
+            "count_preset=low pins both tiles to n_orbs=10, so pack lengths must match"
+        );
+        assert_ne!(
+            last_still, first_video,
+            "still/video boundary tiles must differ in content (direction/speed/seed)"
+        );
+    }
 }
