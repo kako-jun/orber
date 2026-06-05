@@ -148,6 +148,23 @@ pub struct WasmParams {
     /// Aquarelle 外周ハロー（#231）。CLI の `--halo` と同義。0..1、既定 0.5。
     #[serde(default = "default_aquarelle_param")]
     pub aquarelle_halo: f32,
+    /// JS 側で生成した glyph SDF（`shape == "glyph"` のフォールバック、#231）。
+    /// 同梱フォント（Noto Sans Symbols 2 サブセット＝記号のみ）に収録されていない
+    /// 文字（ひらがな・漢字・絵文字）は wasm の `get_glyph_sdf` で描けないため、Web は
+    /// `generateJsGlyphSdf`（OffscreenCanvas + OS フォントスタック、`web/src/lib/jsGlyphSdf.ts`）
+    /// で `glyph_sdf_size * glyph_sdf_size` バイトの SDF を作ってここに乗せる（#159 の
+    /// WebGL フォールバックと同じ設計＝「ユーザーが入れた字を尊重して描画する」）。非空なら
+    /// `resolve_orb_shape` がこの SDF をシルエットとして [`OrbShape::Image`] に解決する
+    /// （core 統一機構では glyph も image も同じ SDF 経路、#235）。空なら従来どおり core
+    /// フォント経路（[`OrbShape::Glyph`]）。WebGL 経路（`get_render_data`）はこの
+    /// フィールドを使わない（不変）。
+    #[serde(default)]
+    pub glyph_sdf: Vec<u8>,
+    /// `glyph_sdf` の一辺サイズ（px、#231）。`glyph_sdf.len() == glyph_sdf_size *
+    /// glyph_sdf_size` でなければ `resolve_orb_shape` が Err にする。`get_glyph_sdf` と
+    /// 同じ 16..=1024 の範囲のみ受理する。`glyph_sdf` が空のときは無視される。
+    #[serde(default)]
+    pub glyph_sdf_size: u32,
 }
 
 /// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
@@ -256,11 +273,17 @@ fn parse_shape(s: &str, glyph_char: &str, aquarelle: AquarelleParams) -> Result<
 
 /// [`WasmParams`] から GPU(WGSL) 経路用の [`OrbShape`] を解決する（#231）。
 ///
-/// `orb` / `glyph` / `aquarelle` は [`parse_shape`] に委譲し、`image` だけは
+/// `orb` / `aquarelle` は [`parse_shape`] に委譲する。`image` は
 /// `image_mask_rgba` (+ width / height) を core の [`image_rgba_to_sdf`]（#219、Web の
 /// `generateImageSdf` と同フォーマット）でシルエット SDF に変換して
 /// [`OrbShape::Image`] を作る。SDF サイズは [`DEFAULT_GLYPH_SDF_SIZE`] = 256（CLI の
 /// `resolve_image_shape` と同値）。マスクが空 / 単色でコントラストが取れない場合は Err。
+///
+/// `glyph` は 2 経路: (1) `glyph_sdf` が非空なら JS フォールバック（同梱フォント外の
+/// ひらがな・漢字・絵文字を `generateJsGlyphSdf` で SDF 化したもの）を
+/// [`resolve_glyph_sdf_shape`] で検証して [`OrbShape::Image`] に解決する（core 統一機構
+/// では glyph も image も同じ SDF シルエット経路、#235）。(2) 空なら従来どおり core
+/// フォント経路（[`parse_shape`] → [`OrbShape::Glyph`]）。
 ///
 /// GPU(WGSL) 経路専用（wasm32 / test のみコンパイル）。
 #[cfg(any(target_arch = "wasm32", test))]
@@ -268,7 +291,47 @@ fn resolve_orb_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
     if p.shape == "image" {
         return resolve_image_shape(p);
     }
+    // #231: shape == "glyph" で JS フォールバック SDF が供給されていれば、同梱フォントに
+    // 無い字（ひらがな・漢字・絵文字）でも image と同じ SDF 経路で描く。
+    if p.shape == "glyph" && !p.glyph_sdf.is_empty() {
+        return resolve_glyph_sdf_shape(p);
+    }
     parse_shape(&p.shape, &p.glyph_char, aquarelle_params(p))
+}
+
+/// `shape == "glyph"` で JS 生成 SDF が供給されたときの解決（#231）。
+///
+/// `glyph_sdf` は Web の [`generateJsGlyphSdf`](web/src/lib/jsGlyphSdf.ts) が
+/// OffscreenCanvas + OS フォントスタックで作った `glyph_sdf_size * glyph_sdf_size` バイトの
+/// SDF（`get_glyph_sdf` / core の `render_glyph_sdf` と同じ符号・正規化）。core 統一機構
+/// （#235）では glyph も image も同じ SDF シルエットなので、ここでは検証してから
+/// [`OrbShape::Image`] として解決する（`resolve_image_shape` と同じ shape を使う）。
+///
+/// 検証は `get_glyph_sdf` と同じ `16..=1024` の size 範囲、`glyph_sdf.len() ==
+/// size * size`。SDF バイト列は clone せず `std::mem::take` で奪う（image_mask と同方針。
+/// resolve_frame は glyph_sdf を読まないので奪っても安全）。
+///
+/// GPU(WGSL) 経路専用（wasm32 / test のみコンパイル）。
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_glyph_sdf_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
+    let size = p.glyph_sdf_size;
+    if !(16..=1024).contains(&size) {
+        return Err(format!("glyph_sdf_size must be in [16, 1024], got {size}"));
+    }
+    let expected = (size as usize) * (size as usize);
+    if p.glyph_sdf.len() != expected {
+        return Err(format!(
+            "glyph_sdf length {} does not match glyph_sdf_size * glyph_sdf_size ({expected})",
+            p.glyph_sdf.len()
+        ));
+    }
+    // image_mask と同じく clone せず take で奪う（このあと resolve_frame は glyph_sdf を
+    // 読まないので安全）。
+    let sdf = std::mem::take(&mut p.glyph_sdf);
+    Ok(OrbShape::Image {
+        sdf: Arc::from(sdf),
+        size,
+    })
 }
 
 /// `shape == "image"` の解決: `image_mask_rgba` (w × h × 4 バイト) を
@@ -1237,6 +1300,9 @@ mod tests {
             aquarelle_bloom: 0.5,
             aquarelle_offset: 0.5,
             aquarelle_halo: 0.5,
+            // #231: glyph SDF フォールバック入力。既定では未使用（同梱フォント経路）。
+            glyph_sdf: Vec::new(),
+            glyph_sdf_size: 0,
         }
     }
 
@@ -1787,6 +1853,101 @@ mod tests {
         assert!(
             build_gpu_render_inputs(p, 12, 0).is_err(),
             "shape='' must error"
+        );
+    }
+
+    /// #231: shape="glyph" で JS フォールバック SDF（`glyph_sdf` / `glyph_sdf_size`）が
+    /// 供給されたら、同梱フォント外の字でも `OrbShape::Image` に解決する（core 統一機構
+    /// で glyph も image も同じ SDF 経路、#235）。size=256・len=256*256 の有効 SDF を渡し、
+    /// `opts.shape == OrbShape::Image{size}`・`sdf.len() == size*size`・clusters 非空を固定する。
+    /// glyph_char は同梱フォント外（漢字）を入れても、SDF 供給時は char を見ずに解決する。
+    #[test]
+    fn build_gpu_render_inputs_glyph_sdf_supplied_resolves_image() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        // 同梱 NotoSansSymbols2 に無い漢字。SDF 供給時は char を引かず SDF を直接使う。
+        p.glyph_char = "字".into();
+        let size = 256u32;
+        p.glyph_sdf_size = size;
+        // 中央付近を inside（255）にした非自明な SDF。中身の値は解決に関与しない
+        // （len と size の整合だけ見る）が、全 0 でも len さえ合えば解決する。
+        p.glyph_sdf = vec![128u8; (size * size) as usize];
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("glyph SDF GPU inputs should build");
+        match gpu.opts.shape {
+            OrbShape::Image { size: got, sdf } => {
+                assert_eq!(got, size, "resolved SDF size must match glyph_sdf_size");
+                assert_eq!(sdf.len(), (size * size) as usize);
+            }
+            other => panic!("expected OrbShape::Image (glyph SDF fallback), got {other:?}"),
+        }
+        // clusters は render_frame_image_to_view（wasm32）へ渡る本物のデータ。
+        assert!(
+            !gpu.clusters.is_empty(),
+            "kmeans should yield at least one cluster for the source image"
+        );
+    }
+
+    /// #231: glyph SDF フォールバックの size 検証。`get_glyph_sdf` と同じ `16..=1024` で、
+    /// 境界 16/1024 ちょうどは OK、15/1025 は Err（`>=`/`>` 取り違え狙い撃ち）。len 不一致も
+    /// Err。境界 OK ケースは len も size*size に合わせて与える。
+    #[test]
+    fn build_gpu_render_inputs_glyph_sdf_validates() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 境界下限 16 ちょうどは OK（len = 16*16）。
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "字".into();
+        p.glyph_sdf_size = 16;
+        p.glyph_sdf = vec![0u8; 16 * 16];
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_ok(),
+            "glyph_sdf_size == 16 (lower bound) must be accepted"
+        );
+
+        // 境界上限 1024 ちょうどは OK（len = 1024*1024）。
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "字".into();
+        p.glyph_sdf_size = 1024;
+        p.glyph_sdf = vec![0u8; 1024 * 1024];
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_ok(),
+            "glyph_sdf_size == 1024 (upper bound) must be accepted"
+        );
+
+        // 15（下限未満）は Err（len は size*size に合わせても size 範囲で弾く）。
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "字".into();
+        p.glyph_sdf_size = 15;
+        p.glyph_sdf = vec![0u8; 15 * 15];
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "glyph_sdf_size == 15 (below lower bound) must error"
+        );
+
+        // 1025（上限超過）は Err。
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "字".into();
+        p.glyph_sdf_size = 1025;
+        p.glyph_sdf = vec![0u8; 1025 * 1025];
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "glyph_sdf_size == 1025 (above upper bound) must error"
+        );
+
+        // len 不一致（size は範囲内だが len != size*size）は Err。
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "字".into();
+        p.glyph_sdf_size = 256;
+        p.glyph_sdf = vec![0u8; 256 * 256 - 1]; // 1 バイト不足
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "glyph_sdf length != size*size must error"
         );
     }
 
