@@ -396,9 +396,16 @@ export default function AbPanel(props: AbPanelProps) {
       setRunning(true);
       startLoop();
     } catch (e) {
+      // loser（より新しい start / stop に追い越された世代）の失敗は自分の残骸だけ畳む。
+      // 全域 stop() を呼ぶと並走中の勝者の生きたセッションを巻き込んで止めてしまう。
+      if (myGen !== generation) {
+        cleanupOwn();
+        return;
+      }
       console.error('[ab-panel]', e);
       setErrorMsg(e instanceof Error ? e.message : String(e));
-      // エラー経路は全域 stop()（このパスでは勝者は存在せず、自分が最後の起動者）。
+      // エラー経路は全域 stop()。上の世代ガードを抜けた時点で自分が最新世代＝
+      // 並走中の勝者は存在せず、自分が最後の起動者なので全域を畳んでよい。
       stop();
     } finally {
       // commit / 中断 / エラーすべての経路で pending を必ず解除する。
