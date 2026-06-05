@@ -1,8 +1,10 @@
-//! orb の一方通行コンベアベルト型アニメーションモジュール。
+//! orb の一方通行コンベアベルト型アニメーションの **per-orb パラメータ計算**モジュール。
 //!
-//! 時間 `t ∈ [0, 1]` を受け取り、その時刻における 1 フレーム
-//! ([`image::RgbaImage`]) を返す関数 [`render_frame`] を提供する。
-//! `t = 0` と `t = 1` は同一フレームに収束する完全ループ。
+//! 時間 `t ∈ [0, 1]` における各 orb の位置・呼吸・回転・色割当を決定論的に算出する。
+//! `t = 0` と `t = 1` は同一状態に収束する完全ループ。#225 で CPU のピクセル
+//! 描画は撲滅され、実描画は GPU(WGSL, [`crate::gpu`]) と web(WebGL) が担う。本モジュールは
+//! 両者が共有する **算術と pack** だけを提供する（[`pack_render_data_for_webgl`] /
+//! [`precompute_orb_params`] / [`aquarelle_modulated_clusters`]）。
 //!
 //! # コンセプト
 //!
@@ -13,46 +15,31 @@
 //!   （wrap = `rem_euclid` による永続ループ）
 //! - orb ごとに初期位相 (phase) を 0..1 でばらけさせ、配置と「同期しない」感を作る
 //! - 移動中は orb ごとに 3 軸独立の位相で半径・blur・opacity が呼吸的に微揺らぎ
-//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立。
-//!   独立モードではなく、常に薄く乗る自動効果）
-//! - 静止画は流れの一瞬。t=0 のフレームを切り取った絵で、phase 由来で
-//!   orb が散らばっており、画面端で半分欠けるのが普通の状態
+//!   （phi_radius / phi_blur / phi_opacity は seed 由来で per-orb / per-axis 独立）
+//! - 静止画は流れの一瞬。t=0 の状態で、phase 由来で orb が散らばる
 //!
 //! # 設計メモ
 //!
-//! - 軌道はもはやリサジュー曲線ではなく、**進行方向への線形運動 +
-//!   画面外バッファ付き `rem_euclid` による wrap**。直交軸の位置は初期位置から動かない。
-//! - 各 orb の進行範囲は `[-r, 1+r]`（`r` = orb 半径を進行軸長で正規化した値）。
-//!   wrap 境界の出現/消失が画面の縁で起こるのではなく、orb が完全に画面外に
-//!   出てから入れ替わるので、視覚的にシームレスにつながる。
+//! - 軌道は**進行方向への線形運動 + 画面外バッファ付き `rem_euclid` による wrap**。
+//!   直交軸の位置は初期位置から動かない。
 //! - 進行量計算: `extent = 1 + 2r`、`raw = (phase + cycle * speed_mult * t) * extent`、
 //!   `pos = raw.rem_euclid(extent) - r`。`cycle_count * speed_mult` は整数なので
-//!   t=1.0 で fract が 0 になり、t=0 と完全一致するピクセル単位ループが成り立つ。
-//! - 速度ジッタは **整数倍** (1x / 2x / 3x) で導入する。orb ごとに seed 由来で
-//!   `speed_mult ∈ {1, 2, 3}` を割り当て、進行量を `cycle * speed_mult * t` とする。
-//!   全部整数なので t=1 で fract が 0 になり、ループ性は保たれる。VerySlow /
-//!   Slow (cycle_count = 1 / 2) と組み合わせると実効周回数は {1, 2, 3, 4, 6} の
-//!   5 段階に分散し、1 動画内のリズムが豊かになる（#53）。
-//! - phase の散らばり (0..1 の一様分布) も併用する。phase が違えば、画面上の各
-//!   時点の orb 位置が散らばるので「同期して動いていない」感が出る。
+//!   t=1.0 で fract が 0 になり、t=0 と完全一致するループが成り立つ。
+//! - 速度ジッタは **整数倍** (1x / 2x / 3x)。VerySlow / Slow (cycle_count = 1 / 2) と
+//!   組み合わせると実効周回数は {1, 2, 3, 4, 6} の 5 段階に分散する（#53）。
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
-//!   それぞれ別位相 (phi_radius / phi_blur / phi_opacity)。動画全体で各 1 周。
-//! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・
-//!   t で 100% 同一フレームが返る。
-//! - 描画は [`crate::orb::render_one_orb`] / [`crate::glyph::render_glyph_orb`] を
-//!   per-orb で呼ぶ。背景塗りと un-premultiply は animate 側で同等の処理を行う。
+//!   それぞれ別位相。動画全体で各 1 周。
+//! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・count で
+//!   100% 同一の per-orb 列が返る（GPU / WebGL の決定論性の根拠）。
 
 use crate::cluster::{Centroid, Cluster};
 use crate::color_track::interpolate_color_track;
 use crate::keyframe_track::{interpolate_keyframe_track, KeyframeClusterPoint};
-use crate::orb::{adjust_saturation_pub, render_one_orb, OrbShape, OrbStyle};
-use crate::style::{FalloffProfile, SoftnessPreset};
-use aquarelle::{render_aquarelle_bleed_pass, AquarelleBleedParams};
-use image::RgbaImage;
+use crate::orb::{OrbShape, OrbStyle};
+use crate::style::SoftnessPreset;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::f32::consts::TAU;
-use tiny_skia::{Color, Pixmap};
 
 /// 流れる方向。1 動画で 1 方向のみ。
 ///
@@ -177,11 +164,9 @@ impl Default for AnimateOptions {
     }
 }
 
-/// 半径呼吸の上限係数。`render_frame` の `radius_factor` の最大値（1.0 + 0.10）と
-/// 一致させる必要がある。`r_pixels_max` の見積りで使うため定数として括り出している。
-const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
-
-/// 半径呼吸の振幅。`BREATH_RADIUS_MAX_FACTOR = 1.0 + BREATH_RADIUS_AMPLITUDE`。
+/// 半径呼吸の振幅（±10%）。Aquarelle の per-orb 変調が weight_scale に乗せる。
+/// GPU 経路は `radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin(...)` の最大値
+/// （= 1.10）を WGSL / gpu.rs 側の `BREATH_RADIUS_MAX_FACTOR` と揃える。
 const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 
 /// 各 orb の決定的なパラメータ。
@@ -445,6 +430,11 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
     (raw * TAU + phi).sin()
 }
 
+/// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU(`orb_glyph.wgsl`) が
+/// 行うため、本関数は WGSL の `glyph_rotation_angle` と式が一致することを担保する
+/// テスト（`wgsl_glyph_rotation_angle_matches_rust_rem_euclid`）専用の reference。
+/// #225 で CPU 描画が消え、lib 本体からの呼び出しは無くなったので `cfg(test)`。
+#[cfg(test)]
 #[inline]
 fn glyph_rotation_angle(
     cycle: u32,
@@ -462,35 +452,16 @@ fn glyph_rotation_angle(
     base_angle + turns * TAU
 }
 
-/// 時間 `t` における 1 フレームを描画する。
+/// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
 ///
-/// `t = 0.0` と `t = 1.0` は同一フレームを返す（完全ループ）。
-///
-/// # ループ性の根拠
-///
-/// - 進行方向の位置: 画面外バッファ付き wrap。`extent = 1 + 2r` の周期上で
-///   `raw = (phase + cycle * speed_mult * t) * extent`、`pos = raw.rem_euclid(extent) - r`。
-///   `cycle * speed_mult` は整数なので `t = 1.0` で `(cycle * speed_mult * 1.0)` も整数、
-///   fract は 0 になり `t = 0.0` のときと完全同一の演算に収束する。
-/// - 呼吸揺らぎ: `sin_loop(1, t, 1, phi)` で 1 周。t=0 と t=1 で同じ sin 値。
-///
-/// # 決定論性
-///
-/// 同じ seed と同じ clusters なら出力は完全一致する。RNG は orb index 順に固定
-/// シーケンスで消費されるため、count や seed が変わると各 orb の phase /
-/// phi_radius / phi_blur / phi_opacity / cross_axis / style / cluster_idx /
-/// speed_mult 割当が同時に変わる。
-pub fn render_frame(clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
-    let params = precompute_orb_params(opts, clusters);
-    render_frame_with_params(clusters, opts, &params, t)
-}
+/// GPU 経路 (#207) も同じ上限で n_orbs を clamp するため `pub`。WebGL 経路の
+/// `GL_RENDERER_MAX_ORBS`(=64) とは別の、アニメーション側の絶対上限。
+pub const MAX_ORB_COUNT: usize = 1024;
 
-/// `render_frame` で使う per-orb パラメータをまとめてプリコンピュートしたもの。
+/// `seed` / `count` / `clusters.weight` から決定的に算出した per-orb パラメータ列。
 ///
-/// 連続するフレームで同じ `seed` / `count` / `clusters` を使う場合（典型的には
-/// 動画書き出し）、これを 1 回計算してフレームループで使い回すことで
-/// `Vec<OrbParams>` 割当と RNG 走行のコストを排除できる。
-///
+/// per-orb パラメータ計算の結果を保持するシーム。GPU Aquarelle 経路
+/// （[`aquarelle_modulated_clusters`]）が位置 wrap / 呼吸 / 色補間に使う。
 /// `seed` / `count` / `cluster_weights` のいずれかを変える場合は再計算する必要がある
 /// （`Default` / `Copy` を実装しないのは、その不変条件をうっかり壊すのを防ぐため）。
 #[derive(Debug, Clone)]
@@ -500,9 +471,8 @@ pub struct CachedOrbParams {
 
 /// `opts.seed` / `opts.count` / `clusters.weight` から決定的な orb パラメータ列を生成する。
 ///
-/// 動画書き出しのフレームループで使い回す前提のキャッシュ。`render_frame` の中で
-/// 暗黙に毎フレーム呼ばれていたものを、呼び出し側で 1 回呼んで保持できるよう
-/// 公開した。
+/// per-orb パラメータ計算（位置・呼吸・回転・wrap・cluster 割当）の入口。GPU 経路
+/// （`aquarelle_modulated_clusters` 等）が同じ決定論列を共有するために使う。
 pub fn precompute_orb_params(opts: &AnimateOptions, clusters: &[Cluster]) -> CachedOrbParams {
     let n_orbs = opts
         .count
@@ -515,323 +485,10 @@ pub fn precompute_orb_params(opts: &AnimateOptions, clusters: &[Cluster]) -> Cac
     }
 }
 
-/// プリコンピュート済みの `CachedOrbParams` を使って 1 フレーム描画する。
-///
-/// `precompute_orb_params(opts, clusters)` で得た cache を渡すこと。
-/// `clusters` / `opts` （seed / count / 解像度等）が cache 計算時と一致していないと
-/// レンダリング結果は不定（パニックはしないが意味のある画像にならない）。
-pub fn render_frame_with_params(
-    clusters: &[Cluster],
-    opts: &AnimateOptions,
-    cache: &CachedOrbParams,
-    t: f32,
-) -> RgbaImage {
-    let cycle = opts.speed.cycle_count();
-    let params = &cache.params;
-
-    let width = opts.width.max(1);
-    let height = opts.height.max(1);
-
-    // Aquarelle 経路は per-orb の独立揺らぎに対応していないので、従来の
-    // render_static + Cluster 列変調パスへフォールバックする（Aquarelle は
-    // bleed/bloom/halo を内部で持っているので 3 軸揺らぎを足すと壊れる）。
-    if let OrbShape::Aquarelle(_) = opts.shape {
-        return render_frame_aquarelle(clusters, opts, params, t);
-    }
-
-    // Circle 経路: 自前で Pixmap を作って per-orb で render_one_orb を呼ぶ。
-    let mut pixmap =
-        Pixmap::new(width, height).expect("pixmap allocation should succeed for >0 dimensions");
-    let [br, bg, bb, ba] = opts.background;
-    if ba > 0 {
-        pixmap.fill(Color::from_rgba8(br, bg, bb, ba));
-    }
-
-    if clusters.is_empty() {
-        return finalize_pixmap(pixmap, width, height);
-    }
-
-    let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
-    let saturation = opts.saturation.max(0.0);
-    // softness 軸: blur は事前に offset を加算、alpha は per-orb opacity_factor に乗じる。
-    // Mid なら blur_offset=0, alpha_mul=1.0 で既存挙動と完全同値。
-    let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
-    let softness_alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
-
-    // 進行軸の長さ（ピクセル）。LR/RL では width、TB/BT では height。
-    // r_normalized を計算する基準になる。
-    let progress_axis_pixels = match opts.direction {
-        MotionDirection::LeftToRight | MotionDirection::RightToLeft => width as f32,
-        MotionDirection::TopToBottom | MotionDirection::BottomToTop => height as f32,
-    };
-
-    for p in params.iter() {
-        // 担当クラスタを取り出す（cluster_idx は pick_weighted で 0..clusters.len() に収まる）。
-        let cluster_idx = p.cluster_idx.min(clusters.len() - 1);
-        let static_c = &clusters[cluster_idx];
-
-        // 動画入力（#33）: keyframe_tracks が指定されているときは色 + 位置 + 重みを
-        // 全部時刻 t の補間値に置き換える。これがない場合は静止画クラスタを使う。
-        // 動画入力（#7）: keyframe_tracks が無く、color_tracks があるときは色だけ
-        // 上書き。位置・サイズ・揺らぎは変えない。
-        let interpolated =
-            pick_cluster_at_t(opts.keyframe_tracks.as_deref(), cluster_idx, static_c, t);
-        let (color_static, centroid_used, weight_used) = match interpolated {
-            Some((col, cen, w)) => (col, cen, w),
-            None => (static_c.color, static_c.centroid, static_c.weight),
-        };
-        // #33 review M1: keyframe_tracks ありのときだけ centroid を反映。
-        // cross_axis (seed 由来 RNG) と centroid 補間値を 50:50 でブレンドして
-        // 入力動画のコンポジショナルな動きを視覚化する。none のとき (#7 / 静止画) は
-        // 完全に既存挙動を保つ（縞模様回避維持）。
-        let cross_axis_used = if opts.keyframe_tracks.is_some() {
-            let centroid_axis = match opts.direction {
-                MotionDirection::LeftToRight | MotionDirection::RightToLeft => centroid_used.y,
-                MotionDirection::TopToBottom | MotionDirection::BottomToTop => centroid_used.x,
-            };
-            p.cross_axis * 0.5 + centroid_axis * 0.5
-        } else {
-            p.cross_axis
-        };
-        let color_at_t = if opts.keyframe_tracks.is_some() {
-            color_static
-        } else {
-            pick_color_at_t(opts.color_tracks.as_deref(), cluster_idx, static_c.color, t)
-        };
-
-        // この orb の最大想定半径（ピクセル）。breath ±10% の上限を見込む。
-        // r_normalized は進行軸 [0,1] スケールにおける半径相当。
-        let r_pixels_max =
-            base_radius_unit * weight_used.max(0.0).sqrt() * BREATH_RADIUS_MAX_FACTOR;
-        let r_normalized = if progress_axis_pixels > 0.0 {
-            r_pixels_max / progress_axis_pixels
-        } else {
-            0.0
-        };
-        // 周期長: 画面外バッファを左右（あるいは上下）に r ずつ持つので [-r, 1+r) の幅。
-        // すなわち extent = 1 + 2r、pos ∈ [-r, 1+r) という対応関係。
-        let extent = 1.0 + 2.0 * r_normalized;
-
-        // 進行量。phase は 0..1 を extent にスケール、advance は extent 単位で進める。
-        // cycle * speed_mult は整数なので t=1 で fract が 0、ループ性は保たれる。
-        let advance_steps = (cycle as f32 * p.speed_mult as f32 * t).fract();
-        let raw = p.phase * extent + advance_steps * extent;
-        // pos ∈ [-r_normalized, 1 + r_normalized)。画面外バッファに居る間は orb 中心が
-        // 画面の縁を超えており、半径を考慮しても完全に画面外。
-        let pos = raw.rem_euclid(extent) - r_normalized;
-
-        // 直交軸は cluster 重心ではなく cross_axis（seed 由来 0..1）で散らせる。
-        // クラスタ重心に固定すると orb 数を増やしても画面の同じ縦/横線に並ぶだけに
-        // なるので、画面全体に散布するため orb 個別のオフセットを使う。
-        let (nx, ny) = match opts.direction {
-            MotionDirection::LeftToRight => (pos, cross_axis_used),
-            MotionDirection::RightToLeft => (1.0 - pos, cross_axis_used),
-            MotionDirection::TopToBottom => (cross_axis_used, pos),
-            MotionDirection::BottomToTop => (cross_axis_used, 1.0 - pos),
-        };
-
-        // 3 軸独立の呼吸揺らぎ。各々が動画 1 周（sin_loop の f=1, scale=1）で
-        // ループする。位相は seed から決定的に生成しているので、軸間で同期しない。
-        // - radius: ±10%
-        // - blur: ±15%
-        // - opacity: ±5%
-        let radius_factor = 1.0 + 0.10 * sin_loop(1, t, 1, p.phi_radius);
-        let blur_delta = 0.15 * sin_loop(1, t, 1, p.phi_blur);
-        let opacity_factor = 1.0 + 0.05 * sin_loop(1, t, 1, p.phi_opacity);
-
-        let radius = base_radius_unit * weight_used.max(0.0).sqrt() * radius_factor;
-        if radius <= 0.0 {
-            continue;
-        }
-
-        // clamp を外し、画面外（負・1超）の値も許可する。tiny-skia 側は描画範囲外を
-        // 安全にクリップする（半透明グラデのカウントだけ無駄に走るが、許容範囲）。
-        let cx = nx * width as f32;
-        let cy = ny * height as f32;
-        let rgb = adjust_saturation_pub(color_at_t, saturation);
-        let blur = (base_blur + blur_delta).clamp(0.0, 1.0);
-        // softness の alpha 倍率を per-orb の opacity_factor に積算（Mid なら ×1.0 で同値）。
-        let opacity = (opacity_factor * softness_alpha_mul).clamp(0.0, 1.0);
-
-        // shape による分岐:
-        // - Glyph: 1 文字の SDF を回転サンプリングし、blur + Rim/Soft falloff を共有
-        // - Image (#217): 与えられた画像シルエット SDF を同じ共有描画に流す
-        // - それ以外（Circle）: per-orb の Rim / Soft スタイルで render_one_orb
-        // Image の SDF は Arc なので move しないよう `&opts.shape` を借用で分岐する。
-        let profile = match p.style {
-            OrbStyle::Rim => FalloffProfile::Rim,
-            OrbStyle::Soft => FalloffProfile::Soft,
-        };
-        match &opts.shape {
-            OrbShape::Glyph { ch, font } => {
-                // Glyph でも style / blur は Circle と同じ falloff カーブに流し込む。
-                // RNG の `style` 引きは Circle/Glyph 切替時の seed 列互換にも使われる。
-                crate::glyph::render_glyph_orb(
-                    &mut pixmap,
-                    (cx, cy),
-                    radius,
-                    rgb,
-                    blur,
-                    opacity,
-                    profile,
-                    *font,
-                    *ch,
-                    glyph_rotation_angle(
-                        cycle,
-                        t,
-                        p.base_angle,
-                        p.rot_speed_signed,
-                        opts.glyph_rotate,
-                    ),
-                );
-            }
-            OrbShape::Image { sdf, size } => {
-                // Image: glyph と同じ共有 SDF 描画 render_sdf_orb に乗せる。回転も Web の
-                // image アーム（glyph と同 shape_id）と揃え、glyph_rotation_angle を使う。
-                crate::glyph::render_sdf_orb(
-                    &mut pixmap,
-                    (cx, cy),
-                    radius,
-                    rgb,
-                    blur,
-                    opacity,
-                    profile,
-                    sdf,
-                    *size as usize,
-                    glyph_rotation_angle(
-                        cycle,
-                        t,
-                        p.base_angle,
-                        p.rot_speed_signed,
-                        opts.glyph_rotate,
-                    ),
-                );
-            }
-            _ => {
-                render_one_orb(&mut pixmap, (cx, cy), radius, rgb, blur, opacity, p.style);
-            }
-        }
-    }
-
-    // SDF 系 shape（Glyph / Image）のときだけ、全 orb 描画後に aquarelle v0.2 の
-    // bleed pass を 1 回かける。per-orb ではなく per-frame で 1 回にすることで、static
-    // 経路 (orb.rs の render_static) と同じ paper-bleed 質感を animation でも維持する (#195)。
-    // Image (#217) も Web の image アームと揃えて Glyph 同様 bleed を掛ける。
-    // seed=0 固定でフレーム間の bleed パターンが t に対してチラつかない。
-    if matches!(opts.shape, OrbShape::Glyph { .. } | OrbShape::Image { .. }) {
-        render_aquarelle_bleed_pass(&mut pixmap, AquarelleBleedParams::default(), 0);
-    }
-
-    finalize_pixmap(pixmap, width, height)
-}
-
-/// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
-///
-/// GPU 経路 (#207) も同じ上限で n_orbs を clamp するため `pub`。WebGL 経路の
-/// `GL_RENDERER_MAX_ORBS`(=64) とは別の、CPU/アニメーション側の絶対上限。
-pub const MAX_ORB_COUNT: usize = 1024;
-
-/// Aquarelle shape は既存の render_static フォールバック経路。
-///
-/// 動画 1 タイル分のフレームを 1 枚ずつ生成する反復子。
-///
-/// `precompute_orb_params` を 1 回だけ走らせ、`next_frame()` 呼び出しごとに
-/// `t = i / total_frames` (i = 0..total_frames) の RGBA フレームを返す。
-/// 完了後は `None`。`total_frames` の倍数では `t = 1` を出さない設計なので、
-/// `t = 0` と「最後のフレームの次」がピクセル一致する `<video loop>` 用途に
-/// そのまま使える（README の "loop closure at t=0 ≡ t=1" を維持）。
-///
-/// `clusters` と `opts` を所有する: 呼び出し側のライフタイムに縛られず JS /
-/// wasm-bindgen 経由で Cursor をハンドルとして持ち回せる設計。
-pub struct AnimationCursor {
-    clusters: Vec<Cluster>,
-    opts: AnimateOptions,
-    cache: CachedOrbParams,
-    total_frames: u32,
-    next_idx: u32,
-}
-
-impl AnimationCursor {
-    /// `clusters` / `opts` / `total_frames` からカーソルを構築する。
-    ///
-    /// # Panics
-    ///
-    /// `total_frames == 0` で panic する（ループ閉鎖の不変条件 `t = i / N`
-    /// で `N > 0` を要求するため）。WASM ラッパーは早期に Result でエラーを
-    /// 返すので、ここに 0 が来るのは内部バグ扱い。
-    pub fn new(clusters: Vec<Cluster>, opts: AnimateOptions, total_frames: u32) -> Self {
-        assert!(
-            total_frames > 0,
-            "AnimationCursor requires total_frames > 0"
-        );
-        let cache = precompute_orb_params(&opts, &clusters);
-        Self {
-            clusters,
-            opts,
-            cache,
-            total_frames,
-            next_idx: 0,
-        }
-    }
-
-    /// 次のフレームを 1 枚返す。すべてのフレームを返し終えたら `None`。
-    pub fn next_frame(&mut self) -> Option<RgbaImage> {
-        if self.next_idx >= self.total_frames {
-            return None;
-        }
-        let t = self.next_idx as f32 / self.total_frames as f32;
-        let frame = render_frame_with_params(&self.clusters, &self.opts, &self.cache, t);
-        self.next_idx += 1;
-        Some(frame)
-    }
-
-    pub fn total_frames(&self) -> u32 {
-        self.total_frames
-    }
-    pub fn next_index(&self) -> u32 {
-        self.next_idx
-    }
-    pub fn width(&self) -> u32 {
-        self.opts.width
-    }
-    pub fn height(&self) -> u32 {
-        self.opts.height
-    }
-}
-
-/// Aquarelle は内部で bleed / bloom / halo を持っているため、per-orb の独立揺らぎを
-/// 足すと質感セットが壊れる。半径だけの呼吸を従来どおり cluster.weight に乗せる。
-/// count による展開は Aquarelle では行わない（質感セットが orb ごとに重い）。
-/// 受け取った `params` の先頭から cluster 数だけ消費する。
-fn render_frame_aquarelle(
-    clusters: &[Cluster],
-    opts: &AnimateOptions,
-    params: &[OrbParams],
-    t: f32,
-) -> RgbaImage {
-    use crate::orb::{render_static, RenderOptions};
-
-    let modulated = modulate_aquarelle_clusters(clusters, opts, params, t);
-
-    let render_opts = RenderOptions {
-        width: opts.width,
-        height: opts.height,
-        orb_size: opts.orb_size,
-        blur: opts.blur,
-        saturation: opts.saturation,
-        background: opts.background,
-        // OrbShape は Copy ではなくなった（Image が Arc<[u8]> を持つ）ので clone する。
-        shape: opts.shape.clone(),
-        softness: opts.softness,
-    };
-    render_static(&modulated, &render_opts)
-}
-
 /// Aquarelle フレームの per-orb 変調（位置 wrap・半径呼吸・#33/#7 色補間）を 1 箇所に
-/// 集約したヘルパ。`render_frame_aquarelle`（CPU 経路）と GPU 経路
-/// （[`aquarelle_modulated_clusters`]）が同じ算術を共有し、片方だけ挙動が
-/// ずれるのを防ぐ。返す `Vec<Cluster>` の index は `render_static` での描画 index と
-/// 一致し、`render_aquarelle_orb` の `seed = i` に対応する。
+/// 集約したヘルパ。GPU 経路（[`aquarelle_modulated_clusters`]）が使う。返す
+/// `Vec<Cluster>` の index は `gpu::GpuRenderer::render_frame_aquarelle` の per-orb 4 層
+/// 描画順（`aquarelle::render_aquarelle_orb` の `seed = i`）に対応する。
 fn modulate_aquarelle_clusters(
     clusters: &[Cluster],
     opts: &AnimateOptions,
@@ -879,12 +536,12 @@ fn modulate_aquarelle_clusters(
         .collect()
 }
 
-/// GPU Aquarelle 経路（#216）が CPU `render_frame_aquarelle` と完全に同じ変調済み
-/// cluster 列を得るための `#[doc(hidden)]` シーム。`pack_render_data_for_webgl` と
-/// 同様、内部の `OrbParams` レイアウトや RNG 列は公開しない。
+/// GPU Aquarelle 経路（#216）が per-orb の変調済み cluster 列を得るための
+/// `#[doc(hidden)]` シーム。`pack_render_data_for_webgl` と同様、内部の `OrbParams`
+/// レイアウトや RNG 列は公開しない。
 ///
-/// 返り値の index は `render_static`（= `render_aquarelle_orb` の `seed = i`）の
-/// 描画順に一致する。`gpu::GpuRenderer::render_frame_aquarelle` が各 cluster の
+/// 返り値の index は `gpu::GpuRenderer::render_frame_aquarelle` の per-orb 描画順
+/// （`aquarelle::render_aquarelle_orb` の `seed = i`）に一致する。各 cluster の
 /// 変調済み中心 / 重み / 色を読み、per-orb の 4 層を WGSL で描く。
 #[doc(hidden)]
 pub fn aquarelle_modulated_clusters(
@@ -896,303 +553,17 @@ pub fn aquarelle_modulated_clusters(
     modulate_aquarelle_clusters(clusters, opts, &cache.params, t)
 }
 
-/// Pixmap → RgbaImage 変換（un-premultiply 込み）。
-///
-/// tiny-skia の Pixmap は premultiplied alpha なので straight に戻す。
-fn finalize_pixmap(pixmap: Pixmap, width: u32, height: u32) -> RgbaImage {
-    let mut buf = pixmap.take();
-    for px in buf.chunks_exact_mut(4) {
-        let a = px[3];
-        if a == 0 {
-            px[0] = 0;
-            px[1] = 0;
-            px[2] = 0;
-        } else if a < 255 {
-            let inv = 255.0 / a as f32;
-            px[0] = (px[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            px[1] = (px[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            px[2] = (px[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-    RgbaImage::from_raw(width, height, buf)
-        .expect("raw buffer length matches width * height * 4 by construction")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::Centroid;
-
-    fn cluster(color: [u8; 3], cx: f32, cy: f32, weight: f32) -> Cluster {
-        Cluster {
-            color,
-            centroid: Centroid { x: cx, y: cy },
-            weight,
-        }
-    }
-
-    fn sample_clusters() -> Vec<Cluster> {
-        vec![
-            cluster([220, 60, 60], 0.3, 0.4, 0.5),
-            cluster([60, 120, 220], 0.7, 0.6, 0.3),
-            cluster([200, 200, 80], 0.5, 0.2, 0.2),
-        ]
-    }
-
-    fn opts_with(direction: MotionDirection, speed: MotionSpeed) -> AnimateOptions {
-        AnimateOptions {
-            width: 64,
-            height: 64,
-            orb_size: 1.0,
-            blur: 0.5,
-            saturation: 1.0,
-            direction,
-            speed,
-            seed: 12345,
-            count: None,
-            background: [0, 0, 0, 255],
-            shape: OrbShape::Circle,
-            softness: SoftnessPreset::Mid,
-            glyph_rotate: true,
-            color_tracks: None,
-            keyframe_tracks: None,
-        }
-    }
-
-    fn pixels_equal(a: &RgbaImage, b: &RgbaImage) -> bool {
-        a.dimensions() == b.dimensions() && a.as_raw() == b.as_raw()
-    }
-
-    #[test]
-    fn t_zero_and_t_one_match() {
-        // wrap で進行量 = (phase + cycle*0) と (phase + cycle*1) は mod 1 で同一に
-        // なるので t=0 と t=1 のフレームは完全一致する（ループ性）。
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let clusters = sample_clusters();
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 1.0);
-        assert!(
-            pixels_equal(&a, &b),
-            "t=0.0 and t=1.0 must produce identical frames (loop closure)"
-        );
-    }
-
-    #[test]
-    fn same_seed_same_t_deterministic() {
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let clusters = sample_clusters();
-        let a = render_frame(&clusters, &opts, 0.37);
-        let b = render_frame(&clusters, &opts, 0.37);
-        assert!(
-            pixels_equal(&a, &b),
-            "same seed + same t must produce identical frames"
-        );
-    }
-
-    #[test]
-    fn different_t_produces_different_frame() {
-        // t を変えると進行量が変わって別フレームになる。
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let clusters = sample_clusters();
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.5);
-        assert!(
-            !pixels_equal(&a, &b),
-            "different t must produce different frames under Slow motion"
-        );
-    }
-
-    #[test]
-    fn different_seed_changes_layout() {
-        // 同じ clusters・opts でも seed が違うと phase が変わって配置が変わる。
-        let clusters = sample_clusters();
-        let mut opts_a = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let mut opts_b = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts_a.seed = 1;
-        opts_b.seed = 2;
-        let a = render_frame(&clusters, &opts_a, 0.25);
-        let b = render_frame(&clusters, &opts_b, 0.25);
-        assert!(
-            !pixels_equal(&a, &b),
-            "different seed should change orb phase (and hence the frame)"
-        );
-    }
-
-    #[test]
-    fn dimensions_match_options() {
-        let opts = AnimateOptions {
-            width: 80,
-            height: 120,
-            ..AnimateOptions::default()
-        };
-        let clusters = sample_clusters();
-        let img = render_frame(&clusters, &opts, 0.1);
-        assert_eq!(img.width(), 80);
-        assert_eq!(img.height(), 120);
-    }
-
-    #[test]
-    fn all_direction_speed_combinations_loop_closed() {
-        // 全 direction × 全 speed で t=0 と t=1 が完全一致することを検証する。
-        let clusters = sample_clusters();
-        for dir in [
-            MotionDirection::LeftToRight,
-            MotionDirection::RightToLeft,
-            MotionDirection::TopToBottom,
-            MotionDirection::BottomToTop,
-        ] {
-            for speed in [
-                MotionSpeed::VerySlow,
-                MotionSpeed::Slow,
-                MotionSpeed::Mid,
-                MotionSpeed::Fast,
-            ] {
-                let opts = opts_with(dir, speed);
-                let a = render_frame(&clusters, &opts, 0.0);
-                let b = render_frame(&clusters, &opts, 1.0);
-                assert!(
-                    pixels_equal(&a, &b),
-                    "loop closure broken for direction={dir:?} speed={speed:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn left_to_right_does_not_move_vertically() {
-        // LeftToRight では y が初期位置（centroid.y）のまま動かない。
-        // 1 cluster だけ centroid を画面下半分に置き、最も明るいピクセルの y 座標が
-        // t=0 と t=0.5 で一致することを確認する。
-        let clusters = vec![cluster([255, 0, 0], 0.5, 0.7, 0.5)];
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.5);
-        let bright_y = |img: &RgbaImage| -> u32 {
-            let mut best = 0u32;
-            let mut best_v = 0u32;
-            for y in 0..img.height() {
-                let mut row_sum = 0u32;
-                for x in 0..img.width() {
-                    row_sum += img.get_pixel(x, y)[0] as u32;
-                }
-                if row_sum > best_v {
-                    best_v = row_sum;
-                    best = y;
-                }
-            }
-            best
-        };
-        assert_eq!(
-            bright_y(&a),
-            bright_y(&b),
-            "LeftToRight must not shift vertically"
-        );
-    }
-
-    #[test]
-    fn top_to_bottom_does_not_move_horizontally() {
-        // TopToBottom では x が初期位置のまま動かない。
-        let clusters = vec![cluster([255, 0, 0], 0.3, 0.5, 0.5)];
-        let opts = opts_with(MotionDirection::TopToBottom, MotionSpeed::Slow);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.5);
-        let bright_x = |img: &RgbaImage| -> u32 {
-            let mut best = 0u32;
-            let mut best_v = 0u32;
-            for x in 0..img.width() {
-                let mut col_sum = 0u32;
-                for y in 0..img.height() {
-                    col_sum += img.get_pixel(x, y)[0] as u32;
-                }
-                if col_sum > best_v {
-                    best_v = col_sum;
-                    best = x;
-                }
-            }
-            best
-        };
-        assert_eq!(
-            bright_x(&a),
-            bright_x(&b),
-            "TopToBottom must not shift horizontally"
-        );
-    }
-
-    #[test]
-    fn left_to_right_advances_x_over_time() {
-        // 単一 orb で phase=0 になるよう調整は難しいので、直接位置を計算して比較する。
-        // generate_orb_params の RNG は seed=0 で再現できるので、その orb が t=0.0 と
-        // t=0.25 で異なる x を持つことを確認する。
-        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
-        let opts = AnimateOptions {
-            width: 128,
-            height: 128,
-            seed: 7,
-            ..AnimateOptions::default()
-        };
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 0.25);
-        assert!(
-            !pixels_equal(&a, &b),
-            "LeftToRight must shift horizontally between t=0 and t=0.25"
-        );
-    }
-
-    #[test]
-    fn wrap_brings_orb_back_at_t_one() {
-        // 1 周期分進んだ orb は元の位置に戻ってくる（rem_euclid による wrap）。
-        // 既に t_zero_and_t_one_match で確認済みだが、Slow 以外も含めて再確認する。
-        let clusters = sample_clusters();
-        for speed in [
-            MotionSpeed::VerySlow,
-            MotionSpeed::Slow,
-            MotionSpeed::Mid,
-            MotionSpeed::Fast,
-        ] {
-            let opts = opts_with(MotionDirection::LeftToRight, speed);
-            let a = render_frame(&clusters, &opts, 0.0);
-            let b = render_frame(&clusters, &opts, 1.0);
-            assert!(
-                pixels_equal(&a, &b),
-                "wrap loop must bring frame back at t=1 (speed={speed:?})"
-            );
-        }
-    }
 
     #[test]
     fn cycle_count_matches_speed() {
         // 速度の cycle_count が仕様通りであることを保証する回帰テスト。
         assert_eq!(MotionSpeed::VerySlow.cycle_count(), 1);
         assert_eq!(MotionSpeed::Slow.cycle_count(), 2);
-    }
-
-    #[test]
-    fn count_expands_orb_pool_beyond_clusters() {
-        // count を None で渡すと cluster 数（3）と同じ orb が描かれる。
-        // count = Some(40) を指定すると 40 個に展開される。展開した方が画面の
-        // 平均明度（R チャネルの平均）が大きくなることで「より多くの orb が描かれた」
-        // ことを間接確認する。
-        let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.count = None;
-        let img_default = render_frame(&clusters, &opts, 0.0);
-
-        opts.count = Some(40);
-        let img_expanded = render_frame(&clusters, &opts, 0.0);
-
-        let mean_r = |img: &RgbaImage| -> f64 {
-            let mut s = 0u64;
-            for px in img.pixels() {
-                s += px[0] as u64;
-            }
-            s as f64 / (img.width() as f64 * img.height() as f64)
-        };
-        let m_def = mean_r(&img_default);
-        let m_exp = mean_r(&img_expanded);
-        assert!(
-            m_exp > m_def + 0.5,
-            "expanding count should increase mean brightness; default={m_def}, expanded={m_exp}"
-        );
+        assert_eq!(MotionSpeed::Mid.cycle_count(), 3);
+        assert_eq!(MotionSpeed::Fast.cycle_count(), 4);
     }
 
     #[test]
@@ -1222,9 +593,6 @@ mod tests {
         let p = generate_orb_params(42, 16, &[1.0]);
         let mut all_three_same = 0;
         for op in &p {
-            // 3 つが完全一致しているケースを数える。0 件であることを期待する
-            // （偶然一致は理論上ゼロではないが、ChaCha8Rng + f32 の連続値で
-            //  一致する確率は実質 0）。
             if (op.phi_radius - op.phi_blur).abs() < 1e-6
                 && (op.phi_blur - op.phi_opacity).abs() < 1e-6
             {
@@ -1252,7 +620,6 @@ mod tests {
                 "speed_mult={label} count out of expected band 25..=55; got n1={n1} n2={n2} n3={n3}"
             );
         }
-        // 全 orb が {1, 2, 3} の範囲内であること。
         for q in &p {
             assert!(
                 (1..=3).contains(&q.speed_mult),
@@ -1311,7 +678,6 @@ mod tests {
     #[test]
     fn glyph_rotation_off_keeps_base_angle() {
         // #136: glyph_rotate=false なら全 t で角度は base_angle のまま不変。
-        // OFF パスでも t=0 と t=1 が一致する（loop closure は自明）。
         let p = generate_orb_params(42, 16, &[1.0]);
         for cycle in 1..=4 {
             for q in &p {
@@ -1328,29 +694,17 @@ mod tests {
     }
 
     /// #212: WGSL の turns 式 `x - floor(x)` は Rust の `rem_euclid(x, 1.0)` と
-    /// 一致しなければならない。`orb_glyph.wgsl::glyph_rotation_angle` は
-    /// `turns = x - floor(x)` で turns を出すが、CPU 側 `glyph_rotation_angle` は
-    /// `rem_euclid(1.0)` を使う。両者は **負の speed** で wrap の挙動が割れやすい
-    /// （`rem_euclid` は非負を返す一方、素朴な `%` は負を返しうる）。WGSL の式を
-    /// Rust に移植し、cycle∈1..=4 × 複数 t × **符号付き speed（負を含む）**で
-    /// CPU 実装と完全一致することを assert し、回転角が WGSL と CPU で乖離しない
-    /// ことを固定する。`floor` 版は 1.0 が正なので負入力でも非負 turns を返し、
-    /// `rem_euclid` と一致するのが期待値。
+    /// 一致しなければならない。回転角が WGSL と CPU(param 計算) で乖離しないことを固定する。
     #[test]
     fn wgsl_glyph_rotation_angle_matches_rust_rem_euclid() {
-        // orb_glyph.wgsl の turns 式（`let x = cycle * rot_speed_signed * t;
-        // let turns = x - floor(x);`）をそのまま Rust に移植したもの。
         fn wgsl_turns(cycle: u32, rot_speed_signed: f32, t: f32) -> f32 {
             let x = cycle as f32 * rot_speed_signed * t;
             x - x.floor()
         }
-
-        // base_angle を載せた WGSL 側の最終角（`base_angle + turns * TAU`）。
         fn wgsl_angle(cycle: u32, t: f32, base_angle: f32, rot_speed_signed: f32) -> f32 {
             base_angle + wgsl_turns(cycle, rot_speed_signed, t) * TAU
         }
 
-        // 符号付き speed: 正・負の両方を直接ピンする（負速度の wrap 乖離を狙う）。
         let base_angles = [0.0_f32, 0.3, 1.7, std::f32::consts::PI];
         let speeds = [-2.0_f32, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0];
         let times = [0.0_f32, 0.1, 0.25, 0.4999, 0.5, 0.7777, 0.9, 1.0];
@@ -1358,9 +712,7 @@ mod tests {
             for &base_angle in &base_angles {
                 for &speed in &speeds {
                     for &t in &times {
-                        // CPU 実装（rem_euclid(_, 1.0)）。glyph_rotate=true。
                         let rust = glyph_rotation_angle(cycle, t, base_angle, speed, true);
-                        // WGSL 移植（x - floor(x)）。
                         let wgsl = wgsl_angle(cycle, t, base_angle, speed);
                         assert!(
                             (rust - wgsl).abs() < 1e-5,
@@ -1409,15 +761,9 @@ mod tests {
 
     #[test]
     fn breath_phases_are_seeded_per_orb_and_per_axis() {
-        // breath 機能の検証は OrbParams の位相分布だけでやる。
         // - 同じ orb 内では radius / blur / opacity の 3 軸が異なる位相
-        // - orb 間でも同じ軸の位相が散らばっている（どれか 1 軸でも全 orb 一致は許さない）
-        //
-        // 旧 breath テストはどちらも LeftToRight + t!=0 で「pixels_equal にならない」
-        // ことを主張していたが、orb は LR 移動するので breath を OFF にしても
-        // 通ってしまう（=何も検証していない）。位相分布チェックに置き換える。
+        // - orb 間でも同じ軸の位相が散らばっている
         let p = generate_orb_params(42, 16, &[1.0]);
-        // 3 軸が同一位相の orb が 1 つでもあったらアウト。
         for op in &p {
             assert!(
                 (op.phi_radius - op.phi_blur).abs() > 1e-6
@@ -1428,8 +774,6 @@ mod tests {
                 op.phi_opacity
             );
         }
-        // orb 間でも各軸の位相が散らばっていること（最小値と最大値が十分離れている）。
-        // f32 の位相が完全一致する確率は実質 0 だが、念のため幅を見る。
         let mut min_r = f32::INFINITY;
         let mut max_r = f32::NEG_INFINITY;
         let mut min_b = f32::INFINITY;
@@ -1444,7 +788,6 @@ mod tests {
             min_o = min_o.min(op.phi_opacity);
             max_o = max_o.max(op.phi_opacity);
         }
-        // TAU ≈ 6.28 のうち、16 サンプルあれば spread が 1.0 以上は固い。
         assert!(
             max_r - min_r > 1.0,
             "phi_radius spread too narrow ({min_r} .. {max_r})"
@@ -1459,403 +802,37 @@ mod tests {
         );
     }
 
+    /// #225: per-orb パラメータ計算（pack/GPU 共有）が決定論的であること。
+    /// `aquarelle_modulated_clusters` の入口 `precompute_orb_params` が同じ seed /
+    /// count / clusters で同じ列を返すことを cross_axis / phase 列の一致で固定する。
     #[test]
-    fn wrap_buffer_keeps_orbs_offscreen_at_seam() {
-        // wrap 境界の前後で、画面内に orb 中心は描かれない。
-        // 直接的に、orb 1 個・phase 既知のセットアップを作ってその orb の中心が
-        // 画面外 (cx < 0 or cx >= width) に居る瞬間に、画面内の最大輝度が低い
-        // ことで「画面端で見える状態のまま消える」アーティファクトが無いことを確認。
-        //
-        // 単一クラスタ + count=1 + seed 固定で、orb のピクセル位置を計算し、
-        // pos = -r や pos = 1+r 周辺の t における画面内ピクセル最大輝度が低いことを見る。
-        let clusters = vec![cluster([255, 255, 255], 0.5, 0.5, 1.0)];
-        let width = 128u32;
-        let height = 128u32;
+    fn precompute_orb_params_is_deterministic() {
+        use crate::cluster::Centroid;
+        let clusters = vec![
+            Cluster {
+                color: [220, 60, 60],
+                centroid: Centroid { x: 0.3, y: 0.4 },
+                weight: 0.5,
+            },
+            Cluster {
+                color: [60, 120, 220],
+                centroid: Centroid { x: 0.7, y: 0.6 },
+                weight: 0.3,
+            },
+        ];
         let opts = AnimateOptions {
-            width,
-            height,
-            orb_size: 1.0,
-            seed: 11,
-            count: Some(1),
-            direction: MotionDirection::LeftToRight,
-            speed: MotionSpeed::VerySlow,
+            seed: 777,
+            count: Some(16),
             ..AnimateOptions::default()
         };
-        // generate_orb_params で実際のパラメータを取り出して、orb が画面外に居る
-        // (cx + r <= 0 または cx - r >= width) ような t を計算する。
-        let params = generate_orb_params(opts.seed, 1, &[1.0]);
-        let p = params[0];
-        let base_radius_unit = (width.min(height) as f32) * 0.25;
-        let r_pixels_max = base_radius_unit * 1.0_f32.sqrt() * BREATH_RADIUS_MAX_FACTOR;
-        let r_normalized = r_pixels_max / width as f32;
-        let extent = 1.0 + 2.0 * r_normalized;
-        // 探索: 0..=N の t の中で、orb 中心 cx の画面内位置 pos*width が
-        // [-r_pixels-1, r_pixels+1] のどこかに居る t を探し、その t において
-        // 画面内のピクセル最大輝度が低いことを確認する。
-        let cycle = opts.speed.cycle_count() as f32 * p.speed_mult as f32;
-        let mut found_offscreen_t: Option<f32> = None;
-        for i in 0..1000 {
-            let t = i as f32 / 1000.0;
-            let advance_steps = (cycle * t).fract();
-            let raw = p.phase * extent + advance_steps * extent;
-            let pos = raw.rem_euclid(extent) - r_normalized;
-            // 画面外: cx + r_pixels <= 0  ⇔  pos*width + r_pixels <= 0  ⇔ pos <= -r_normalized
-            // または cx - r_pixels >= width  ⇔ pos >= 1 + r_normalized
-            // 最も画面外らしい瞬間（pos が -r_normalized 付近 or 1+r_normalized 付近）。
-            if pos <= -r_normalized + 0.001 || pos >= 1.0 + r_normalized - 0.001 {
-                found_offscreen_t = Some(t);
-                break;
-            }
+        let a = precompute_orb_params(&opts, &clusters);
+        let b = precompute_orb_params(&opts, &clusters);
+        assert_eq!(a.params.len(), 16);
+        for (pa, pb) in a.params.iter().zip(b.params.iter()) {
+            assert_eq!(pa.phase, pb.phase);
+            assert_eq!(pa.cross_axis, pb.cross_axis);
+            assert_eq!(pa.cluster_idx, pb.cluster_idx);
+            assert_eq!(pa.speed_mult, pb.speed_mult);
         }
-        let t_off = found_offscreen_t.expect("should find an off-screen instant within [0,1)");
-        let img = render_frame(&clusters, &opts, t_off);
-        // 画面内の最大 R 値が極めて低い（背景 alpha=255 なので R は 0）か、グラデの
-        // 端が少し漏れる場合でも 8/255 未満であることを見る。
-        let mut max_r = 0u8;
-        for px in img.pixels() {
-            if px[0] > max_r {
-                max_r = px[0];
-            }
-        }
-        assert!(
-            max_r < 16,
-            "off-screen orb should not contribute visible pixels; max_r={max_r} at t={t_off}"
-        );
-    }
-
-    #[test]
-    fn animation_cursor_yields_n_frames_then_none() {
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let mut cursor = AnimationCursor::new(sample_clusters(), opts, 4);
-        assert_eq!(cursor.total_frames(), 4);
-        for expected_idx in 0..4 {
-            assert_eq!(cursor.next_index(), expected_idx);
-            assert!(
-                cursor.next_frame().is_some(),
-                "frame {expected_idx} missing"
-            );
-        }
-        assert!(
-            cursor.next_frame().is_none(),
-            "exhausted cursor must return None"
-        );
-    }
-
-    #[test]
-    fn animation_cursor_first_frame_matches_render_frame_at_zero() {
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let clusters = sample_clusters();
-        let mut cursor = AnimationCursor::new(clusters.clone(), opts.clone(), 24);
-        let cursor_frame = cursor.next_frame().expect("first frame");
-        let direct = render_frame(&clusters, &opts, 0.0);
-        assert!(
-            pixels_equal(&cursor_frame, &direct),
-            "AnimationCursor first frame must equal render_frame(t=0)"
-        );
-    }
-
-    #[test]
-    fn animation_cursor_does_not_emit_t_one() {
-        // ループ閉鎖の不変条件: cursor は t = i/N (i = 0..N) のみ出すので
-        // 最後のフレームは i = N-1。i = N のフレーム（= t = 1）は出さず、
-        // <video loop> の次のループ頭 (= 改めて render_frame(.., 0.0)) と
-        // ピクセル一致する。逆に、最後の next_frame() が render_frame(.., 1.0)
-        // と一致しないことで「t=1 を出していない」ことが確認できる
-        // （t=0 と t=1 が一致するという別不変条件を逆手に使うと、
-        // 最後フレーム == render_frame(t=0) と一致してはいけない）。
-        let n = 8;
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let clusters = sample_clusters();
-        let mut cursor = AnimationCursor::new(clusters.clone(), opts.clone(), n);
-        let mut last = None;
-        for _ in 0..n {
-            last = Some(cursor.next_frame().unwrap());
-        }
-        let t_zero = render_frame(&clusters, &opts, 0.0);
-        assert!(
-            !pixels_equal(&last.unwrap(), &t_zero),
-            "last frame (t=(N-1)/N) must NOT equal render_frame(t=0); otherwise the cursor is emitting t=1"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "total_frames > 0")]
-    fn animation_cursor_panics_on_zero_frames() {
-        let opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let _ = AnimationCursor::new(sample_clusters(), opts, 0);
-    }
-
-    #[test]
-    fn loop_continuity_at_t1_with_speed_mult() {
-        // 速度倍数 (1/2) を含めても t=0 と t=1 が完全一致することを再確認。
-        // 既存 all_direction_speed_combinations_loop_closed でカバーしているが、
-        // count=64 で speed_mult のばらつきが必ず起きるケースで明示的に再検証する。
-        let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.count = Some(64);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 1.0);
-        assert!(
-            pixels_equal(&a, &b),
-            "loop must close at t=1 even with mixed speed_mult"
-        );
-    }
-
-    // ---- #33 review S1: keyframe_tracks E2E 統合テスト ----
-    //
-    // ここから 4 件は keyframe_tracks 経路の入口〜出口（render_frame_with_params）まで
-    // を通して回し、(a) Aquarelle / Circle で centroid drift が視覚反映されること、
-    // (b) 決定論性、(c) keyframe_tracks が color_tracks より優先されること、を検証する。
-
-    /// 1 cluster ぶんの keyframe トラックを (k0=左上 / k1=右下、色も大きく異なる) で
-    /// 構築するヘルパ。M1/S1 の centroid drift 検証はこの「t=0 と t=1 で位置・色が
-    /// 大幅に異なる」性質に依存する。
-    fn drift_keyframe_tracks() -> Vec<Vec<KeyframeClusterPoint>> {
-        vec![vec![
-            KeyframeClusterPoint {
-                color: [240, 40, 40],
-                centroid: Centroid { x: 0.15, y: 0.15 },
-                weight: 1.0,
-                time: 0.0,
-            },
-            KeyframeClusterPoint {
-                color: [40, 80, 240],
-                centroid: Centroid { x: 0.85, y: 0.85 },
-                weight: 1.0,
-                time: 1.0,
-            },
-        ]]
-    }
-
-    /// drift_keyframe_tracks() に対応する static cluster（先頭キーと同じ位置・色）。
-    fn drift_static_clusters() -> Vec<Cluster> {
-        vec![cluster([240, 40, 40], 0.15, 0.15, 1.0)]
-    }
-
-    /// 中央列 (x = width/2) の RGB 行ベクトルを取り出す。Aquarelle の centroid drift
-    /// 検出に使う（左上→右下のドリフトでは中央列上の輝度分布が t によって変わる）。
-    fn middle_column_bytes(img: &RgbaImage) -> Vec<u8> {
-        let mid_x = img.width() / 2;
-        let mut out = Vec::with_capacity(img.height() as usize * 3);
-        for y in 0..img.height() {
-            let p = img.get_pixel(mid_x, y);
-            out.push(p[0]);
-            out.push(p[1]);
-            out.push(p[2]);
-        }
-        out
-    }
-
-    fn pixel_diff_count(a: &RgbaImage, b: &RgbaImage) -> usize {
-        assert_eq!(a.dimensions(), b.dimensions());
-        a.as_raw()
-            .chunks_exact(4)
-            .zip(b.as_raw().chunks_exact(4))
-            .filter(|(pa, pb)| pa != pb)
-            .count()
-    }
-
-    #[test]
-    fn keyframe_tracks_render_centroid_drift_aquarelle() {
-        // Aquarelle 経路は cluster.centroid を直接位置に使う。keyframe_tracks で
-        // centroid が大きく移動するキー列を渡すと t=0 と t=1 で中央列 RGB が
-        // 異なるはず（左上→右下の対角ドリフト）。
-        let clusters = drift_static_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = OrbShape::Aquarelle(aquarelle::AquarelleParams::default());
-        opts.keyframe_tracks = Some(drift_keyframe_tracks());
-
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 1.0);
-        let col_a = middle_column_bytes(&a);
-        let col_b = middle_column_bytes(&b);
-        assert_ne!(
-            col_a, col_b,
-            "Aquarelle centroid drift must change middle-column RGB between t=0 and t=1"
-        );
-    }
-
-    #[test]
-    fn keyframe_tracks_render_centroid_drift_circle_with_keyframes() {
-        // M1 修正後: Circle 経路でも keyframe_tracks ありのとき centroid を 50% 反映。
-        // 同じ keyframe トラックで t=0 と t=1 を比べると少なくとも 1 ピクセル以上
-        // 差分が出るはず（cross_axis 単独だった以前は色変化のみで微差はあったが、
-        // ここでは「位置」の効果も加わるため、より顕著に異なるフレームが出る）。
-        let clusters = drift_static_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = OrbShape::Circle;
-        opts.keyframe_tracks = Some(drift_keyframe_tracks());
-
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 1.0);
-        let diff = pixel_diff_count(&a, &b);
-        assert!(
-            diff >= 1,
-            "Circle + keyframe_tracks must show centroid drift (>=1 pixel diff between t=0 and t=1, got {diff})"
-        );
-    }
-
-    #[test]
-    fn keyframe_tracks_determinism_e2e() {
-        // 同じ keyframe_tracks + 同じ seed + 同じ t=0.5 で render_frame_with_params を
-        // 2 回呼んで byte-exact 同値であることを保証する。決定論性の最終ガード。
-        let clusters = drift_static_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.keyframe_tracks = Some(drift_keyframe_tracks());
-
-        let cache = precompute_orb_params(&opts, &clusters);
-        let a = render_frame_with_params(&clusters, &opts, &cache, 0.5);
-        let b = render_frame_with_params(&clusters, &opts, &cache, 0.5);
-        assert!(
-            pixels_equal(&a, &b),
-            "keyframe_tracks render must be byte-exact deterministic at t=0.5"
-        );
-    }
-
-    #[test]
-    fn keyframe_tracks_takes_precedence_over_color_tracks() {
-        // 色が大きく違う color_tracks (#7) と keyframe_tracks (#33) を両方指定して、
-        // 出力色は keyframe_tracks に従うことを確認する（#33 が #7 の上位互換のため）。
-        // color_tracks 単独 vs keyframe_tracks+color_tracks の出力を比較し、
-        // 後者が「keyframe_tracks 単独」と byte-exact 一致することを assert する。
-        let clusters = drift_static_clusters();
-
-        // keyframe_tracks のみ
-        let mut opts_kf_only = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts_kf_only.keyframe_tracks = Some(drift_keyframe_tracks());
-
-        // keyframe_tracks + color_tracks（color_tracks は明らかに違う色 — 緑系）
-        let mut opts_both = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts_both.keyframe_tracks = Some(drift_keyframe_tracks());
-        opts_both.color_tracks = Some(vec![vec![[20, 240, 20], [20, 240, 20]]]);
-
-        let kf_only = render_frame(&clusters, &opts_kf_only, 0.5);
-        let both = render_frame(&clusters, &opts_both, 0.5);
-        assert!(
-            pixels_equal(&kf_only, &both),
-            "keyframe_tracks must take precedence over color_tracks (output should match keyframe-only render)"
-        );
-    }
-
-    /// Glyph shape の animate frame が決定論的であること（#195 review S2）。
-    ///
-    /// 同じ clusters / opts / t で 2 回 render しても byte-equal を保つことを保証する。
-    /// per-frame で走らせる bleed pass の seed が 0 固定なので、ここが破れていれば
-    /// bleed pass の seed が動的に変化している（= フレーム間でチラつく）兆候になる。
-    #[test]
-    fn animate_glyph_frame_is_deterministic() {
-        use crate::glyph::GlyphFontId;
-        let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = OrbShape::Glyph {
-            ch: '★',
-            font: GlyphFontId::NotoSymbols2,
-        };
-        let a = render_frame(&clusters, &opts, 0.37);
-        let b = render_frame(&clusters, &opts, 0.37);
-        assert!(
-            pixels_equal(&a, &b),
-            "Glyph animate frame must be byte-equal on repeated calls (per-frame bleed pass with fixed seed)"
-        );
-    }
-
-    /// Glyph shape の animate frame が Circle と byte-equal にならないこと（#195 review S2）。
-    ///
-    /// 同条件で shape だけ Glyph / Circle に切り替えてフレームを比較し、両者が一致しないことを
-    /// 確認する。これにより Glyph 経路で per-frame bleed pass が実際に効いている
-    /// （= Glyph 経路だけが追加処理を持つ）ことが保たれる。
-    #[test]
-    fn animate_glyph_frame_differs_from_circle() {
-        use crate::glyph::GlyphFontId;
-        let clusters = sample_clusters();
-        let mut opts_glyph = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts_glyph.shape = OrbShape::Glyph {
-            ch: '★',
-            font: GlyphFontId::NotoSymbols2,
-        };
-        let opts_circle = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-
-        let g = render_frame(&clusters, &opts_glyph, 0.25);
-        let c = render_frame(&clusters, &opts_circle, 0.25);
-        assert!(
-            !pixels_equal(&g, &c),
-            "Glyph and Circle animate frames must differ (Glyph adds a per-frame bleed pass)"
-        );
-    }
-
-    /// #217: テスト用の `OrbShape::Image`（中央に不透明ブロックの透過画像シルエット →
-    /// `image_rgba_to_sdf`）。glyph テストの作りに倣ってフォント資産に依存しない。
-    fn test_image_shape() -> OrbShape {
-        let w = 64u32;
-        let mut img = image::RgbaImage::from_pixel(w, w, image::Rgba([0, 0, 0, 0]));
-        for y in 18..46 {
-            for x in 18..46 {
-                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
-            }
-        }
-        let sdf = crate::glyph::image_rgba_to_sdf(&img, 256).expect("test silhouette → Some");
-        OrbShape::Image {
-            sdf: std::sync::Arc::from(sdf),
-            size: 256,
-        }
-    }
-
-    /// #217 (#7): Image shape の animate frame が決定論的であること。
-    ///
-    /// 同じ clusters / opts / t で 2 回 render しても byte-equal を保つ。glyph 版
-    /// (`animate_glyph_frame_is_deterministic`) に倣う。Image アームも glyph と同じ
-    /// per-frame bleed pass（seed=0 固定）に乗るので、ここが破れていれば bleed seed が
-    /// 動的に変化している（= フレーム間チラつき）兆候になる。
-    #[test]
-    fn animate_image_frame_is_deterministic() {
-        let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = test_image_shape();
-        let a = render_frame(&clusters, &opts, 0.37);
-        let b = render_frame(&clusters, &opts, 0.37);
-        assert!(
-            pixels_equal(&a, &b),
-            "Image animate frame must be byte-equal on repeated calls (per-frame bleed pass with fixed seed)"
-        );
-    }
-
-    /// #217 (#8): Image shape の animate frame が Circle と byte-equal にならないこと。
-    ///
-    /// 同条件で shape だけ Image / Circle に切り替えてフレームを比較し、両者が一致しない
-    /// ことを確認する。これにより animate の Image アーム（render_sdf_orb + per-frame
-    /// bleed）が実際に効いている（= Circle と別経路）ことが保たれる。
-    #[test]
-    fn animate_image_frame_differs_from_circle() {
-        let clusters = sample_clusters();
-        let mut opts_image = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts_image.shape = test_image_shape();
-        let opts_circle = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-
-        let i = render_frame(&clusters, &opts_image, 0.25);
-        let c = render_frame(&clusters, &opts_circle, 0.25);
-        assert!(
-            !pixels_equal(&i, &c),
-            "Image and Circle animate frames must differ (Image rides the SDF + bleed path)"
-        );
-    }
-
-    /// #217 (#9): glyph_rotate=true, shape=Image で render_frame(t=0) と (t=1) が
-    /// byte-equal（回転 + 一方通行コンベアのループ性）。Image アームは
-    /// `glyph_rotation_angle` を glyph と同じ整数周期に乗せるので、t=0 と t=1 で
-    /// 回転角も進行量も完全一致して閉じる。これが動画ループ性も実質カバーする。
-    #[test]
-    fn animate_image_rotation_loop_closure_t0_eq_t1() {
-        let clusters = sample_clusters();
-        let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = test_image_shape();
-        opts.glyph_rotate = true;
-        // 速度倍数のばらつきを必ず起こして cycle*speed_mult の最大周期でも閉じることを見る。
-        opts.count = Some(32);
-        let a = render_frame(&clusters, &opts, 0.0);
-        let b = render_frame(&clusters, &opts, 1.0);
-        assert!(
-            pixels_equal(&a, &b),
-            "Image shape with glyph_rotate=true must close the loop (t=0 ≡ t=1)"
-        );
     }
 }

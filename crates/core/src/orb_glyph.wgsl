@@ -1,35 +1,35 @@
 // orber #212 Phase 1b — Glyph orb の production WGSL（native CLI / wgpu）。
 //
-// CPU 経路 `crate::glyph::render_glyph_orb`（= bleed pass 前の塗り）を WGSL に
-// 1:1 で写したもの。各 orb は埋め込みフォント 1 文字の SDF を bilinear sampling し、
+// glyph fill（bleed pass 前の塗り）を WGSL で描く。各 orb は埋め込みフォント 1 文字の
+// SDF を bilinear sampling し、
 //   signed_unit = sdf01 * 2 - 1
 //   r = 1 - signed_unit
 //   alpha = falloff_curve(profile, r, blur, opacity)   ← Circle と同じ Rim/Soft profile
 // で塗り、straight-alpha の source-over で合成する。回転(#136)は per-orb の
-// (base_angle, rot_speed_signed) を data-texture の x=3 texel から読み、CPU の
-// glyph_rotation_angle と同式で角度を出して SDF サンプル座標を回す。
+// (base_angle, rot_speed_signed) を data-texture の x=3 texel から読み、
+// `crate::animate::glyph_rotation_angle` と同式で角度を出して SDF サンプル座標を回す。
 //
-// パリティ範囲（過大主張しない）:
-//   - bit-exact は課さない。CPU 経路は全 orb 描画後に aquarelle bleed pass を 1 回
-//     かける（#195）が、この WGSL は **bleed 前の塗り** だけを描く。よって lit 被覆 /
-//     エッジ位置 / softness 連動 / 回転角は CPU と緩い許容で一致するが、bleed 由来の
-//     滲み差は期待値として許容する（別 slice 2.5 で実装予定）。
+// 描画範囲（過大主張しない）:
+//   - この WGSL は **bleed 前の塗り** だけを描く。全 orb 描画後の aquarelle bleed pass
+//     （#195、参照アルゴリズムは `aquarelle::render_aquarelle_bleed_pass`）は 2nd pass の
+//     `orb_glyph_bleed.wgsl` が担う。lit 被覆 / エッジ位置 / softness 連動 / 回転角は
+//     GPU 構造テストで検証する。
 //   - falloff_curve は style.rs の raw-float 版（u8 量子化なし）を写す。Circle の
-//     orb_circle.wgsl の falloff（tiny-skia lowp の u8 量子化版）とは別物なので
+//     orb_circle.wgsl の falloff（Skia lowp の u8 量子化版）とは別物なので
 //     共有しない。
-//   - blend は CPU の blend_source_over（straight rgba を per-orb で u8 量子化しながら
-//     source-over）を写し、finalize（a<255 で rgb を a で割って straight 化）まで
-//     再現する。背景塗りは不透明前提で premul==straight。
+//   - blend は straight rgba を per-orb で u8 量子化しながら source-over し、finalize
+//     （a<255 で rgb を a で割って straight 化）まで行う。背景塗りは不透明前提で
+//     premul==straight。
 //
 // 座標系:
-//   @builtin(position) は top-left のピクセル座標（中心 +0.5）。CPU も px = x+0.5 /
-//   py = y+0.5 で評価するので flip 不要。SDF テクスチャは R8Unorm、filterable な
+//   @builtin(position) は top-left のピクセル座標（中心 +0.5）。px = x+0.5 / py = y+0.5
+//   で評価するので flip 不要。SDF テクスチャは R8Unorm、filterable な
 //   bilinear sampler で読む（WebGL2 portable、Phase 2）。
 
 const TAU: f32 = 6.28318530718;
 const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
 // 1/√2。crate::glyph::GLYPH_SDF_CONTENT_SPAN と同期。Rust 側から override せず
-// ここに定数で持つ（CPU と同値であることをテストで担保する）。
+// ここに定数で持つ（Rust 側の値と同値であることを gpu.rs のテストで担保する）。
 const GLYPH_SDF_CONTENT_SPAN: f32 = 0.70710678;
 
 struct Params {
@@ -44,7 +44,7 @@ struct Params {
     alpha_mul: f32,        // softness.alpha_mul
     glyph_rotate: f32,     // #136: 1.0=ON / 0.0=OFF
     edge_softness: f32,    // #205: 現 fill では未使用（予約）
-    sdf_size: f32,         // glyph SDF の一辺（texel 数）。CPU の bilinear 規約を写すため
+    sdf_size: f32,         // glyph SDF の一辺（texel 数）。SDF bilinear サンプルの規約に合わせるため
 };
 
 // per-orb のパック（data-texture, 幅 4 texel × 高さ N の Rgba32Float）。
@@ -134,7 +134,7 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity_in: f32) -> f32 {
     return opacity * (1.0 - u);
 }
 
-// CPU の glyph_rotation_angle(cycle, t, base_angle, rot_speed_signed, glyph_rotate)。
+// `crate::animate::glyph_rotation_angle`(cycle, t, base_angle, rot_speed_signed, glyph_rotate) と同式。
 //   glyph_rotate=false → base_angle 静止。
 //   それ以外 → base_angle + rem_euclid(cycle * rot_speed_signed * t, 1.0) * TAU。
 // loop closure: cycle * rot_speed_signed が整数なので t=1 で turns=0 に閉じる。
@@ -158,9 +158,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         progress_axis = params.resolution.x;
     }
 
-    // CPU 経路は Pixmap を背景色で fill してから blend_source_over を重ねる。
+    // まず背景色で塗ってから各 orb を source-over で重ねる。
     // 背景は不透明前提（premul==straight）。アキュムレータは straight rgba を u8
-    // (0..255 float) で持ち、各 orb で round して量子化する（blend_source_over と同じ）。
+    // (0..255 float) で持ち、各 orb で round して量子化する（source-over と同じ流儀）。
     var acc = vec4<f32>(
         floor(clampf(params.bg.r, 0.0, 1.0) * 255.0 + 0.5),
         floor(clampf(params.bg.g, 0.0, 1.0) * 255.0 + 0.5),
@@ -226,8 +226,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let cx = nx * params.resolution.x;
         let cy = ny * params.resolution.y;
 
-        // CPU render_glyph_orb と同じ座標変換: orb 中心からの差分を +angle で回し、
-        // (2*radius) で割って CONTENT_SPAN を掛けて 0.5 中心の UV にする。
+        // 座標変換: orb 中心からの差分を +angle で回し、(2*radius) で割って
+        // CONTENT_SPAN を掛けて 0.5 中心の UV にする。
         let angle = glyph_rotation_angle(base_angle, rot_speed_signed);
         let cos_a = cos(angle);
         let sin_a = sin(angle);
@@ -241,10 +241,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             continue;
         }
 
-        // CPU sample_sdf_bilinear の規約に合わせる: CPU は coord = clamp(u,0,1)*(size-1)
+        // SDF bilinear サンプルの規約に合わせる: coord = clamp(u,0,1)*(size-1)
         // の格子点を線形補間する。GPU sampler は uv*size-0.5 の texel 空間で補間するので、
         //   uv_gpu = (u*(size-1) + 0.5) / size
-        // と remap すると両者が同じ格子点・同じ重みで補間し、半 texel ずれを消せる。
+        // と remap すると同じ格子点・同じ重みで補間し、半 texel ずれを消せる。
         let s = params.sdf_size;
         let uu = (clampf(u, 0.0, 1.0) * (s - 1.0) + 0.5) / s;
         let vv = (clampf(v, 0.0, 1.0) * (s - 1.0) + 0.5) / s;
@@ -257,7 +257,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             continue;
         }
 
-        // blend_source_over: dst を straight として扱い、src_rgb = orb_rgb * alpha、
+        // source-over: dst を straight として扱い、src_rgb = orb_rgb * alpha、
         // out = src + dst*(1-alpha)、out_a = alpha + dst_a*(1-alpha)。各成分を
         // *255 round clamp で u8 量子化してアキュムレータに書き戻す（per-orb）。
         let one_minus_a = 1.0 - alpha;

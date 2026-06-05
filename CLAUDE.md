@@ -12,6 +12,12 @@ cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
+CLI は GPU がハード依存（#225 で GPU(WGSL) が唯一のレンダラ）。`cargo build -p orber`
+でそのまま GPU 経路がビルドされ、`--features gpu` は不要。`orber-core` 単体で GPU 経路を
+clippy する場合のみ `cargo clippy -p orber-core --features gpu --all-targets` のように feature を渡す。
+`cargo test` は GPU 構造テスト（lit-pixel 有無・決定論・cache 再利用・ループ閉じ・空 cluster は背景のみ）も走る
+（GPU アダプタが無い環境では該当テストは skip）。
+
 Web GUI 側 (Astro + Solid):
 ```bash
 cd web
@@ -50,15 +56,18 @@ orber/
 └── crates/
     ├── core/               # orber-core: 純粋描画コア（wasm ビルド可能・I/O 一切なし）
     │   ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
+    │   ├── assets/fonts/   #   NotoSansSymbols2-Regular.ttf（glyph 用 subset）+ OFL.txt
     │   └── src/
     │       ├── lib.rs
     │       ├── output_mode.rs  # 出力拡張子 → OutputMode 判定
     │       ├── cluster.rs      # 入力画像 → 代表色クラスタ抽出
-    │       ├── orb.rs          # orb 1 個の描画（円形ぼかし）
-    │       ├── animate.rs      # 時間 t におけるフレーム生成
+    │       ├── orb.rs          # 形状/スタイルの型 + 彩度調整（描画は GPU 側、#225 で CPU 描画は撲滅）
+    │       ├── animate.rs      # フレーム parameters（AnimateOptions / pack_render_data_for_webgl 等）
+    │       ├── glyph.rs        # フォント/画像 → SDF（ttf-parser + zeno、#223）
+    │       ├── gpu.rs          # GPU(WGSL, wgpu) レンダラ — 唯一のレンダラ（#207〜#225）
+    │       ├── orb_circle.wgsl / orb_glyph.wgsl / orb_glyph_bleed.wgsl / orb_aquarelle.wgsl
     │       ├── style.rs        # CSS / SVG 静的書き出し
-    │       ├── variations.rs   # バリエーション spec 定義
-    │       └── batch.rs        # generate_batch — 1 入力から複数 PNG を一括生成（GUI / WASM 用）
+    │       └── variations.rs   # バリエーション spec 定義
     │                           # にじみ処理は外部 crate `aquarelle = "0.2"` に分離済み（旧 src/aquarelle/ は撤去）
     ├── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
     │   ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
@@ -67,11 +76,10 @@ orber/
     │       └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
     └── wasm/               # orber-wasm: ブラウザ向け wasm-bindgen ラッパー（#36）
         ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]
-        ├── test.html       #   ブラウザ確認用デモ（pkg/ を fetch）
         └── src/
-            └── lib.rs          # generate_single / generate_batch / generate_svg /
-                                # generate_one_at_index (#73) /
-                                # start_animation_for_batch_spec (#52)
+            └── lib.rs          # データ供給のみ（#225 で CPU 描画 generate_* は撲滅）。
+                                #   get_render_data（per-orb パラメータの pack）/
+                                #   get_glyph_sdf（フォント文字 → SDF）。実描画は WebGL2 fragment shader 側
 
 web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind
@@ -108,9 +116,9 @@ web/                        # Web フロントエンド (#37, #38)
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
 - **`Motion` / `Shape` enum は当面 `main.rs` に置く** — `animate.rs`（#4）で必要になった時点で `pub mod` に昇格させる。今は CLI パース直後にしか使わないので main.rs ローカルで十分
 - **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
-- **描画バックエンドは tiny-skia** — pure Rust で外部 C ライブラリ不要、`RadialGradient` をネイティブで持っており orb 表現に向く。`Pixmap` は **premultiplied alpha** なので、`RgbaImage` (straight alpha) に変換する際は un-premultiply が必要
-- **アニメーション軌道はリサジュー曲線** — `animate.rs` の `render_frame` は `(sin(2π·a·t·s + φx), sin(2π·b·t·s + φy))` を採用。周波数比 `(a, b)` は整数比候補 `[(1,2),(2,3),(3,4),(1,3),(2,5)]` から `seed` で決定的に選ぶ。`(a · t · s).fract()` で位相を巻き戻すことで、t=0 と t=1 のフレームが浮動小数点誤差なく完全一致する（ループ性保証）。色揺らぎは HSL の S/L に追加倍率として乗せ、`saturation` フラグの倍率と二重掛けにならないよう独立させる
-- **`animate.rs` は `orb::render_static` を再利用** — 位置と色を変調した `Cluster` 列を作って渡すだけ。orb 側に新 API を増やさない
+- **描画バックエンドは GPU(WGSL, wgpu) が唯一（#225 で tiny-skia 撲滅）** — ネイティブ CLI は `crates/core/src/gpu.rs` の `GpuRenderer` が全 shape（Circle / Glyph / Image / Aquarelle）を WGSL で描く。CPU(tiny-skia) ピクセル描画・CPU↔GPU parity オラクル・`--renderer cpu`・CPU フォールバックは削除済み。GPU アダプタが取れなければ `GpuRenderer::new` が `None` を返し、CLI は error 終了する（フォールバック無し）。tiny-skia は外部 crate `aquarelle` 経由の推移依存としてのみ残る（orber 自身のコード/マニフェストは tiny-skia フリー）。Skia lowp 互換の合成は WGSL 内で u8 量子化 → premultiply → source_over を再現する
+- **per-orb パラメータと WebGL 経路を共有する** — `animate.rs::pack_render_data_for_webgl` が header + per-orb 列を 1 本の `f32` バッファに詰め、ネイティブ GPU(`gpu.rs`) も Web の WebGL2 fragment shader も同じ pack を読む。算術は再実装しない（彩度だけはネイティブ側で後段適用、WebGL は独自ノブ）
+- **アニメーション軌道は一方通行コンベア（#41）** — 位相は `seed` から決定論的に散らし、`(cycle * speed_mult * t).fract()` で巻き戻して t=0 と t=1 のフレームをループ閉じさせる（`cycle * speed_mult` が整数なので浮動小数点誤差なく一致）。orb 位置/色の変調は `animate.rs::aquarelle_modulated_clusters` 等で `Cluster` 列を作って pack に渡すだけで、形状側に新 API を増やさない
 - **Web GUI の wasm は Worker で動かす（#75）** — メインスレッドは UI / DOM / Solid signal だけにして、wasm 描画 + WebCodecs エンコード + mp4-muxer は全部 `orberWorker.ts` 内で完結させる。スマホで生成中もタップ・スクロールが反応するためのコア施策。フォールバックパスは作らない（最新ブラウザ前提、死コード化を防ぐ）
 - **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
 - **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
@@ -119,7 +127,7 @@ web/                        # Web フロントエンド (#37, #38)
 
 ## 関連プロジェクト
 
-- [aquarelle](https://github.com/kako-jun/aquarelle)（v0.2 として独立済み）— にじみエンジンを独立 crate 化したもの。orber は `aquarelle = "0.2"` を依存し、`OrbShape::Aquarelle`（per-orb）と `OrbShape::Glyph`（全体 bleed pass）から呼ぶ。blueprinter からも共有依存される想定
+- [aquarelle](https://github.com/kako-jun/aquarelle)（v0.2 として独立済み）— にじみエンジンを独立 crate 化したもの。orber は `aquarelle = "0.2"` を依存し、`OrbShape::Aquarelle`（per-orb の `render_aquarelle_orb`）と `OrbShape::Glyph` / `OrbShape::Image`（全体 bleed pass `render_aquarelle_bleed_pass`）の **参照アルゴリズム** として使う。実描画は GPU(WGSL) でこれらを再現する（aquarelle は tiny-skia を内部で使うため、orber へは推移依存として残る）。blueprinter からも共有依存される想定
 
 ## 技術ルール
 

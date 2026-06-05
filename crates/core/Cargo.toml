@@ -16,10 +16,10 @@ categories = ["graphics", "multimedia"]
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# OFF (default): pure CPU (tiny-skia) reference renderer のみ。wasm32 ビルドを
-# 最小に保ち、wgpu / pollster / bytemuck を引かない。
+# OFF (default): レンダラを持たない「SDF 生成 + データ pack + cluster/色 + SVG/CSS」
+# だけの core。wasm32 ビルドを最小に保ち、wgpu / pollster / bytemuck を引かない。
 # ON: native CLI 向けの wgpu (Rust + WGSL) production render path (#207) を足す。
-# Circle orb を WGSL で描き、CPU(tiny-skia) と ±2/channel のパリティを取る。
+# #225 で CPU 描画は撲滅され、GPU(WGSL) が唯一のレンダラ。
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
@@ -31,9 +31,8 @@ palette = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
-tiny-skia = { workspace = true }
-# glyph font→SDF の fill 専用ラスタライザ（pure Rust, wasm 可）。tiny-skia 撲滅 (#223)
-# の前提スライス A として、グリフのカバレッジ生成だけ tiny-skia から zeno に移す。
+# glyph font→SDF の fill 専用ラスタライザ（pure Rust, wasm 可）。グリフの
+# カバレッジ生成に使う（#223）。
 zeno = { workspace = true }
 # OrbShape::Glyph 用のフォントパース。'static lifetime のスライスから Face::parse で
 # 読めるので、include_bytes! 経路と相性がよい。

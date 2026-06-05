@@ -218,7 +218,7 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 
 /// GUI のバッチ後半を `VariationKind::Mp4` 枠にする件数の既定値。
 ///
-/// `crates/wasm` の `generate_batch` / `start_animation_for_batch_spec` と
+/// `crates/wasm` の `get_render_data`（`direction_for_spec_idx` / `speed_for_spec_idx`）と
 /// Web フロント (`web/src/components/Studio.tsx`) の両方が参照する。GUI は
 /// #61 で 12 枚統一になったため、後半 4 タイル (= 12 - 4 = 8 枚静止 + 4 枚
 /// 動画) を動画枠で固定する。この定数を軸に各層が
@@ -226,7 +226,7 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 ///
 /// 4 にしている理由（#59）: 動画タイル 4 枚に LR / RL / TB / BT を **重複なく
 /// 1 枚ずつ** 割り当てて「全方向揃い踏み」の見せ場にするため。direction の
-/// 上書きは `start_animation_for_batch_spec` が `video_idx = spec_idx -
+/// 上書きは `direction_for_spec_idx` が `video_idx = spec_idx -
 /// still_count` を [`GUI_VIDEO_DIRECTIONS`] で引いて決定的に行う。
 pub const GUI_VIDEO_COUNT_DEFAULT: usize = 4;
 

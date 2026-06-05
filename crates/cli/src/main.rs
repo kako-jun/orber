@@ -144,26 +144,6 @@ impl From<CliVariationMode> for VariationMode {
     }
 }
 
-/// Which renderer backend to drive (`--renderer`).
-///
-/// `gpu` is the wgpu (Rust + WGSL) production path (#207). Circle, Glyph (#212)
-/// and Aquarelle (#216) all render on the GPU; the only fallback to the CPU
-/// renderer is when no GPU adapter is available, or when the binary was built
-/// without the `gpu` feature. The `image` shape is web-only. Orb count never
-/// forces a fallback: per-orb data is a data-texture, so the GPU renders any
-/// count up to 1024 directly (#210 Phase 1a). Circle matches the CPU oracle
-/// within ±2/channel (bit-exact on real GPUs); Glyph and Aquarelle match
-/// structurally (float SDF / AA differences only). Video frames are always
-/// rendered on the CPU; color/keyframe tracks are not yet folded into the GPU
-/// pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Renderer {
-    /// Reference CPU (tiny-skia) renderer.
-    Cpu,
-    /// Production wgpu (Rust + WGSL) renderer; falls back to CPU when unavailable.
-    Gpu,
-}
-
 /// Shape used to render each orb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Shape {
@@ -309,28 +289,6 @@ struct Cli {
     /// Orb rendering shape.
     #[arg(long, value_enum, default_value_t = Shape::Circle)]
     shape: Shape,
-
-    /// Renderer backend: production `gpu` (wgpu) or the `cpu` reference (#207).
-    /// Circle, Glyph (#212) and Aquarelle (#216) all render on the GPU; `gpu`
-    /// only falls back to `cpu` when no GPU adapter is available or when built
-    /// without the `gpu` feature. The `image` shape is web-only. --count never
-    /// triggers a fallback (the GPU renders up to 1024 orbs via a data-texture,
-    /// #210). Circle matches the CPU oracle within +/-2/channel (bit-exact on
-    /// real GPUs); Glyph and Aquarelle match structurally (float SDF / AA
-    /// differences). Video and color/keyframe tracks are cpu-only.
-    /// Default depends on the build: the `gpu` feature builds default to `gpu`,
-    /// plain (CPU-only) builds default to `cpu` — so a stock `cargo install orber`
-    /// renders silently on the CPU instead of emitting a "no gpu feature, falling
-    /// back" warning on every run. Passing `--renderer gpu` to a CPU-only build
-    /// still warns (the user asked for something this build can't do).
-    #[cfg(feature = "gpu")]
-    #[arg(long, value_enum, default_value_t = Renderer::Gpu)]
-    renderer: Renderer,
-
-    /// See the `gpu`-build variant above; CPU-only builds default to `cpu`.
-    #[cfg(not(feature = "gpu"))]
-    #[arg(long, value_enum, default_value_t = Renderer::Cpu)]
-    renderer: Renderer,
 
     /// Glyph character used when --shape glyph (#55). Must be a single character.
     /// Defaults to ☆ (U+2606). Use a character covered by Noto Sans Symbols 2.
@@ -532,129 +490,59 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
     (cli.direction.into(), cli.speed.into())
 }
 
-/// 単一フレーム描画のバックエンド。`--renderer` を解決して GPU/CPU を選ぶ (#207)。
+/// 単一フレーム描画のバックエンド。GPU(WGSL) を唯一のレンダラとする (#225)。
 ///
-/// GPU は Circle / Glyph / Aquarelle shape かつ GPU アダプタが取れた場合に使う。count は
-/// 1024 まで GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は
-/// #212 Phase 1b で WGSL 化（SDF fill + 回転）。Aquarelle は #216 Phase 1c で WGSL 化
-/// （4 層を解析 radial で評価、RNG/色は CPU pack で算出）。アダプタ無し・`gpu` feature
-/// 無しビルドは CPU にフォールバックする。Circle 経路は CPU オラクルと ±2/channel
-/// （実 GPU では bit-exact）一致。Glyph は CPU の bleed 前塗りと構造一致だが、Glyph 専用の
-/// per-frame bleed pass は当面 CPU 専用（既知の見た目差）。Aquarelle は 4 層が構造一致し
-/// RNG/色は bit-identical、post-blur 無しで完全 parity（残差は tiny-skia の AA 塗りとの差
-/// のみ）。video や color/keyframe tracks も GPU pack 未対応で CPU 専用。
-enum FrameRenderer {
-    Cpu,
-    #[cfg(feature = "gpu")]
-    Gpu(Box<orber_core::gpu::GpuRenderer>),
-}
-
-/// アダプタ取得前のルーティング判定（`FrameRenderer::route` の戻り値）。`Cpu` の
-/// `Option<String>` は「GPU を諦めた理由」の stderr 文言（CPU 明示指定なら `None`）。
-/// 現状は全 shape が GPU に乗るため `Cpu(Some(_))` は route から返らない（将来 GPU
-/// 非対応 shape を足したときの防御用に残す variant）。
-#[derive(Debug, PartialEq, Eq)]
-enum RenderRoute {
-    Cpu(Option<String>),
-    Gpu,
+/// 全 shape（Circle / Glyph / Aquarelle / Image）が GPU 上で描かれる。count は 1024 まで
+/// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は #212
+/// Phase 1b で WGSL 化（SDF fill + 回転）、Image は同じ SDF shader を共有（#217）、Aquarelle
+/// は #216 Phase 1c で WGSL 化（4 層を解析 radial で評価、RNG/色は pack で算出）。GPU アダプタ
+/// が取得できない場合は CPU にフォールバックせず、`new` が `None` を返すので呼び出し側が
+/// 明示エラーで終了する（CPU 描画は撲滅済み）。
+struct FrameRenderer {
+    gpu: Box<orber_core::gpu::GpuRenderer>,
 }
 
 impl FrameRenderer {
-    /// `--renderer` の選択と shape からバックエンドを決める。現状は全 shape が GPU に
-    /// 乗るため、GPU 要求が CPU に落ちるのはアダプタ取得失敗 / feature 無しのときだけ。
-    ///
-    /// orb 数による分岐は無い: GPU は per-orb データを data-texture に積んで
-    /// fragment shader で `textureLoad` し、count を `MAX_ORB_COUNT` (1024) まで CPU と
-    /// 同じ枚数だけ直接描く（#210 Phase 1a で旧 64 制限・CPU フォールバックを撤去）。
-    /// storage buffer は wgpu の WebGL2 backend では非対応のため使わず、data-texture
-    /// で portable にしている（Phase 2 のブラウザ fallback を壊さない）。
-    fn select(choice: Renderer, shape: &OrbShape) -> Self {
-        match Self::route(choice, shape) {
-            // 現状 route は全 shape を Gpu に振るため、この arm は到達しない。将来 GPU
-            // 非対応 shape を足したときに stderr 文言を出すための防御として残す。
-            RenderRoute::Cpu(Some(reason)) => {
-                eprintln!("{reason}");
-                FrameRenderer::Cpu
-            }
-            RenderRoute::Cpu(None) => FrameRenderer::Cpu,
-            // GPU が選ばれても、アダプタ取得失敗 / feature 無しなら最終的に CPU に落ちる。
-            RenderRoute::Gpu => Self::select_gpu(),
-        }
-    }
-
-    /// アダプタ取得より前の「どのバックエンドに振るか」だけを決める純関数。現状は
-    /// 全 shape（Circle / Glyph / Aquarelle）を `Gpu` に振るため `Cpu(Some(_))` は
-    /// 発生しない。`Cpu(Some(_))` アームは将来 GPU 非対応 shape を足したときの防御
-    /// として残してあり、その場合だけ stderr 文言を載せる。`--renderer cpu` 明示は
-    /// `Cpu(None)`（文言なし）。GPU を選んでも、最終的にアダプタが取れなければ
-    /// `select_gpu` がさらに CPU に落とす。アダプタに依存しないので、ルーティング
-    /// 判定をそのままユニットテストできる。
-    fn route(choice: Renderer, shape: &OrbShape) -> RenderRoute {
-        match choice {
-            Renderer::Cpu => RenderRoute::Cpu(None),
-            Renderer::Gpu => {
-                // Circle (#210), Glyph (#212 Phase 1b), Aquarelle (#216 Phase 1c) and
-                // Image (#217) all render in WGSL. Glyph / Image share the SDF shader
-                // path (their per-frame bleed pass is reproduced as a 2nd pass).
-                // Aquarelle reproduces the crate's four layers analytically. All
-                // shapes route to the GPU.
-                match shape {
-                    OrbShape::Circle
-                    | OrbShape::Glyph { .. }
-                    | OrbShape::Aquarelle(_)
-                    | OrbShape::Image { .. } => RenderRoute::Gpu,
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "gpu")]
-    fn select_gpu() -> Self {
-        match orber_core::gpu::GpuRenderer::new() {
-            Some(gpu) => {
-                eprintln!(
-                    "orber: using gpu renderer (adapter: {})",
-                    gpu.adapter_name()
-                );
-                FrameRenderer::Gpu(Box::new(gpu))
-            }
-            None => {
-                eprintln!("orber: GPU アダプタが取得できないため cpu にフォールバックします");
-                FrameRenderer::Cpu
-            }
-        }
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn select_gpu() -> Self {
+    /// GPU レンダラを初期化する。アダプタが取れなければ `None`（呼び出し側で error 終了）。
+    /// CPU フォールバックは持たない（#225 で撲滅）。
+    fn new() -> Option<Self> {
+        let gpu = orber_core::gpu::GpuRenderer::new()?;
         eprintln!(
-            "orber: この orber は gpu feature 無しでビルドされています。cpu にフォールバックします"
+            "orber: using gpu renderer (adapter: {})",
+            gpu.adapter_name()
         );
-        FrameRenderer::Cpu
+        Some(FrameRenderer { gpu: Box::new(gpu) })
     }
 
-    /// 1 フレームを描画する。GPU 経路は Circle / Glyph / Aquarelle / Image（select /
-    /// route で保証済み）。
+    /// 1 フレームを GPU で描画する。shape ごとに専用 WGSL 経路へ dispatch する。
     fn render(
         &self,
         clusters: &[Cluster],
         opts: &orber_core::animate::AnimateOptions,
         t: f32,
     ) -> image::RgbaImage {
-        match self {
-            FrameRenderer::Cpu => orber_core::animate::render_frame(clusters, opts, t),
-            #[cfg(feature = "gpu")]
-            FrameRenderer::Gpu(gpu) => match &opts.shape {
-                // Glyph uses the dedicated WGSL glyph path (#212); Image the same SDF
-                // path with a supplied texture (#217); Aquarelle the dedicated WGSL
-                // four-layer path (#216); Circle the default.
-                OrbShape::Glyph { .. } => gpu.render_frame_glyph(clusters, opts, t),
-                OrbShape::Image { .. } => gpu.render_frame_image(clusters, opts, t),
-                OrbShape::Aquarelle(_) => gpu.render_frame_aquarelle(clusters, opts, t),
-                _ => gpu.render_frame(clusters, opts, t),
-            },
+        match &opts.shape {
+            // Glyph uses the dedicated WGSL glyph path (#212); Image the same SDF
+            // path with a supplied texture (#217); Aquarelle the dedicated WGSL
+            // four-layer path (#216); Circle the default.
+            OrbShape::Glyph { .. } => self.gpu.render_frame_glyph(clusters, opts, t),
+            OrbShape::Image { .. } => self.gpu.render_frame_image(clusters, opts, t),
+            OrbShape::Aquarelle(_) => self.gpu.render_frame_aquarelle(clusters, opts, t),
+            _ => self.gpu.render_frame(clusters, opts, t),
         }
     }
+}
+
+/// GPU レンダラを初期化し、アダプタが取れなければ stderr に出して `Err(ExitCode)` を返す。
+/// CLI は GPU を唯一のレンダラとするため、CPU フォールバックはしない (#225)。
+fn init_renderer() -> Result<FrameRenderer, ExitCode> {
+    FrameRenderer::new().ok_or_else(|| {
+        eprintln!(
+            "orber: no GPU adapter available; orber renders only on the GPU (#225). \
+             Install a working GPU driver / Vulkan ICD and retry."
+        );
+        ExitCode::from(1)
+    })
 }
 
 /// orb プールが空になった（K=1 / 単色画像）ときに stderr で警告し、処理は継続する。
@@ -816,7 +704,19 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     };
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
-    if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
+    //    #225: フレームは GPU で描く。renderer は 1 本だけ作ってフレーム間で使い回す。
+    let renderer = match init_renderer() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if let Err(e) = render_video(
+        &renderer,
+        &orb_clusters,
+        &opts,
+        output,
+        cli.duration_ms,
+        codec,
+    ) {
         eprintln!("orber: video render failed: {e}");
         return ExitCode::from(2);
     }
@@ -855,10 +755,10 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         Err(code) => return code,
     };
 
-    // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
-    //    描画する。これで --count による orb 数の展開が単発出力でも効く。
-    //    （render_static は count を解釈しないので、count=clusters.len() に固定された
-    //     旧経路にしないよう animate::render_frame を一律に使う。）
+    // 4. PNG は「コンベアベルトの一瞬」（t=0）として GPU レンダラの 1 フレーム描画
+    //    （`renderer.render(.., t=0.0)`）で出力する。AnimateOptions に `count` を
+    //    渡すので --count による orb 数の展開が単発 PNG でも効く（pack_render_data_for_webgl
+    //    が count を解釈する）。
     let (direction, speed) = resolve_motion(cli);
     let frame_opts = orber_core::animate::AnimateOptions {
         width: RenderOptions::default().width,
@@ -877,9 +777,12 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         color_tracks: None,
         keyframe_tracks: None,
     };
-    // #207/#210: --renderer で GPU/CPU を選ぶ。GPU は全 shape（Circle/Glyph/Aquarelle/
+    // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Circle/Glyph/Aquarelle/
     // Image）に対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
-    let renderer = FrameRenderer::select(cli.renderer, &orb_shape);
+    let renderer = match init_renderer() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
     let out = renderer.render(&orb_clusters, &frame_opts, 0.0);
 
     // 4. 保存。
@@ -974,6 +877,12 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
         Err(code) => return code,
     };
 
+    // #225: PNG / 動画どちらの経路も GPU で描く。renderer は 1 本だけ作る。
+    let renderer = match init_renderer() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         let (direction, speed) = resolve_motion(cli);
@@ -991,7 +900,14 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
             color_tracks: Some(orb_tracks),
             keyframe_tracks: None,
         };
-        if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
+        if let Err(e) = render_video(
+            &renderer,
+            &orb_clusters,
+            &opts,
+            output,
+            cli.duration_ms,
+            codec,
+        ) {
             eprintln!("orber: video render failed: {e}");
             return ExitCode::from(2);
         }
@@ -1020,7 +936,7 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
                 color_tracks: Some(orb_tracks),
                 keyframe_tracks: None,
             };
-            let img = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+            let img = renderer.render(&orb_clusters, &frame_opts, 0.0);
             if let Err(e) = img.save(output) {
                 eprintln!("orber: failed to write output {}: {e}", output.display());
                 return ExitCode::from(2);
@@ -1105,6 +1021,12 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
         Err(code) => return code,
     };
 
+    // #225: PNG / 動画どちらの経路も GPU で描く。renderer は 1 本だけ作る。
+    let renderer = match init_renderer() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         let (direction, speed) = resolve_motion(cli);
@@ -1122,7 +1044,14 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
             color_tracks: None,
             keyframe_tracks: Some(orb_kf_tracks),
         };
-        if let Err(e) = render_video(&orb_clusters, &opts, output, cli.duration_ms, codec) {
+        if let Err(e) = render_video(
+            &renderer,
+            &orb_clusters,
+            &opts,
+            output,
+            cli.duration_ms,
+            codec,
+        ) {
             eprintln!("orber: video render failed: {e}");
             return ExitCode::from(2);
         }
@@ -1152,7 +1081,7 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
                 color_tracks: None,
                 keyframe_tracks: Some(orb_kf_tracks),
             };
-            let img = orber_core::animate::render_frame(&orb_clusters, &frame_opts, 0.0);
+            let img = renderer.render(&orb_clusters, &frame_opts, 0.0);
             if let Err(e) = img.save(output) {
                 eprintln!("orber: failed to write output {}: {e}", output.display());
                 return ExitCode::from(2);
@@ -1234,6 +1163,12 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
 
+    // #225: 全 spec を GPU で描く。renderer は 1 本だけ作ってループで使い回す。
+    let renderer = match init_renderer() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
     for (i, spec) in specs.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{idx:02}_{}.{}", spec.label, spec.kind.ext());
@@ -1241,6 +1176,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
         eprintln!("orber: variation {idx}/{total} ({filename})");
 
         let result = render_one_variation(
+            &renderer,
             &orb_clusters,
             spec,
             &out_path,
@@ -1263,6 +1199,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
 const VARIATIONS_KMEANS_K: usize = 5;
 
 fn render_one_variation(
+    renderer: &FrameRenderer,
     clusters: &[Cluster],
     spec: &VariationSpec,
     out_path: &std::path::Path,
@@ -1293,7 +1230,7 @@ fn render_one_variation(
                 color_tracks: None,
                 keyframe_tracks: None,
             };
-            let img = orber_core::animate::render_frame(clusters, &frame_opts, 0.0);
+            let img = renderer.render(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
         }
         VariationKind::Mp4 => {
@@ -1312,6 +1249,7 @@ fn render_one_variation(
                 keyframe_tracks: None,
             };
             render_video(
+                renderer,
                 clusters,
                 &opts,
                 out_path,
@@ -1431,95 +1369,6 @@ mod tests {
     fn count_default_is_twenty() {
         let cli = Cli::parse_from(["orber", "--input", "x", "--output", "x.png"]);
         assert_eq!(cli.count, 20);
-    }
-
-    /// C1 (#210): count が GPU 容量を超えても CPU フォールバック警告は出ない。
-    /// 旧仕様では --renderer gpu + Circle + count > 64 が `Cpu(Some(警告))` に落ちて
-    /// いた。data-texture 化で 64 cap が消えたので、65〜1024 のどの count でも
-    /// route(Gpu, Circle) は `Gpu`（= フォールバック文言を返さない）であることを守る。
-    /// route はもう count を受け取らないので判定は count に依存しない単一呼び出しで行い、
-    /// 旧 64/1024 境界という回帰意図はテスト名・コメントで残す。アダプタ非依存のルー
-    /// ティング判定のみ。
-    #[test]
-    fn gpu_route_emits_no_warning_for_high_count() {
-        // 旧仕様では --renderer gpu + Circle + count > 64（65/100/256/1024 等）が
-        // `Cpu(Some(警告))` に落ちていた。data-texture 化で 64 cap が消え、route は
-        // count 引数も失ったので、もはや count に依らず route(Gpu, Circle) は `Gpu`
-        // 一択。回帰意図（旧 64/1024 境界）はテスト名・コメントで残し、判定は count に
-        // 依存しない単一呼び出しで行う。アダプタ非依存のルーティング判定のみ。
-        let route = FrameRenderer::route(Renderer::Gpu, &OrbShape::Circle);
-        assert_eq!(
-            route,
-            RenderRoute::Gpu,
-            "Circle + gpu must stay on the gpu route with no fallback warning at any count (#210)"
-        );
-        // 念のため「警告文言を持つ Cpu」では絶対にないことも明示する。
-        assert!(
-            !matches!(route, RenderRoute::Cpu(Some(_))),
-            "must not emit a CPU fallback warning anymore (#210)"
-        );
-    }
-
-    /// C2 (#210 → #212 → #216 → #217): GPU 要求時、Circle / Glyph / Aquarelle / Image
-    /// の全 shape が `Gpu` に乗る（#216 Phase 1c で aquarelle も WGSL 化、#217 で image
-    /// も glyph SDF 経路に乗り、理由つき CPU フォールバックは無くなった）。
-    /// --renderer cpu は理由なし `Cpu(None)` のまま。
-    #[test]
-    fn gpu_route_covers_circle_glyph_and_aquarelle() {
-        // Aquarelle (#216) は GPU 経路に乗る（フォールバック文言なし）。
-        assert_eq!(
-            FrameRenderer::route(
-                Renderer::Gpu,
-                &OrbShape::Aquarelle(AquarelleParams {
-                    bleed: 0.5,
-                    bloom: 0.5,
-                    offset: 0.5,
-                    halo: 0.5,
-                }),
-            ),
-            RenderRoute::Gpu,
-            "aquarelle + gpu must route to the gpu path (#216)"
-        );
-
-        // Glyph (#212) は GPU 経路に乗る（フォールバック文言なし）。
-        assert_eq!(
-            FrameRenderer::route(
-                Renderer::Gpu,
-                &OrbShape::Glyph {
-                    ch: '☆',
-                    font: GlyphFontId::NotoSymbols2,
-                },
-            ),
-            RenderRoute::Gpu,
-            "glyph + gpu must route to the gpu path (#212)"
-        );
-
-        // Image (#217) も GPU 経路（glyph SDF 経路を共有）。
-        assert_eq!(
-            FrameRenderer::route(
-                Renderer::Gpu,
-                &OrbShape::Image {
-                    sdf: std::sync::Arc::from(vec![0u8; 4]),
-                    size: 2,
-                },
-            ),
-            RenderRoute::Gpu,
-            "image + gpu must route to the gpu path (#217)"
-        );
-
-        // Circle (#210) も GPU 経路。
-        assert_eq!(
-            FrameRenderer::route(Renderer::Gpu, &OrbShape::Circle),
-            RenderRoute::Gpu,
-            "circle + gpu must route to the gpu path (#210)"
-        );
-
-        // --renderer cpu は理由なしで CPU（明示指定なので警告は出さない）。
-        assert_eq!(
-            FrameRenderer::route(Renderer::Cpu, &OrbShape::Circle),
-            RenderRoute::Cpu(None),
-            "explicit cpu must route to Cpu(None) with no warning"
-        );
     }
 
     #[test]
@@ -1800,16 +1649,15 @@ mod tests {
         assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
     }
 
-    /// #212 (#11): `FrameRenderer::Gpu::render()` must dispatch by `opts.shape` —
+    /// #212 (#11) / #225: `FrameRenderer::render()` must dispatch by `opts.shape` —
     /// Glyph opts go to `render_frame_glyph`, Circle opts to `render_frame`. This
     /// pins the `render()` match arm (main.rs) that picks the GPU sub-path: the two
     /// sub-paths produce visibly different images for the same parameters (a star
     /// SDF fill vs round orbs), so the dispatch is observable.
     ///
-    /// GPU-gated and GPU-required-aware: with `ORBER_REQUIRE_GPU=1` a missing
-    /// adapter is a hard failure (matching the core parity tests); otherwise it
-    /// SKIPs. Default multi-threaded `cargo test --features gpu` exercises it.
-    #[cfg(feature = "gpu")]
+    /// GPU-required-aware: with `ORBER_REQUIRE_GPU=1` a missing adapter is a hard
+    /// failure; otherwise it SKIPs. The CLI always builds with the GPU renderer
+    /// (#225), so this test is no longer feature-gated.
     #[test]
     fn frame_renderer_render_dispatches_glyph_vs_circle() {
         use orber_core::cluster::{Centroid, Cluster};
@@ -1883,7 +1731,7 @@ mod tests {
              (otherwise the dispatch test proves nothing)"
         );
 
-        let renderer = FrameRenderer::Gpu(Box::new(gpu));
+        let renderer = FrameRenderer { gpu: Box::new(gpu) };
 
         // Glyph opts → render() must equal the glyph sub-path, not the circle one.
         let glyph_dispatched = renderer.render(&clusters, &glyph_opts, 0.0);

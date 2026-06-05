@@ -11,22 +11,20 @@
 //!   そのまま [`ttf_parser::Face::parse`] に渡す。バイト列が静的なので
 //!   `Face<'static>` は `Send + Sync`、`OnceLock` 経由でプロセス全体で 1 回だけ初期化する
 //! - グリフごとの `bounding_box` / `outline` 計算は SDF bake 時にだけ行い、
-//!   呼び出し側 ([`render_glyph_orb`]) はキャッシュ済み texture を bilinear
-//!   sampling で使い回す
+//!   呼び出し側（GPU の glyph レンダラ [`crate::gpu`]）はキャッシュ済み texture を
+//!   bilinear sampling で使い回す
 //! - グリフが見つからない場合 ([`Face::glyph_index`] が `None` を返す or `outline_glyph`
 //!   が空アウトラインを返す) は **何も描画しない**。tofu は出さない。Phase A の方針として、
 //!   絵文字など Symbols 2 に無い文字は静かに無視する
 //! - フォントのアウトラインは Y 軸が上向き（font em スケール）。ラスタライザ (zeno) は
 //!   Y 軸下向きなので、`OutlineBuilder` 内で y を反転して積み込む。SDF の fill は
-//!   tiny-skia から zeno (pure Rust, wasm 可) に置換済み (#223)
+//!   Skia lowp から zeno (pure Rust, wasm 可) に置換済み (#223)
 //! - センタリングは `glyph_bounding_box` の中央を orb 中心に合わせ、半径 × 2 の正方領域に
 //!   収まるよう em-square 基準でスケールする
 
-use crate::style::{falloff_curve, FalloffProfile};
 use std::collections::HashMap;
 use std::f32::consts::FRAC_1_SQRT_2;
 use std::sync::{Arc, Mutex, OnceLock};
-use tiny_skia::Pixmap;
 use ttf_parser::{Face, OutlineBuilder, Rect};
 use zeno::{Command, Mask, Point};
 
@@ -84,7 +82,7 @@ fn face_for(id: GlyphFontId) -> Option<&'static Face<'static>> {
 ///
 /// フォントは Y 軸上向き、zeno のラスタライザは Y 軸下向き (`Origin::TopLeft`) なので、
 /// ここで y を反転する。同時に em スケールから「orb 半径×2 の正方領域」スケールへの
-/// 線形変換を適用する。`map()` の幾何は tiny-skia 時代から不変 (#223)。
+/// 線形変換を適用する。`map()` の幾何は Skia lowp 時代から不変 (#223)。
 struct GlyphPathBuilder {
     cmds: Vec<Command>,
     /// X 方向のスケール係数（em 単位 → ピクセル）。
@@ -202,7 +200,7 @@ fn render_glyph_binary_mask(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
         None => return vec![0u8; n],
     };
     // zeno: Alpha (1 byte/px) coverage を size×size に直接ラスタライズする。
-    // 既定の Fill::NonZero は旧 tiny-skia の FillRule::Winding と等価で、Origin は
+    // 既定の Fill::NonZero は旧 Skia lowp の FillRule::Winding と等価で、Origin は
     // TopLeft (Y 下向き)。GlyphPathBuilder 側で font Y-up → screen Y-down を反転済み。
     // 明示 size を与えると buffer は size×size、placement も同サイズになる。
     let (coverage, placement) = Mask::new(&cmds).size(s, s).render();
@@ -279,8 +277,7 @@ fn edt_2d(features: &[bool], size: usize) -> Vec<f32> {
 /// `signed_px` → `size * GLYPH_SDF_MAX_DIST_FACTOR` で正規化 → `[0, 255]` に量子化、
 /// という [`render_glyph_sdf`] が従来 inline で持っていた算術をそのまま括り出したもの。
 /// バイト列のフォーマットは [`render_glyph_sdf`] と完全同一なので、Image 経路は
-/// この関数で得た SDF を glyph と同じレンダラ（CPU の [`render_glyph_orb`] / GPU の
-/// glyph SDF パイプライン）にそのまま渡せる。
+/// この関数で得た SDF を glyph と同じ GPU の glyph SDF パイプラインにそのまま渡せる。
 ///
 /// `mask` が全 0（描画なし）のときは全 0 の SDF を返す（[`render_glyph_sdf`] の
 /// tofu 契約と同じ）。`mask.len()` は `(size * size)` 以上を想定する（不足分は
@@ -470,15 +467,13 @@ fn cached_glyph_sdf(font: GlyphFontId, ch: char, size: u32) -> Arc<[u8]> {
 }
 
 /// GPU (#212) entry point: return the cached SDF bytes **and** the chosen square
-/// size for an orb of pixel `radius`, picking the same size the CPU
-/// [`render_glyph_orb`] would (`glyph_sdf_size_for_radius`). The GPU path uploads
-/// these bytes as an `R8Unorm` texture and samples them with a bilinear sampler,
-/// exactly mirroring the CPU `sample_sdf_bilinear` so the two fills agree
-/// (pre-bleed) within a loose tolerance.
+/// size for an orb of pixel `radius` (`glyph_sdf_size_for_radius`). The GPU path
+/// uploads these bytes as an `R8Unorm` texture and samples them with a bilinear
+/// sampler.
 ///
 /// Returns `None` for a non-positive radius or an unknown/empty glyph (all-zero
 /// SDF), so the caller can skip GPU glyph upload and leave the frame
-/// background-only — matching the CPU "draw nothing for tofu" contract.
+/// background-only — "draw nothing for tofu".
 pub fn cached_glyph_sdf_for_radius(
     font: GlyphFontId,
     ch: char,
@@ -496,7 +491,7 @@ pub fn cached_glyph_sdf_for_radius(
 }
 
 /// The glyph SDF content-span constant (`1/√2`), exposed for the GPU shader so the
-/// UV mapping in `orb_glyph.wgsl` matches the CPU `render_glyph_orb` exactly.
+/// UV mapping in `orb_glyph.wgsl` matches the SDF bake (`render_glyph_binary_mask`).
 pub const GLYPH_SDF_CONTENT_SPAN_PUB: f32 = GLYPH_SDF_CONTENT_SPAN;
 
 #[inline]
@@ -506,153 +501,6 @@ fn glyph_sdf_size_for_radius(radius: f32) -> u32 {
     }
     let desired = (radius * 2.25).ceil().max(DEFAULT_GLYPH_SDF_SIZE as f32) as u32;
     desired.next_power_of_two().min(MAX_GLYPH_SDF_SIZE)
-}
-
-fn sample_sdf_bilinear(bytes: &[u8], size: usize, u: f32, v: f32) -> f32 {
-    let x = u.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
-    let y = v.clamp(0.0, 1.0) * (size.saturating_sub(1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(size - 1);
-    let y1 = (y0 + 1).min(size - 1);
-    let tx = x - x0 as f32;
-    let ty = y - y0 as f32;
-    let idx = |xx: usize, yy: usize| yy * size + xx;
-    let p00 = bytes[idx(x0, y0)] as f32 / 255.0;
-    let p10 = bytes[idx(x1, y0)] as f32 / 255.0;
-    let p01 = bytes[idx(x0, y1)] as f32 / 255.0;
-    let p11 = bytes[idx(x1, y1)] as f32 / 255.0;
-    let top = p00 + (p10 - p00) * tx;
-    let bottom = p01 + (p11 - p01) * tx;
-    top + (bottom - top) * ty
-}
-
-fn blend_source_over(pixmap: &mut Pixmap, x: u32, y: u32, rgb: [u8; 3], alpha: f32) {
-    let alpha = alpha.clamp(0.0, 1.0);
-    if alpha <= 0.0 {
-        return;
-    }
-    let width = pixmap.width() as usize;
-    let idx = ((y as usize) * width + x as usize) * 4;
-    let dst = &mut pixmap.data_mut()[idx..idx + 4];
-    let dst_a = dst[3] as f32 / 255.0;
-    let one_minus_a = 1.0 - alpha;
-    let src_r = rgb[0] as f32 / 255.0 * alpha;
-    let src_g = rgb[1] as f32 / 255.0 * alpha;
-    let src_b = rgb[2] as f32 / 255.0 * alpha;
-    let dst_r = dst[0] as f32 / 255.0;
-    let dst_g = dst[1] as f32 / 255.0;
-    let dst_b = dst[2] as f32 / 255.0;
-    dst[0] = ((src_r + dst_r * one_minus_a) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[1] = ((src_g + dst_g * one_minus_a) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[2] = ((src_b + dst_b * one_minus_a) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    dst[3] = ((alpha + dst_a * one_minus_a) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-}
-
-/// 与えられた SDF テクスチャ (`size × size`、128≈edge) を 1 orb として pixmap に
-/// SourceOver で重ねる、shape 非依存の共有描画関数。
-///
-/// Glyph ([`render_glyph_orb`]) と Image (#217、`OrbShape::Image`) が **SDF の
-/// 出どころだけ変えて同じこの描画に乗る**。`u`/`v` の content-span マッピング・
-/// bilinear サンプル・`falloff_curve` は両者で完全共通。`rotation` は SDF テクスチャ
-/// 空間に対する回転角 (rad)。`sdf` が全 0（描画なし）なら何もしない。
-#[allow(clippy::too_many_arguments)]
-pub fn render_sdf_orb(
-    pixmap: &mut Pixmap,
-    center: (f32, f32),
-    radius: f32,
-    rgb: [u8; 3],
-    blur: f32,
-    opacity: f32,
-    profile: FalloffProfile,
-    sdf: &[u8],
-    size: usize,
-    rotation: f32,
-) {
-    if radius <= 0.0 {
-        return;
-    }
-    let opacity = opacity.clamp(0.0, 1.0);
-    if opacity <= 0.0 {
-        return;
-    }
-    if size == 0 || sdf.len() < size * size || sdf.iter().all(|&b| b == 0) {
-        return;
-    }
-    let (cx, cy) = center;
-    let cos_a = rotation.cos();
-    let sin_a = rotation.sin();
-    let width = pixmap.width();
-    let height = pixmap.height();
-    let min_x = (cx - radius).floor().max(0.0) as u32;
-    let min_y = (cy - radius).floor().max(0.0) as u32;
-    let max_x = (cx + radius).ceil().min(width as f32) as u32;
-    let max_y = (cy + radius).ceil().min(height as f32) as u32;
-    for y in min_y..max_y {
-        let py = y as f32 + 0.5;
-        for x in min_x..max_x {
-            let px = x as f32 + 0.5;
-            let dx = px - cx;
-            let dy = py - cy;
-            let rx = cos_a * dx - sin_a * dy;
-            let ry = sin_a * dx + cos_a * dy;
-            let u = rx / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
-            let v = ry / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;
-            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                continue;
-            }
-            let sdf01 = sample_sdf_bilinear(sdf, size, u, v);
-            let signed_unit = sdf01 * 2.0 - 1.0;
-            let r = 1.0 - signed_unit;
-            let alpha = falloff_curve(profile, r, blur, opacity);
-            blend_source_over(pixmap, x, y, rgb, alpha);
-        }
-    }
-}
-
-/// 単一の Glyph orb を pixmap に SourceOver で重ねる。
-///
-/// Circle と同じ `falloff_curve` を使うため、入力は `blur` / `style` / `opacity`
-/// をそのまま受ける。`rotation` は glyph テクスチャ空間に対する回転角 (rad)。
-/// radius からキャッシュ済み glyph SDF を引き、共有の [`render_sdf_orb`] に流すだけ。
-#[allow(clippy::too_many_arguments)]
-pub fn render_glyph_orb(
-    pixmap: &mut Pixmap,
-    center: (f32, f32),
-    radius: f32,
-    rgb: [u8; 3],
-    blur: f32,
-    opacity: f32,
-    profile: FalloffProfile,
-    font: GlyphFontId,
-    ch: char,
-    rotation: f32,
-) {
-    if radius <= 0.0 {
-        return;
-    }
-    let sdf_size = glyph_sdf_size_for_radius(radius);
-    let sdf = cached_glyph_sdf(font, ch, sdf_size);
-    render_sdf_orb(
-        pixmap,
-        center,
-        radius,
-        rgb,
-        blur,
-        opacity,
-        profile,
-        &sdf,
-        sdf_size as usize,
-        rotation,
-    );
 }
 
 #[cfg(test)]
@@ -688,69 +536,6 @@ mod tests {
     fn build_glyph_path_returns_some_for_known_char() {
         let path = build_glyph_path(GlyphFontId::NotoSymbols2, '☆', (32.0, 32.0), 16.0);
         assert!(path.is_some(), "☆ outline should produce a non-empty path");
-    }
-
-    #[test]
-    fn render_glyph_orb_paints_pixels() {
-        // 64x64 の Pixmap に ☆ を描いて、alpha が立っているピクセルが
-        // 一定数以上あることを確認する。
-        let mut pix = Pixmap::new(64, 64).unwrap();
-        render_glyph_orb(
-            &mut pix,
-            (32.0, 32.0),
-            20.0,
-            [255, 255, 255],
-            0.5,
-            1.0,
-            FalloffProfile::Rim,
-            GlyphFontId::NotoSymbols2,
-            '☆',
-            0.0,
-        );
-        let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
-        assert!(
-            lit > 32,
-            "rendering ☆ should produce at least 32 lit pixels, got {lit}"
-        );
-    }
-
-    #[test]
-    fn render_glyph_orb_zero_radius_no_panic() {
-        let mut pix = Pixmap::new(16, 16).unwrap();
-        render_glyph_orb(
-            &mut pix,
-            (8.0, 8.0),
-            0.0,
-            [255, 255, 255],
-            0.5,
-            1.0,
-            FalloffProfile::Rim,
-            GlyphFontId::NotoSymbols2,
-            '☆',
-            0.0,
-        );
-        // 何も描かれていないことを確認。
-        let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
-        assert_eq!(lit, 0);
-    }
-
-    #[test]
-    fn render_glyph_orb_zero_opacity_no_paint() {
-        let mut pix = Pixmap::new(64, 64).unwrap();
-        render_glyph_orb(
-            &mut pix,
-            (32.0, 32.0),
-            20.0,
-            [255, 255, 255],
-            0.5,
-            0.0,
-            FalloffProfile::Rim,
-            GlyphFontId::NotoSymbols2,
-            '☆',
-            0.0,
-        );
-        let lit = pix.data().chunks_exact(4).filter(|p| p[3] > 0).count();
-        assert_eq!(lit, 0, "opacity=0 must not paint anything");
     }
 
     // Glyph SDF の単体テスト群。WebGL / CPU の両 glyph 経路で使う canonical texture。
@@ -1205,43 +990,6 @@ mod tests {
             "silhouette must follow the small subject, not fill the drawn rect \
              (a full-rectangle silhouette is the #174 bug): inside_in_rect={inside_in_rect} \
              of drawn={drawn_pixel_count}"
-        );
-    }
-
-    #[test]
-    fn rotated_glyph_does_not_clip_severely() {
-        let mut plain = Pixmap::new(256, 256).unwrap();
-        let mut rotated = Pixmap::new(256, 256).unwrap();
-        render_glyph_orb(
-            &mut plain,
-            (128.0, 128.0),
-            80.0,
-            [255, 255, 255],
-            0.5,
-            1.0,
-            FalloffProfile::Rim,
-            GlyphFontId::NotoSymbols2,
-            '☆',
-            0.0,
-        );
-        render_glyph_orb(
-            &mut rotated,
-            (128.0, 128.0),
-            80.0,
-            [255, 255, 255],
-            0.5,
-            1.0,
-            FalloffProfile::Rim,
-            GlyphFontId::NotoSymbols2,
-            '☆',
-            std::f32::consts::FRAC_PI_4,
-        );
-        let lit_plain = plain.data().chunks_exact(4).filter(|p| p[3] > 0).count() as f32;
-        let lit_rotated = rotated.data().chunks_exact(4).filter(|p| p[3] > 0).count() as f32;
-        let ratio = lit_rotated / lit_plain.max(1.0);
-        assert!(
-            ratio > 0.9,
-            "rotated glyph should keep most lit pixels; ratio={ratio}"
         );
     }
 }

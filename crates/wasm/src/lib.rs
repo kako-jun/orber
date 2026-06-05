@@ -4,28 +4,24 @@
 //! 生 RGB バイトを取り出して `WasmParams.source_rgb` に詰めて渡す。core クレート
 //! は wasm バンドルサイズ削減のため PNG デコード以外を積まない。
 //!
-//! ## API の責務分離
+//! ## API の責務分離（#225 以降）
 //!
-//! - `generate_single`: 呼び出し側のパラメータ（seed/direction/speed/count/
-//!   orb_size/blur/shape）をそのまま使って 1 フレームを描く。フル制御版。
-//! - `generate_batch`: `random_batch_specs(params.seed, n, ceil(n/2))` で `n`
-//!   件のランダム spec を生成し、各 spec ごとに 1 フレームを描く。前半 `ceil(n/2)`
-//!   は `Png`、残りは `Mp4` の枠を維持する（当面 GUI 側は両方とも先頭フレームを
-//!   PNG として表示する。`Mp4` の動画化は #40 / #50 で別途扱う）。`params` の
-//!   うち direction/speed/count/orb_size/blur は **無視** され、ランダム値が
-//!   使われる（shape / 入力画像 / 出力サイズ / k / seed のみ反映）。
-//! - `generate_svg`: SVG は静的なので動き系パラメータは無視。orb_size/blur のみ反映。
+//! CPU 描画は撲滅され、wasm は **データ供給だけ**を担う。実描画は
+//! ブラウザ側の WebGL2/WebGPU が行う:
+//!
+//! - `get_render_data`: バッチ `spec_idx` 番目の per-orb 決定論データ（色 / phase /
+//!   呼吸位相 / cross_axis / style / speed_mult / 回転 + ヘッダ）を `Float32Array`
+//!   1 本にパックして返す。WebGL fragment shader が各 t のフレームを描く。
+//! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
+//! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{
-    pack_render_data_for_webgl, render_frame, AnimateOptions, MotionDirection, MotionSpeed,
-};
-use orber_core::batch::{generate_batch as core_generate_batch, BatchInput};
+use orber_core::animate::{pack_render_data_for_webgl, MotionDirection, MotionSpeed};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber_core::glyph::{has_glyph, render_glyph_sdf, GlyphFontId};
 use orber_core::orb::OrbShape;
-use orber_core::style::{render_svg as core_render_svg, SoftnessPreset, StyleOptions};
+use orber_core::style::SoftnessPreset;
 use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
     GUI_VIDEO_SPEEDS,
@@ -109,30 +105,6 @@ fn default_glyph_rotate() -> bool {
 
 // Pure parsers/validators return String errors so they can be unit-tested on
 // the host (non-wasm) target where JsError can't be constructed.
-
-fn parse_direction(s: &str) -> Result<MotionDirection, String> {
-    match s {
-        "lr" => Ok(MotionDirection::LeftToRight),
-        "rl" => Ok(MotionDirection::RightToLeft),
-        "tb" => Ok(MotionDirection::TopToBottom),
-        "bt" => Ok(MotionDirection::BottomToTop),
-        other => Err(format!(
-            "invalid direction: {other} (expected one of lr / rl / tb / bt)"
-        )),
-    }
-}
-
-fn parse_speed(s: &str) -> Result<MotionSpeed, String> {
-    match s {
-        "very-slow" => Ok(MotionSpeed::VerySlow),
-        "slow" => Ok(MotionSpeed::Slow),
-        "mid" => Ok(MotionSpeed::Mid),
-        "fast" => Ok(MotionSpeed::Fast),
-        other => Err(format!(
-            "invalid speed: {other} (expected one of very-slow / slow / mid / fast)"
-        )),
-    }
-}
 
 /// Phase B (#55): preset 文字列を `Option<MotionSpeed>` に変換。
 ///
@@ -364,13 +336,8 @@ fn err_to_js(s: String) -> JsError {
 /// 静止画タイル領域 (`spec_idx < still_count`) では spec の direction を
 /// そのまま使い、動画タイル領域 (`spec_idx >= still_count`) では
 /// `GUI_VIDEO_DIRECTIONS` の対応 index で上書きする。これにより GUI 経路
-/// では動画 4 枚に LR/RL/TB/BT が 1 枚ずつ重複なく割り当てられる
-/// （core の `generate_batch` は spec.direction をそのまま使うので、この
-/// 上書きは wasm 入口を通った GUI 経路でのみ発生することに注意）。
-///
-/// `generate_one_at_index` と `start_animation_for_batch_spec` の両方から
-/// 呼ばれることで、両 API が同じ index に対して同じ direction を返すこと
-/// を構造的に保証する（プレビュー静止 PNG と動画の direction が一致）。
+/// では動画 4 枚に LR/RL/TB/BT が 1 枚ずつ重複なく割り当てられる。
+/// `get_render_data` から呼ばれ、各 spec_idx の direction を決める。
 fn direction_for_spec_idx(
     spec_idx: usize,
     still_count: usize,
@@ -392,9 +359,7 @@ fn direction_for_spec_idx(
 /// 動画 4 枚は VerySlow / Slow / VerySlow / Slow と必ずばらけて、
 /// 「4 つ全部速い / 全部遅い」のガチャ感低下を防ぐ (#77)。
 ///
-/// `direction_for_spec_idx` と同じ責務分担で、core の `generate_batch`
-/// は spec.speed をそのまま使うので、speed 固定割当は wasm 入口経由の
-/// GUI 経路でのみ適用される。
+/// `direction_for_spec_idx` と同じ責務分担で、`get_render_data` から呼ばれる。
 fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec) -> MotionSpeed {
     if spec_idx >= still_count {
         let video_idx = spec_idx - still_count;
@@ -405,120 +370,16 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
     }
 }
 
-fn encode_png_rgba(img: &image::RgbaImage) -> Result<Vec<u8>, JsError> {
-    use image::codecs::png::PngEncoder;
-    use image::{ExtendedColorType, ImageEncoder};
-    let mut buf = Vec::new();
-    PngEncoder::new(&mut buf)
-        .write_image(
-            img.as_raw(),
-            img.width(),
-            img.height(),
-            ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| JsError::new(&format!("PNG encode failed: {e}")))?;
-    Ok(buf)
-}
-
-/// 入力画像 1 枚から 1 フレーム PNG を生成する。
-///
-/// パラメータの seed / direction / speed / count / orb_size / blur をそのまま
-/// AnimateOptions に流して `t = 0` のフレームを描く。背景色は
-/// `derive_background_rgba` で入力画像から自動決定する。
-#[wasm_bindgen]
-pub fn generate_single(params_js: JsValue) -> Result<js_sys::Uint8Array, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let direction = parse_direction(&p.direction).map_err(err_to_js)?;
-    // generate_single は呼び出し側が指定した speed をそのまま使う（preset 上書きは
-    // get_render_data 側のみ）。Mid / Fast も Phase B から受け付ける。
-    let speed = parse_speed(&p.speed).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
-    let softness = parse_softness_preset(&p.softness_preset).map_err(err_to_js)?;
-
-    let source = build_source_image(&mut p).map_err(err_to_js)?;
-    let clusters_full = extract_clusters(&source, p.k)
-        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
-    let bg = derive_background_rgba(&clusters_full);
-    let clusters = drop_dominant(&clusters_full);
-
-    let opts = AnimateOptions {
-        width: p.width,
-        height: p.height,
-        seed: p.seed as u64,
-        direction,
-        speed,
-        count: Some(p.count),
-        orb_size: p.orb_size,
-        blur: p.blur,
-        saturation: 1.0,
-        background: bg,
-        shape,
-        softness,
-        // generate_single は generate_one_at_index と違い single-frame PNG を
-        // t=0 で 1 枚返す API。t=0 では glyph_rotate ON/OFF どちらでも角度は
-        // 同じ（rot ON でも turns=0）なので、デフォルト ON のまま渡しても
-        // OFF と同じ静止画が出る。CLI 同等の互換性維持として true を渡す。
-        glyph_rotate: true,
-        // #7: Web GUI は静止画入力のみなので color_tracks は常に None。
-        color_tracks: None,
-        // #33: Web GUI は静止画入力のみなので keyframe_tracks も常に None。
-        keyframe_tracks: None,
-    };
-    let frame = render_frame(&clusters, &opts, 0.0);
-    let png = encode_png_rgba(&frame)?;
-    Ok(js_sys::Uint8Array::from(&png[..]))
-}
-
-/// 入力画像 1 枚から `n` 個の variation PNG をランダム生成する。
-///
-/// 後半 [`GUI_VIDEO_COUNT_DEFAULT`] (= 4) 件を `VariationKind::Mp4`、残りを
-/// `Png` にする。GUI では n = 12 (#61 で縦横共通に統一、前半 8 枚静止 +
-/// 後半 4 枚動画) で運用されるため、「後半 4 枚は動画枠」になる。動画 4 枚
-/// には `start_animation_for_batch_spec` で LR / RL / TB / BT が 1 枚ずつ
-/// 重複なく割り当てられる（#59）。
-/// `n < GUI_VIDEO_COUNT_DEFAULT` のときは全件 Mp4。Mp4 タイルも当面は先頭
-/// フレーム PNG として返す（動画化は `start_animation_for_batch_spec` 経由）。
-///
-/// `n` は 1..=50 にクランプする。
-#[wasm_bindgen]
-pub fn generate_batch(params_js: JsValue, n: u32) -> Result<js_sys::Array, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let shape = parse_shape(&p.shape, &p.glyph_char).map_err(err_to_js)?;
-
-    let source = build_source_image(&mut p).map_err(err_to_js)?;
-
-    let total = (n as usize).clamp(1, 50);
-    let still_count = total.saturating_sub(GUI_VIDEO_COUNT_DEFAULT);
-    let specs = random_batch_specs(p.seed as u64, total, still_count);
-
-    let input = BatchInput {
-        source,
-        k: p.k,
-        width: p.width,
-        height: p.height,
-        shape,
-        specs,
-    };
-    let pngs = core_generate_batch(input)
-        .map_err(|e| JsError::new(&format!("batch generation failed: {e}")))?;
-
-    let arr = js_sys::Array::new();
-    for png in pngs {
-        arr.push(&js_sys::Uint8Array::from(&png[..]));
-    }
-    Ok(arr)
-}
-
 /// バッチ N 枚のうち `spec_idx` 番目の描画に必要な per-orb データをパックして返す。
 ///
-/// `generate_one_at_index` / `start_animation_for_batch_spec` の置き換え。CPU 側
-/// （core）で per-orb の決定論パラメータと clusters / 背景色を計算し、
-/// Float32Array 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）
-/// で各 t におけるフレームを per-pixel ループ + Source-Over 合成で描く。
+/// core で per-orb の決定論パラメータと clusters / 背景色を計算し、Float32Array
+/// 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）で各 t における
+/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅され、
+/// wasm はこのデータ供給と `get_glyph_sdf` だけを担う）。
 ///
-/// 既存 `generate_batch` と同じ `random_batch_specs(seed, total, still_count)`
-/// で spec 列を再構築するので、`spec_idx` 番目の spec / direction / speed /
-/// count / orb_size / blur / seed は他 API と完全一致する（互換性維持）。
+/// `random_batch_specs(seed, total, still_count)` で spec 列を再構築するので、
+/// `spec_idx` 番目の spec / direction / speed / count / orb_size / blur / seed は
+/// バッチ全体で決定論的に一致する。
 ///
 /// per-orb の rng シーケンスは `orber_core::animate::generate_orb_params`
 /// をそのまま使うので、core 側アニメーションと同じ seed なら同じ
@@ -752,32 +613,6 @@ fn glyph_sdf_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     v
 }
 
-/// 入力画像 1 枚から SVG 文字列を生成する。
-///
-/// SVG の viewBox は core 側で固定（1080×1920）。`width` / `height` /
-/// `direction` / `speed` / `count` / `seed` / `shape` は使われない（SVG は
-/// 静的のみ）。`orb_size` / `blur` のみ反映する。
-#[wasm_bindgen]
-pub fn generate_svg(params_js: JsValue) -> Result<String, JsError> {
-    let mut p = deserialize_params(params_js).map_err(err_to_js)?;
-    let softness = parse_softness_preset(&p.softness_preset).map_err(err_to_js)?;
-    let source = build_source_image(&mut p).map_err(err_to_js)?;
-
-    let clusters_full = extract_clusters(&source, p.k)
-        .map_err(|e| JsError::new(&format!("cluster extraction failed: {e}")))?;
-    let bg = derive_background_rgba(&clusters_full);
-    let clusters = drop_dominant(&clusters_full);
-
-    let opts = StyleOptions {
-        orb_size: p.orb_size,
-        blur: p.blur,
-        saturation: 1.0,
-        background: bg,
-        softness,
-    };
-    Ok(core_render_svg(&clusters, &opts))
-}
-
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -787,40 +622,6 @@ mod tests {
     /// `get_or_build_clusters()` → `borrow_mut()` すると `BorrowMutError` になる
     /// (#220)。production(wasm) は single-thread なのでこの直列化はテスト専用。
     static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn parse_direction_roundtrip() {
-        assert!(matches!(
-            parse_direction("lr"),
-            Ok(MotionDirection::LeftToRight)
-        ));
-        assert!(matches!(
-            parse_direction("rl"),
-            Ok(MotionDirection::RightToLeft)
-        ));
-        assert!(matches!(
-            parse_direction("tb"),
-            Ok(MotionDirection::TopToBottom)
-        ));
-        assert!(matches!(
-            parse_direction("bt"),
-            Ok(MotionDirection::BottomToTop)
-        ));
-        assert!(parse_direction("xx").is_err());
-    }
-
-    #[test]
-    fn parse_speed_roundtrip() {
-        // Phase B (#55) で Mid / Fast を追加済み。
-        assert!(matches!(
-            parse_speed("very-slow"),
-            Ok(MotionSpeed::VerySlow)
-        ));
-        assert!(matches!(parse_speed("slow"), Ok(MotionSpeed::Slow)));
-        assert!(matches!(parse_speed("mid"), Ok(MotionSpeed::Mid)));
-        assert!(matches!(parse_speed("fast"), Ok(MotionSpeed::Fast)));
-        assert!(parse_speed("xxx").is_err());
-    }
 
     #[test]
     fn parse_speed_preset_handles_empty_and_values() {

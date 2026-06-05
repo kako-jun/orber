@@ -8,11 +8,17 @@
 input image / video
   ├─ (video only) extract representative frames via ffmpeg
   ├─ extract color clusters       → N representative colors  [implemented]
-  ├─ place orbs                   → position, size, base color per orb  [implemented for static PNG]
-  ├─ render frame(s)              → RGBA buffer with radial-gradient orbs  [implemented via tiny-skia]
+  ├─ place orbs                   → position, size, base color per orb  [implemented]
+  ├─ (glyph / image) build SDF    → font outline or image silhouette → signed-distance field  [implemented]
+  ├─ render frame(s)              → RGBA buffer, drawn on the GPU via WGSL (wgpu)  [implemented]
   ├─ (animated) interpolate       → frame sequence over time t  [implemented]
   └─ encode                       → PNG / MP4 / WebM / SVG / CSS  [PNG / MP4 / WebM / SVG / CSS implemented]
 ```
+
+Since #225 the **GPU (WGSL via `wgpu`) is the only renderer**: every PNG / video /
+variation frame the CLI emits is drawn on the GPU. There is no CPU pixel path and
+no `--renderer` flag; if no GPU adapter is available the CLI exits with an error.
+SVG / CSS output stays a separate vector / style export (no rasterization).
 
 ## Output formats
 
@@ -162,7 +168,7 @@ all ten outputs. Differentiation comes from layout (count / size / blur) and mot
 - 6 animations (8 s each): `flow_lr_slow`, `flow_rl_very_slow`, `flow_tb_dense`,
   `flow_bt_blurry`, `flow_lr_dense_small`, `flow_rl_huge`
 
-Stills are not pure `render_static` snapshots — they are the `t = 0` frame of the
+Stills are not a separate static-only code path — they are the `t = 0` frame of the
 conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fraction
 of the requested `--count` will sit just outside the visible area, matching the
 visual language of the videos.
@@ -263,21 +269,24 @@ crate at [`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is
 pulled in via `aquarelle = "0.2"` in `Cargo.toml`. `orber-core` consumes it in
 two distinct places:
 
-- **`OrbShape::Aquarelle`** uses the crate's per-orb watercolor bleed renderer
-  to paint each orb as an irregular pigment blob.
-- **`OrbShape::Glyph` and `OrbShape::Image`** run a single full-pixmap
-  `render_aquarelle_bleed_pass` after all SDF orbs have been drawn, so the
-  SDF-derived outline picks up the same paper-bleed softness even though each
-  orb itself is still a glyph / silhouette fill. Both share the SDF rendering
-  path (`render_sdf_orb`); the only difference is the SDF source (a bundled font
-  glyph vs. an image silhouette from `--image-mask`). `OrbShape::Circle` does
-  not invoke either path.
+- **`OrbShape::Aquarelle`** follows the crate's four-layer `render_aquarelle_orb`
+  model. The GPU shader (`orb_aquarelle.wgsl`) evaluates those layers analytically;
+  the ChaCha8 RNG / HSL color math is run host-side in the parameter pack so it stays
+  byte-identical to the crate, and the resulting centers / radii / colors are uploaded.
+- **`OrbShape::Glyph` and `OrbShape::Image`** run a single full-frame bleed pass
+  (the `render_aquarelle_bleed_pass` algorithm, translated to WGSL in
+  `orb_glyph_bleed.wgsl`) after all SDF orbs have been drawn, so the SDF-derived
+  outline picks up the same paper-bleed softness even though each orb itself is
+  still a glyph / silhouette fill. Both share the GPU SDF render path
+  (`render_frame_glyph` / `render_frame_image`); the only difference is the SDF
+  source (a bundled font glyph vs. an image silhouette from `--image-mask`).
+  `OrbShape::Circle` does not invoke either path.
 
 ## Workspace layout
 
 Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
-- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, orb rendering, animation frames, CSS / SVG output, and the `batch::generate_batch` helper. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so a future Web frontend can call it directly.
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; rendering on the web runs in WebGL2).
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
@@ -444,32 +453,30 @@ color. The pipeline:
    itself became `Clone` rather than `Copy` once `#217` added an
    `Image { sdf: Arc<[u8]>, size }` arm; the `Arc` clone is a refcount bump, so
    `OrbShape` still flows through the spec / per-orb param paths cheaply.)
-3. For each orb, the glyph outline is extracted via `Face::outline_glyph` and
-   converted into a `tiny-skia::Path`. The path is filled (not stroked) with
-   the orb's color at the orb's center, scaled to the orb's radius.
-4. The outline is converted to a cached SDF, so **`--blur` and `--softness`
-   both affect Glyph mode** with the same edge-falloff meaning as circle
-   orbs rather than a hard text fill.
-5. After every glyph orb has been painted into the pixmap, Glyph mode runs a
-   single `aquarelle::render_aquarelle_bleed_pass` over the whole image (with
-   `AquarelleBleedParams::default()` and a fixed seed). This adds a
-   paper-bleed-style softening to the SDF-derived outline so the Glyph result
-   sits closer to the Circle and Aquarelle shapes in overall feel. The bleed
-   pass runs for the **SDF shapes (`OrbShape::Glyph` and `OrbShape::Image`)** —
-   Circle and Aquarelle renders are bit-identical to before this pass was added.
-   The animated path (`render_frame_with_params`) applies the same single
-   `render_aquarelle_bleed_pass` per frame with a fixed seed of `0`, so the bleed
-   pattern stays stable across frames instead of flickering frame to frame.
+3. For each orb's glyph, the outline is extracted via `Face::outline_glyph` and
+   walked into a `zeno` path; `zeno::Mask` rasterizes it to an alpha-coverage
+   silhouette (pure Rust, wasm-capable — replaced the earlier Skia-based path in
+   #223). The silhouette is turned into a cached signed-distance field via the
+   shared `mask_to_sdf` (EDT → signed-unit → u8).
+4. The glyph is drawn from that SDF on the GPU: the Glyph WGSL shader
+   (`orb_glyph.wgsl`) bilinear-samples the SDF and applies the same Rim/Soft
+   `falloff_curve` circle orbs use, so **`--blur` and `--softness` both affect
+   Glyph mode** with the same edge-falloff meaning rather than a hard text fill.
+   Each orb's rotation (#136) is applied in the shader.
+5. After every glyph orb is drawn, Glyph mode runs a single full-frame aquarelle
+   bleed pass (the `render_aquarelle_bleed_pass` algorithm with
+   `AquarelleBleedParams::default()` and a fixed seed), translated to WGSL as a
+   2nd pass (`orb_glyph_bleed.wgsl`, #214). This adds a paper-bleed-style softening
+   to the SDF-derived outline so the Glyph result sits closer to the Circle and
+   Aquarelle shapes in overall feel. The pass runs for the **SDF shapes
+   (`OrbShape::Glyph` and `OrbShape::Image`)** only; Circle and Aquarelle skip it.
+   It uses a fixed seed across frames so the bleed pattern stays stable instead of
+   flickering. The box-blur / halo / intensity match the crate; the aquarelle
+   paper-grain noise is omitted on the GPU (its per-pixel ChaCha8 order cannot be
+   bit-reproduced in parallel), which is an accepted, expected difference.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
-
-Native `--renderer gpu` also draws Glyph orbs on the GPU (#212 Phase 1b): a WGSL
-shader fills each glyph from its SDF and applies the per-orb rotation, reproducing
-the CPU fill, followed by a WGSL bleed 2nd pass (#214) that mirrors step 5. Parity
-is loose (structural + tolerant): the box-blur / halo / intensity match the crate,
-but the aquarelle paper-grain noise is omitted on the GPU (its per-pixel ChaCha8
-order cannot be bit-reproduced in parallel).
 
 ## Image rendering pipeline (#217)
 
@@ -490,9 +497,9 @@ of the Web GUI's `generateImageSdf`:
    contrast and is rejected — the CLI exits with an explicit error (no panic).
 4. The resulting binary mask goes through the **shared** `mask_to_sdf` (the same
    EDT → signed-unit → u8 step the glyph SDF uses), so the output is byte-format
-   identical to a glyph SDF. From there it rides the same `render_sdf_orb` (CPU)
-   and `render_frame_image` (GPU, the glyph shader + bleed pass with the supplied
-   SDF texture), so `--blur` / `--softness` / the bleed pass behave identically.
+   identical to a glyph SDF. From there it rides the same GPU SDF path —
+   `render_frame_image` reuses the glyph shader + bleed 2nd pass with the supplied
+   SDF texture — so `--blur` / `--softness` / the bleed pass behave identically.
 
 The image SDF is built once and shared via `Arc<[u8]>` inside `OrbShape::Image`.
 The Web GUI's `OrbShape` image arm uses the same `shape_id == 1` shader path as
@@ -534,10 +541,10 @@ which projects to roughly the following fraction of orb radius:
 | `high` | 1.0 | ~25% of orb radius | ~12.5% |
 
 Note: edge_softness is consumed only by the WebGL2 fragment shader
-(Glyph/image arm). The CPU path (`render_static` / `animate.rs`) achieves
-the analogous softness via `blur_offset` and the post-render
-`aquarelle bleed pass` (#195/#199). The two implementations differ but
-target the same visual goal.
+(Glyph/image arm). The native WGSL Glyph/image path achieves the analogous
+softness via `blur_offset` and the post-render aquarelle bleed pass
+(#195/#199). The two shader implementations differ slightly but target the
+same visual goal.
 
 The preset is implemented as `SoftnessPreset { Low, Mid, High }` in
 `crates/core/src/style.rs`. The values flow into the WebGL2 path via

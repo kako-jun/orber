@@ -1,71 +1,54 @@
-//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c.
+//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c, #225.
 //!
-//! [`GpuRenderer`] is the headless, native side of the renderer. It runs the
-//! **Circle** orb WGSL ([`orb_circle.wgsl`](../src/orb_circle.wgsl)) that is a
-//! faithful translation of the browser's `web/src/lib/orberGl.ts` Circle arm, so
-//! the native CLI and the web produce matching Circle frames, and so the GPU path
-//! matches the CPU (tiny-skia) oracle ([`crate::animate::render_frame`]) within
-//! ±2/channel.
+//! [`GpuRenderer`] is the headless, native side of the renderer and — since #225 —
+//! the **only** renderer (the CPU pixel path and the CPU↔GPU parity oracle were
+//! purged). It runs the Circle orb WGSL
+//! ([`orb_circle.wgsl`](../src/orb_circle.wgsl)), the glyph / image SDF WGSL
+//! ([`orb_glyph.wgsl`](../src/orb_glyph.wgsl)) and the aquarelle WGSL
+//! ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Circle,
+//! Glyph, Image, Aquarelle) render on the GPU; the CLI renders every PNG / video /
+//! variation frame through it.
 //!
-//! ## Parity scope (narrow — do not over-claim)
+//! ## Per-orb data path
 //!
-//! Parity with the CPU oracle holds **only** on this exact path:
-//!
-//! - **shape = Circle** for the strict ±2/channel bit-exact parity described
-//!   here. Glyph (#212/#214) and Aquarelle (#216) also render on the GPU, but
-//!   match the CPU oracle only **structurally** (float SDF / analytic-vs-AA
-//!   differences), not bit-exact — see `render_frame_glyph` /
-//!   `render_frame_aquarelle`. The `image` shape is web-only and rides the Glyph
-//!   SDF path (core/wasm have no native `image` shape). The CPU renderer is now
-//!   only a no-GPU-adapter fallback (it will be removed in Phase 1.5, but still
-//!   exists today);
 //! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
 //!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
 //!   `opts.saturation` to each packed orb color after
 //!   [`pack_render_data_for_webgl`] (which itself never applies saturation,
-//!   because it is shared with the WebGL path). Without that step the GPU and CPU
-//!   would diverge for `--saturation != 1.0`;
+//!   because it is shared with the WebGL path);
 //! - **count up to [`MAX_ORB_COUNT`] (1024)**: per-orb data is uploaded as a
 //!   **data-texture** (`Rgba32Float`, read with `textureLoad`) — not a fixed-size
-//!   uniform array — so the WGSL has **no 64-orb cap** and the GPU renders the same
-//!   count the CPU does (#210 Phase 1a). The old `count > 64 → CPU` fallback in the
-//!   CLI is gone. (The 64 limit only ever applied to the WebGL GLSL path —
+//!   uniform array — so the WGSL has **no 64-orb cap** (#210 Phase 1a). (The 64
+//!   limit only ever applied to the WebGL GLSL path —
 //!   `web/src/lib/orberGl.ts::MAX_ORBS` / `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`
 //!   — which is untouched until Phase 3; do not re-sync a 64 cap onto this path.)
 //!
-//! Outside that path the GPU is **not** a drop-in for the CPU oracle: video is
-//! rendered on the CPU, and the per-orb `color_tracks` / `keyframe_tracks` (#7 /
-//! #33) are not yet folded into the GPU pack, so animated color/position tracks
-//! are CPU-only for now.
+//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not yet folded into
+//! the GPU pack; animated color/position tracks come in via the cluster列 instead.
 //!
-//! ## Parity contract (must match [`crate::animate::render_frame`] for Circle)
+//! ## Compositing contract
 //!
-//! The CPU oracle composites orbs in **straight sRGB byte space** (tiny-skia
-//! premultiplied internally, then un-premultiplied back to straight on output).
-//! To match it the GPU path:
+//! Orbs are composited in **straight sRGB byte space**. The GPU path:
 //!
 //! - renders into an [`wgpu::TextureFormat::Rgba8Unorm`] target (NOT `*Srgb`), so
 //!   no sRGB↔linear conversion happens — the shader's float blend maps to bytes
-//!   by `round(value * 255)`, the same arithmetic as the CPU loop;
-//! - feeds the shader the **exact same per-orb data** the WebGL path uses
+//!   by `round(value * 255)`;
+//! - feeds the shader the per-orb data the WebGL path also uses
 //!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
-//!   reused, never reimplemented, so the orb positions / radii / alphas are
-//!   identical to the proven web/CPU result. The per-orb data goes up as a
-//!   `Rgba32Float` data-texture (4 texels wide × N orbs tall) so float precision is
-//!   preserved exactly — no quantization happens on the orb data itself;
+//!   reused, never reimplemented, so the orb positions / radii / alphas match the
+//!   web result. The per-orb data goes up as a `Rgba32Float` data-texture
+//!   (4 texels wide × N orbs tall) so float precision is preserved exactly;
 //! - reads the result back accounting for wgpu's 256-byte row-alignment
 //!   requirement on `copy_texture_to_buffer` (that alignment applies only to the
 //!   texture→buffer read-back; the orb data upload via `write_texture` is exempt).
 //!
-//! ## Scope
+//! ## Validation (post-#225)
 //!
-//! Circle (Phase 0, #209), Glyph (Phase 1b, #212/#214) and Aquarelle (Phase 1c,
-//! #216) all render on the GPU. The `image` shape is web-only and reuses the
-//! Glyph SDF path (core/wasm have no `image` shape — the browser hands an image
-//! silhouette in as a glyph SDF). The CPU (tiny-skia) renderer remains only as a
-//! no-GPU-adapter fallback and as the parity oracle; both will be removed in
-//! Phase 1.5 (they still exist today). Video and per-orb color/keyframe tracks
-//! (#7 / #33) are still CPU-only.
+//! With the CPU oracle gone, the tests in this module are **GPU-only structural
+//! checks** (lit-pixel presence, determinism for the same seed/t, cache reuse vs
+//! growth, rotation loop closure, alpha/empty-cluster background-only). They no
+//! longer compare against a CPU reference; correctness on new GPUs is confirmed by
+//! these structural invariants plus real-machine visual inspection.
 
 use std::collections::HashMap;
 
@@ -129,8 +112,8 @@ fn orb_circle_wgsl() -> &'static str {
 
 /// The Glyph orb WGSL (#212 Phase 1b). Same data-texture orb layout as the Circle
 /// shader, plus an `R8Unorm` glyph SDF texture + bilinear sampler (bindings 2/3),
-/// and reads the per-orb rotation texel (x=3). It reproduces the CPU
-/// `glyph::render_glyph_orb` fill (pre-bleed), not the WebGL mask×profile arm.
+/// and reads the per-orb rotation texel (x=3). It draws the glyph SDF fill
+/// (pre-bleed) via the Circle Rim/Soft `falloff_curve`, not the WebGL mask×profile arm.
 fn orb_glyph_wgsl() -> &'static str {
     include_str!("orb_glyph.wgsl")
 }
@@ -158,9 +141,9 @@ fn orb_aquarelle_wgsl() -> &'static str {
     include_str!("orb_aquarelle.wgsl")
 }
 
-/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()` (the
-/// values the CPU `render_frame` passes: `radius = 3.0, intensity = 0.5,
-/// halo = 0.3`) so the GPU 2nd pass matches the CPU paper-bleed.
+/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()`
+/// (`radius = 3.0, intensity = 0.5, halo = 0.3`) so the GPU 2nd pass matches the
+/// `aquarelle::render_aquarelle_bleed_pass` paper-bleed.
 ///
 /// `BLEED_BOX_RADIUS` is `round(radius * 1.15).max(1)` = `round(3.45)` = `3`, the
 /// box-blur half-window the crate derives from `radius` (see
@@ -199,11 +182,11 @@ struct Params {
     /// valid; it simply names the slots `_pad0`/`_pad1`).
     glyph_rotate: f32,
     /// Glyph edge softness (#205): unused by the current Glyph fill (it uses
-    /// `falloff_curve` like the CPU `render_glyph_orb`), reserved for the future
-    /// SDF-mask path; kept so the header layout mirrors the WebGL one.
+    /// the Circle `falloff_curve`), reserved for the future SDF-mask path; kept so
+    /// the header layout mirrors the WebGL one.
     edge_softness: f32,
-    /// Glyph SDF square side in texels. The Glyph shader uses it to reproduce the
-    /// CPU `sample_sdf_bilinear` convention (`coord = u*(size-1)`) when remapping
+    /// Glyph SDF square side in texels. The Glyph shader uses it for the SDF
+    /// bilinear sampling convention (`coord = u*(size-1)`) when remapping
     /// UVs to the wgpu sampler's texel space. Circle ignores this slot (its WGSL
     /// `Params` names it `_pad2`). `0.0` for the Circle path.
     sdf_size: f32,
@@ -313,7 +296,7 @@ struct BleedPipelines {
 /// between `ping` / `pong` (premultiplied); the compose pass reads `fill` +
 /// the final blurred texture and writes straight RGBA to the `SizedResources`
 /// `target`. All three are `Rgba8Unorm` so each box-blur pass quantizes to u8 the
-/// way the CPU crate does between its H/V passes.
+/// way the `aquarelle` crate does between its H/V passes.
 struct BleedTextures {
     fill_view: wgpu::TextureView,
     ping_view: wgpu::TextureView,
@@ -421,8 +404,9 @@ pub struct GpuRenderer {
 
 impl GpuRenderer {
     /// Bring up a headless GPU context (no surface). Returns `None` when no
-    /// adapter is available (e.g. CI without a GPU / software rasterizer), so
-    /// callers can fall back to the CPU path instead of hard-failing.
+    /// adapter is available (e.g. CI without a GPU / software rasterizer). GPU is
+    /// the only renderer (#225), so the CLI treats `None` as a fatal error and
+    /// exits; tests treat it as skip.
     pub fn new() -> Option<Self> {
         pollster::block_on(Self::new_async())
     }
@@ -443,9 +427,9 @@ impl GpuRenderer {
             })
             .await
             .ok()?;
-        // Bilinear, clamp-to-edge sampler for the glyph SDF. Clamp-to-edge mirrors
-        // the CPU `sample_sdf_bilinear` neighbor clamp (`x1 = (x0+1).min(size-1)`),
-        // and linear min/mag gives the 2×2 lerp the CPU does by hand.
+        // Bilinear, clamp-to-edge sampler for the glyph SDF. Clamp-to-edge gives the
+        // neighbor clamp the SDF sampling convention expects (`x1 = (x0+1).min(size-1)`),
+        // and linear min/mag gives the 2×2 lerp.
         let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("orber-glyph-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -844,36 +828,35 @@ impl GpuRenderer {
         view
     }
 
-    /// Render one Circle frame at time `t` from `clusters` + `opts`, matching
-    /// [`crate::animate::render_frame`].
+    /// Render one Circle frame at time `t` from `clusters` + `opts`.
     ///
     /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
-    /// arithmetic the WebGL path uses — so the GPU output matches the CPU oracle
-    /// within ±2/channel. `opts.width` / `opts.height` give the output size; `t`
-    /// is clamped to `0.0..=1.0`.
+    /// arithmetic the WebGL path (`orberGl.ts`) uses — so the orb positions /
+    /// radii / alphas match the web result. `opts.width` / `opts.height` give the
+    /// output size; `t` is clamped to `0.0..=1.0`.
     ///
     /// # Orb count
     ///
-    /// The resolved orb count is clamped only to [`MAX_ORB_COUNT`] (1024), the same
-    /// ceiling the CPU oracle uses. Per-orb data is uploaded as a data-texture that
-    /// grows to fit, so there is no 64-orb cap and the GPU renders the same image
-    /// the CPU does for any count up to 1024 (#210 Phase 1a). No CPU fallback for
-    /// `count > 64` is needed anymore.
+    /// The resolved orb count is clamped only to [`MAX_ORB_COUNT`] (1024). Per-orb
+    /// data is uploaded as a data-texture that grows to fit, so there is no 64-orb
+    /// cap and the GPU renders any count up to 1024 directly (#210 Phase 1a).
     ///
-    /// # Panics / scope
+    /// # Scope
     ///
     /// This is the **Circle** path only. The shape in `opts.shape` is ignored
-    /// here; the caller routes `Glyph` to `render_frame_glyph` and `Aquarelle`
-    /// to `render_frame_aquarelle` (both GPU), and only falls back to the CPU
-    /// renderer when no GPU adapter is available. See the module docs.
+    /// here; the caller routes `Glyph` to `render_frame_glyph`, `Image` to
+    /// `render_frame_image`, and `Aquarelle` to `render_frame_aquarelle` (all GPU).
+    /// GPU is the only renderer (#225) — no CPU fallback exists; when no adapter is
+    /// available, [`GpuRenderer::new`] returns `None` and the CLI exits with an
+    /// error. See the module docs.
     pub fn render_frame(&self, clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
 
-        // Derive the WebGL pack-buffer scalars exactly as the CPU oracle /
-        // `get_render_data` do, then reuse `pack_render_data_for_webgl` so the
-        // per-orb arithmetic is never reimplemented.
+        // Derive the WebGL pack-buffer scalars exactly as `get_render_data`
+        // (the wasm/WebGL entry) does, then reuse `pack_render_data_for_webgl` so
+        // the per-orb arithmetic is never reimplemented.
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
         let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
@@ -909,47 +892,45 @@ impl GpuRenderer {
         );
 
         // `pack_render_data_for_webgl` is shared with the WebGL path and must NOT
-        // bake in saturation (the web side has its own knob). The CPU oracle,
-        // however, applies `adjust_saturation_pub(color_at_t, saturation)` per orb
-        // (`animate::render_frame`). To stay bit-exact we re-apply the *same*
-        // function here, in native GPU land only, over the packed color words.
+        // bake in saturation (the web side has its own knob). The native CLI has no
+        // separate saturation knob, so we apply
+        // `adjust_saturation_pub(color_at_t, saturation)` per orb here, in native
+        // GPU land only, over the packed color words.
         //
         // Each color word triple is `c.color[i] as f32 / 255.0`, so `round(w*255)`
-        // recovers the exact u8 the CPU fed to `adjust_saturation_pub`; we run the
-        // identical HSL transform and write the result back as `u8 / 255.0`.
+        // recovers the exact u8; we run the HSL saturation transform and write the
+        // result back as `u8 / 255.0`.
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         self.render_packed(&pack, width, height, t)
     }
 
-    /// Render one **Glyph** frame at time `t` from `clusters` + `opts`, matching
-    /// the CPU [`crate::glyph::render_glyph_orb`] fill (#212 Phase 1b).
+    /// Render one **Glyph** frame at time `t` from `clusters` + `opts` (#212 Phase 1b).
     ///
     /// `opts.shape` must be [`OrbShape::Glyph`]; the glyph `ch` / `font` select the
     /// SDF. The per-orb arithmetic reuses [`pack_render_data_for_webgl`] (so
-    /// positions / radii / rotation match the CPU path), saturation is re-applied
-    /// per orb like the CPU oracle, the glyph SDF is uploaded as an `R8Unorm`
-    /// texture, and the Glyph shader bilinear-samples it and fills with
-    /// `falloff_curve(1 - signed_unit)`.
+    /// positions / radii / rotation match the WebGL path), saturation is re-applied
+    /// per orb (the native CLI has no separate saturation knob), the glyph SDF is
+    /// uploaded as an `R8Unorm` texture, and the Glyph shader bilinear-samples it
+    /// and fills with `falloff_curve(1 - signed_unit)`.
     ///
-    /// # Parity scope (loose — structural + tolerant)
+    /// # Bleed pass
     ///
-    /// The CPU `render_frame` applies a per-frame aquarelle **bleed pass** after
-    /// the glyph fill (#195). This GPU path now reproduces it as a 2nd pass group
+    /// After the glyph fill, an aquarelle **bleed pass** (#195, reference algorithm
+    /// `aquarelle::render_aquarelle_bleed_pass`) is applied as a 2nd pass group
     /// (#214): the glyph fill renders into an intermediate texture, then a WGSL
     /// premultiply → separable box-blur ×3 → halo saturation → intensity compose +
     /// finalize writes the backbuffer (see [`Self::run_glyph_fill_bleed_readback`]
-    /// / `orb_glyph_bleed.wgsl`). Parity is **loose, not bit-exact**: the box-blur
-    /// structure / halo / intensity match the crate, but the aquarelle paper-grain
-    /// noise (a faint ±0.05 seed-derived jitter) is **omitted** on the GPU because
-    /// its ChaCha8 per-pixel-order consumption cannot be bit-reproduced in parallel,
-    /// and the GPU's HSL path differs from `palette`'s by sub-ULP rounding. Those
-    /// small per-pixel differences vs. the CPU are **expected and allowed** (a
-    /// future WGSL hash could approximate the noise).
+    /// / `orb_glyph_bleed.wgsl`). The box-blur structure / halo / intensity match
+    /// the crate, but the aquarelle paper-grain noise (a faint ±0.05 seed-derived
+    /// jitter) is **omitted** on the GPU because its ChaCha8 per-pixel-order
+    /// consumption cannot be bit-reproduced in parallel; that small per-pixel
+    /// difference vs. the crate algorithm is **expected and allowed** (a future
+    /// WGSL hash could approximate the noise).
     ///
     /// Returns a background-only frame (no glyph fill) when the glyph is unknown /
-    /// empty in the bundled font, mirroring the CPU "draw nothing for tofu"
-    /// contract.
+    /// empty in the bundled font — the "draw nothing for tofu" contract (never
+    /// draw `.notdef` boxes).
     pub fn render_frame_glyph(
         &self,
         clusters: &[Cluster],
@@ -982,10 +963,10 @@ impl GpuRenderer {
             .min(MAX_ORB_COUNT)
             .max(if clusters.is_empty() { 0 } else { 1 });
 
-        // SDF size: the CPU picks one per orb from its breath radius; the GPU binds
-        // one SDF for the frame, so size it from the *largest* orb radius (max
-        // weight × the breath max factor) so most orbs sample at or above the size
-        // the CPU used — bilinear sampling then matches closely.
+        // SDF size: the GPU binds one SDF for the whole frame (it cannot pick a
+        // per-orb size like a per-orb fill would), so size it from the *largest* orb
+        // radius (max weight × the breath max factor) so most orbs sample at or above
+        // their own size — bilinear up/down-sampling then keeps the edge sharp.
         let max_weight = clusters
             .iter()
             .map(|c| c.weight.max(0.0))
@@ -993,14 +974,14 @@ impl GpuRenderer {
         let frame_radius = base_radius_unit * max_weight.sqrt() * BREATH_RADIUS_MAX_FACTOR;
 
         // No glyph (radius 0 / unknown char / empty SDF) ⇒ background-only frame,
-        // matching the CPU "draw nothing" contract. Build a glyph-shaped pack with
-        // zero orbs so only the background paints. This routes through `render_packed`
-        // (the Circle path), so the bleed 2nd pass is skipped — intentional: the CPU
-        // runs `render_aquarelle_bleed_pass` unconditionally for Glyph, but blurring
+        // the "draw nothing" contract. Build a glyph-shaped pack with zero orbs so
+        // only the background paints. This routes through `render_packed` (the Circle
+        // path), so the bleed 2nd pass is skipped — intentional: the bleed pass
+        // (`aquarelle::render_aquarelle_bleed_pass`) would run for Glyph, but blurring
         // orber's uniform opaque background is a no-op *up to the omitted paper-grain
-        // noise* (the CPU would jitter that flat background by ±0.05; the GPU leaves it
-        // flat). Both yield a background-only frame within the same noise-omitted
-        // loose-parity contract this pass already accepts.
+        // noise* (the crate algorithm would jitter that flat background by ±0.05; the
+        // GPU leaves it flat). Either way the result is a background-only frame, within
+        // the same noise-omitted behavior this pass already documents.
         let Some((sdf, sdf_size)) =
             crate::glyph::cached_glyph_sdf_for_radius(font, ch, frame_radius)
         else {
@@ -1035,8 +1016,8 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
         );
-        // CPU glyph path applies per-orb saturation too (`render_frame_with_params`
-        // calls `adjust_saturation_pub(color_at_t, saturation)` before drawing).
+        // Apply per-orb saturation, same as the Circle path: the shared WebGL pack
+        // never bakes it in, so the native side runs `adjust_saturation_pub` here.
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         // Upload (or reuse) the glyph SDF, then render with the Glyph pipeline.
@@ -1059,7 +1040,7 @@ impl GpuRenderer {
     }
 
     /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217),
-    /// matching the CPU [`crate::glyph::render_sdf_orb`] fill.
+    /// using the same SDF fill as [`Self::render_frame_glyph`].
     ///
     /// `opts.shape` must be [`OrbShape::Image`]; its `sdf` / `size` are uploaded as
     /// an `R8Unorm` texture and bound to the **same** Glyph pipeline + bleed 2nd pass
@@ -1068,9 +1049,9 @@ impl GpuRenderer {
     /// from outside, one fixed texture for the whole frame) instead of a per-radius
     /// cached font glyph. Per-orb positions / radii / rotation reuse
     /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
-    /// like the glyph path, so the same loose-parity contract (structural + tolerant,
-    /// paper-grain noise omitted on the GPU) applies. Non-Image shapes fall back to
-    /// the Circle path so the call is total.
+    /// like the glyph path, so the same bleed-pass behavior (box-blur / halo /
+    /// intensity match the crate, paper-grain noise omitted on the GPU) applies.
+    /// Non-Image shapes fall back to the Circle path so the call is total.
     pub fn render_frame_image(
         &self,
         clusters: &[Cluster],
@@ -1104,7 +1085,7 @@ impl GpuRenderer {
             .max(if clusters.is_empty() { 0 } else { 1 });
 
         // Empty SDF (all-zero / no contrast slipped through) or wrong length ⇒
-        // background-only frame, matching the CPU "draw nothing" contract.
+        // background-only frame ("draw nothing" contract).
         if sdf_size == 0
             || sdf.len() < (sdf_size as usize) * (sdf_size as usize)
             || sdf.iter().all(|&b| b == 0)
@@ -1140,8 +1121,8 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
         );
-        // CPU image path applies per-orb saturation too (render_sdf_orb receives the
-        // saturation-adjusted rgb in `render_frame_with_params`).
+        // Apply per-orb saturation, same as the Circle / Glyph paths (the shared
+        // WebGL pack never bakes it in).
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         // Upload (or reuse) the image SDF with a content-derived key disjoint from
@@ -1160,25 +1141,24 @@ impl GpuRenderer {
         )
     }
 
-    /// Render one **Aquarelle** frame at time `t` from `clusters` + `opts`,
-    /// matching the CPU [`crate::animate::render_frame`] → `render_frame_aquarelle`
-    /// → `render_static` → `aquarelle::render_aquarelle_orb` path (#216 Phase 1c).
+    /// Render one **Aquarelle** frame at time `t` from `clusters` + `opts`, built on
+    /// the [`aquarelle::render_aquarelle_orb`] four-layer model (#216 Phase 1c).
     ///
     /// `opts.shape` must be [`OrbShape::Aquarelle`]; its [`AquarelleParams`] drive
     /// the four layers. Per-orb positions / radii / colors come from
-    /// [`crate::animate::aquarelle_modulated_clusters`] (the same modulation the CPU
-    /// path uses), then [`Self::pack_aquarelle_orbs`] runs the crate's ChaCha8 RNG
-    /// (`seed = orb index`) + `palette` HSL color math on the CPU to produce the
+    /// [`crate::animate::aquarelle_modulated_clusters`] (the shared per-orb
+    /// modulation), then [`Self::pack_aquarelle_orbs`] runs the crate's ChaCha8 RNG
+    /// (`seed = orb index`) + `palette` HSL color math host-side to produce the
     /// offset center, satellite placements, and boosted/mixed u8 colors. The
     /// `orb_aquarelle.wgsl` shader evaluates the radials and composites SourceOver.
     ///
-    /// # Parity scope (loose — structural + tolerant)
+    /// # Fidelity
     ///
-    /// Bit-exact in the RNG / color math (it reuses the crate's exact arithmetic),
-    /// but the radial fill is analytic where tiny-skia anti-aliases `fill_path`, so
-    /// the residual is the same AA-only difference Circle accepts (±2/channel on
-    /// most hardware, 0 on the real GPU for interior pixels). Non-Aquarelle shapes
-    /// fall back to the Circle path so the call is total.
+    /// The RNG / color math reuse the crate's exact arithmetic (host-side), so those
+    /// are byte-identical to the crate; only the radial fill is analytic where Skia
+    /// lowp anti-aliases `fill_path`, so the residual is an AA-only difference at orb
+    /// edges (the same kind Circle has). Non-Aquarelle shapes fall back to the Circle
+    /// path so the call is total.
     pub fn render_frame_aquarelle(
         &self,
         clusters: &[Cluster],
@@ -1195,12 +1175,12 @@ impl GpuRenderer {
             _ => return self.render_frame(clusters, opts, t),
         };
 
-        // Same per-orb modulation the CPU aquarelle path uses (position wrap, radius
-        // breath, #33/#7 color interpolation). Index order == `render_static` draw
-        // order == `render_aquarelle_orb` seed `i`.
+        // Shared per-orb modulation (position wrap, radius breath, #33/#7 color
+        // interpolation). The cluster index order is the orb draw order and is also
+        // the `render_aquarelle_orb` seed `i`, so RNG consumption stays in step.
         let modulated = crate::animate::aquarelle_modulated_clusters(clusters, opts, t);
 
-        // `base_radius_unit` mirrors `render_static`: min(w,h) * 0.25 * orb_size.
+        // `base_radius_unit` is the standard orb radius unit: min(w,h) * 0.25 * orb_size.
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let saturation = opts.saturation.max(0.0);
 
@@ -1246,7 +1226,7 @@ impl GpuRenderer {
 
         let mut orbs = Vec::with_capacity(n.max(1));
         for (i, cluster) in clusters.iter().take(n).enumerate() {
-            // `render_static`: radius = base_radius_unit * sqrt(weight),
+            // Standard orb geometry: radius = base_radius_unit * sqrt(weight),
             // color = adjust_saturation(cluster.color, saturation),
             // center = clamp(centroid, 0..1) * (width, height).
             let radius = base_radius_unit * cluster.weight.max(0.0).sqrt();
@@ -1504,7 +1484,7 @@ impl GpuRenderer {
         // This is the outermost lock, taken exactly once before any cache Mutex, so
         // it cannot deadlock against the inner pipeline / sized / orb caches. The
         // single-threaded CLI never contends it. It does not change the drawing
-        // result — bit-exact parity is preserved.
+        // result — the same params render byte-identically with or without the lock.
         let _render_guard = self
             .render_guard
             .lock()
@@ -1537,8 +1517,8 @@ impl GpuRenderer {
             alpha_mul: pack[9],
             // header[11] = glyph_rotate (#136), header[12] = edge_softness (#205).
             // Both are Glyph-only; the Circle shader never reads them. `sdf_size`
-            // comes from the Glyph binding (the shader uses it to match the CPU
-            // bilinear convention); Circle leaves it 0.
+            // comes from the Glyph binding (the shader uses it for the SDF bilinear
+            // sampling convention); Circle leaves it 0.
             glyph_rotate: pack[11],
             edge_softness: pack[12],
             sdf_size: glyph.as_ref().map_or(0.0, |g| g.size as f32),
@@ -1756,8 +1736,8 @@ impl GpuRenderer {
     /// Compile the bleed shader once and build its four fragment-entry pipelines,
     /// all sharing one bind-group layout (uniform 0 + `src` texture 1 + `blurred`
     /// texture 2; both textures `filterable: false` because the shader reads them
-    /// with `textureLoad`, keeping the box-blur on exact texel centers like the CPU
-    /// crate). All targets are `Rgba8Unorm`, `blend: None`.
+    /// with `textureLoad`, keeping the box-blur on exact texel centers like the
+    /// `aquarelle` crate). All targets are `Rgba8Unorm`, `blend: None`.
     fn build_bleed_pipelines(&self) -> BleedPipelines {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let bind_group_layout =
@@ -2065,8 +2045,8 @@ fn align_up(value: u32, align: u32) -> u32 {
 /// `pack_render_data_for_webgl` buffer, in place (native GPU path only).
 ///
 /// `pack_render_data_for_webgl` is shared with the WebGL path and intentionally
-/// leaves saturation out, but the CPU oracle applies it per orb, so the native
-/// GPU path re-applies the identical transform here to keep bit-exact parity.
+/// leaves saturation out (the web side has its own knob), so the native GPU path
+/// re-applies the `adjust_saturation_pub` transform per orb here instead.
 /// Color words live at `[off .. off+3]` per orb as `u8 / 255.0`; we round back to
 /// the original u8, run the same HSL adjust, and write the result back the same
 /// way. A factor of `1.0` is the `adjust_saturation_pub` fast-path (no change).
@@ -2091,7 +2071,7 @@ fn apply_saturation_to_pack(pack: &mut [f32], saturation: f32, n_orbs: usize) {
 }
 
 /// `boost_saturation` from `aquarelle::render_aquarelle_orb`, reproduced verbatim
-/// so the CPU pack produces the **same u8 color** the crate feeds tiny-skia. The
+/// so the CPU pack produces the **same u8 color** the crate feeds Skia lowp. The
 /// HSL transform runs through `palette` at the exact version aquarelle pins
 /// (`palette 0.7`, the workspace dep), so the result is bit-identical and never
 /// reimplemented in WGSL. A factor within an ULP of 1.0 short-circuits like the
@@ -2189,7 +2169,7 @@ fn glyph_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+    use crate::animate::{AnimateOptions, MotionDirection, MotionSpeed};
     use crate::cluster::{Centroid, Cluster};
     use crate::orb::OrbShape;
     use crate::style::SoftnessPreset;
@@ -2322,7 +2302,7 @@ mod tests {
         }
         assert!(
             max_diff <= 2,
-            "{ctx}: max per-channel diff {max_diff} at pixel ({},{}) channel {} (cpu={:?} gpu={:?})",
+            "{ctx}: max per-channel diff {max_diff} at pixel ({},{}) channel {} (a={:?} b={:?})",
             worst.0,
             worst.1,
             worst.2,
@@ -2330,162 +2310,6 @@ mod tests {
             worst.4,
         );
         max_diff
-    }
-
-    #[test]
-    fn gpu_matches_cpu_within_tolerance() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_within_tolerance") else {
-            return;
-        };
-        eprintln!(
-            "GPU Circle parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
-
-        let clusters = sample_clusters();
-        // Cover the read-back strip boundary both ways with orb-bearing frames:
-        //   - 37x23: width*4 = 148, not a multiple of 256, so rows ARE padded;
-        //   - 64x16: width*4 = 256 is already row-aligned, so NO padding.
-        // (1x1 is exercised separately by `gpu_matches_cpu_1x1_readback`: at a
-        // sub-pixel orb radius tiny-skia's analytic path-coverage AA diverges from
-        // a point-sampled shader — a degenerate case orber never renders — so the
-        // 1x1 row-padding readback is checked background-only instead.)
-        let mut overall_max = 0u8;
-        for &(w, h) in &[(37u32, 23u32), (64, 16)] {
-            let dir = match (w, h) {
-                (37, 23) => MotionDirection::LeftToRight,
-                _ => MotionDirection::TopToBottom,
-            };
-            let opts = circle_opts(w, h, dir, MotionSpeed::Slow);
-            for &t in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} {dir:?} t={t}"));
-                overall_max = overall_max.max(max_diff);
-                eprintln!("{w}x{h} {dir:?} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-        eprintln!("overall max per-channel diff across all cases = {overall_max}");
-    }
-
-    /// count > 64 must hold parity now that orb data is a data-texture (no 64
-    /// cap). Covers the old CPU-fallback boundary (65) plus 100 / 256 / 1024.
-    /// A size with > 64 distinct clusters so each orb is independent (not just the
-    /// weight-scattered expansion of a handful of colors); the texture must grow to
-    /// hold every row and the shader must iterate the full dynamic count. Expect
-    /// bit-exact on a real GPU; the assertion allows the ±2/channel contract.
-    #[test]
-    fn gpu_matches_cpu_high_count() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count") else {
-            return;
-        };
-        eprintln!(
-            "GPU Circle high-count parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        for &count in &[65usize, 100, 256, 1024] {
-            // A size whose width*4 is not 256-aligned, to also keep the read-back
-            // padding strip in play while the orb count grows.
-            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(count);
-            for &t in &[0.0_f32, 0.5] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count={count} t={t}"));
-                overall_max = overall_max.max(max_diff);
-                eprintln!("count={count} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-        eprintln!("high-count overall max per-channel diff = {overall_max}");
-    }
-
-    /// `--saturation != 1.0` must hold parity: the native GPU path re-applies
-    /// `adjust_saturation_pub` (the CPU oracle's own per-orb saturation) after the
-    /// shared `pack_render_data_for_webgl`. Without that step desaturated (0.5) and
-    /// boosted (2.0) frames would diverge from the CPU. Covers a couple of sizes /
-    /// times so the orb colors actually change between frames.
-    #[test]
-    fn gpu_matches_cpu_with_saturation() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_with_saturation") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        for &saturation in &[0.5_f32, 2.0] {
-            for &(w, h) in &[(37u32, 23u32), (40, 28)] {
-                let mut opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
-                opts.saturation = saturation;
-                for &t in &[0.0_f32, 0.5, 1.0] {
-                    let cpu = render_frame(&clusters, &opts, t);
-                    let gpu = renderer.render_frame(&clusters, &opts, t);
-                    let max_diff = assert_within_tolerance(
-                        &cpu,
-                        &gpu,
-                        &format!("sat={saturation} {w}x{h} t={t}"),
-                    );
-                    eprintln!("sat={saturation} {w}x{h} t={t}: max per-channel diff = {max_diff}");
-                }
-            }
-        }
-    }
-
-    /// 1x1 read-back boundary: width*4 = 4 bytes/row is padded to 256, so this
-    /// exercises the most extreme row-padding strip. Use a background-only frame
-    /// (no clusters) so the assertion is about read-back geometry, not the
-    /// degenerate sub-pixel-orb AA where a point-sampled shader cannot match
-    /// tiny-skia's analytic path coverage. Also checks 1x3 / 3x1 strips.
-    #[test]
-    fn gpu_matches_cpu_1x1_readback() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_1x1_readback") else {
-            return;
-        };
-        for &(w, h) in &[(1u32, 1u32), (1, 3), (3, 1), (5, 1)] {
-            let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-            for &t in &[0.0_f32, 0.5, 1.0] {
-                // Background-only frame on both paths.
-                let cpu = render_frame(&[], &opts, t);
-                let gpu = renderer.render_frame(&[], &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} bg-only t={t}"));
-                eprintln!("{w}x{h} bg-only t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-    }
-
-    /// All four flow directions must hold parity at a single non-trivial size/t.
-    #[test]
-    fn gpu_matches_cpu_all_directions() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_all_directions") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        for dir in [
-            MotionDirection::LeftToRight,
-            MotionDirection::RightToLeft,
-            MotionDirection::TopToBottom,
-            MotionDirection::BottomToTop,
-        ] {
-            let opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
-            let cpu = render_frame(&clusters, &opts, 0.37);
-            let gpu = renderer.render_frame(&clusters, &opts, 0.37);
-            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("dir {dir:?}"));
-            eprintln!("dir {dir:?}: max per-channel diff = {max_diff}");
-        }
-    }
-
-    /// Empty clusters → background-only frame must still match (bg fill path).
-    #[test]
-    fn gpu_matches_cpu_empty_clusters() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_empty_clusters") else {
-            return;
-        };
-        let opts = circle_opts(32, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let cpu = render_frame(&[], &opts, 0.5);
-        let gpu = renderer.render_frame(&[], &opts, 0.5);
-        let max_diff = assert_within_tolerance(&cpu, &gpu, "empty clusters");
-        eprintln!("empty clusters: max per-channel diff = {max_diff}");
     }
 
     /// Pipeline + sized caches must each hold exactly one entry after a clip of
@@ -2577,34 +2401,6 @@ mod tests {
                 cluster([r as u8, g as u8, b as u8], cx, cy, weight)
             })
             .collect()
-    }
-
-    /// C3 (#210): parity with **65+ individually-colored** clusters. The existing
-    /// `gpu_matches_cpu_high_count` only has the 4-color `sample_clusters`, so a
-    /// high `count` there just re-scatters those 4 colors — it can't catch a bug
-    /// where texture row `k` loads the wrong orb's color. Here each cluster is its
-    /// own color, so the `clusters.len()` (= count) distinct rows must each load
-    /// independently and correctly for CPU↔GPU to agree within ±2/channel.
-    #[test]
-    fn gpu_matches_cpu_high_count_distinct_clusters() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_matches_cpu_high_count_distinct_clusters")
-        else {
-            return;
-        };
-        for &n in &[65usize, 200] {
-            let clusters = distinct_clusters(n);
-            // count = None so every distinct cluster becomes its own orb row.
-            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(n);
-            for &t in &[0.0_f32, 0.5] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("distinct n={n} t={t}"));
-                eprintln!("distinct n={n} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
     }
 
     /// C4 (#210): the orb data-texture grows **only on increase**. A higher count
@@ -2763,44 +2559,6 @@ mod tests {
         eprintln!("short-row zero-fill: max per-channel diff = {max_diff}");
     }
 
-    /// C7 (#210): a width whose `width*4` is **not** 256-aligned, at the max
-    /// count=1024, in a single frame. Stresses the read-back row-padding strip and
-    /// the tall (1024-row) orb texture at once; CPU↔GPU must still agree.
-    #[test]
-    fn gpu_matches_cpu_high_count_unaligned_width_max() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_matches_cpu_high_count_unaligned_width_max")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        // 50*4 = 200, not a multiple of 256 → read-back rows are padded.
-        let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        opts.count = Some(1024);
-        let cpu = render_frame(&clusters, &opts, 0.5);
-        let gpu = renderer.render_frame(&clusters, &opts, 0.5);
-        let max_diff = assert_within_tolerance(&cpu, &gpu, "unaligned width × count=1024");
-        eprintln!("unaligned-width count=1024: max per-channel diff = {max_diff}");
-    }
-
-    /// C8 (#210): count=1 — the minimum (one orb row, `rows.max(1)` / `n_orbs.max(1)`
-    /// lower bounds). The single-row orb texture must render and match the CPU.
-    #[test]
-    fn gpu_matches_cpu_count_one() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_count_one") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        opts.count = Some(1);
-        for &t in &[0.0_f32, 0.5, 1.0] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count=1 t={t}"));
-            eprintln!("count=1 t={t}: max per-channel diff = {max_diff}");
-        }
-    }
-
     /// C9 (#210): the internal `render_packed` contract clamps a header `n_orbs`
     /// above [`MAX_ORB_COUNT`] (1024) down to 1024 — no panic, no out-of-bounds
     /// texture read. This bypasses the CLI (which can't request > 1024 via
@@ -2852,29 +2610,6 @@ mod tests {
             "header=2000 (clamped) vs header=1024",
         );
         eprintln!("over-max clamp: max per-channel diff = {max_diff}");
-    }
-
-    /// C10 (#210): `--saturation != 1.0` parity holds at high count. The
-    /// `apply_saturation_to_pack` loop must run over **all** 256 orb rows (not just
-    /// the first 64), so a desaturated (0.5) and a boosted (2.0) high-count frame
-    /// must each still match the CPU oracle.
-    #[test]
-    fn gpu_matches_cpu_high_count_with_saturation() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count_with_saturation")
-        else {
-            return;
-        };
-        let clusters = distinct_clusters(256);
-        for &saturation in &[0.5_f32, 2.0] {
-            let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(256);
-            opts.saturation = saturation;
-            let cpu = render_frame(&clusters, &opts, 0.5);
-            let gpu = renderer.render_frame(&clusters, &opts, 0.5);
-            let max_diff =
-                assert_within_tolerance(&cpu, &gpu, &format!("sat={saturation} count=256"));
-            eprintln!("sat={saturation} count=256: max per-channel diff = {max_diff}");
-        }
     }
 
     /// C11 (#210): after the lock fix, concurrent `render_frame` on a shared
@@ -3096,8 +2831,8 @@ mod tests {
         );
     }
 
-    /// #217: an empty (all-zero) image SDF yields a background-only frame, mirroring
-    /// the CPU "draw nothing" contract (no panic).
+    /// #217: an empty (all-zero) image SDF yields a background-only frame
+    /// ("draw nothing" contract, no panic).
     #[test]
     fn gpu_image_empty_sdf_is_background_only() {
         let Some(renderer) = require_or_skip_renderer("gpu_image_empty_sdf_is_background_only")
@@ -3144,86 +2879,6 @@ mod tests {
         );
     }
 
-    /// #217 (#13): structural parity of the GPU image path (`render_frame_image`)
-    /// with the CPU oracle (`render_frame` on the same `OrbShape::Image`). This is
-    /// the image analogue of `gpu_glyph_structural_parity_with_cpu`: the CPU adds
-    /// the aquarelle bleed pass after the SDF fill and the GPU resampler / bilinear
-    /// differ from the CPU's, so parity is **loose, not bit-exact**. The contract:
-    ///   (a) both paths light pixels (> 0),
-    ///   (b) lit-pixel counts are within a 2× band either way,
-    ///   (c) lit bounding boxes align within ±6 px per edge (fill is in the same
-    ///       place at the same scale → UV mapping / rotation / scale agree),
-    ///   (d) the two lit sets overlap > 60% of the smaller set.
-    /// Resampler / bleed per-pixel differences are expected and allowed.
-    #[test]
-    fn gpu_image_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("gpu_image_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        eprintln!(
-            "GPU Image parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
-        let clusters = sample_clusters();
-        let opts = image_opts(120, 90);
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_image(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            // (a) both light pixels.
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // (b) comparable coverage (loose 2× band either direction).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
-            );
-
-            // (c) lit bounding boxes align within ±6 px per edge.
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 6i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // (d) overlap > 60% of the smaller lit set.
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.6,
-                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "image parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
-    }
-
     /// #217 (#14): rotation loop closure for the GPU image path. With
     /// `glyph_rotate=true`, `render_frame_image(t=0)` and `(t=1)` must render the
     /// same frame within tolerance (the per-orb rotation + one-way conveyor both
@@ -3259,109 +2914,6 @@ mod tests {
             "image rotation loop closure (Fast, high cycle×speed) t=0 vs t=1",
         );
         eprintln!("image fast loop closure: max per-channel diff = {max_diff}");
-    }
-
-    /// Lit-pixel bounding box of `img` against the opaque background, with a
-    /// per-channel `thresh`. Returns `None` when nothing is lit.
-    fn lit_bbox(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> Option<(u32, u32, u32, u32)> {
-        let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        let mut any = false;
-        for (x, y, p) in img.enumerate_pixels() {
-            if (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh) {
-                any = true;
-                minx = minx.min(x);
-                miny = miny.min(y);
-                maxx = maxx.max(x);
-                maxy = maxy.max(y);
-            }
-        }
-        any.then_some((minx, miny, maxx, maxy))
-    }
-
-    /// Structural parity with the CPU oracle (loose; bleed excluded). The CPU
-    /// `render_frame` adds an aquarelle bleed pass *after* the glyph fill, which
-    /// blurs/spreads the fill and shifts many pixels above/below the lit threshold,
-    /// so exact coverage is *not* expected to match. What must match is the
-    /// **structure** of the fill (same glyph, same orb positions / scale):
-    ///   - the lit-pixel **bounding boxes** align within a few pixels (position +
-    ///     extent of the glyph fill agree, proving UV mapping / rotation / scale);
-    ///   - both paths light a non-trivial, comparable number of pixels (within a
-    ///     2× band either way — bleed can raise or lower the count vs the sharp
-    ///     pre-bleed fill);
-    ///   - the two lit sets overlap substantially (the fill is in the same place).
-    ///
-    /// Bleed-derived per-pixel differences are expected and allowed.
-    #[test]
-    fn gpu_glyph_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let opts = glyph_opts(
-            120,
-            90,
-            MotionDirection::LeftToRight,
-            MotionSpeed::Slow,
-            true,
-        );
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_glyph(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // Comparable coverage (loose 2× band either direction).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
-            );
-
-            // Lit bounding boxes must align within a small tolerance (the fill is
-            // in the same screen region at the same scale). Bleed grows the CPU
-            // bbox slightly; allow 6 px slack on each edge.
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 6i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // Overlap: a good fraction of the smaller lit set coincides with the
-            // larger one (the fills occupy the same pixels, not merely the same box).
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.6,
-                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "glyph parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
     }
 
     /// Rotation (#136): ON animates the glyph (frames at different t differ), OFF
@@ -3466,8 +3018,8 @@ mod tests {
     }
 
     /// An unknown / unrenderable glyph (pizza emoji, absent from the bundled
-    /// Symbols 2 subset) must yield a background-only frame — no orb fill, matching
-    /// the CPU "draw nothing for tofu" contract.
+    /// Symbols 2 subset) must yield a background-only frame — no orb fill, the
+    /// "draw nothing for tofu" contract.
     #[test]
     fn gpu_glyph_unknown_char_background_only() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_unknown_char_background_only")
@@ -3517,51 +3069,6 @@ mod tests {
     }
 
     // ---- #212 Phase 1b: 4-texel widening / glyph dispatch regression guards ----
-
-    /// #212 (#1): widening the orb data-texture 3→4 texels (x=3 = rotation) must
-    /// leave the **Circle** path bit-exact — the Circle shader ignores texel x=3.
-    /// This pins the Circle bit-exact requirement after the layout change across
-    /// several frames (count / direction / t varied), proving x=3 is dead weight
-    /// for Circle. On the real GPU the diff is expected to be 0; the assertion
-    /// allows the ±2/channel contract as the other Circle parity tests do.
-    #[test]
-    fn circle_bitexact_after_4texel_widening() {
-        let Some(renderer) = require_or_skip_renderer("circle_bitexact_after_4texel_widening")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        // Vary count, direction, and t so the per-orb rows (and the now-present but
-        // Circle-ignored x=3 rotation texel) take many distinct values; Circle must
-        // stay byte-for-byte on the CPU oracle regardless.
-        let cases = [
-            (8usize, MotionDirection::LeftToRight, 0.0_f32),
-            (12, MotionDirection::RightToLeft, 0.25),
-            (20, MotionDirection::TopToBottom, 0.5),
-            (33, MotionDirection::BottomToTop, 0.75),
-            (50, MotionDirection::LeftToRight, 1.0),
-        ];
-        for &(count, dir, t) in &cases {
-            let mut opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
-            opts.count = Some(count);
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff =
-                assert_within_tolerance(&cpu, &gpu, &format!("count={count} {dir:?} t={t}"));
-            // Pin the *bit-exact* contract explicitly (the Circle requirement),
-            // stronger than the ±2 band the helper enforces. On the GTX 1050 Ti
-            // round(value*255) is the same arithmetic as the CPU loop, so Circle is
-            // diff 0; if x=3 ever leaked into Circle this would break first.
-            assert_eq!(
-                max_diff, 0,
-                "Circle must stay bit-exact after the 3→4 texel widening \
-                 (x=3 rotation texel must be ignored): count={count} {dir:?} t={t}"
-            );
-            overall_max = overall_max.max(max_diff);
-        }
-        eprintln!("circle 4-texel widening bit-exact: overall max diff = {overall_max}");
-    }
 
     /// #212 (#2): the `render_packed_inner` short-row guard changed from a per-orb
     /// `off + 11` cut-off to `off + 13` (so the new rotation words at `off+11` /
@@ -3772,7 +3279,8 @@ mod tests {
     /// #212 (#6): rotation loop closure under stress — ON, MotionSpeed::Fast (high
     /// cycle count) plus high per-orb speed multipliers — the t=0 and t=1 frames
     /// must still match within tolerance. This stresses the WGSL `fract` / `floor`
-    /// wrap (`turns = cycle * speed * t - floor(...)`) against the CPU `rem_euclid`
+    /// wrap (`turns = cycle * speed * t - floor(...)`) against the Rust
+    /// `crate::animate::glyph_rotation_angle` `rem_euclid`
     /// at the largest `cycle * speed` products, where a float-precision mismatch in
     /// the wrap would be most visible. (Loop closure relies on `cycle * speed_mult`
     /// being integral so turns = 0 at t = 1.)
@@ -4014,11 +3522,10 @@ mod tests {
 
     // ---- #214 Phase 1b.5: Glyph bleed/halo 2nd pass (WGSL) ----
 
-    /// A Glyph `AnimateOptions` matching the CPU bleed oracle's setup: a single
-    /// white centered cluster, `orb_size = 1.0`, `softness = Low` (the sharp
-    /// pre-#205 baseline the CPU bleed tests pin so the halo R survives the blur),
-    /// no flow advance / rotation so the glyph sits at the canvas center. Mirrors
-    /// the `orb.rs` `glyph_bleed_produces_halo_around_lit_pixel_cluster` opts.
+    /// A Glyph `AnimateOptions` for the bleed-pass tests: a single white centered
+    /// cluster, `orb_size = 1.0`, `softness = Low` (the sharp pre-#205 baseline, so
+    /// the halo R survives the blur), no flow advance / rotation so the glyph sits
+    /// at the canvas center.
     fn glyph_bleed_opts(w: u32, h: u32) -> AnimateOptions {
         AnimateOptions {
             width: w,
@@ -4043,14 +3550,13 @@ mod tests {
     }
 
     /// #214 (A): the GPU bleed pass must leak a **halo ring** outside the glyph
-    /// body — the direct evidence the box-blur/compose 2nd pass ran. Mirrors the
-    /// CPU oracle `glyph_bleed_produces_halo_around_lit_pixel_cluster`: a single
+    /// body — the direct evidence the box-blur/compose 2nd pass ran. A single
     /// white ☆ at 64×64, `orb_size = 1.0` (radius ≈ 16 px, center (32,32)). The
     /// star body is essentially complete by r ≈ 16; the ring 18..21 px from the
     /// center is outside the body, so any lit (R>0) pixel there must come from the
     /// bleed pass spreading the fill outward. Without the 2nd pass that ring would
-    /// be pure background black. Loose count (`>= 10`) like the CPU oracle (noise
-    /// is omitted on the GPU, so the absolute count differs from the CPU's).
+    /// be pure background black. The count threshold is loose (`>= 10`) because the
+    /// paper-grain noise is omitted on the GPU, so an exact pixel count is not pinned.
     #[test]
     fn gpu_glyph_bleed_produces_halo_ring() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_produces_halo_ring") else {
@@ -4091,8 +3597,7 @@ mod tests {
     }
 
     /// #214 (A): the bleed pass must not wash the glyph fill out — the lit body
-    /// pixels must survive the box-blur/compose. Mirrors the CPU oracle
-    /// `glyph_lit_pixels_remain_visible_after_bleed` (softness Low ☆, `lit > 32`
+    /// pixels must survive the box-blur/compose (softness Low ☆, `lit > 32`
     /// counted as R > 32). If the compose `intensity` over-weighted the (dimmer)
     /// blurred layer the bright body would collapse below this threshold.
     #[test]
@@ -4138,8 +3643,7 @@ mod tests {
 
     /// #214 (A): a weight-0 cluster yields zero orbs (radius 0 → skipped), so the
     /// glyph fill is empty and the bleed pass has nothing to spread. The frame
-    /// must stay background-only. Mirrors the CPU oracle
-    /// `glyph_zero_weight_cluster_stays_black_after_bleed`.
+    /// must stay background-only.
     #[test]
     fn gpu_glyph_bleed_weight_zero_stays_background() {
         let Some(renderer) =
@@ -4204,40 +3708,6 @@ mod tests {
             "glyph bleed pass must be byte-identical on repeat (noise omitted → full determinism)"
         );
         eprintln!("gpu glyph bleed determinism: two renders byte-identical");
-    }
-
-    /// #214 (A / D1 pin): adding the bleed pass group must leave the **Circle**
-    /// path untouched. Circle never enters `run_glyph_fill_bleed_readback` (it goes
-    /// through `run_pass_and_readback` instead), so a Circle frame must still match
-    /// the CPU oracle within the ±2/channel contract every other Circle parity test
-    /// uses. This is the explicit non-regression pin that the #214 addition did not
-    /// leak into the Circle dispatch.
-    #[test]
-    fn gpu_circle_unaffected_by_bleed_addition() {
-        let Some(renderer) = require_or_skip_renderer("gpu_circle_unaffected_by_bleed_addition")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        for &(dir, t) in &[
-            (MotionDirection::LeftToRight, 0.0_f32),
-            (MotionDirection::TopToBottom, 0.5),
-            (MotionDirection::BottomToTop, 1.0),
-        ] {
-            let opts = circle_opts(48, 32, dir, MotionSpeed::Mid);
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff = assert_within_tolerance(
-                &cpu,
-                &gpu,
-                &format!("circle bleed-unaffected {dir:?} t={t}"),
-            );
-            overall_max = overall_max.max(max_diff);
-        }
-        eprintln!(
-            "circle unaffected by bleed addition: overall max per-channel diff = {overall_max}"
-        );
     }
 
     /// #214 (B): the box-blur radius clamp (`r = min(radius, w-1)` / `min(radius,
@@ -4417,86 +3887,6 @@ mod tests {
         eprintln!("concurrent glyph bleed: all threads matched solo oracle (no mid-pass aliasing)");
     }
 
-    /// #214 (structural parity tighten): with the bleed pass now reproduced on the
-    /// GPU, the lit bbox and overlap should agree **more tightly** than the
-    /// pre-bleed `gpu_glyph_structural_parity_with_cpu` allowed — bbox within 3 px
-    /// (was 6) and overlap > 80% (was 60%). The **lit-count band [0.5, 2.0] is left
-    /// unchanged**: the GPU omits the paper-grain noise, so the CPU still scatters
-    /// extra faint soft pixels the GPU lacks, and pinning the count ratio tighter
-    /// would be a false positive. The existing looser test is intentionally left in
-    /// place; this one is the tightened companion.
-    #[test]
-    fn gpu_glyph_bleed_parity_tighter_bbox_overlap() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_bleed_parity_tighter_bbox_overlap")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let opts = glyph_opts(
-            120,
-            90,
-            MotionDirection::LeftToRight,
-            MotionSpeed::Slow,
-            true,
-        );
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_glyph(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // Lit-count band left at the looser [0.5, 2.0] (noise omitted on GPU).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit}/cpu_lit={cpu_lit}={ratio:.2}, band [0.5,2.0] (unchanged)"
-            );
-
-            // Tighter bbox: 3 px slack on each edge (was 6).
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 3i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tightened tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // Tighter overlap: > 80% of the smaller lit set (was 60%).
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.8,
-                "t={t}: lit overlap {:.1}% of the smaller set; tightened expectation >80%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "glyph bleed tighter parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} \
-                 ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
-    }
-
     // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
 
     use aquarelle::AquarelleParams;
@@ -4596,71 +3986,6 @@ mod tests {
         };
         let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, no_bloom);
         assert!(orbs[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
-    }
-
-    /// Aquarelle GPU↔CPU **structural** parity: the WGSL four-layer path matches the
-    /// CPU `render_frame_aquarelle` oracle within a loose tolerance (AA-only residual,
-    /// like Circle). Asserts the lit-pixel sets overlap heavily and the mean color is
-    /// close — not byte-exact, because tiny-skia anti-aliases its `fill_path` where
-    /// the shader evaluates the radial analytically.
-    #[test]
-    fn aquarelle_gpu_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        let (w, h) = (96u32, 128u32);
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.8),
-            cluster([60, 120, 220], 0.7, 0.55, 0.5),
-            cluster([200, 200, 80], 0.5, 0.8, 0.4),
-        ];
-        let params = AquarelleParams::default();
-        let opts = aquarelle_opts(w, h, params);
-        let t = 0.0;
-
-        let cpu = render_frame(&clusters, &opts, t);
-        let gpu = renderer.render_frame_aquarelle(&clusters, &opts, t);
-        assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-        let bg = opts.background;
-        let mut cpu_lit = 0usize;
-        let mut gpu_lit = 0usize;
-        let mut overlap = 0usize;
-        let mut sum_abs = 0u64;
-        for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-            let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-            let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-            if c_lit {
-                cpu_lit += 1;
-            }
-            if g_lit {
-                gpu_lit += 1;
-            }
-            if c_lit && g_lit {
-                overlap += 1;
-            }
-            for c in 0..3 {
-                sum_abs += cp.0[c].abs_diff(gp.0[c]) as u64;
-            }
-        }
-        assert!(cpu_lit > 0 && gpu_lit > 0, "both renders must light pixels");
-        let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-        assert!(
-            overlap_frac > 0.9,
-            "aquarelle lit overlap {:.1}% of smaller set; expected >90% (cpu_lit={cpu_lit} gpu_lit={gpu_lit})",
-            overlap_frac * 100.0
-        );
-        let mean_abs = sum_abs as f64 / (w as f64 * h as f64 * 3.0);
-        assert!(
-            mean_abs < 2.0,
-            "aquarelle mean per-channel |cpu-gpu| {mean_abs:.3} should be small (AA-only residual)"
-        );
-        eprintln!(
-            "aquarelle structural parity: cpu_lit={cpu_lit} gpu_lit={gpu_lit} \
-             overlap={:.1}% mean_abs={mean_abs:.3}",
-            overlap_frac * 100.0
-        );
     }
 
     /// Aquarelle GPU determinism: the same `(clusters, opts, t)` must render
@@ -5097,8 +4422,8 @@ mod tests {
 
     /// (#7) `saturation=0.0` desaturates every packed layer color: each must equal the
     /// grayscale `adjust_saturation_pub(base, 0.0)` (boosting a gray stays gray, mixing
-    /// a gray toward white stays gray), so the GPU never sees a saturated color the CPU
-    /// oracle desaturated.
+    /// a gray toward white stays gray), so the desaturation is applied in the pack and
+    /// the shader only ever sees already-grayscale colors.
     #[test]
     fn aquarelle_pack_saturation_zero_desaturates_layer_colors() {
         // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
@@ -5153,174 +4478,5 @@ mod tests {
             inner8, gray,
             "inner layer must be the desaturated base color"
         );
-    }
-
-    /// (#8, pure CPU — runs everywhere) Aquarelle ignores `--count`: one orb per
-    /// cluster. `count=Some(64)` with 3 clusters must render byte-identically to
-    /// `count=None`. Uses only the CPU `render_frame` oracle (no GPU needed).
-    #[test]
-    fn aquarelle_render_frame_ignores_count() {
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.8),
-            cluster([60, 120, 220], 0.7, 0.55, 0.5),
-            cluster([200, 200, 80], 0.5, 0.8, 0.4),
-        ];
-        let mut opts = aquarelle_opts(72, 56, AquarelleParams::default());
-        opts.count = None;
-        let none = render_frame(&clusters, &opts, 0.0);
-        opts.count = Some(64);
-        let with_count = render_frame(&clusters, &opts, 0.0);
-        assert_eq!(
-            none.as_raw(),
-            with_count.as_raw(),
-            "aquarelle must render one orb per cluster regardless of --count"
-        );
-    }
-
-    /// Shared structural-parity check: GPU↔CPU aquarelle must light overlapping pixel
-    /// sets and stay close in mean per-channel diff (AA-only residual, like Circle).
-    /// Returns nothing; panics on failure. Used by the corner / branch tests below.
-    fn assert_aquarelle_structural_parity(
-        renderer: &GpuRenderer,
-        clusters: &[Cluster],
-        opts: &AnimateOptions,
-        t: f32,
-        label: &str,
-    ) {
-        let cpu = render_frame(clusters, opts, t);
-        let gpu = renderer.render_frame_aquarelle(clusters, opts, t);
-        assert_eq!(cpu.dimensions(), gpu.dimensions(), "{label}: dim mismatch");
-        let bg = opts.background;
-        let (mut cpu_lit, mut gpu_lit, mut overlap, mut sum_abs) = (0usize, 0usize, 0usize, 0u64);
-        for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-            let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-            let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-            if c_lit {
-                cpu_lit += 1;
-            }
-            if g_lit {
-                gpu_lit += 1;
-            }
-            if c_lit && g_lit {
-                overlap += 1;
-            }
-            for c in 0..3 {
-                sum_abs += cp.0[c].abs_diff(gp.0[c]) as u64;
-            }
-        }
-        assert!(
-            cpu_lit > 0 && gpu_lit > 0,
-            "{label}: both renders must light pixels"
-        );
-        let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-        assert!(
-            overlap_frac > 0.85,
-            "{label}: lit overlap {:.1}% of smaller set; expected >85% (cpu_lit={cpu_lit} gpu_lit={gpu_lit})",
-            overlap_frac * 100.0
-        );
-        let (w, h) = cpu.dimensions();
-        let mean_abs = sum_abs as f64 / (w as f64 * h as f64 * 3.0);
-        assert!(
-            mean_abs < 3.0,
-            "{label}: mean per-channel |cpu-gpu| {mean_abs:.3} should be small (AA-only residual)"
-        );
-    }
-
-    /// (#9) A large orb near a corner pushes its satellites' `radius*1.5` cutoff past
-    /// the frame edge. The shader clips at the cutoff (outside ⇒ background); the GPU
-    /// must still match the CPU within the structural-parity band, proving the
-    /// edge-clipped arc is composited correctly rather than smeared or wrapped.
-    #[test]
-    fn aquarelle_gpu_satellite_cutoff_clipped_at_edge() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_gpu_satellite_cutoff_clipped_at_edge")
-        else {
-            return;
-        };
-        // Big orb (weight 1.0 ⇒ radius == base_radius_unit, large for 64x64) tucked in
-        // the top-left corner so the main + satellites overhang the edge.
-        let clusters = vec![cluster([220, 80, 80], 0.08, 0.08, 1.0)];
-        let params = AquarelleParams {
-            bleed: 1.0,
-            bloom: 0.5,
-            offset: 0.5,
-            halo: 0.5,
-        };
-        let opts = aquarelle_opts(64, 64, params);
-        assert_aquarelle_structural_parity(
-            renderer,
-            &clusters,
-            &opts,
-            0.0,
-            "aquarelle edge-clipped satellites",
-        );
-    }
-
-    /// (#10) Transparent background (`bg.a < 255`, here fully transparent). The shader's
-    /// `0 < acc_a8 < 255` un-premultiply branch in `fs_main` must round-trip premultiplied
-    /// → straight the same way the CPU `finalize_pixmap` does, so GPU↔CPU stay within the
-    /// structural-parity band over a transparent canvas.
-    #[test]
-    fn aquarelle_gpu_transparent_background_premul_roundtrip() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_gpu_transparent_background_premul_roundtrip")
-        else {
-            return;
-        };
-        let clusters = vec![
-            cluster([220, 60, 60], 0.35, 0.4, 0.6),
-            cluster([60, 140, 220], 0.65, 0.6, 0.5),
-        ];
-        let mut opts = aquarelle_opts(80, 80, AquarelleParams::default());
-        opts.background = [0, 0, 0, 0]; // fully transparent canvas
-        assert_aquarelle_structural_parity(
-            renderer,
-            &clusters,
-            &opts,
-            0.0,
-            "aquarelle transparent bg premul round-trip",
-        );
-    }
-
-    /// (#11) Param-corner parity. The existing structural test only exercises the
-    /// default mid (0.5) params; this sweeps representative `{bleed,bloom,halo,offset}`
-    /// corners in `{0,1}` so an extreme-param divergence (e.g. bloom-off vs bloom-max,
-    /// no-bleed vs full-bleed) is caught by the GPU↔CPU structural band.
-    #[test]
-    fn aquarelle_gpu_parity_across_param_corners() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_parity_across_param_corners")
-        else {
-            return;
-        };
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.7),
-            cluster([60, 120, 220], 0.7, 0.6, 0.5),
-        ];
-        // Representative corners (not the full 16 — keep GPU work bounded).
-        let corners = [
-            (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32),
-            (1.0, 0.0, 0.0, 1.0),
-            (0.0, 1.0, 1.0, 0.0),
-            (1.0, 1.0, 1.0, 1.0),
-            (1.0, 0.0, 1.0, 0.0),
-        ];
-        for (bleed, bloom, halo, offset) in corners {
-            let params = AquarelleParams {
-                bleed,
-                bloom,
-                offset,
-                halo,
-            };
-            let opts = aquarelle_opts(72, 72, params);
-            assert_aquarelle_structural_parity(
-                renderer,
-                &clusters,
-                &opts,
-                0.0,
-                &format!(
-                    "aquarelle corner bleed={bleed} bloom={bloom} halo={halo} offset={offset}"
-                ),
-            );
-        }
     }
 }

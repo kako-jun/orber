@@ -18,14 +18,10 @@ exclude = [".github/", "target/"]
 name = "orber"
 path = "src/main.rs"
 
-[features]
-# OFF (default): CPU (tiny-skia) renderer のみ。
-# ON: wgpu (Rust + WGSL) renderer を足し、--renderer gpu を有効化する (#207)。
-default = []
-gpu = ["orber-core/gpu"]
-
 [dependencies]
-orber-core = { path = "../core", version = "0.3.0" }
+# CLI は GPU(WGSL) を唯一のレンダラとする (#225)。orber-core の gpu feature を
+# ハード依存にして、`cargo build -p orber`（--features 無し）で常に GPU ビルドになる。
+orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
 aquarelle = { workspace = true }
 clap = { workspace = true }
 image = { workspace = true, default-features = true }

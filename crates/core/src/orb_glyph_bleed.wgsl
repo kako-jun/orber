@@ -1,7 +1,7 @@
 // orber #214 Phase 1b.5 — Glyph orb の aquarelle bleed/halo パスを WGSL 化。
 //
-// CPU 経路（`crate::animate::render_frame` が全 orb 描画後に 1 回かける
-// `aquarelle::render_aquarelle_bleed_pass`、default params seed=0）を 2nd pass 群
+// 参照アルゴリズムは `aquarelle::render_aquarelle_bleed_pass`（default params
+// seed=0）— glyph / image の全 orb 描画後に 1 回かける紙にじみパス。これを 2nd pass 群
 // として GPU に写したもの。glyph fill（#212、straight RGBA を中間テクスチャに描画）
 // を入力に、premultiply → 分離 box-blur×3 → halo saturation → compose → finalize
 // の順で backbuffer に straight RGBA を出力する。
@@ -17,19 +17,19 @@
 //      a==0 は hue 未定義なのでスキップ。
 //   4. paper-grain noise（ChaCha8Rng(seed=0) をピクセル順消費、振幅 ±0.1*intensity）。
 //      **GPU では省略する。** ChaCha8 のピクセル順消費は並列 GPU で bit 一致再現が
-//      非現実的で、効果も faint（±0.05）。loose parity の確定方針。CPU との差は
-//      期待値（将来 WGSL hash で近似可）。
+//      非現実的で、効果も faint（±0.05）。省略を確定方針とする（aquarelle crate の
+//      出力との差はこの noise ぶん。将来 WGSL hash で近似可）。
 //   5. compose: dst = original*(1-intensity) + blurred*intensity（全 channel・premult）。
 //      intensity = 0.5。
 //
 // すべて premult RGBA（0..1）で処理し、最後の compose で finalize（un-premult して
 // straight 化）する。box-blur は textureLoad（整数 texel fetch）で隣接 texel を読み、
-// CPU の格子点平均と一致させる（sampler 補間は使わない）。clamp-to-edge は
+// crate の格子点平均と一致させる（sampler 補間は使わない）。clamp-to-edge は
 // clamp(coord, 0, dim-1) で実装。
 //
-// パリティ範囲: bit-exact は課さない。構造 + 緩い許容（halo が lit cluster 周囲に出る /
-// lit pixel が bleed 後も visible / 空 clusters・weight0 は背景黒）。noise 省略ぶんと
-// HSL 実装差は CPU と差が出るが期待値。
+// 検証方針: aquarelle crate との bit-exact は課さない。構造 + 緩い許容（halo が lit
+// cluster 周囲に出る / lit pixel が bleed 後も visible / 空 clusters・weight0 は背景黒）
+// を GPU 構造テストで確認する。noise 省略ぶんと HSL 実装差は crate と差が出るが期待値。
 
 struct BleedParams {
     resolution: vec2<f32>, // (width, height) px
@@ -76,7 +76,7 @@ fn load_premult(ix: i32, iy: i32) -> vec4<f32> {
     return c;
 }
 
-// 量子化（CPU の各 box-blur パス末尾 `(v).clamp(0,255).round() as u8` を写す）。
+// 量子化（aquarelle crate の各 box-blur パス末尾 `(v).clamp(0,255).round() as u8` を写す）。
 // 中間ターゲットは Rgba8Unorm なので store で同じ丸めが起きるが、明示しておく。
 fn quantize8(v: vec4<f32>) -> vec4<f32> {
     return floor(clamp(v, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + 0.5) / 255.0;
@@ -214,7 +214,7 @@ fn fs_halo(in: VsOut) -> @location(0) vec4<f32> {
 
 // compose + finalize: dst_premult = original*(1-t) + blurred*t、その後 finalize で
 // straight 化して出力（backbuffer は Rgba8Unorm）。original は src（glyph fill の
-// straight）を premult 化して再現する（CPU の original premult スナップショット相当）。
+// straight）を premult 化して再現する（crate の original premult スナップショット相当）。
 @fragment
 fn fs_compose(in: VsOut) -> @location(0) vec4<f32> {
     let w = i32(params.resolution.x);
