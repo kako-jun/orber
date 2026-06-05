@@ -1236,7 +1236,7 @@ impl GpuRenderer {
         height: f32,
         base_radius_unit: f32,
         saturation: f32,
-        params: crate::aquarelle::AquarelleParams,
+        params: aquarelle::AquarelleParams,
     ) -> Vec<GpuAquaOrb> {
         use std::f32::consts::TAU;
 
@@ -4499,7 +4499,7 @@ mod tests {
 
     // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
 
-    use crate::aquarelle::AquarelleParams;
+    use aquarelle::AquarelleParams;
 
     fn aquarelle_opts(w: u32, h: u32, params: AquarelleParams) -> AnimateOptions {
         AnimateOptions {

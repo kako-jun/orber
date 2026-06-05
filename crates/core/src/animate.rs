@@ -1662,7 +1662,7 @@ mod tests {
         // 異なるはず（左上→右下の対角ドリフト）。
         let clusters = drift_static_clusters();
         let mut opts = opts_with(MotionDirection::LeftToRight, MotionSpeed::Slow);
-        opts.shape = OrbShape::Aquarelle(crate::aquarelle::AquarelleParams::default());
+        opts.shape = OrbShape::Aquarelle(aquarelle::AquarelleParams::default());
         opts.keyframe_tracks = Some(drift_keyframe_tracks());
 
         let a = render_frame(&clusters, &opts, 0.0);
