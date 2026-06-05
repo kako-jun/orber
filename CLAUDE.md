@@ -83,7 +83,7 @@ orber/
             │                   #   get_glyph_sdf（フォント文字 → SDF）。実描画は WebGL2 fragment shader 側
             └── gpu.rs          # WebGPU canvas present 経路（#230、wasm32 専用 cfg）。
                                 #   gpu_init / gpu_set_render_data / gpu_render / gpu_resize。
-                                #   core の GpuRenderer(WGSL) が canvas surface に直接描く。Circle のみ（#231 で拡張）
+                                #   core の GpuRenderer(WGSL) が canvas surface に直接描く。Orb のみ（#231 で拡張）
 
 web/                        # Web フロントエンド (#37, #38)
 ├── astro.config.mjs        #   Astro 4 / output: 'static' / Solid + Tailwind

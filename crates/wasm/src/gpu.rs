@@ -17,7 +17,7 @@
 //!
 //! ## 形状について
 //!
-//! 現状 **Circle のみ**の最小経路だが、API は形状に閉じていない:
+//! 現状 **Orb のみ**の最小経路だが、API は形状に閉じていない:
 //! `gpu_set_render_data` は `params.shape` をそのまま `build_render_pack` に
 //! 通す（shape_id が pack に入る）ので、Glyph / Image / Aquarelle（#231）は
 //! shape ごとの SDF / aquarelle pack の保持と `render_frame_*_to_view` への
