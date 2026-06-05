@@ -35,12 +35,12 @@ CSS / SVG output is attractive because it is essentially zero-byte, infinitely l
 The CLI exposes the following flags (run `orber --help` for the authoritative list):
 
 - `--orb-size` — relative orb size multiplier (small = many tiny orbs, large = few soft blobs)
-- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). In Glyph mode this now controls the same edge falloff width used by circle orbs.
+- `--blur` — blur intensity in 0.0..=1.0 (sharp ↔ fully diffused). In Glyph mode this controls the same edge falloff width used by plain orbs.
 - `--count` — orbs visible on screen at once (1..=1024, default 20)
 - `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
-- `--shape` — `circle`, `aquarelle` (watercolor bleed), `glyph` (text character), or `image` (silhouette from `--image-mask`)
+- `--shape` — `orb`, `aquarelle` (watercolor bleed), `glyph` (text character), or `image` (silhouette from `--image-mask`)
 - `--glyph-char` — single character used when `--shape glyph` (default `☆`)
 - `--image-mask` — silhouette image used when `--shape image` (the *shape* source; `--input` stays the *color* source). Raster only (PNG/JPEG/…); SVG is web-only
 - `--softness` — blur/edge-softness preset: `low` / `mid` / `high` (default `mid`, existing behavior)
@@ -133,7 +133,7 @@ in 8 seconds (4 s/cross), with `2x` orbs proportionally faster.
 > Note: the aquarelle shape uses the legacy `[0, 1]` wrap. Its bleed / bloom / halo
 > textures clip cleanly enough that the off-screen wrap buffer would interfere with
 > the halo rendering. The `[-r, 1+r]` off-screen wrap described above applies to
-> the `circle` and `glyph` shapes.
+> the `orb`, `glyph`, and `image` shapes.
 
 ## Orb count and visual mix (v0.3.0)
 
@@ -233,10 +233,10 @@ How `centroid` drift becomes visible depends on the orb shape:
 
 - **Aquarelle** shape uses `cluster.centroid` directly for orb placement, so the
   input video's compositional motion is fully reflected in the output.
-- **Circle** shape blends `cluster.centroid` drift with the per-orb seeded
+- **Orb** shape blends `cluster.centroid` drift with the per-orb seeded
   `cross_axis` at 50:50 to keep the input video's compositional motion visible
   without losing the per-orb scatter that prevents stripe artifacts. With
-  `--input-mode color-track` (#7) or still-image input, Circle uses `cross_axis`
+  `--input-mode color-track` (#7) or still-image input, the orb uses `cross_axis`
   alone (existing behavior preserved).
 
 Output length is still set entirely by `--duration-ms`. A 3-minute clip
@@ -266,21 +266,24 @@ yields an explicit error rather than silently degrading. The default
 
 The aquarelle (watercolor bleed) shape generator now ships as its own external
 crate at [`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is
-pulled in via `aquarelle = "0.2"` in `Cargo.toml`. `orber-core` consumes it in
-two distinct places:
+pulled in via `aquarelle = "0.2"` in `Cargo.toml`. Since #235 it backs **only**
+the `OrbShape::Aquarelle` shape:
 
 - **`OrbShape::Aquarelle`** follows the crate's four-layer `render_aquarelle_orb`
   model. The GPU shader (`orb_aquarelle.wgsl`) evaluates those layers analytically;
   the ChaCha8 RNG / HSL color math is run host-side in the parameter pack so it stays
   byte-identical to the crate, and the resulting centers / radii / colors are uploaded.
-- **`OrbShape::Glyph` and `OrbShape::Image`** run a single full-frame bleed pass
-  (the `render_aquarelle_bleed_pass` algorithm, translated to WGSL in
-  `orb_glyph_bleed.wgsl`) after all SDF orbs have been drawn, so the SDF-derived
-  outline picks up the same paper-bleed softness even though each orb itself is
-  still a glyph / silhouette fill. Both share the GPU SDF render path
+- **`OrbShape::Glyph` and `OrbShape::Image`** no longer run an aquarelle bleed
+  pass. As of #235 they are fed to the **same orb mechanism** as `OrbShape::Orb`:
+  the SDF sample becomes the normalized distance `r`, which the unified shader
+  (`orb.wgsl`, SDF variant) blurs with the orb's `falloff_curve` / 3-axis breath /
+  Skia-lowp compositing in a single pass. The glyph / image silhouette is simply a
+  different shape fed to the orb — a `●` glyph looks like a plain orb, a `▲` blurs
+  while keeping its triangular form. The old `render_aquarelle_bleed_pass`-derived
+  2nd pass (`orb_glyph_bleed.wgsl`) and its bleed/halo are removed; "bleed" is the
+  Aquarelle shape's domain only. Both glyph and image share the GPU SDF render path
   (`render_frame_glyph` / `render_frame_image`); the only difference is the SDF
   source (a bundled font glyph vs. an image silhouette from `--image-mask`).
-  `OrbShape::Circle` does not invoke either path.
 
 ## Workspace layout
 
@@ -458,22 +461,19 @@ color. The pipeline:
    silhouette (pure Rust, wasm-capable — replaced the earlier Skia-based path in
    #223). The silhouette is turned into a cached signed-distance field via the
    shared `mask_to_sdf` (EDT → signed-unit → u8).
-4. The glyph is drawn from that SDF on the GPU: the Glyph WGSL shader
-   (`orb_glyph.wgsl`) bilinear-samples the SDF and applies the same Rim/Soft
-   `falloff_curve` circle orbs use, so **`--blur` and `--softness` both affect
-   Glyph mode** with the same edge-falloff meaning rather than a hard text fill.
-   Each orb's rotation (#136) is applied in the shader.
-5. After every glyph orb is drawn, Glyph mode runs a single full-frame aquarelle
-   bleed pass (the `render_aquarelle_bleed_pass` algorithm with
-   `AquarelleBleedParams::default()` and a fixed seed), translated to WGSL as a
-   2nd pass (`orb_glyph_bleed.wgsl`, #214). This adds a paper-bleed-style softening
-   to the SDF-derived outline so the Glyph result sits closer to the Circle and
-   Aquarelle shapes in overall feel. The pass runs for the **SDF shapes
-   (`OrbShape::Glyph` and `OrbShape::Image`)** only; Circle and Aquarelle skip it.
-   It uses a fixed seed across frames so the bleed pattern stays stable instead of
-   flickering. The box-blur / halo / intensity match the crate; the aquarelle
-   paper-grain noise is omitted on the GPU (its per-pixel ChaCha8 order cannot be
-   bit-reproduced in parallel), which is an accepted, expected difference.
+4. The glyph is drawn from that SDF on the GPU through the **unified orb
+   mechanism** (#235): the SDF orb variant of `orb.wgsl` bilinear-samples the SDF,
+   turns the signed-distance value into the normalized distance `r = 1 - signed_unit`,
+   and feeds it to the **same** Rim/Soft `falloff_curve` / 3-axis breath /
+   Skia-lowp premultiply compositing the plain `orb` shape uses. So **`--blur` and
+   `--softness` affect Glyph mode** with the same edge-falloff meaning rather than a
+   hard text fill, and the glyph blurs exactly like an orb. Each orb's rotation
+   (#136) is applied to the SDF sample coordinates in the shader (before sampling).
+5. That is the **only** pass. Since #235 there is no aquarelle bleed/halo 2nd pass
+   for Glyph / Image — the old `orb_glyph_bleed.wgsl` group is removed. The glyph /
+   image silhouette is just a different shape fed to the orb (a `●` glyph looks like
+   a plain orb; a `▲` blurs while keeping its triangular form). "Bleed" is the
+   Aquarelle shape's domain only.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).
@@ -560,7 +560,7 @@ speed / softness without dropping to the terminal.
 - `WasmParams` gains four optional string fields (`glyph_char`, `count_preset`,
   `speed_preset`, `softness_preset`) all defaulting to `""` (= "use the spec
   / Phase A behaviour"). `parse_shape` accepts `"glyph"` in addition to
-  `"circle"`.
+  `"orb"` (renamed from `"circle"` in #235).
 - The browser now bakes Glyph **signed-distance fields** via
   `orber_core::glyph::render_glyph_sdf(font, ch, size) -> Vec<u8>`. The wasm
   wrapper exports it as `get_glyph_sdf(ch, size) -> Uint8Array` and caches per
@@ -623,7 +623,7 @@ speed / softness without dropping to the terminal.
 - Studio UI (#131): the collapsible Advanced section is gone. Instead, the
   four axes are always visible as flat control rows directly under the aspect
   toggles. Every control immediately re-runs the batch:
-  - Shape = Circle / Glyph + inline glyph input
+  - Shape = Orb / Glyph + inline glyph input
   - Count = Few / Standard / Many → 10 / 20 / 30
   - Speed = Slow / Standard / Fast → VerySlow / Slow / Mid
   - Softness = Low / Standard / High → sharp / identity / soft

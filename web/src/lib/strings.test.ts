@@ -157,4 +157,16 @@ describe('lang signal + t()', () => {
     expect(t('viewsLabelPrefix')).toBe('');
     expect(t('viewsLabelSuffix')).toBe(' views');
   });
+
+  test('shapeOptionOrb は ja/en とも定義され、旧 shapeOptionCircle は存在しない (#235)', async () => {
+    // #235 で内部の shape 名を circle → orb に統一し、文言キーも
+    // shapeOptionCircle → shapeOptionOrb に改名した。旧キーが残っていると
+    // Studio.tsx 側で復活させて二重管理・表示揺れになるため、新キーが ja/en とも
+    // 定義され、旧キーが STRINGS から消えていることを直接押さえる。
+    const { STRINGS } = await import('./strings');
+    expect('shapeOptionCircle' in STRINGS).toBe(false);
+    expect(STRINGS.shapeOptionOrb).toBeDefined();
+    expect(STRINGS.shapeOptionOrb.ja).toBe('オーブ');
+    expect(STRINGS.shapeOptionOrb.en).toBe('Orb');
+  });
 });

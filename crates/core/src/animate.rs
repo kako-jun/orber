@@ -155,7 +155,7 @@ impl Default for AnimateOptions {
             seed: 0,
             count: None,
             background: [0, 0, 0, 255],
-            shape: OrbShape::Circle,
+            shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
@@ -430,8 +430,9 @@ fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
     (raw * TAU + phi).sin()
 }
 
-/// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU(`orb_glyph.wgsl`) が
-/// 行うため、本関数は WGSL の `glyph_rotation_angle` と式が一致することを担保する
+/// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU の SDF variant
+/// （`orb.wgsl` を `gpu.rs` の `orb_sdf_wgsl()` が合成）が行うため、本関数は WGSL の
+/// `glyph_rotation_angle` と式が一致することを担保する
 /// テスト（`wgsl_glyph_rotation_angle_matches_rust_rem_euclid`）専用の reference。
 /// #225 で CPU 描画が消え、lib 本体からの呼び出しは無くなったので `cfg(test)`。
 #[cfg(test)]

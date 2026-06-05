@@ -350,7 +350,7 @@ mod tests {
     }
 
     /// #217 (#10) / #225: `shape = Image` の `VideoOptions` が `render_video` のフレーム
-    /// 描画経路（AnimateOptions 構築）を通っても Image として伝播し、Circle に退化しない
+    /// 描画経路（AnimateOptions 構築）を通っても Image として伝播し、Orb に退化しない
     /// こと。`OrbShape` が `Copy` → `Clone` 化された際に `shape: opts.shape.clone()` の
     /// clone を入れ忘れると shape が落ちる回帰を、構築した AnimateOptions の shape 判定で
     /// 検出する。#225 で CPU 描画を撲滅したため、実描画差分の検証は gpu.rs の GPU 構造
@@ -364,24 +364,24 @@ mod tests {
             count: Some(8),
             ..VideoOptions::default()
         };
-        let circle_opts = VideoOptions {
-            shape: OrbShape::Circle,
+        let orb_opts = VideoOptions {
+            shape: OrbShape::Orb,
             count: Some(8),
             ..VideoOptions::default()
         };
 
         let img_frame_opts = frame_opts_like_render_video(&image_opts, w, h);
-        let circle_frame_opts = frame_opts_like_render_video(&circle_opts, w, h);
+        let orb_frame_opts = frame_opts_like_render_video(&orb_opts, w, h);
 
         // 組み立てた AnimateOptions の shape が Image のまま伝播していること。
         assert!(
             matches!(img_frame_opts.shape, OrbShape::Image { .. }),
             "VideoOptions Image shape must survive into the render_video frame AnimateOptions"
         );
-        // Circle 側は Circle のまま（取り違えていないこと）。
+        // Orb 側は Orb のまま（取り違えていないこと）。
         assert!(
-            matches!(circle_frame_opts.shape, OrbShape::Circle),
-            "VideoOptions Circle shape must stay Circle"
+            matches!(orb_frame_opts.shape, OrbShape::Orb),
+            "VideoOptions Orb shape must stay Orb"
         );
     }
 

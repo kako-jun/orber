@@ -105,7 +105,7 @@ pub struct WasmParams {
     pub softness_preset: String,
     /// Glyph 形状時に per-orb 回転をアニメーションさせるか（#136）。
     /// `true` で従来挙動、`false` で全 t において base_angle を保つ静止描画。
-    /// Circle 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
+    /// Orb 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
     /// で省略時は `true`（従来挙動互換）。既存の wasm caller が `glyph_rotate`
     /// フィールドを送っていなくても `true` でデシリアライズされるため影響を受けない。
     #[serde(default = "default_glyph_rotate")]
@@ -180,10 +180,10 @@ fn first_char_of(s: &str) -> Result<char, String> {
 }
 
 fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
-    // OrbShape::Aquarelle はパラメータが多いので wasm 入口では `circle` / `glyph` のみ受ける。
-    // Aquarelle は将来必要になったら別 API を生やす。
+    // OrbShape::Aquarelle はパラメータが多いので wasm 入口では `orb` / `glyph` のみ受ける。
+    // Aquarelle は将来必要になったら別 API を生やす。#235 で `circle` → `orb` に統一。
     match s {
-        "circle" => Ok(OrbShape::Circle),
+        "orb" => Ok(OrbShape::Orb),
         "glyph" => {
             let ch = first_char_of(glyph_char)?;
             Ok(OrbShape::Glyph {
@@ -192,7 +192,7 @@ fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
             })
         }
         other => Err(format!(
-            "invalid shape: {other} (expected 'circle' or 'glyph')"
+            "invalid shape: {other} (expected 'orb' or 'glyph')"
         )),
     }
 }
@@ -200,7 +200,7 @@ fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
 /// WebGL fragment shader 用の shape_id を返す (#172 N2)。
 ///
 /// per-orb pack は SDF を持たない（SDF は web が WebGL に直接 upload する）ので、
-/// wasm 側が形状について返すのは shape_id（0=Circle / 1=Glyph・Image）だけで足りる。
+/// wasm 側が形状について返すのは shape_id（0=Orb / 1=Glyph・Image）だけで足りる。
 ///
 /// - `"image"` (#217): char は不要。web が画像から生成した SDF テクスチャを upload
 ///   するため、wasm は SDF を持たず Glyph と同じ SDF サンプル経路に乗せるだけ。
@@ -212,7 +212,7 @@ fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
         return Ok(1.0);
     }
     match parse_shape(shape, glyph_char)? {
-        OrbShape::Circle => Ok(0.0),
+        OrbShape::Orb => Ok(0.0),
         OrbShape::Glyph { .. } => Ok(1.0),
         _ => Ok(0.0),
     }
@@ -221,17 +221,17 @@ fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
 /// #230 レビュー S1: WebGPU canvas present 経路（[`gpu`] モジュール）が現時点で
 /// 描ける shape かを検証する。glyph / image の SDF upload と aquarelle pack の
 /// 配線は #231 の領分で、それまで `gpu_render` は orb パイプライン
-/// （`render_packed_to_view`、SDF 無し）しか持たない。circle 以外を黙って受理
+/// （`render_packed_to_view`、SDF 無し）しか持たない。orb 以外を黙って受理
 /// すると orb として誤描画される（silent wrong-render）ため、明確なエラーで
 /// reject する。wasm32 専用の gpu.rs から呼ぶが、エラー文言を native テストで
 /// 固定するため `cfg(any(wasm32, test))` で共有部に置く。
 #[cfg(any(target_arch = "wasm32", test))]
 fn ensure_gpu_supported_shape(shape: &str) -> Result<(), String> {
-    if shape == "circle" {
+    if shape == "orb" {
         Ok(())
     } else {
         Err(format!(
-            "gpu renderer: shape '{shape}' is not wired yet (#231); only 'circle' is supported"
+            "gpu renderer: shape '{shape}' is not wired yet (#231); only 'orb' is supported"
         ))
     }
 }
@@ -451,7 +451,7 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 /// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow, 3 = Mid, 4 = Fast)
 /// - `[8]`: n_orbs (整数を f32 として)
 /// - `[9]`: softness_alpha_mul (0..1) — Phase B (#55)。Mid なら 0.55 (#205 後)
-/// - `[10]`: shape_id (0=Circle, 1=Glyph/Image) — Phase B (#55) / #172 N2。
+/// - `[10]`: shape_id (0=Orb, 1=Glyph/Image) — Phase B (#55) / #172 N2。
 ///   Image は web が SDF を upload するため Glyph と同じ shape_id=1 に乗る。
 /// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
 /// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
@@ -490,7 +490,7 @@ pub fn get_render_data(
 /// count 上限 30 を大きく下回るため、Phase 3 で WebGL を撤去するまでは
 /// 同一バリデーションで揃えておく）。
 fn build_render_pack(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, String> {
-    // Phase B (#55) / #172 N2: shape = "circle" | "glyph" | "image"。
+    // Phase B (#55) / #172 N2: shape = "orb" | "glyph" | "image"。
     // glyph_char は Glyph のときに必須（image は char 不要）。webgl_shape_id が
     // 形状に応じた shape_id を返しつつ glyph のバリデーションを維持する。
     let shape_id = webgl_shape_id(&p.shape, &p.glyph_char)?;
@@ -552,9 +552,9 @@ fn build_render_pack(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32
     // #205 以降 Mid は +0.25 で blurry 寄りの新 default。
     let base_blur = (spec.blur + softness.blur_offset()).clamp(0.0, 1.0);
     let alpha_mul = softness.alpha_mul().clamp(0.0, 1.0);
-    // #205: Glyph/image アーム smoothstep 幅を softness 連動。Circle は参照しない。
+    // #205: Glyph/image アーム smoothstep 幅を softness 連動。Orb は参照しない。
     let edge_softness = softness.edge_softness();
-    // shape_id は webgl_shape_id で算出済み（Circle=0 / Glyph・Image=1）。#172 N2 で
+    // shape_id は webgl_shape_id で算出済み（Orb=0 / Glyph・Image=1）。#172 N2 で
     // image を wasm 入口へ直接受けるようになり、web 側のダミー glyph_char 受け渡しは廃止。
     // image の SDF は web が WebGL に upload するので、wasm は Glyph と同じ shape_id=1 に
     // 乗せて同一の SDF サンプル経路で描かせる（描画結果は従来と不変）。
@@ -779,8 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_shape_circle_and_glyph() {
-        assert!(matches!(parse_shape("circle", ""), Ok(OrbShape::Circle)));
+    fn parse_shape_orb_and_glyph() {
+        assert!(matches!(parse_shape("orb", ""), Ok(OrbShape::Orb)));
         // glyph では glyph_char が必須。空はエラー。
         assert!(parse_shape("glyph", "").is_err());
         let g = parse_shape("glyph", "☆").unwrap();
@@ -791,13 +791,13 @@ mod tests {
     }
 
     /// #172 N2: webgl_shape_id が shape 文字列を直接 shape_id にマップする。
-    /// image は char 不要で 1.0、circle は 0.0、glyph は char 必須で 1.0。
+    /// image は char 不要で 1.0、orb は 0.0、glyph は char 必須で 1.0。
     /// 不正 shape / 空 glyph_char は parse_shape 経由で Err になる。
     #[test]
     fn webgl_shape_id_maps_shapes() {
         // image は glyph_char 不要で shape_id=1（Glyph と同じ SDF サンプル経路）。
         assert_eq!(webgl_shape_id("image", "").unwrap(), 1.0);
-        assert_eq!(webgl_shape_id("circle", "").unwrap(), 0.0);
+        assert_eq!(webgl_shape_id("orb", "").unwrap(), 0.0);
         assert_eq!(webgl_shape_id("glyph", "☆").unwrap(), 1.0);
         // glyph は glyph_char 必須。空はエラー（parse_shape のバリデーション維持）。
         assert!(webgl_shape_id("glyph", "").is_err());
@@ -806,18 +806,18 @@ mod tests {
     }
 
     /// #230 レビュー S1: WebGPU 経路（gpu_set_render_data）は #231 で配線される
-    /// まで circle のみ。glyph / image を黙って orb として誤描画しないよう、
+    /// まで orb のみ。glyph / image を黙って orb として誤描画しないよう、
     /// reject とそのエラー文言をここで固定する。
     #[test]
     fn ensure_gpu_supported_shape_rejects_unwired_shapes() {
-        assert!(ensure_gpu_supported_shape("circle").is_ok());
+        assert!(ensure_gpu_supported_shape("orb").is_ok());
         assert_eq!(
             ensure_gpu_supported_shape("glyph").unwrap_err(),
-            "gpu renderer: shape 'glyph' is not wired yet (#231); only 'circle' is supported"
+            "gpu renderer: shape 'glyph' is not wired yet (#231); only 'orb' is supported"
         );
         assert_eq!(
             ensure_gpu_supported_shape("image").unwrap_err(),
-            "gpu renderer: shape 'image' is not wired yet (#231); only 'circle' is supported"
+            "gpu renderer: shape 'image' is not wired yet (#231); only 'orb' is supported"
         );
     }
 
@@ -856,7 +856,7 @@ mod tests {
             count: 10,
             orb_size: 3.0,
             blur: 0.5,
-            shape: "circle".into(),
+            shape: "orb".into(),
             // Phase B (#55): 既存挙動互換のため空文字。
             glyph_char: String::new(),
             count_preset: String::new(),

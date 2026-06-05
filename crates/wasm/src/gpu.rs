@@ -18,7 +18,7 @@
 //! ## 形状について
 //!
 //! 現状 **Orb のみ**の最小経路。`gpu_set_render_data` は #231 で配線されるまで
-//! circle 以外の shape（glyph / image）を明確なエラーで reject する
+//! orb 以外の shape（glyph / image）を明確なエラーで reject する
 //! （`ensure_gpu_supported_shape`）。`gpu_render` は orb パイプライン
 //! （`render_packed_to_view`、SDF 無し）しか持たないため、黙って受理すると
 //! orb として誤描画される。Glyph / Image / Aquarelle（#231）は shape ごとの
@@ -179,12 +179,12 @@ pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsEr
 /// キャッシュ込み）なので、同じ params なら WebGL 版と同一の pack になる。
 /// モーションは pack に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
 ///
-/// shape は #231 で配線されるまで `"circle"` のみ。glyph / image は orb として
+/// shape は #231 で配線されるまで `"orb"` のみ。glyph / image は orb として
 /// 誤描画されるため明確なエラーで reject する（モジュール doc「形状について」）。
 #[wasm_bindgen]
 pub fn gpu_set_render_data(params_js: JsValue, n: u32, spec_idx: u32) -> Result<(), JsError> {
     let p = deserialize_params(params_js).map_err(err_to_js)?;
-    // S1: gpu_render は orb パイプラインしか持たない。circle 以外は silent
+    // S1: gpu_render は orb パイプラインしか持たない。orb 以外は silent
     // wrong-render になるため、pack を構築する前に reject する。
     ensure_gpu_supported_shape(&p.shape).map_err(err_to_js)?;
     let pack = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;

@@ -184,7 +184,7 @@ type Req =
     }
   // #56: 透過 PNG または透過 WebP を返す静止画 alpha 経路。`format` で出し分ける。
   // wasm の get_render_data 出力をそのまま流用し、bg.a だけを 0 に上書きして
-  // canvas を描画する。Circle / Glyph どちらの shape でも straight alpha が残る。
+  // canvas を描画する。Orb / Glyph どちらの shape でも straight alpha が残る。
   | {
       kind: 'generateOneAlpha';
       id: number;

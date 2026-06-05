@@ -491,7 +491,8 @@ pub fn cached_glyph_sdf_for_radius(
 }
 
 /// The glyph SDF content-span constant (`1/√2`), exposed for the GPU shader so the
-/// UV mapping in `orb_glyph.wgsl` matches the SDF bake (`render_glyph_binary_mask`).
+/// UV mapping in the SDF variant of `orb.wgsl` (composed by `gpu.rs`'s
+/// `orb_sdf_wgsl()`) matches the SDF bake (`render_glyph_binary_mask`).
 pub const GLYPH_SDF_CONTENT_SPAN_PUB: f32 = GLYPH_SDF_CONTENT_SPAN;
 
 #[inline]

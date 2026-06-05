@@ -147,8 +147,8 @@ impl From<CliVariationMode> for VariationMode {
 /// Shape used to render each orb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Shape {
-    /// Plain circular orb (default).
-    Circle,
+    /// Plain orb: a single soft radial gradient (default).
+    Orb,
     /// Cel-painted nightscape texture set: bleed + bloom + offset + halo.
     Aquarelle,
     /// One bundled-font glyph filled per orb (#55). Pick the glyph with --glyph-char.
@@ -287,7 +287,7 @@ struct Cli {
     count_preset: Option<CliCountPreset>,
 
     /// Orb rendering shape.
-    #[arg(long, value_enum, default_value_t = Shape::Circle)]
+    #[arg(long, value_enum, default_value_t = Shape::Orb)]
     shape: Shape,
 
     /// Glyph character used when --shape glyph (#55). Must be a single character.
@@ -366,7 +366,7 @@ impl Cli {
     /// has no usable contrast, so callers can `eprintln!` and exit cleanly.
     fn orb_shape(&self) -> Result<OrbShape, String> {
         match self.shape {
-            Shape::Circle => Ok(OrbShape::Circle),
+            Shape::Orb => Ok(OrbShape::Orb),
             Shape::Aquarelle => Ok(OrbShape::Aquarelle(self.aquarelle_params())),
             Shape::Glyph => Ok(OrbShape::Glyph {
                 ch: self.glyph_char,
@@ -492,9 +492,9 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
 
 /// 単一フレーム描画のバックエンド。GPU(WGSL) を唯一のレンダラとする (#225)。
 ///
-/// 全 shape（Circle / Glyph / Aquarelle / Image）が GPU 上で描かれる。count は 1024 まで
-/// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph は #212
-/// Phase 1b で WGSL 化（SDF fill + 回転）、Image は同じ SDF shader を共有（#217）、Aquarelle
+/// 全 shape（Orb / Glyph / Aquarelle / Image）が GPU 上で描かれる。count は 1024 まで
+/// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph / Image は
+/// #235 で orb 機構に統一（SDF を orb に食わせる単パス、bleed/halo は撲滅）、Aquarelle
 /// は #216 Phase 1c で WGSL 化（4 層を解析 radial で評価、RNG/色は pack で算出）。GPU アダプタ
 /// が取得できない場合は CPU にフォールバックせず、`new` が `None` を返すので呼び出し側が
 /// 明示エラーで終了する（CPU 描画は撲滅済み）。
@@ -522,9 +522,9 @@ impl FrameRenderer {
         t: f32,
     ) -> image::RgbaImage {
         match &opts.shape {
-            // Glyph uses the dedicated WGSL glyph path (#212); Image the same SDF
-            // path with a supplied texture (#217); Aquarelle the dedicated WGSL
-            // four-layer path (#216); Circle the default.
+            // Glyph / Image feed an SDF silhouette to the unified orb mechanism
+            // (#235, single pass, no bleed); Aquarelle uses the dedicated WGSL
+            // four-layer path (#216); Orb is the default analytic-circle path.
             OrbShape::Glyph { .. } => self.gpu.render_frame_glyph(clusters, opts, t),
             OrbShape::Image { .. } => self.gpu.render_frame_image(clusters, opts, t),
             OrbShape::Aquarelle(_) => self.gpu.render_frame_aquarelle(clusters, opts, t),
@@ -598,12 +598,12 @@ fn resolve_orb_shape(cli: &Cli) -> Result<OrbShape, ExitCode> {
 }
 
 fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
-    // SVG / CSS 出力は静的な radial-gradient のみで orb 形状を持たないため、
+    // SVG / CSS 出力は静的な radial-gradient のみで shape を持たないため、
     // `--shape`（と `--shape image` の `--image-mask`）は無視される。黙って円に
-    // 落ちると驚くので、circle 以外を指定したら警告する（PNG / video 出力では効く）。
-    if cli.shape != Shape::Circle {
+    // 落ちると驚くので、orb 以外を指定したら警告する（PNG / video 出力では効く）。
+    if cli.shape != Shape::Orb {
         eprintln!(
-            "orber: warning: --shape {:?} is ignored for {:?} output (SVG/CSS render circles only); use a PNG or video output to apply the orb shape",
+            "orber: warning: --shape {:?} is ignored for {:?} output (SVG/CSS render plain orbs only); use a PNG or video output to apply the orb shape",
             cli.shape, mode
         );
     }
@@ -777,7 +777,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         color_tracks: None,
         keyframe_tracks: None,
     };
-    // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Circle/Glyph/Aquarelle/
+    // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Orb/Glyph/Aquarelle/
     // Image）に対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
     let renderer = match init_renderer() {
         Ok(r) => r,
@@ -1649,21 +1649,22 @@ mod tests {
         assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
     }
 
-    /// #212 (#11) / #225: `FrameRenderer::render()` must dispatch by `opts.shape` —
-    /// Glyph opts go to `render_frame_glyph`, Circle opts to `render_frame`. This
-    /// pins the `render()` match arm (main.rs) that picks the GPU sub-path: the two
-    /// sub-paths produce visibly different images for the same parameters (a star
-    /// SDF fill vs round orbs), so the dispatch is observable.
+    /// #212 (#11) / #225 / #235: `FrameRenderer::render()` must dispatch by
+    /// `opts.shape` — Glyph opts go to `render_frame_glyph`, Orb opts to
+    /// `render_frame`. This pins the `render()` match arm (main.rs) that picks the
+    /// GPU sub-path: the two sub-paths produce visibly different images for the same
+    /// parameters (a star SDF silhouette vs round orbs), so the dispatch is
+    /// observable.
     ///
     /// GPU-required-aware: with `ORBER_REQUIRE_GPU=1` a missing adapter is a hard
     /// failure; otherwise it SKIPs. The CLI always builds with the GPU renderer
     /// (#225), so this test is no longer feature-gated.
     #[test]
-    fn frame_renderer_render_dispatches_glyph_vs_circle() {
+    fn frame_renderer_render_dispatches_glyph_vs_orb() {
         use orber_core::cluster::{Centroid, Cluster};
         use orber_core::gpu::GpuRenderer;
 
-        let what = "frame_renderer_render_dispatches_glyph_vs_circle";
+        let what = "frame_renderer_render_dispatches_glyph_vs_orb";
         let Some(gpu) = GpuRenderer::new() else {
             if std::env::var("ORBER_REQUIRE_GPU").as_deref() == Ok("1") {
                 panic!("{what}: ORBER_REQUIRE_GPU=1 but no GPU adapter available");
@@ -1703,7 +1704,7 @@ mod tests {
             seed: 7,
             count: Some(6),
             background: [10, 12, 20, 255],
-            shape: OrbShape::Circle,
+            shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             color_tracks: None,
@@ -1720,36 +1721,38 @@ mod tests {
 
         // Reference sub-path outputs computed directly off the GpuRenderer.
         let glyph_ref = gpu.render_frame_glyph(&clusters, &glyph_opts, 0.0);
-        let circle_ref_for_glyph_params = gpu.render_frame(&clusters, &glyph_opts, 0.0);
-        let circle_ref = gpu.render_frame(&clusters, &base, 0.0);
+        let orb_ref_for_glyph_params = gpu.render_frame(&clusters, &glyph_opts, 0.0);
+        let orb_ref = gpu.render_frame(&clusters, &base, 0.0);
 
         // Sanity: the two GPU sub-paths really differ for these glyph params, so the
-        // dispatch assertion below is meaningful (not trivially satisfied).
+        // dispatch assertion below is meaningful (not trivially satisfied). The
+        // glyph (star SDF silhouette) and plain orb share the orb mechanism (#235)
+        // but the silhouette is different, so the images still differ.
         assert_ne!(
-            glyph_ref, circle_ref_for_glyph_params,
-            "glyph and circle GPU sub-paths must differ for the same params \
+            glyph_ref, orb_ref_for_glyph_params,
+            "glyph and orb GPU sub-paths must differ for the same params \
              (otherwise the dispatch test proves nothing)"
         );
 
         let renderer = FrameRenderer { gpu: Box::new(gpu) };
 
-        // Glyph opts → render() must equal the glyph sub-path, not the circle one.
+        // Glyph opts → render() must equal the glyph sub-path, not the orb one.
         let glyph_dispatched = renderer.render(&clusters, &glyph_opts, 0.0);
         assert_eq!(
             glyph_dispatched, glyph_ref,
             "FrameRenderer::render must dispatch Glyph opts to render_frame_glyph"
         );
         assert_ne!(
-            glyph_dispatched, circle_ref_for_glyph_params,
-            "FrameRenderer::render must NOT send Glyph opts to the circle render_frame"
+            glyph_dispatched, orb_ref_for_glyph_params,
+            "FrameRenderer::render must NOT send Glyph opts to the orb render_frame"
         );
 
-        // Circle opts → render() must equal the circle sub-path.
-        let circle_dispatched = renderer.render(&clusters, &base, 0.0);
+        // Orb opts → render() must equal the orb sub-path.
+        let orb_dispatched = renderer.render(&clusters, &base, 0.0);
         assert_eq!(
-            circle_dispatched, circle_ref,
-            "FrameRenderer::render must dispatch Circle opts to render_frame"
+            orb_dispatched, orb_ref,
+            "FrameRenderer::render must dispatch Orb opts to render_frame"
         );
-        eprintln!("{what}: glyph→glyph, circle→circle dispatch confirmed");
+        eprintln!("{what}: glyph→glyph, orb→orb dispatch confirmed");
     }
 }

@@ -1,6 +1,26 @@
-// orber #207 Phase 0 — Circle orb の production WGSL（native CLI / wgpu）。
+// orber #207 / #235 — orb の production WGSL（native CLI / wgpu）。
 //
-// `web/src/lib/orberGl.ts` の **Circle アーム** を 1:1 で WGSL に翻訳したもの。
+// **orb の機構を全 shape の唯一の機構にしたもの（#235）。** 元は orb_circle.wgsl
+// （`web/src/lib/orberGl.ts` の orb アームを 1:1 で WGSL 化）だったが、#235 で
+// 「orb に別のシルエットを食わせる」形へ一般化した: 各ピクセルの "形からの距離" を
+// 正規化した r を、3 軸呼吸・falloff 曲線・Skia lowp premultiply 合成へ食わせる。
+// この距離の出どころ（DISTANCE SOURCE ブロック）だけが shape ごとに差し替わる:
+//   - orb   : 解析的な円距離（`distance(px, center) / radius`）。**現行と 1 ビットも
+//             変えない**。下流の数式・量子化も orb_circle.wgsl 時代と完全同一。
+//   - glyph / image : SDF サンプル（SDF はまさに "形からの距離" そのもの）。回転を
+//             SDF サンプル前に適用し、signed 距離 → 正規化 r に変換して **同じ**
+//             falloff_curve / composite_premul へ渡す。にじみ（bleed/halo）の追加
+//             パスは持たない（#235 で撲滅。にじみは aquarelle shape の領分）。
+//
+// このシェーダは Rust 側（gpu.rs::orb_wgsl / orb_sdf_wgsl）で DISTANCE SOURCE ブロック /
+// 追加 binding を文字列合成して 2 variant を生成する。共通部（header / per-orb 算術 /
+// falloff / 合成 / finalize）は完全に共有され、「orb に別のものを食わせる」が文字どおり
+// の実装になっている。orb variant は SDF binding を一切持ち込まない（dummy binding
+// 不可）ので、orb の WGSL は orb_circle.wgsl 時代と実質同一に保たれ byte-exact。
+// DISTANCE SOURCE ブロックは loop 本体に**インライン展開**されるので、orb variant の
+// 合成ループは旧 orb_circle.wgsl と文字どおり同一の算術になり、GPU コンパイラの最適化も
+// 変わらない（byte-exact の前提）。
+//
 // per-orb データは `pack_render_data_for_webgl`（= WebGL 経路と同一）が詰めた
 // header(16 words) + per-orb(16 words × n_orbs) を gpu.rs が data-texture に詰め替え、
 // このシェーダは textureLoad で読む。パラメータ算術は再実装せず、gpu.rs 側で pack
@@ -14,8 +34,8 @@
 //     crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS）だけのもので、この WGSL とは無関係。
 //     誤って 64 を同期させないこと。
 //
-// WebGL (orberGl.ts) との対応:
-//   - Circle アームは WebGL GLSL 経路と同式・同パラメータで、GLSL 実装が本番で
+// WebGL (orberGl.ts) との対応（orb DISTANCE SOURCE）:
+//   - orb アームは WebGL GLSL 経路と同式・同パラメータで、GLSL 実装が本番で
 //     byte-near（≤1/255）一致を実証済み。本 WGSL はその GLSL を忠実に写経しているので、
 //     ±2/channel の許容内で一致する（実 GPU では 0）。saturation は
 //     pack_render_data_for_webgl では掛けず（WebGL と共有のため）、native GPU 側
@@ -42,6 +62,9 @@
 
 const TAU: f32 = 6.28318530718;
 const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
+// 1/√2。crate::glyph::GLYPH_SDF_CONTENT_SPAN と同期（SDF DISTANCE SOURCE 用）。Rust 側
+// から override せずここに定数で持つ（Rust 側の値と同値であることを gpu.rs のテストで担保）。
+const GLYPH_SDF_CONTENT_SPAN: f32 = 0.70710678;
 
 struct Params {
     resolution: vec2<f32>, // (width, height) px
@@ -53,9 +76,9 @@ struct Params {
     cycle: f32,            // 1=VerySlow, 2=Slow, 3=Mid, 4=Fast
     n_orbs: f32,           // 整数を f32 で（uniform alignment 簡略化のため）
     alpha_mul: f32,        // softness.alpha_mul
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    glyph_rotate: f32,     // #136: 1.0=ON / 0.0=OFF（SDF source のみ使用、orb は無視）
+    edge_softness: f32,    // #205: 予約（現状未使用）
+    sdf_size: f32,         // glyph/image SDF の一辺（texel 数）。orb は 0。
 };
 
 // per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
@@ -64,10 +87,9 @@ struct Params {
 //   x=0: color = (r, g, b, weight)
 //   x=1: phase = (phase, phi_radius, phi_blur, phi_opacity)
 //   x=2: misc  = (cross_axis, style_bit, speed_mult, _)
-//   x=3: rot   = (base_angle, rot_speed_signed, _, _)  ← Glyph 専用、Circle は無視
+//   x=3: rot   = (base_angle, rot_speed_signed, _, _)  ← SDF source（glyph/image）専用、orb は無視
 //   y  : orb index
-// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。Circle 経路は
-// x=0..2 の 3 つの vec4 だけを読み、回転 (x=3) は未使用なので持ち込まない。
+// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。
 //
 // sampler は持たず textureLoad（texelFetch 相当）のみで読むので linear filtering に
 // 依存しない（gpu.rs の sample_type は Float{ filterable: false }）。これにより
@@ -75,22 +97,14 @@ struct Params {
 // wgpu の WebGL2 backend でも可搬（Phase 2）。
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var orb_tex: texture_2d<f32>;
+//!ORB_EXTRA_BINDINGS
 
-// orb i の 3 つの vec4 を data-texture から読む（mip 0、point fetch）。
-struct Orb {
-    color: vec4<f32>, // (r, g, b, weight)
-    phase: vec4<f32>, // (phase, phi_radius, phi_blur, phi_opacity)
-    misc: vec4<f32>,  // (cross_axis, style_bit, speed_mult, _)
-};
-
-fn load_orb(i: u32) -> Orb {
-    let row = i32(i);
-    var o: Orb;
-    o.color = textureLoad(orb_tex, vec2<i32>(0, row), 0);
-    o.phase = textureLoad(orb_tex, vec2<i32>(1, row), 0);
-    o.misc = textureLoad(orb_tex, vec2<i32>(2, row), 0);
-    return o;
-}
+// orb i の vec4 群を data-texture から読む（mip 0、point fetch）。Orb 構造体と load_orb
+// は variant ごとに差し替わる（DISTANCE SOURCE が必要とするフィールドだけを読む）:
+//   - orb : color / phase / misc の 3 texel（rot は読まない。旧 orb_circle.wgsl と同一）
+//   - SDF : 上記 + rot (x=3) texel（回転に base_angle / rot_speed_signed を使う）
+// これにより orb variant は旧 orb_circle.wgsl と文字どおり同一の load_orb になり byte-exact。
+//!ORB_LOAD
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -113,6 +127,8 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
     return min(max(x, a), b);
 }
 
+//!ORB_HELPERS
+
 // Skia lowp の RadialGradient stop 補間を **bit-exact** に再現する falloff。
 //
 // 返り値 `.x` = straight alpha (0..1)、`.y` = orb 色に掛ける rgb スケール (0..1)。
@@ -132,6 +148,9 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
 // stop alpha は Skia lowp の `Color::from_rgba8` が u8 に量子化する値
 // （center_a = round(opacity*255)/255, mid_a = round(opacity*80)/255）。
 // style_bit < 0.5 が Rim、それ以外が Soft。
+//
+// SDF DISTANCE SOURCE（glyph/image）でも **同じこの falloff_curve** を使う（#235）。
+// 形（r の出どころ）だけが違い、ぼやけ方・rim/soft・合成は orb と完全に共通。
 fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32> {
     if (opacity <= 0.0 || r_in >= 1.0) {
         return vec2<f32>(0.0, 0.0);
@@ -255,8 +274,14 @@ fn composite_premul(sample_px: vec2<f32>) -> vec4<f32> {
         let cx = nx * params.resolution.x;
         let cy = ny * params.resolution.y;
 
-        let dist = distance(sample_px, vec2<f32>(cx, cy));
-        let r = dist / radius;
+        // === DISTANCE SOURCE ブロック（loop 本体にインライン展開）===
+        // orb = 円距離 / SDF(glyph・image) = サンプル距離。`r`（0=中心/深部、1=edge、
+        // >1=外側）をここで定義する。SDF は UV 範囲外で `continue` する。下流
+        // （falloff_curve / 合成 / finalize）は全 shape 共通。orb variant はこのブロック
+        // を旧 orb_circle.wgsl と文字どおり同一の 2 行に展開するので byte-exact。
+        //!ORB_DISTANCE_SOURCE
+        // === /DISTANCE SOURCE ブロック ===
+
         // .x = straight alpha, .y = rgb スケール（外周フェードで rgb も 0 へ）。
         let fall = falloff_curve(style_bit, r, blur, opacity);
         let alpha = fall.x;

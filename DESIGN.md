@@ -312,7 +312,7 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 
 | 軸 | 値（内部） | UI 表示 | 既定 | wasm 引数 |
 | --- | --- | --- | --- | --- |
-| 形状 | `circle` / `glyph` | 円 / 文字 | `circle` | `shape` |
+| 形状 | `orb` / `glyph` / `image` | Orb / 文字 / 画像 | `orb` | `shape` |
 | Glyph 文字 | 1 Unicode scalar | 入力欄 + picker | `☆` | `glyph_char` |
 | 数 | `''` / `low` / `mid` / `high` | 少なめ / 標準 / 多め | `''` | `count_preset` (`low`=10, `mid`=20, `high`=30) |
 | 速さ | `''` / `slow` / `mid` / `fast` | ゆっくり / 標準 / 速め | `''` | `speed_preset` (`slow`→VerySlow, `mid`→Slow, `fast`→Mid) |
@@ -343,17 +343,18 @@ Reduced motion: respect `prefers-reduced-motion: reduce` by clamping all transit
 - シンボルピッカーは見た目を端末非依存に保つため wasm 同梱フォントで描画
   できる字に限定する (任意文字は入力欄経由で受け付ける)
 - glyph の描画 backend は alpha mask ではなく **SDF + 共通 falloff**。picker UI は
-  変えず、見た目だけ circle と同じ「ぼけた光」に寄せる
+  変えず、見た目を orb と同じ「ぼけた光」に寄せる（#235 で orb 機構に統一）
 - glyph は seed 由来の `base_angle` で始まり、静止画でも向きがばらける
 - 動画中の glyph はそこからさらに orb ごとに異なる向き・回転方向・
   回転速度で連続回転する
 
 ### Image 入力 (#160)
 
-- shape segmented pill は `Orb / Glyph / Image` の 3 択 (内部値 `circle` /
-  `glyph` / `image` は wasm enum と紐付くため不変。UI ラベルのみ #174 で
-  Circle → Orb に改名し、専用ぼかし経路と Glyph の汎用 SDF 経路の挙動差を
-  明示)
+- shape segmented pill は `Orb / Glyph / Image` の 3 択 (内部値 `orb` /
+  `glyph` / `image` は wasm enum と紐付く。#174 で UI ラベルを Circle → Orb に、
+  #235 で内部値も `circle` → `orb` に改名し、WGSL / core / CLI / wasm まで統一。
+  #235 で Glyph / Image は orb と同じ機構（SDF を orb に食わせる）に統合され、
+  挙動差は「形（シルエット）だけ」になった)
 - `Image` を選ぶとシェイプ row の下に画像入力 row が出現する: ファイル選択
   ボタン + 9×9 サムネイル + ファイル名表示
 - 入力画像 (PNG / JPG / WebP / GIF / SVG) は **`File` を worker に

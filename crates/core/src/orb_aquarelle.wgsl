@@ -78,7 +78,7 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
 };
 
-// フルスクリーン三角形（頂点バッファ無し）。orb_circle.wgsl と同形。
+// フルスクリーン三角形（頂点バッファ無し）。orb.wgsl と同形。
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     var xy = array<vec2<f32>, 3>(
@@ -96,14 +96,14 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
 }
 
 // Skia lowp の div255: (v + 255) >> 8 == floor((v + 255) / 256)。
-// 入力 v は u8*u8 積（0..65025 程度）を float で持つ。orb_circle.wgsl と同一。
+// 入力 v は u8*u8 積（0..65025 程度）を float で持つ。orb.wgsl と同一。
 fn div255(v: f32) -> f32 {
     return floor((v + 255.0) / 256.0);
 }
 
 // straight float (0..1) を Skia lowp の lowp 量子化で u8 (0..255 float) にする。
 // rgb は normalize(clamp 0..1) 後に *255+0.5 を floor。alpha は clamp 無し。
-// orb_circle.wgsl の to_u8_rgb / to_u8_a と完全に同一（aquarelle の alpha は
+// orb.wgsl の to_u8_rgb / to_u8_a と完全に同一（aquarelle の alpha は
 // すべて N/255 の定数を mix した [0,1] 値なので clamp は元から no-op）。
 fn to_u8_rgb(c: f32) -> f32 {
     return floor(clampf(c, 0.0, 1.0) * 255.0 + 0.5);

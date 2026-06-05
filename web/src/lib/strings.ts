@@ -44,11 +44,9 @@ export const STRINGS = {
     en: 'Roll again with the same image',
   },
   shapeLabel: { ja: '形状', en: 'Shape' },
-  // #174 (二次対応): 'Circle' は orber 専用のぼかし経路で描画される (SDF を
-  // 介さず純粋な soft circle gradient)。Glyph の ● は generateJsGlyphSdf を
-  // 通る汎用 SDF 経路でエッジが立つ。両者は意図的に挙動が違うため、UI 上は
-  // 専用経路であることが伝わる 'Orb' / 'オーブ' に改名する。
-  shapeOptionCircle: { ja: 'オーブ', en: 'Orb' },
+  // #174 / #235: 解析的な円距離で描く既定の orb。#235 で内部名も circle → orb に
+  // 統一（WGSL / core / CLI / wasm すべて）。表示は従来どおり 'Orb' / 'オーブ'。
+  shapeOptionOrb: { ja: 'オーブ', en: 'Orb' },
   shapeOptionGlyph: { ja: '文字', en: 'Glyph' },
   shapeOptionImage: { ja: '画像', en: 'Image' },
   // #160: Image shape (任意の画像をシルエット化して orb として使う) の UI。

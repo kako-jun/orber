@@ -30,7 +30,7 @@ type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error'
 // UI では `'' | 'mid'` のどちらでも「標準」ボタンを押下扱いにする。
 // count / softness は `'mid'` でも実質 identity、speed は `''` だけが identity で
 // `'mid'` を明示選択すると `Slow` に固定される（#131 仕様）。
-type ShapeChoice = 'circle' | 'glyph' | 'image';
+type ShapeChoice = 'orb' | 'glyph' | 'image';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
@@ -119,7 +119,7 @@ export default function Studio() {
   const [tilesAspect, setTilesAspect] = createSignal<Aspect>('portrait');
   // #131: 4 軸は常時展開で、どのボタンも押した瞬間に runBatch を起動する。
   // 初期値は empty identity を維持し、既存 output regression を防ぐ。
-  const [shape, setShape] = createSignal<ShapeChoice>('circle');
+  const [shape, setShape] = createSignal<ShapeChoice>('orb');
   // 初期値は空文字。User: 「最初から ☆ が入力されてるせいでプレイスホルダ
   // を見られない」。空にすればプレイスホルダ (例: emoji) が見え、ユーザーが
   // 自由入力欄であることに気付ける。glyph shape を選んでも何も入れなければ
@@ -440,7 +440,7 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
-      // #136: glyph_rotate=false で per-orb 回転を抑止。Circle 経路では未使用。
+      // #136: glyph_rotate=false で per-orb 回転を抑止。Orb 経路では未使用。
       glyph_rotate: glyphRotate(),
     };
 
@@ -1347,12 +1347,12 @@ export default function Studio() {
         <div class={SEG_GROUP}>
           <button
             type="button"
-            aria-pressed={shape() === 'circle'}
-            onClick={() => onShapeClick('circle')}
+            aria-pressed={shape() === 'orb'}
+            onClick={() => onShapeClick('orb')}
             disabled={!decoded() || downloading()}
-            class={SEG_BTN(0, 3, shape() === 'circle')}
+            class={SEG_BTN(0, 3, shape() === 'orb')}
           >
-            {t('shapeOptionCircle')}
+            {t('shapeOptionOrb')}
           </button>
           <button
             type="button"
