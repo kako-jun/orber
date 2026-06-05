@@ -1,7 +1,8 @@
 ---
-// orber#230 — WebGPU (wgpu/WGSL) 検証ページ。開発用で本番導線（ナビ・トップ）
+// orber#230 / #231 — WebGPU (wgpu/WGSL) 検証ページ。開発用で本番導線（ナビ・トップ）
 // からはリンクしない。wasm の gpu_init / gpu_set_render_data / gpu_render を
-// main thread で叩き、canvas に Orb アニメーションを rAF で回す。
+// main thread で叩き、canvas に Orb / Glyph / Image / Aquarelle アニメーションを
+// rAF で回す（#231 で 4 shape 切替 + aquarelle パラメータ入力を追加）。
 // WebGPU 不在時は明確なエラーを表示する（fallback 無し = #207 方針）。
 // #232 で Studio に WebGL↔WGSL A/B トグルが入ったら、このページは比較基準として
 // 残すか撤去するかを判断する。
@@ -13,26 +14,118 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width" />
     <meta name="robots" content="noindex, nofollow" />
-    <title>orber gpu-lab (#230 dev)</title>
+    <title>orber gpu-lab (#231 dev)</title>
   </head>
   <body style="margin:0; min-height:100vh; background:#040404; color:#e8e8e8; font-family:ui-monospace, monospace; display:flex; flex-direction:column; align-items:center; gap:12px; padding:24px;">
-    <h1 style="font-size:14px; font-weight:500; margin:0;">orber gpu-lab — WebGPU orb (#230)</h1>
+    <h1 style="font-size:14px; font-weight:500; margin:0;">orber gpu-lab — WebGPU shapes (#231)</h1>
     <canvas id="gpu-canvas" width="270" height="480" style="border:1px solid #333; width:270px; height:480px;"></canvas>
+
+    <!-- shape セレクタ + per-shape 入力。値変更で gpu_set_render_data を呼び直す。 -->
+    <div style="display:flex; flex-direction:column; gap:10px; width:320px;">
+      <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+        <span style="width:96px;">shape</span>
+        <select id="shape" style="flex:1; background:#222; color:#e8e8e8; border:1px solid #555; padding:4px; font:inherit;">
+          <option value="orb">orb</option>
+          <option value="glyph">glyph</option>
+          <option value="image">image</option>
+          <option value="aquarelle">aquarelle</option>
+        </select>
+      </label>
+
+      <!-- glyph: 1 文字入力（既定 ☆）+ glyph_rotate トグル（#136） -->
+      <div id="glyph-controls" style="display:none; flex-direction:column; gap:8px;">
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">glyph char</span>
+          <input id="glyph-char" type="text" maxlength="2" value="☆" title="最初の1文字だけ使われます（maxlength=2 はサロゲートペアの絵文字1文字を入れられるようにするためで、BMP文字を2つ入れると先頭だけが採用されます）" style="flex:1; background:#222; color:#e8e8e8; border:1px solid #555; padding:4px; font:inherit;" />
+        </label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">glyph rotate</span>
+          <input id="glyph-rotate" type="checkbox" checked />
+        </label>
+      </div>
+
+      <!-- image: ファイル選択 → RGBA bytes + w/h を params へ -->
+      <div id="image-controls" style="display:none; flex-direction:column; gap:8px;">
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">image mask</span>
+          <input id="image-file" type="file" accept="image/*" style="flex:1; font-size:11px;" />
+        </label>
+        <div id="image-info" style="font-size:11px; color:#9a9a9a;">no mask loaded</div>
+      </div>
+
+      <!-- aquarelle: bleed / bloom / offset / halo（0..1、既定 0.5） -->
+      <div id="aquarelle-controls" style="display:none; flex-direction:column; gap:8px;">
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">bleed</span>
+          <input class="aq-slider" id="aq-bleed" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
+          <span id="aq-bleed-val" style="width:36px; text-align:right;">0.50</span>
+        </label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">bloom</span>
+          <input class="aq-slider" id="aq-bloom" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
+          <span id="aq-bloom-val" style="width:36px; text-align:right;">0.50</span>
+        </label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">offset</span>
+          <input class="aq-slider" id="aq-offset" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
+          <span id="aq-offset-val" style="width:36px; text-align:right;">0.50</span>
+        </label>
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">halo</span>
+          <input class="aq-slider" id="aq-halo" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
+          <span id="aq-halo-val" style="width:36px; text-align:right;">0.50</span>
+        </label>
+      </div>
+    </div>
+
     <button id="start" style="background:#222; color:#e8e8e8; border:1px solid #555; padding:8px 24px; cursor:pointer; font:inherit;">start</button>
     <div id="status" style="font-size:12px; color:#9a9a9a; max-width:480px; text-align:center;">idle</div>
     <div id="fps" style="font-size:12px; color:#9a9a9a;"></div>
 
     <script>
-      import init, { gpu_init, gpu_set_render_data, gpu_render } from '../wasm/orber_wasm.js';
+      import init, { gpu_init, gpu_set_render_data, gpu_render, glyph_supported } from '../wasm/orber_wasm.js';
+      // #231: 同梱フォント外（ひらがな・漢字・絵文字）の glyph SDF を OS フォントスタックで
+      // 作るフォールバック（WebGL 版 #159 と同じ設計）。size は WebGL 版（orberWorker.ts が
+      // 使う orberGl.ts の GLYPH_SDF_SIZE）と同じ定数源を参照する（ハードコードしない）。
+      import { generateJsGlyphSdf } from '../lib/jsGlyphSdf';
+      import { GLYPH_SDF_SIZE } from '../lib/orberGl';
 
       const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
       const btn = document.getElementById('start') as HTMLButtonElement;
       const statusEl = document.getElementById('status') as HTMLDivElement;
       const fpsEl = document.getElementById('fps') as HTMLDivElement;
+      const shapeSel = document.getElementById('shape') as HTMLSelectElement;
+      const glyphControls = document.getElementById('glyph-controls') as HTMLDivElement;
+      const imageControls = document.getElementById('image-controls') as HTMLDivElement;
+      const aquarelleControls = document.getElementById('aquarelle-controls') as HTMLDivElement;
+      const glyphChar = document.getElementById('glyph-char') as HTMLInputElement;
+      const glyphRotate = document.getElementById('glyph-rotate') as HTMLInputElement;
+      const imageFile = document.getElementById('image-file') as HTMLInputElement;
+      const imageInfo = document.getElementById('image-info') as HTMLDivElement;
 
       const setStatus = (s: string) => {
         statusEl.textContent = s;
       };
+
+      // ready: gpu_init が成功して以降だけ gpu_set_render_data を呼ぶ。
+      let ready = false;
+      // image マスク（File → RGBA bytes）。shape=image のとき必須。
+      let imageMask: { rgba: Uint8Array; width: number; height: number } | null = null;
+      // #231: 直近の glyph で OS フォントフォールバック（同梱フォント外）を使ったか。
+      // buildParams が立て、applyRenderData が status 注記に使う。
+      let lastGlyphUsedJsFallback = false;
+      // #231: OS フォントにも無い字（generateJsGlyphSdf が全 0 SDF を返した）か。
+      // 全 0 だと空描画になるので、status を「OS フォントで描画」ではなく
+      // 「OS フォントにも見つからない」注記に切り替えるための判定。
+      let lastGlyphSdfEmpty = false;
+
+      // 各 shape のコントロール表示を切り替える。
+      function syncControls() {
+        const shape = shapeSel.value;
+        glyphControls.style.display = shape === 'glyph' ? 'flex' : 'none';
+        imageControls.style.display = shape === 'image' ? 'flex' : 'none';
+        aquarelleControls.style.display = shape === 'aquarelle' ? 'flex' : 'none';
+      }
 
       // ソース画像は小さなハードコードのグラデーション。kmeans が拾える程度に
       // 色相が散っていれば十分（実画像アップロードは本番 Studio の領分）。
@@ -58,6 +151,151 @@
         return rgb;
       }
 
+      // dev ページの素朴な canvas デコード: File → RGBA bytes + w/h。
+      // 本番 Studio の decodeImage.ts のような厳密さは不要（A/B 比較は WGSL 経路の
+      // image_rgba_to_sdf に任せる）。
+      async function decodeImageFile(
+        file: File,
+      ): Promise<{ rgba: Uint8Array; width: number; height: number }> {
+        const bitmap = await createImageBitmap(file);
+        const c = document.createElement('canvas');
+        c.width = bitmap.width;
+        c.height = bitmap.height;
+        const ctx = c.getContext('2d')!;
+        ctx.drawImage(bitmap, 0, 0);
+        const data = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+        return {
+          rgba: new Uint8Array(data.buffer.slice(0)),
+          width: bitmap.width,
+          height: bitmap.height,
+        };
+      }
+
+      const SRC = 32;
+
+      // 現在の UI 状態から wasm 用 params を組む。WasmParams の必須フィールド
+      // （direction / speed / count / orb_size / blur 等）は常に送るが、resolve_frame は
+      // それらの一部を spec（random_batch_specs）由来の値で上書きするため、ここで入れた
+      // 値がそのまま使われるとは限らない。shape 依存の追加フィールド（image マスク /
+      // aquarelle 4 値）だけは shape に応じて条件付きで足す（serde default が残りを補完）。
+      function buildParams(): Record<string, unknown> {
+        const shape = shapeSel.value;
+        const params: Record<string, unknown> = {
+          source_rgb: makeSourceRgb(SRC, SRC),
+          source_width: SRC,
+          source_height: SRC,
+          k: 5,
+          width: canvas.width,
+          height: canvas.height,
+          seed: 42,
+          direction: 'lr',
+          speed: 'slow',
+          count: 20,
+          orb_size: 1.0,
+          blur: 0.5,
+          shape,
+          glyph_char: shape === 'glyph' ? glyphChar.value : '',
+          glyph_rotate: glyphRotate.checked,
+          count_preset: '',
+          speed_preset: '',
+          softness_preset: '',
+        };
+        lastGlyphUsedJsFallback = false;
+        lastGlyphSdfEmpty = false;
+        if (shape === 'glyph') {
+          // #231: 先頭 1 文字を採り、同梱フォント（Noto Sans Symbols 2 サブセット）に
+          // 収録されていれば従来どおり core 経路（glyph_sdf を送らない）。収録外
+          // （ひらがな・漢字・絵文字）は generateJsGlyphSdf（OffscreenCanvas + OS フォント
+          // スタック）で SDF 化して glyph_sdf / glyph_sdf_size に乗せる（WebGL 版 #159 と
+          // 同じフォールバック。「ユーザーが入れた字を尊重して描画する」設計）。
+          const ch = glyphChar.value;
+          const firstCh = Array.from(ch)[0] ?? '';
+          if (firstCh && !glyph_supported(firstCh)) {
+            const size = GLYPH_SDF_SIZE;
+            const sdf = generateJsGlyphSdf(firstCh, size);
+            params.glyph_sdf = sdf;
+            params.glyph_sdf_size = size;
+            lastGlyphUsedJsFallback = true;
+            // OS フォントにも無い字だと generateJsGlyphSdf は全 0 SDF を返す（空描画）。
+            // 256*256=64KB の every は一瞬なので毎回判定してよい。
+            lastGlyphSdfEmpty = sdf.every((b) => b === 0);
+          }
+        }
+        if (shape === 'image') {
+          if (!imageMask) throw new Error('shape=image requires an image mask (choose a file)');
+          params.image_mask_rgba = imageMask.rgba;
+          params.image_mask_width = imageMask.width;
+          params.image_mask_height = imageMask.height;
+        }
+        if (shape === 'aquarelle') {
+          params.aquarelle_bleed = parseFloat((document.getElementById('aq-bleed') as HTMLInputElement).value);
+          params.aquarelle_bloom = parseFloat((document.getElementById('aq-bloom') as HTMLInputElement).value);
+          params.aquarelle_offset = parseFloat((document.getElementById('aq-offset') as HTMLInputElement).value);
+          params.aquarelle_halo = parseFloat((document.getElementById('aq-halo') as HTMLInputElement).value);
+        }
+        return params;
+      }
+
+      // ready 以降のみ呼ぶ。shape / パラメータ変更時に再構築する。
+      function applyRenderData() {
+        if (!ready) return;
+        // shape=image でマスク未ロードのときは汎用 ERROR ではなく、何をすべきか
+        // 分かる案内を出して早期 return する（rAF ループは止めない。次にマスクを
+        // 選べば imageFile の change ハンドラから再び applyRenderData が走る）。
+        if (shapeSel.value === 'image' && !imageMask) {
+          setStatus('shape=image: 先に画像を選んでください（choose an image file for the mask）');
+          return;
+        }
+        try {
+          // n=12 / spec_idx=8: GUI バッチと同じ 12 枚構成の動画タイル先頭
+          // （direction=LR / speed=VerySlow の固定割当）。入力は spec ごとに
+          // 静的で、モーションは t がシェーダ内で駆動する。
+          gpu_set_render_data(buildParams(), 12, 8);
+          // #231: glyph が同梱フォント外で OS フォントフォールバックを使ったときは注記する。
+          // ただし OS フォントにも無い字（全 0 SDF）は空描画になるので、誤解を招く
+          // 「OS フォントで描画」ではなく見つからなかった旨を出す。
+          let note = '';
+          if (lastGlyphUsedJsFallback) {
+            note = lastGlyphSdfEmpty
+              ? '（この文字はOSフォントにも見つからず描画されません）'
+              : '（OS フォントで描画＝同梱フォント外）';
+          }
+          setStatus(`shape=${shapeSel.value} — rendering${note}`);
+        } catch (e) {
+          console.error('[gpu-lab]', e);
+          setStatus(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      // ---- UI イベント配線 ----
+      syncControls();
+      shapeSel.addEventListener('change', () => {
+        syncControls();
+        applyRenderData();
+      });
+      glyphChar.addEventListener('input', applyRenderData);
+      glyphRotate.addEventListener('change', applyRenderData);
+      imageFile.addEventListener('change', async () => {
+        const file = imageFile.files?.[0];
+        if (!file) return;
+        try {
+          imageMask = await decodeImageFile(file);
+          imageInfo.textContent = `mask ${imageMask.width}×${imageMask.height}`;
+          applyRenderData();
+        } catch (e) {
+          console.error('[gpu-lab]', e);
+          imageInfo.textContent = `decode failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      });
+      for (const id of ['aq-bleed', 'aq-bloom', 'aq-offset', 'aq-halo']) {
+        const slider = document.getElementById(id) as HTMLInputElement;
+        const val = document.getElementById(`${id}-val`) as HTMLSpanElement;
+        slider.addEventListener('input', () => {
+          val.textContent = parseFloat(slider.value).toFixed(2);
+          applyRenderData();
+        });
+      }
+
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         try {
@@ -80,31 +318,8 @@
           console.log(`[gpu-lab] gpu_init: ${initMs.toFixed(1)} ms, adapter = ${adapterName}`);
           setStatus(`init ${initMs.toFixed(1)} ms — ${adapterName}`);
 
-          const SRC = 32;
-          const params = {
-            source_rgb: makeSourceRgb(SRC, SRC),
-            source_width: SRC,
-            source_height: SRC,
-            k: 5,
-            width: canvas.width,
-            height: canvas.height,
-            seed: 42,
-            direction: 'lr',
-            speed: 'slow',
-            count: 20,
-            orb_size: 1.0,
-            blur: 0.5,
-            shape: 'orb',
-            glyph_char: '',
-            count_preset: '',
-            speed_preset: '',
-            softness_preset: '',
-            glyph_rotate: true,
-          };
-          // n=12 / spec_idx=8: GUI バッチと同じ 12 枚構成の動画タイル先頭
-          // （direction=LR / speed=VerySlow の固定割当）。pack は spec ごとに
-          // 静的で、モーションは t がシェーダ内で駆動する。
-          gpu_set_render_data(params, 12, 8);
+          ready = true;
+          applyRenderData();
 
           // t は 0..1 ループ。8 秒で 1 周（VerySlow の 1 cycle）。
           const PERIOD_MS = 8000;
