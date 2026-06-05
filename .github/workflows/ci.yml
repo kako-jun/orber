@@ -168,6 +168,13 @@ jobs:
       - name: Build orber-wasm for wasm32
         run: cargo build --target wasm32-unknown-unknown -p orber-wasm
 
+      - name: Build orber-core (gpu feature) for wasm32
+        # #229: core の GpuRenderer は wasm32 でもビルド可能を維持する（wgpu の
+        # webgpu バックエンド・new_async・*_to_view 経路）。readback 系 /
+        # pollster は native 専用 cfg に閉じているので、この step が通る =
+        # wasm から見える gpu API が壊れていないことの検証になる。
+        run: cargo build --target wasm32-unknown-unknown -p orber-core --features gpu
+
   web-test:
     name: Web test
     # web に導入済みの vitest を CI で走らせる (#165)。strings / glyph SDF /
