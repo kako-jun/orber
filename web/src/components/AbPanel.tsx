@@ -115,6 +115,11 @@ export default function AbPanel(props: AbPanelProps) {
 
   const [active, setActive] = createSignal<Side>('webgl');
   const [running, setRunning] = createSignal(false);
+  // start() が in-flight（冒頭 stop() で running()=false になってから commit まで）の間 true。
+  // この間 Start ボタンを押せると、並走した古い start の中断 cleanup が勝者 start の
+  // 生きたリソースを巻き込んで破棄してしまう。Start の disabled に pending() を加え、
+  // かつ中断パスを own-resource 化することで二重に防ぐ。
+  const [pending, setPending] = createSignal(false);
   const [webglInitMs, setWebglInitMs] = createSignal<number | null>(null);
   const [wgslInitMs, setWgslInitMs] = createSignal<number | null>(null);
   const [fps, setFps] = createSignal<number | null>(null);
@@ -163,8 +168,15 @@ export default function AbPanel(props: AbPanelProps) {
     );
   }
 
-  // 停止処理: rAF を止め、リソースを破棄して計測をリセットする。
+  // 停止処理（全域）: rAF を止め、グローバルリソースを破棄して計測をリセットする。
+  // ユーザー操作（Stop ボタン）・onCleanup・rAF エラー経路に限定して呼ぶ。
+  // start() の中断パスからは呼ばない（own-cleanup を使う。下記 start 参照）。
+  //
+  // generation を進めるのが肝: in-flight な start は各 await 後に
+  // myGen !== generation で自分が古いと判断して中断するので、Stop を押すと
+  // 走行中の start も確実に殺せる（Stop の意味が「全部止める」になる）。
   function stop() {
+    generation++;
     if (rafId !== undefined) {
       cancelAnimationFrame(rafId);
       rafId = undefined;
@@ -175,6 +187,7 @@ export default function AbPanel(props: AbPanelProps) {
     }
     wgslReady = false;
     setRunning(false);
+    setPending(false);
     setFps(null);
     setWebglInitMs(null);
     setWgslInitMs(null);
@@ -188,6 +201,10 @@ export default function AbPanel(props: AbPanelProps) {
   //   - start は内部で stop() を呼んでから作り直すので、ここでは start() だけ呼ぶ。
   //   - start は async + 世代カウンタなので、props が立て続けに変わっても
   //     最新の start のみが有効になる（古い setup が後勝ちで残らない）。
+  //   - 早期 return は !running() && !pending()：in-flight（pending）中の props 変更も
+  //     拾って再 start する。これにより「in-flight 中の props 変更が黙って捨てられる」
+  //     問題は解消される。並走した start のうち generation により最新だけが commit され、
+  //     loser の中断 cleanup は own-resource 化されているので勝者を巻き込まない。
   createEffect(
     on(
       () => [
@@ -201,7 +218,9 @@ export default function AbPanel(props: AbPanelProps) {
         props.softnessPreset(),
       ],
       () => {
-        if (!running()) return; // 停止中は無視（手動 Start でのみ起動する）。
+        // 停止中（手動 Start を待つ状態）は無視。ただし in-flight（pending）中の
+        // props 変更は拾う＝最新の入力で最終的に立ち上がる。
+        if (!running() && !pending()) return;
         void start();
       },
       { defer: true },
@@ -289,19 +308,45 @@ export default function AbPanel(props: AbPanelProps) {
   }
 
   const start = async () => {
-    // 世代を進めて自分を captured する。これ以降に新しい start が走ると
-    // generation が変わるので、各 await の後で「自分が最新か」を確認できる。
-    const myGen = ++generation;
     // 既存リソースを必ず畳んでから作り直す（自動再初期化の stop→start 経路でも、
     // 手動 Start の二度押し抑止が外れた経路でも、二重 setup を起こさない）。
+    // stop() は generation を進めるので、in-flight だった前の start もここで死ぬ。
     stop();
-    // stop() は generation を触らないので myGen はそのまま有効。
-    const src = props.decoded();
-    if (!src) return;
-    setErrorMsg('');
+    // stop() の後に自分の世代を captured する（stop の generation++ を含めて確定させる）。
+    // これ以降に新しい start / stop が走ると generation が変わるので、各 await の後で
+    // 「自分が最新か」を確認できる。
+    const myGen = ++generation;
+    // pending: この invocation が commit / 中断 / エラーのいずれかで終わるまで true。
+    // この間 Start ボタンは disabled になる（再入を防ぐ）。finally で必ず false に戻す。
+    setPending(true);
+    // 自分の invocation がローカルに立てたリソース（中断時はこれだけ畳む）。
+    let ownGl: GlRenderer | null = null;
+    // 中断パス（own-cleanup）: 全域 stop() を呼ぶと勝者 start の生きたリソース
+    // （glRenderer / rafId / wgslReady）を巻き込んで破棄するので、自分が立てた
+    // リソースだけを畳む。中断が起きる前提＝自分より新しい start か stop が走った：
+    //   - WebGL: 自分の setupWebgl が作った GlRenderer。グローバル glRenderer が
+    //     まだ自分のものなら（勝者が差し替えていなければ）dispose して null に戻す。
+    //     勝者が既に差し替え済みなら自分の参照だけを dispose し、グローバルは触らない。
+    //   - WGSL: gpu context は wgslCanvas 上の単一インスタンス。中断契機の stop()/
+    //     新 start() の冒頭 stop() が既に global wgslReady=false にしている（勝者が
+    //     再 setupWgsl したならその true は勝者の所有物）。よって loser は global
+    //     wgslReady を一切触らない（触ると勝者の生きた true を消す）。
+    const cleanupOwn = () => {
+      if (ownGl) {
+        if (glRenderer === ownGl) glRenderer = null;
+        ownGl.dispose();
+        ownGl = null;
+      }
+    };
     try {
+      const src = props.decoded();
+      if (!src) return;
+      setErrorMsg('');
       await ensureWasm();
-      if (myGen !== generation) return; // より新しい start が走った → 中断
+      if (myGen !== generation) {
+        cleanupOwn();
+        return; // より新しい start / stop が走った → 中断（own のみ畳む）
+      }
 
       const params = buildBaseParams(src);
 
@@ -311,7 +356,10 @@ export default function AbPanel(props: AbPanelProps) {
         const file = props.imageShapeFile();
         if (!file) throw new Error('image shape requires a file');
         const dec = await decodeImageFile(file);
-        if (myGen !== generation) return; // より新しい start が走った → 中断
+        if (myGen !== generation) {
+          cleanupOwn();
+          return; // より新しい start / stop が走った → 中断（own のみ畳む）
+        }
         params.image_mask_rgba = dec.rgba;
         params.image_mask_width = dec.width;
         params.image_mask_height = dec.height;
@@ -328,12 +376,18 @@ export default function AbPanel(props: AbPanelProps) {
       }
 
       // WebGL は常に立てる。WGSL は非対応ブラウザでは立てない（active も webgl 固定）。
-      setWebglInitMs(Number(setupWebgl(params, imageBitmap).toFixed(1)));
+      // setupWebgl は glRenderer に書くので、自分の own 参照にも控える。
+      const webglMs = setupWebgl(params, imageBitmap);
+      ownGl = glRenderer;
+      setWebglInitMs(Number(webglMs.toFixed(1)));
       if (webgpuOk) {
         const ms = await setupWgsl(params);
         if (myGen !== generation) {
-          // await 中に新しい start が走った。setupWgsl が立てた wgslReady を畳む。
-          stop();
+          // await 中に新しい start / stop が走った。自分が立てた own リソースだけ畳む
+          // （全域 stop() を呼ぶと勝者の生きた glRenderer/rafId/wgslReady を巻き込む）。
+          // global wgslReady は中断契機の stop() / 新 start 冒頭の stop() が既に管理
+          // 済みなので loser からは触らない（cleanupOwn 参照）。
+          cleanupOwn();
           return;
         }
         setWgslInitMs(Number(ms.toFixed(1)));
@@ -344,7 +398,13 @@ export default function AbPanel(props: AbPanelProps) {
     } catch (e) {
       console.error('[ab-panel]', e);
       setErrorMsg(e instanceof Error ? e.message : String(e));
+      // エラー経路は全域 stop()（このパスでは勝者は存在せず、自分が最後の起動者）。
       stop();
+    } finally {
+      // commit / 中断 / エラーすべての経路で pending を必ず解除する。
+      // ただし自分が古い（中断された）場合、勝者が pending を立てている可能性があるので、
+      // 自分が最新世代のときだけ落とす（勝者の pending を消さない）。
+      if (myGen === generation) setPending(false);
     }
   };
 
@@ -470,16 +530,18 @@ export default function AbPanel(props: AbPanelProps) {
         <button
           type="button"
           onClick={() => void start()}
-          disabled={running() || !canStart()}
+          disabled={running() || pending() || !canStart()}
           title={!canStart() ? t('abNeedSource') : undefined}
           class={CTRL_BTN}
         >
           {t('abStart')}
         </button>
+        {/* Stop は pending 中も押せてよい。stop() が generation を進めるので、
+            in-flight な start も確実に中断される（Stop=「全部止める」）。 */}
         <button
           type="button"
           onClick={() => stop()}
-          disabled={!running()}
+          disabled={!running() && !pending()}
           class={CTRL_BTN}
         >
           {t('abStop')}
