@@ -1,71 +1,54 @@
-//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c.
+//! wgpu (Rust + WGSL) production render path — orber #207 Phase 0–1c, #225.
 //!
-//! [`GpuRenderer`] is the headless, native side of the renderer. It runs the
-//! **Circle** orb WGSL ([`orb_circle.wgsl`](../src/orb_circle.wgsl)) that is a
-//! faithful translation of the browser's `web/src/lib/orberGl.ts` Circle arm, so
-//! the native CLI and the web produce matching Circle frames, and so the GPU path
-//! matches the CPU (tiny-skia) oracle ([`crate::animate::render_frame`]) within
-//! ±2/channel.
+//! [`GpuRenderer`] is the headless, native side of the renderer and — since #225 —
+//! the **only** renderer (the CPU / tiny-skia path and the CPU↔GPU parity oracle
+//! were purged). It runs the Circle orb WGSL
+//! ([`orb_circle.wgsl`](../src/orb_circle.wgsl)), the glyph / image SDF WGSL
+//! ([`orb_glyph.wgsl`](../src/orb_glyph.wgsl)) and the aquarelle WGSL
+//! ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Circle,
+//! Glyph, Image, Aquarelle) render on the GPU; the CLI renders every PNG / video /
+//! variation frame through it.
 //!
-//! ## Parity scope (narrow — do not over-claim)
+//! ## Per-orb data path
 //!
-//! Parity with the CPU oracle holds **only** on this exact path:
-//!
-//! - **shape = Circle** for the strict ±2/channel bit-exact parity described
-//!   here. Glyph (#212/#214) and Aquarelle (#216) also render on the GPU, but
-//!   match the CPU oracle only **structurally** (float SDF / analytic-vs-AA
-//!   differences), not bit-exact — see `render_frame_glyph` /
-//!   `render_frame_aquarelle`. The `image` shape is web-only and rides the Glyph
-//!   SDF path (core/wasm have no native `image` shape). The CPU renderer is now
-//!   only a no-GPU-adapter fallback (it will be removed in Phase 1.5, but still
-//!   exists today);
 //! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
 //!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
 //!   `opts.saturation` to each packed orb color after
 //!   [`pack_render_data_for_webgl`] (which itself never applies saturation,
-//!   because it is shared with the WebGL path). Without that step the GPU and CPU
-//!   would diverge for `--saturation != 1.0`;
+//!   because it is shared with the WebGL path);
 //! - **count up to [`MAX_ORB_COUNT`] (1024)**: per-orb data is uploaded as a
 //!   **data-texture** (`Rgba32Float`, read with `textureLoad`) — not a fixed-size
-//!   uniform array — so the WGSL has **no 64-orb cap** and the GPU renders the same
-//!   count the CPU does (#210 Phase 1a). The old `count > 64 → CPU` fallback in the
-//!   CLI is gone. (The 64 limit only ever applied to the WebGL GLSL path —
+//!   uniform array — so the WGSL has **no 64-orb cap** (#210 Phase 1a). (The 64
+//!   limit only ever applied to the WebGL GLSL path —
 //!   `web/src/lib/orberGl.ts::MAX_ORBS` / `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`
 //!   — which is untouched until Phase 3; do not re-sync a 64 cap onto this path.)
 //!
-//! Outside that path the GPU is **not** a drop-in for the CPU oracle: video is
-//! rendered on the CPU, and the per-orb `color_tracks` / `keyframe_tracks` (#7 /
-//! #33) are not yet folded into the GPU pack, so animated color/position tracks
-//! are CPU-only for now.
+//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not yet folded into
+//! the GPU pack; animated color/position tracks come in via the cluster列 instead.
 //!
-//! ## Parity contract (must match [`crate::animate::render_frame`] for Circle)
+//! ## Compositing contract
 //!
-//! The CPU oracle composites orbs in **straight sRGB byte space** (tiny-skia
-//! premultiplied internally, then un-premultiplied back to straight on output).
-//! To match it the GPU path:
+//! Orbs are composited in **straight sRGB byte space**. The GPU path:
 //!
 //! - renders into an [`wgpu::TextureFormat::Rgba8Unorm`] target (NOT `*Srgb`), so
 //!   no sRGB↔linear conversion happens — the shader's float blend maps to bytes
-//!   by `round(value * 255)`, the same arithmetic as the CPU loop;
-//! - feeds the shader the **exact same per-orb data** the WebGL path uses
+//!   by `round(value * 255)`;
+//! - feeds the shader the per-orb data the WebGL path also uses
 //!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
-//!   reused, never reimplemented, so the orb positions / radii / alphas are
-//!   identical to the proven web/CPU result. The per-orb data goes up as a
-//!   `Rgba32Float` data-texture (4 texels wide × N orbs tall) so float precision is
-//!   preserved exactly — no quantization happens on the orb data itself;
+//!   reused, never reimplemented, so the orb positions / radii / alphas match the
+//!   web result. The per-orb data goes up as a `Rgba32Float` data-texture
+//!   (4 texels wide × N orbs tall) so float precision is preserved exactly;
 //! - reads the result back accounting for wgpu's 256-byte row-alignment
 //!   requirement on `copy_texture_to_buffer` (that alignment applies only to the
 //!   texture→buffer read-back; the orb data upload via `write_texture` is exempt).
 //!
-//! ## Scope
+//! ## Validation (post-#225)
 //!
-//! Circle (Phase 0, #209), Glyph (Phase 1b, #212/#214) and Aquarelle (Phase 1c,
-//! #216) all render on the GPU. The `image` shape is web-only and reuses the
-//! Glyph SDF path (core/wasm have no `image` shape — the browser hands an image
-//! silhouette in as a glyph SDF). The CPU (tiny-skia) renderer remains only as a
-//! no-GPU-adapter fallback and as the parity oracle; both will be removed in
-//! Phase 1.5 (they still exist today). Video and per-orb color/keyframe tracks
-//! (#7 / #33) are still CPU-only.
+//! With the CPU oracle gone, the tests in this module are **GPU-only structural
+//! checks** (lit-pixel presence, determinism for the same seed/t, cache reuse vs
+//! growth, rotation loop closure, alpha/empty-cluster background-only). They no
+//! longer compare against a CPU reference; correctness on new GPUs is confirmed by
+//! these structural invariants plus real-machine visual inspection.
 
 use std::collections::HashMap;
 
@@ -2189,7 +2172,7 @@ fn glyph_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animate::{render_frame, AnimateOptions, MotionDirection, MotionSpeed};
+    use crate::animate::{AnimateOptions, MotionDirection, MotionSpeed};
     use crate::cluster::{Centroid, Cluster};
     use crate::orb::OrbShape;
     use crate::style::SoftnessPreset;
@@ -2332,161 +2315,11 @@ mod tests {
         max_diff
     }
 
-    #[test]
-    fn gpu_matches_cpu_within_tolerance() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_within_tolerance") else {
-            return;
-        };
-        eprintln!(
-            "GPU Circle parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
 
-        let clusters = sample_clusters();
-        // Cover the read-back strip boundary both ways with orb-bearing frames:
-        //   - 37x23: width*4 = 148, not a multiple of 256, so rows ARE padded;
-        //   - 64x16: width*4 = 256 is already row-aligned, so NO padding.
-        // (1x1 is exercised separately by `gpu_matches_cpu_1x1_readback`: at a
-        // sub-pixel orb radius tiny-skia's analytic path-coverage AA diverges from
-        // a point-sampled shader — a degenerate case orber never renders — so the
-        // 1x1 row-padding readback is checked background-only instead.)
-        let mut overall_max = 0u8;
-        for &(w, h) in &[(37u32, 23u32), (64, 16)] {
-            let dir = match (w, h) {
-                (37, 23) => MotionDirection::LeftToRight,
-                _ => MotionDirection::TopToBottom,
-            };
-            let opts = circle_opts(w, h, dir, MotionSpeed::Slow);
-            for &t in &[0.0_f32, 0.25, 0.5, 0.75, 1.0] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} {dir:?} t={t}"));
-                overall_max = overall_max.max(max_diff);
-                eprintln!("{w}x{h} {dir:?} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-        eprintln!("overall max per-channel diff across all cases = {overall_max}");
-    }
 
-    /// count > 64 must hold parity now that orb data is a data-texture (no 64
-    /// cap). Covers the old CPU-fallback boundary (65) plus 100 / 256 / 1024.
-    /// A size with > 64 distinct clusters so each orb is independent (not just the
-    /// weight-scattered expansion of a handful of colors); the texture must grow to
-    /// hold every row and the shader must iterate the full dynamic count. Expect
-    /// bit-exact on a real GPU; the assertion allows the ±2/channel contract.
-    #[test]
-    fn gpu_matches_cpu_high_count() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count") else {
-            return;
-        };
-        eprintln!(
-            "GPU Circle high-count parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        for &count in &[65usize, 100, 256, 1024] {
-            // A size whose width*4 is not 256-aligned, to also keep the read-back
-            // padding strip in play while the orb count grows.
-            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(count);
-            for &t in &[0.0_f32, 0.5] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count={count} t={t}"));
-                overall_max = overall_max.max(max_diff);
-                eprintln!("count={count} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-        eprintln!("high-count overall max per-channel diff = {overall_max}");
-    }
 
-    /// `--saturation != 1.0` must hold parity: the native GPU path re-applies
-    /// `adjust_saturation_pub` (the CPU oracle's own per-orb saturation) after the
-    /// shared `pack_render_data_for_webgl`. Without that step desaturated (0.5) and
-    /// boosted (2.0) frames would diverge from the CPU. Covers a couple of sizes /
-    /// times so the orb colors actually change between frames.
-    #[test]
-    fn gpu_matches_cpu_with_saturation() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_with_saturation") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        for &saturation in &[0.5_f32, 2.0] {
-            for &(w, h) in &[(37u32, 23u32), (40, 28)] {
-                let mut opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
-                opts.saturation = saturation;
-                for &t in &[0.0_f32, 0.5, 1.0] {
-                    let cpu = render_frame(&clusters, &opts, t);
-                    let gpu = renderer.render_frame(&clusters, &opts, t);
-                    let max_diff = assert_within_tolerance(
-                        &cpu,
-                        &gpu,
-                        &format!("sat={saturation} {w}x{h} t={t}"),
-                    );
-                    eprintln!("sat={saturation} {w}x{h} t={t}: max per-channel diff = {max_diff}");
-                }
-            }
-        }
-    }
 
-    /// 1x1 read-back boundary: width*4 = 4 bytes/row is padded to 256, so this
-    /// exercises the most extreme row-padding strip. Use a background-only frame
-    /// (no clusters) so the assertion is about read-back geometry, not the
-    /// degenerate sub-pixel-orb AA where a point-sampled shader cannot match
-    /// tiny-skia's analytic path coverage. Also checks 1x3 / 3x1 strips.
-    #[test]
-    fn gpu_matches_cpu_1x1_readback() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_1x1_readback") else {
-            return;
-        };
-        for &(w, h) in &[(1u32, 1u32), (1, 3), (3, 1), (5, 1)] {
-            let opts = circle_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-            for &t in &[0.0_f32, 0.5, 1.0] {
-                // Background-only frame on both paths.
-                let cpu = render_frame(&[], &opts, t);
-                let gpu = renderer.render_frame(&[], &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("{w}x{h} bg-only t={t}"));
-                eprintln!("{w}x{h} bg-only t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-    }
 
-    /// All four flow directions must hold parity at a single non-trivial size/t.
-    #[test]
-    fn gpu_matches_cpu_all_directions() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_all_directions") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        for dir in [
-            MotionDirection::LeftToRight,
-            MotionDirection::RightToLeft,
-            MotionDirection::TopToBottom,
-            MotionDirection::BottomToTop,
-        ] {
-            let opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
-            let cpu = render_frame(&clusters, &opts, 0.37);
-            let gpu = renderer.render_frame(&clusters, &opts, 0.37);
-            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("dir {dir:?}"));
-            eprintln!("dir {dir:?}: max per-channel diff = {max_diff}");
-        }
-    }
-
-    /// Empty clusters → background-only frame must still match (bg fill path).
-    #[test]
-    fn gpu_matches_cpu_empty_clusters() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_empty_clusters") else {
-            return;
-        };
-        let opts = circle_opts(32, 24, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let cpu = render_frame(&[], &opts, 0.5);
-        let gpu = renderer.render_frame(&[], &opts, 0.5);
-        let max_diff = assert_within_tolerance(&cpu, &gpu, "empty clusters");
-        eprintln!("empty clusters: max per-channel diff = {max_diff}");
-    }
 
     /// Pipeline + sized caches must each hold exactly one entry after a clip of
     /// many same-size frames, and a second size must grow only the sized cache.
@@ -2579,33 +2412,6 @@ mod tests {
             .collect()
     }
 
-    /// C3 (#210): parity with **65+ individually-colored** clusters. The existing
-    /// `gpu_matches_cpu_high_count` only has the 4-color `sample_clusters`, so a
-    /// high `count` there just re-scatters those 4 colors — it can't catch a bug
-    /// where texture row `k` loads the wrong orb's color. Here each cluster is its
-    /// own color, so the `clusters.len()` (= count) distinct rows must each load
-    /// independently and correctly for CPU↔GPU to agree within ±2/channel.
-    #[test]
-    fn gpu_matches_cpu_high_count_distinct_clusters() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_matches_cpu_high_count_distinct_clusters")
-        else {
-            return;
-        };
-        for &n in &[65usize, 200] {
-            let clusters = distinct_clusters(n);
-            // count = None so every distinct cluster becomes its own orb row.
-            let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(n);
-            for &t in &[0.0_f32, 0.5] {
-                let cpu = render_frame(&clusters, &opts, t);
-                let gpu = renderer.render_frame(&clusters, &opts, t);
-                let max_diff =
-                    assert_within_tolerance(&cpu, &gpu, &format!("distinct n={n} t={t}"));
-                eprintln!("distinct n={n} t={t}: max per-channel diff = {max_diff}");
-            }
-        }
-    }
 
     /// C4 (#210): the orb data-texture grows **only on increase**. A higher count
     /// must grow `capacity`; a lower or equal count must leave it unchanged (no
@@ -2763,43 +2569,7 @@ mod tests {
         eprintln!("short-row zero-fill: max per-channel diff = {max_diff}");
     }
 
-    /// C7 (#210): a width whose `width*4` is **not** 256-aligned, at the max
-    /// count=1024, in a single frame. Stresses the read-back row-padding strip and
-    /// the tall (1024-row) orb texture at once; CPU↔GPU must still agree.
-    #[test]
-    fn gpu_matches_cpu_high_count_unaligned_width_max() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_matches_cpu_high_count_unaligned_width_max")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        // 50*4 = 200, not a multiple of 256 → read-back rows are padded.
-        let mut opts = circle_opts(50, 34, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        opts.count = Some(1024);
-        let cpu = render_frame(&clusters, &opts, 0.5);
-        let gpu = renderer.render_frame(&clusters, &opts, 0.5);
-        let max_diff = assert_within_tolerance(&cpu, &gpu, "unaligned width × count=1024");
-        eprintln!("unaligned-width count=1024: max per-channel diff = {max_diff}");
-    }
 
-    /// C8 (#210): count=1 — the minimum (one orb row, `rows.max(1)` / `n_orbs.max(1)`
-    /// lower bounds). The single-row orb texture must render and match the CPU.
-    #[test]
-    fn gpu_matches_cpu_count_one() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_count_one") else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
-        opts.count = Some(1);
-        for &t in &[0.0_f32, 0.5, 1.0] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff = assert_within_tolerance(&cpu, &gpu, &format!("count=1 t={t}"));
-            eprintln!("count=1 t={t}: max per-channel diff = {max_diff}");
-        }
-    }
 
     /// C9 (#210): the internal `render_packed` contract clamps a header `n_orbs`
     /// above [`MAX_ORB_COUNT`] (1024) down to 1024 — no panic, no out-of-bounds
@@ -2854,28 +2624,6 @@ mod tests {
         eprintln!("over-max clamp: max per-channel diff = {max_diff}");
     }
 
-    /// C10 (#210): `--saturation != 1.0` parity holds at high count. The
-    /// `apply_saturation_to_pack` loop must run over **all** 256 orb rows (not just
-    /// the first 64), so a desaturated (0.5) and a boosted (2.0) high-count frame
-    /// must each still match the CPU oracle.
-    #[test]
-    fn gpu_matches_cpu_high_count_with_saturation() {
-        let Some(renderer) = require_or_skip_renderer("gpu_matches_cpu_high_count_with_saturation")
-        else {
-            return;
-        };
-        let clusters = distinct_clusters(256);
-        for &saturation in &[0.5_f32, 2.0] {
-            let mut opts = circle_opts(40, 28, MotionDirection::LeftToRight, MotionSpeed::Mid);
-            opts.count = Some(256);
-            opts.saturation = saturation;
-            let cpu = render_frame(&clusters, &opts, 0.5);
-            let gpu = renderer.render_frame(&clusters, &opts, 0.5);
-            let max_diff =
-                assert_within_tolerance(&cpu, &gpu, &format!("sat={saturation} count=256"));
-            eprintln!("sat={saturation} count=256: max per-channel diff = {max_diff}");
-        }
-    }
 
     /// C11 (#210): after the lock fix, concurrent `render_frame` on a shared
     /// renderer must each match its solo render. Several threads render **different**
@@ -3144,85 +2892,6 @@ mod tests {
         );
     }
 
-    /// #217 (#13): structural parity of the GPU image path (`render_frame_image`)
-    /// with the CPU oracle (`render_frame` on the same `OrbShape::Image`). This is
-    /// the image analogue of `gpu_glyph_structural_parity_with_cpu`: the CPU adds
-    /// the aquarelle bleed pass after the SDF fill and the GPU resampler / bilinear
-    /// differ from the CPU's, so parity is **loose, not bit-exact**. The contract:
-    ///   (a) both paths light pixels (> 0),
-    ///   (b) lit-pixel counts are within a 2× band either way,
-    ///   (c) lit bounding boxes align within ±6 px per edge (fill is in the same
-    ///       place at the same scale → UV mapping / rotation / scale agree),
-    ///   (d) the two lit sets overlap > 60% of the smaller set.
-    /// Resampler / bleed per-pixel differences are expected and allowed.
-    #[test]
-    fn gpu_image_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("gpu_image_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        eprintln!(
-            "GPU Image parity test running on adapter: {}",
-            renderer.adapter_name()
-        );
-        let clusters = sample_clusters();
-        let opts = image_opts(120, 90);
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_image(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            // (a) both light pixels.
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // (b) comparable coverage (loose 2× band either direction).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
-            );
-
-            // (c) lit bounding boxes align within ±6 px per edge.
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 6i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // (d) overlap > 60% of the smaller lit set.
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.6,
-                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "image parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
-    }
 
     /// #217 (#14): rotation loop closure for the GPU image path. With
     /// `glyph_rotate=true`, `render_frame_image(t=0)` and `(t=1)` must render the
@@ -3259,109 +2928,6 @@ mod tests {
             "image rotation loop closure (Fast, high cycle×speed) t=0 vs t=1",
         );
         eprintln!("image fast loop closure: max per-channel diff = {max_diff}");
-    }
-
-    /// Lit-pixel bounding box of `img` against the opaque background, with a
-    /// per-channel `thresh`. Returns `None` when nothing is lit.
-    fn lit_bbox(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> Option<(u32, u32, u32, u32)> {
-        let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        let mut any = false;
-        for (x, y, p) in img.enumerate_pixels() {
-            if (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh) {
-                any = true;
-                minx = minx.min(x);
-                miny = miny.min(y);
-                maxx = maxx.max(x);
-                maxy = maxy.max(y);
-            }
-        }
-        any.then_some((minx, miny, maxx, maxy))
-    }
-
-    /// Structural parity with the CPU oracle (loose; bleed excluded). The CPU
-    /// `render_frame` adds an aquarelle bleed pass *after* the glyph fill, which
-    /// blurs/spreads the fill and shifts many pixels above/below the lit threshold,
-    /// so exact coverage is *not* expected to match. What must match is the
-    /// **structure** of the fill (same glyph, same orb positions / scale):
-    ///   - the lit-pixel **bounding boxes** align within a few pixels (position +
-    ///     extent of the glyph fill agree, proving UV mapping / rotation / scale);
-    ///   - both paths light a non-trivial, comparable number of pixels (within a
-    ///     2× band either way — bleed can raise or lower the count vs the sharp
-    ///     pre-bleed fill);
-    ///   - the two lit sets overlap substantially (the fill is in the same place).
-    ///
-    /// Bleed-derived per-pixel differences are expected and allowed.
-    #[test]
-    fn gpu_glyph_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("gpu_glyph_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let opts = glyph_opts(
-            120,
-            90,
-            MotionDirection::LeftToRight,
-            MotionSpeed::Slow,
-            true,
-        );
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_glyph(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // Comparable coverage (loose 2× band either direction).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit} / cpu_lit={cpu_lit} = {ratio:.2}, expected within [0.5, 2.0]"
-            );
-
-            // Lit bounding boxes must align within a small tolerance (the fill is
-            // in the same screen region at the same scale). Bleed grows the CPU
-            // bbox slightly; allow 6 px slack on each edge.
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 6i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // Overlap: a good fraction of the smaller lit set coincides with the
-            // larger one (the fills occupy the same pixels, not merely the same box).
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.6,
-                "t={t}: lit overlap {:.1}% of the smaller set; expected >60%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "glyph parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
     }
 
     /// Rotation (#136): ON animates the glyph (frames at different t differ), OFF
@@ -3518,50 +3084,6 @@ mod tests {
 
     // ---- #212 Phase 1b: 4-texel widening / glyph dispatch regression guards ----
 
-    /// #212 (#1): widening the orb data-texture 3→4 texels (x=3 = rotation) must
-    /// leave the **Circle** path bit-exact — the Circle shader ignores texel x=3.
-    /// This pins the Circle bit-exact requirement after the layout change across
-    /// several frames (count / direction / t varied), proving x=3 is dead weight
-    /// for Circle. On the real GPU the diff is expected to be 0; the assertion
-    /// allows the ±2/channel contract as the other Circle parity tests do.
-    #[test]
-    fn circle_bitexact_after_4texel_widening() {
-        let Some(renderer) = require_or_skip_renderer("circle_bitexact_after_4texel_widening")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        // Vary count, direction, and t so the per-orb rows (and the now-present but
-        // Circle-ignored x=3 rotation texel) take many distinct values; Circle must
-        // stay byte-for-byte on the CPU oracle regardless.
-        let cases = [
-            (8usize, MotionDirection::LeftToRight, 0.0_f32),
-            (12, MotionDirection::RightToLeft, 0.25),
-            (20, MotionDirection::TopToBottom, 0.5),
-            (33, MotionDirection::BottomToTop, 0.75),
-            (50, MotionDirection::LeftToRight, 1.0),
-        ];
-        for &(count, dir, t) in &cases {
-            let mut opts = circle_opts(40, 28, dir, MotionSpeed::Mid);
-            opts.count = Some(count);
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff =
-                assert_within_tolerance(&cpu, &gpu, &format!("count={count} {dir:?} t={t}"));
-            // Pin the *bit-exact* contract explicitly (the Circle requirement),
-            // stronger than the ±2 band the helper enforces. On the GTX 1050 Ti
-            // round(value*255) is the same arithmetic as the CPU loop, so Circle is
-            // diff 0; if x=3 ever leaked into Circle this would break first.
-            assert_eq!(
-                max_diff, 0,
-                "Circle must stay bit-exact after the 3→4 texel widening \
-                 (x=3 rotation texel must be ignored): count={count} {dir:?} t={t}"
-            );
-            overall_max = overall_max.max(max_diff);
-        }
-        eprintln!("circle 4-texel widening bit-exact: overall max diff = {overall_max}");
-    }
 
     /// #212 (#2): the `render_packed_inner` short-row guard changed from a per-orb
     /// `off + 11` cut-off to `off + 13` (so the new rotation words at `off+11` /
@@ -4206,39 +3728,6 @@ mod tests {
         eprintln!("gpu glyph bleed determinism: two renders byte-identical");
     }
 
-    /// #214 (A / D1 pin): adding the bleed pass group must leave the **Circle**
-    /// path untouched. Circle never enters `run_glyph_fill_bleed_readback` (it goes
-    /// through `run_pass_and_readback` instead), so a Circle frame must still match
-    /// the CPU oracle within the ±2/channel contract every other Circle parity test
-    /// uses. This is the explicit non-regression pin that the #214 addition did not
-    /// leak into the Circle dispatch.
-    #[test]
-    fn gpu_circle_unaffected_by_bleed_addition() {
-        let Some(renderer) = require_or_skip_renderer("gpu_circle_unaffected_by_bleed_addition")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let mut overall_max = 0u8;
-        for &(dir, t) in &[
-            (MotionDirection::LeftToRight, 0.0_f32),
-            (MotionDirection::TopToBottom, 0.5),
-            (MotionDirection::BottomToTop, 1.0),
-        ] {
-            let opts = circle_opts(48, 32, dir, MotionSpeed::Mid);
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame(&clusters, &opts, t);
-            let max_diff = assert_within_tolerance(
-                &cpu,
-                &gpu,
-                &format!("circle bleed-unaffected {dir:?} t={t}"),
-            );
-            overall_max = overall_max.max(max_diff);
-        }
-        eprintln!(
-            "circle unaffected by bleed addition: overall max per-channel diff = {overall_max}"
-        );
-    }
 
     /// #214 (B): the box-blur radius clamp (`r = min(radius, w-1)` / `min(radius,
     /// h-1)` in `orb_glyph_bleed.wgsl`) must keep tiny canvases from sampling out
@@ -4417,85 +3906,6 @@ mod tests {
         eprintln!("concurrent glyph bleed: all threads matched solo oracle (no mid-pass aliasing)");
     }
 
-    /// #214 (structural parity tighten): with the bleed pass now reproduced on the
-    /// GPU, the lit bbox and overlap should agree **more tightly** than the
-    /// pre-bleed `gpu_glyph_structural_parity_with_cpu` allowed — bbox within 3 px
-    /// (was 6) and overlap > 80% (was 60%). The **lit-count band [0.5, 2.0] is left
-    /// unchanged**: the GPU omits the paper-grain noise, so the CPU still scatters
-    /// extra faint soft pixels the GPU lacks, and pinning the count ratio tighter
-    /// would be a false positive. The existing looser test is intentionally left in
-    /// place; this one is the tightened companion.
-    #[test]
-    fn gpu_glyph_bleed_parity_tighter_bbox_overlap() {
-        let Some(renderer) =
-            require_or_skip_renderer("gpu_glyph_bleed_parity_tighter_bbox_overlap")
-        else {
-            return;
-        };
-        let clusters = sample_clusters();
-        let opts = glyph_opts(
-            120,
-            90,
-            MotionDirection::LeftToRight,
-            MotionSpeed::Slow,
-            true,
-        );
-        for &t in &[0.0_f32, 0.5] {
-            let cpu = render_frame(&clusters, &opts, t);
-            let gpu = renderer.render_frame_glyph(&clusters, &opts, t);
-            assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-            let bg = opts.background;
-            let cpu_lit = lit_vs_bg(&cpu, bg, 8);
-            let gpu_lit = lit_vs_bg(&gpu, bg, 8);
-            assert!(cpu_lit > 0 && gpu_lit > 0, "both paths must light pixels");
-
-            // Lit-count band left at the looser [0.5, 2.0] (noise omitted on GPU).
-            let ratio = gpu_lit as f32 / cpu_lit as f32;
-            assert!(
-                (0.5..=2.0).contains(&ratio),
-                "t={t}: gpu_lit={gpu_lit}/cpu_lit={cpu_lit}={ratio:.2}, band [0.5,2.0] (unchanged)"
-            );
-
-            // Tighter bbox: 3 px slack on each edge (was 6).
-            let cb = lit_bbox(&cpu, bg, 8).expect("cpu has lit pixels");
-            let gb = lit_bbox(&gpu, bg, 8).expect("gpu has lit pixels");
-            let tol = 3i64;
-            for (label, a, b) in [
-                ("minx", cb.0 as i64, gb.0 as i64),
-                ("miny", cb.1 as i64, gb.1 as i64),
-                ("maxx", cb.2 as i64, gb.2 as i64),
-                ("maxy", cb.3 as i64, gb.3 as i64),
-            ] {
-                assert!(
-                    (a - b).abs() <= tol,
-                    "t={t}: lit bbox {label} differs by {} (cpu={a} gpu={b}), tightened tol={tol}",
-                    (a - b).abs()
-                );
-            }
-
-            // Tighter overlap: > 80% of the smaller lit set (was 60%).
-            let mut overlap = 0usize;
-            for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-                let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-                let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-                if c_lit && g_lit {
-                    overlap += 1;
-                }
-            }
-            let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-            assert!(
-                overlap_frac > 0.8,
-                "t={t}: lit overlap {:.1}% of the smaller set; tightened expectation >80%",
-                overlap_frac * 100.0
-            );
-            eprintln!(
-                "glyph bleed tighter parity t={t}: cpu_lit={cpu_lit} gpu_lit={gpu_lit} \
-                 ratio={ratio:.2} overlap={:.1}%",
-                overlap_frac * 100.0
-            );
-        }
-    }
 
     // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
 
@@ -4598,70 +4008,6 @@ mod tests {
         assert!(orbs[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
     }
 
-    /// Aquarelle GPU↔CPU **structural** parity: the WGSL four-layer path matches the
-    /// CPU `render_frame_aquarelle` oracle within a loose tolerance (AA-only residual,
-    /// like Circle). Asserts the lit-pixel sets overlap heavily and the mean color is
-    /// close — not byte-exact, because tiny-skia anti-aliases its `fill_path` where
-    /// the shader evaluates the radial analytically.
-    #[test]
-    fn aquarelle_gpu_structural_parity_with_cpu() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_structural_parity_with_cpu")
-        else {
-            return;
-        };
-        let (w, h) = (96u32, 128u32);
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.8),
-            cluster([60, 120, 220], 0.7, 0.55, 0.5),
-            cluster([200, 200, 80], 0.5, 0.8, 0.4),
-        ];
-        let params = AquarelleParams::default();
-        let opts = aquarelle_opts(w, h, params);
-        let t = 0.0;
-
-        let cpu = render_frame(&clusters, &opts, t);
-        let gpu = renderer.render_frame_aquarelle(&clusters, &opts, t);
-        assert_eq!(cpu.dimensions(), gpu.dimensions());
-
-        let bg = opts.background;
-        let mut cpu_lit = 0usize;
-        let mut gpu_lit = 0usize;
-        let mut overlap = 0usize;
-        let mut sum_abs = 0u64;
-        for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-            let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-            let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-            if c_lit {
-                cpu_lit += 1;
-            }
-            if g_lit {
-                gpu_lit += 1;
-            }
-            if c_lit && g_lit {
-                overlap += 1;
-            }
-            for c in 0..3 {
-                sum_abs += cp.0[c].abs_diff(gp.0[c]) as u64;
-            }
-        }
-        assert!(cpu_lit > 0 && gpu_lit > 0, "both renders must light pixels");
-        let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-        assert!(
-            overlap_frac > 0.9,
-            "aquarelle lit overlap {:.1}% of smaller set; expected >90% (cpu_lit={cpu_lit} gpu_lit={gpu_lit})",
-            overlap_frac * 100.0
-        );
-        let mean_abs = sum_abs as f64 / (w as f64 * h as f64 * 3.0);
-        assert!(
-            mean_abs < 2.0,
-            "aquarelle mean per-channel |cpu-gpu| {mean_abs:.3} should be small (AA-only residual)"
-        );
-        eprintln!(
-            "aquarelle structural parity: cpu_lit={cpu_lit} gpu_lit={gpu_lit} \
-             overlap={:.1}% mean_abs={mean_abs:.3}",
-            overlap_frac * 100.0
-        );
-    }
 
     /// Aquarelle GPU determinism: the same `(clusters, opts, t)` must render
     /// byte-identical twice (the pack RNG is seeded per orb index, no thread_rng).
@@ -5155,172 +4501,8 @@ mod tests {
         );
     }
 
-    /// (#8, pure CPU — runs everywhere) Aquarelle ignores `--count`: one orb per
-    /// cluster. `count=Some(64)` with 3 clusters must render byte-identically to
-    /// `count=None`. Uses only the CPU `render_frame` oracle (no GPU needed).
-    #[test]
-    fn aquarelle_render_frame_ignores_count() {
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.8),
-            cluster([60, 120, 220], 0.7, 0.55, 0.5),
-            cluster([200, 200, 80], 0.5, 0.8, 0.4),
-        ];
-        let mut opts = aquarelle_opts(72, 56, AquarelleParams::default());
-        opts.count = None;
-        let none = render_frame(&clusters, &opts, 0.0);
-        opts.count = Some(64);
-        let with_count = render_frame(&clusters, &opts, 0.0);
-        assert_eq!(
-            none.as_raw(),
-            with_count.as_raw(),
-            "aquarelle must render one orb per cluster regardless of --count"
-        );
-    }
 
-    /// Shared structural-parity check: GPU↔CPU aquarelle must light overlapping pixel
-    /// sets and stay close in mean per-channel diff (AA-only residual, like Circle).
-    /// Returns nothing; panics on failure. Used by the corner / branch tests below.
-    fn assert_aquarelle_structural_parity(
-        renderer: &GpuRenderer,
-        clusters: &[Cluster],
-        opts: &AnimateOptions,
-        t: f32,
-        label: &str,
-    ) {
-        let cpu = render_frame(clusters, opts, t);
-        let gpu = renderer.render_frame_aquarelle(clusters, opts, t);
-        assert_eq!(cpu.dimensions(), gpu.dimensions(), "{label}: dim mismatch");
-        let bg = opts.background;
-        let (mut cpu_lit, mut gpu_lit, mut overlap, mut sum_abs) = (0usize, 0usize, 0usize, 0u64);
-        for (cp, gp) in cpu.pixels().zip(gpu.pixels()) {
-            let c_lit = (0..3).any(|c| cp.0[c].abs_diff(bg[c]) > 8);
-            let g_lit = (0..3).any(|c| gp.0[c].abs_diff(bg[c]) > 8);
-            if c_lit {
-                cpu_lit += 1;
-            }
-            if g_lit {
-                gpu_lit += 1;
-            }
-            if c_lit && g_lit {
-                overlap += 1;
-            }
-            for c in 0..3 {
-                sum_abs += cp.0[c].abs_diff(gp.0[c]) as u64;
-            }
-        }
-        assert!(
-            cpu_lit > 0 && gpu_lit > 0,
-            "{label}: both renders must light pixels"
-        );
-        let overlap_frac = overlap as f32 / cpu_lit.min(gpu_lit) as f32;
-        assert!(
-            overlap_frac > 0.85,
-            "{label}: lit overlap {:.1}% of smaller set; expected >85% (cpu_lit={cpu_lit} gpu_lit={gpu_lit})",
-            overlap_frac * 100.0
-        );
-        let (w, h) = cpu.dimensions();
-        let mean_abs = sum_abs as f64 / (w as f64 * h as f64 * 3.0);
-        assert!(
-            mean_abs < 3.0,
-            "{label}: mean per-channel |cpu-gpu| {mean_abs:.3} should be small (AA-only residual)"
-        );
-    }
 
-    /// (#9) A large orb near a corner pushes its satellites' `radius*1.5` cutoff past
-    /// the frame edge. The shader clips at the cutoff (outside ⇒ background); the GPU
-    /// must still match the CPU within the structural-parity band, proving the
-    /// edge-clipped arc is composited correctly rather than smeared or wrapped.
-    #[test]
-    fn aquarelle_gpu_satellite_cutoff_clipped_at_edge() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_gpu_satellite_cutoff_clipped_at_edge")
-        else {
-            return;
-        };
-        // Big orb (weight 1.0 ⇒ radius == base_radius_unit, large for 64x64) tucked in
-        // the top-left corner so the main + satellites overhang the edge.
-        let clusters = vec![cluster([220, 80, 80], 0.08, 0.08, 1.0)];
-        let params = AquarelleParams {
-            bleed: 1.0,
-            bloom: 0.5,
-            offset: 0.5,
-            halo: 0.5,
-        };
-        let opts = aquarelle_opts(64, 64, params);
-        assert_aquarelle_structural_parity(
-            renderer,
-            &clusters,
-            &opts,
-            0.0,
-            "aquarelle edge-clipped satellites",
-        );
-    }
 
-    /// (#10) Transparent background (`bg.a < 255`, here fully transparent). The shader's
-    /// `0 < acc_a8 < 255` un-premultiply branch in `fs_main` must round-trip premultiplied
-    /// → straight the same way the CPU `finalize_pixmap` does, so GPU↔CPU stay within the
-    /// structural-parity band over a transparent canvas.
-    #[test]
-    fn aquarelle_gpu_transparent_background_premul_roundtrip() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_gpu_transparent_background_premul_roundtrip")
-        else {
-            return;
-        };
-        let clusters = vec![
-            cluster([220, 60, 60], 0.35, 0.4, 0.6),
-            cluster([60, 140, 220], 0.65, 0.6, 0.5),
-        ];
-        let mut opts = aquarelle_opts(80, 80, AquarelleParams::default());
-        opts.background = [0, 0, 0, 0]; // fully transparent canvas
-        assert_aquarelle_structural_parity(
-            renderer,
-            &clusters,
-            &opts,
-            0.0,
-            "aquarelle transparent bg premul round-trip",
-        );
-    }
 
-    /// (#11) Param-corner parity. The existing structural test only exercises the
-    /// default mid (0.5) params; this sweeps representative `{bleed,bloom,halo,offset}`
-    /// corners in `{0,1}` so an extreme-param divergence (e.g. bloom-off vs bloom-max,
-    /// no-bleed vs full-bleed) is caught by the GPU↔CPU structural band.
-    #[test]
-    fn aquarelle_gpu_parity_across_param_corners() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_parity_across_param_corners")
-        else {
-            return;
-        };
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.7),
-            cluster([60, 120, 220], 0.7, 0.6, 0.5),
-        ];
-        // Representative corners (not the full 16 — keep GPU work bounded).
-        let corners = [
-            (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32),
-            (1.0, 0.0, 0.0, 1.0),
-            (0.0, 1.0, 1.0, 0.0),
-            (1.0, 1.0, 1.0, 1.0),
-            (1.0, 0.0, 1.0, 0.0),
-        ];
-        for (bleed, bloom, halo, offset) in corners {
-            let params = AquarelleParams {
-                bleed,
-                bloom,
-                offset,
-                halo,
-            };
-            let opts = aquarelle_opts(72, 72, params);
-            assert_aquarelle_structural_parity(
-                renderer,
-                &clusters,
-                &opts,
-                0.0,
-                &format!(
-                    "aquarelle corner bleed={bleed} bloom={bloom} halo={halo} offset={offset}"
-                ),
-            );
-        }
-    }
 }
