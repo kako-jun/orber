@@ -112,8 +112,8 @@ fn orb_circle_wgsl() -> &'static str {
 
 /// The Glyph orb WGSL (#212 Phase 1b). Same data-texture orb layout as the Circle
 /// shader, plus an `R8Unorm` glyph SDF texture + bilinear sampler (bindings 2/3),
-/// and reads the per-orb rotation texel (x=3). It reproduces the CPU
-/// `glyph::render_glyph_orb` fill (pre-bleed), not the WebGL mask×profile arm.
+/// and reads the per-orb rotation texel (x=3). It draws the glyph SDF fill
+/// (pre-bleed) via the Circle Rim/Soft `falloff_curve`, not the WebGL mask×profile arm.
 fn orb_glyph_wgsl() -> &'static str {
     include_str!("orb_glyph.wgsl")
 }
@@ -141,9 +141,9 @@ fn orb_aquarelle_wgsl() -> &'static str {
     include_str!("orb_aquarelle.wgsl")
 }
 
-/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()` (the
-/// values the CPU `render_frame` passes: `radius = 3.0, intensity = 0.5,
-/// halo = 0.3`) so the GPU 2nd pass matches the CPU paper-bleed.
+/// Aquarelle bleed constants, fixed to `AquarelleBleedParams::default()`
+/// (`radius = 3.0, intensity = 0.5, halo = 0.3`) so the GPU 2nd pass matches the
+/// `aquarelle::render_aquarelle_bleed_pass` paper-bleed.
 ///
 /// `BLEED_BOX_RADIUS` is `round(radius * 1.15).max(1)` = `round(3.45)` = `3`, the
 /// box-blur half-window the crate derives from `radius` (see
@@ -182,11 +182,11 @@ struct Params {
     /// valid; it simply names the slots `_pad0`/`_pad1`).
     glyph_rotate: f32,
     /// Glyph edge softness (#205): unused by the current Glyph fill (it uses
-    /// `falloff_curve` like the CPU `render_glyph_orb`), reserved for the future
-    /// SDF-mask path; kept so the header layout mirrors the WebGL one.
+    /// the Circle `falloff_curve`), reserved for the future SDF-mask path; kept so
+    /// the header layout mirrors the WebGL one.
     edge_softness: f32,
-    /// Glyph SDF square side in texels. The Glyph shader uses it to reproduce the
-    /// CPU `sample_sdf_bilinear` convention (`coord = u*(size-1)`) when remapping
+    /// Glyph SDF square side in texels. The Glyph shader uses it for the SDF
+    /// bilinear sampling convention (`coord = u*(size-1)`) when remapping
     /// UVs to the wgpu sampler's texel space. Circle ignores this slot (its WGSL
     /// `Params` names it `_pad2`). `0.0` for the Circle path.
     sdf_size: f32,
@@ -296,7 +296,7 @@ struct BleedPipelines {
 /// between `ping` / `pong` (premultiplied); the compose pass reads `fill` +
 /// the final blurred texture and writes straight RGBA to the `SizedResources`
 /// `target`. All three are `Rgba8Unorm` so each box-blur pass quantizes to u8 the
-/// way the CPU crate does between its H/V passes.
+/// way the `aquarelle` crate does between its H/V passes.
 struct BleedTextures {
     fill_view: wgpu::TextureView,
     ping_view: wgpu::TextureView,
@@ -404,8 +404,9 @@ pub struct GpuRenderer {
 
 impl GpuRenderer {
     /// Bring up a headless GPU context (no surface). Returns `None` when no
-    /// adapter is available (e.g. CI without a GPU / software rasterizer), so
-    /// callers can fall back to the CPU path instead of hard-failing.
+    /// adapter is available (e.g. CI without a GPU / software rasterizer). GPU is
+    /// the only renderer (#225), so the CLI treats `None` as a fatal error and
+    /// exits; tests treat it as skip.
     pub fn new() -> Option<Self> {
         pollster::block_on(Self::new_async())
     }
@@ -426,9 +427,9 @@ impl GpuRenderer {
             })
             .await
             .ok()?;
-        // Bilinear, clamp-to-edge sampler for the glyph SDF. Clamp-to-edge mirrors
-        // the CPU `sample_sdf_bilinear` neighbor clamp (`x1 = (x0+1).min(size-1)`),
-        // and linear min/mag gives the 2×2 lerp the CPU does by hand.
+        // Bilinear, clamp-to-edge sampler for the glyph SDF. Clamp-to-edge gives the
+        // neighbor clamp the SDF sampling convention expects (`x1 = (x0+1).min(size-1)`),
+        // and linear min/mag gives the 2×2 lerp.
         let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("orber-glyph-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -827,36 +828,35 @@ impl GpuRenderer {
         view
     }
 
-    /// Render one Circle frame at time `t` from `clusters` + `opts`, matching
-    /// [`crate::animate::render_frame`].
+    /// Render one Circle frame at time `t` from `clusters` + `opts`.
     ///
     /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
-    /// arithmetic the WebGL path uses — so the GPU output matches the CPU oracle
-    /// within ±2/channel. `opts.width` / `opts.height` give the output size; `t`
-    /// is clamped to `0.0..=1.0`.
+    /// arithmetic the WebGL path (`orberGl.ts`) uses — so the orb positions /
+    /// radii / alphas match the web result. `opts.width` / `opts.height` give the
+    /// output size; `t` is clamped to `0.0..=1.0`.
     ///
     /// # Orb count
     ///
-    /// The resolved orb count is clamped only to [`MAX_ORB_COUNT`] (1024), the same
-    /// ceiling the CPU oracle uses. Per-orb data is uploaded as a data-texture that
-    /// grows to fit, so there is no 64-orb cap and the GPU renders the same image
-    /// the CPU does for any count up to 1024 (#210 Phase 1a). No CPU fallback for
-    /// `count > 64` is needed anymore.
+    /// The resolved orb count is clamped only to [`MAX_ORB_COUNT`] (1024). Per-orb
+    /// data is uploaded as a data-texture that grows to fit, so there is no 64-orb
+    /// cap and the GPU renders any count up to 1024 directly (#210 Phase 1a).
     ///
-    /// # Panics / scope
+    /// # Scope
     ///
     /// This is the **Circle** path only. The shape in `opts.shape` is ignored
-    /// here; the caller routes `Glyph` to `render_frame_glyph` and `Aquarelle`
-    /// to `render_frame_aquarelle` (both GPU), and only falls back to the CPU
-    /// renderer when no GPU adapter is available. See the module docs.
+    /// here; the caller routes `Glyph` to `render_frame_glyph`, `Image` to
+    /// `render_frame_image`, and `Aquarelle` to `render_frame_aquarelle` (all GPU).
+    /// GPU is the only renderer (#225) — no CPU fallback exists; when no adapter is
+    /// available, [`GpuRenderer::new`] returns `None` and the CLI exits with an
+    /// error. See the module docs.
     pub fn render_frame(&self, clusters: &[Cluster], opts: &AnimateOptions, t: f32) -> RgbaImage {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
 
-        // Derive the WebGL pack-buffer scalars exactly as the CPU oracle /
-        // `get_render_data` do, then reuse `pack_render_data_for_webgl` so the
-        // per-orb arithmetic is never reimplemented.
+        // Derive the WebGL pack-buffer scalars exactly as `get_render_data`
+        // (the wasm/WebGL entry) does, then reuse `pack_render_data_for_webgl` so
+        // the per-orb arithmetic is never reimplemented.
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
         let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
@@ -892,47 +892,45 @@ impl GpuRenderer {
         );
 
         // `pack_render_data_for_webgl` is shared with the WebGL path and must NOT
-        // bake in saturation (the web side has its own knob). The CPU oracle,
-        // however, applies `adjust_saturation_pub(color_at_t, saturation)` per orb
-        // (`animate::render_frame`). To stay bit-exact we re-apply the *same*
-        // function here, in native GPU land only, over the packed color words.
+        // bake in saturation (the web side has its own knob). The native CLI has no
+        // separate saturation knob, so we apply
+        // `adjust_saturation_pub(color_at_t, saturation)` per orb here, in native
+        // GPU land only, over the packed color words.
         //
         // Each color word triple is `c.color[i] as f32 / 255.0`, so `round(w*255)`
-        // recovers the exact u8 the CPU fed to `adjust_saturation_pub`; we run the
-        // identical HSL transform and write the result back as `u8 / 255.0`.
+        // recovers the exact u8; we run the HSL saturation transform and write the
+        // result back as `u8 / 255.0`.
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         self.render_packed(&pack, width, height, t)
     }
 
-    /// Render one **Glyph** frame at time `t` from `clusters` + `opts`, matching
-    /// the CPU [`crate::glyph::render_glyph_orb`] fill (#212 Phase 1b).
+    /// Render one **Glyph** frame at time `t` from `clusters` + `opts` (#212 Phase 1b).
     ///
     /// `opts.shape` must be [`OrbShape::Glyph`]; the glyph `ch` / `font` select the
     /// SDF. The per-orb arithmetic reuses [`pack_render_data_for_webgl`] (so
-    /// positions / radii / rotation match the CPU path), saturation is re-applied
-    /// per orb like the CPU oracle, the glyph SDF is uploaded as an `R8Unorm`
-    /// texture, and the Glyph shader bilinear-samples it and fills with
-    /// `falloff_curve(1 - signed_unit)`.
+    /// positions / radii / rotation match the WebGL path), saturation is re-applied
+    /// per orb (the native CLI has no separate saturation knob), the glyph SDF is
+    /// uploaded as an `R8Unorm` texture, and the Glyph shader bilinear-samples it
+    /// and fills with `falloff_curve(1 - signed_unit)`.
     ///
-    /// # Parity scope (loose — structural + tolerant)
+    /// # Bleed pass
     ///
-    /// The CPU `render_frame` applies a per-frame aquarelle **bleed pass** after
-    /// the glyph fill (#195). This GPU path now reproduces it as a 2nd pass group
+    /// After the glyph fill, an aquarelle **bleed pass** (#195, reference algorithm
+    /// `aquarelle::render_aquarelle_bleed_pass`) is applied as a 2nd pass group
     /// (#214): the glyph fill renders into an intermediate texture, then a WGSL
     /// premultiply → separable box-blur ×3 → halo saturation → intensity compose +
     /// finalize writes the backbuffer (see [`Self::run_glyph_fill_bleed_readback`]
-    /// / `orb_glyph_bleed.wgsl`). Parity is **loose, not bit-exact**: the box-blur
-    /// structure / halo / intensity match the crate, but the aquarelle paper-grain
-    /// noise (a faint ±0.05 seed-derived jitter) is **omitted** on the GPU because
-    /// its ChaCha8 per-pixel-order consumption cannot be bit-reproduced in parallel,
-    /// and the GPU's HSL path differs from `palette`'s by sub-ULP rounding. Those
-    /// small per-pixel differences vs. the CPU are **expected and allowed** (a
-    /// future WGSL hash could approximate the noise).
+    /// / `orb_glyph_bleed.wgsl`). The box-blur structure / halo / intensity match
+    /// the crate, but the aquarelle paper-grain noise (a faint ±0.05 seed-derived
+    /// jitter) is **omitted** on the GPU because its ChaCha8 per-pixel-order
+    /// consumption cannot be bit-reproduced in parallel; that small per-pixel
+    /// difference vs. the crate algorithm is **expected and allowed** (a future
+    /// WGSL hash could approximate the noise).
     ///
     /// Returns a background-only frame (no glyph fill) when the glyph is unknown /
-    /// empty in the bundled font, mirroring the CPU "draw nothing for tofu"
-    /// contract.
+    /// empty in the bundled font — the "draw nothing for tofu" contract (never
+    /// draw `.notdef` boxes).
     pub fn render_frame_glyph(
         &self,
         clusters: &[Cluster],
@@ -965,10 +963,10 @@ impl GpuRenderer {
             .min(MAX_ORB_COUNT)
             .max(if clusters.is_empty() { 0 } else { 1 });
 
-        // SDF size: the CPU picks one per orb from its breath radius; the GPU binds
-        // one SDF for the frame, so size it from the *largest* orb radius (max
-        // weight × the breath max factor) so most orbs sample at or above the size
-        // the CPU used — bilinear sampling then matches closely.
+        // SDF size: the GPU binds one SDF for the whole frame (it cannot pick a
+        // per-orb size like a per-orb fill would), so size it from the *largest* orb
+        // radius (max weight × the breath max factor) so most orbs sample at or above
+        // their own size — bilinear up/down-sampling then keeps the edge sharp.
         let max_weight = clusters
             .iter()
             .map(|c| c.weight.max(0.0))
@@ -976,14 +974,14 @@ impl GpuRenderer {
         let frame_radius = base_radius_unit * max_weight.sqrt() * BREATH_RADIUS_MAX_FACTOR;
 
         // No glyph (radius 0 / unknown char / empty SDF) ⇒ background-only frame,
-        // matching the CPU "draw nothing" contract. Build a glyph-shaped pack with
-        // zero orbs so only the background paints. This routes through `render_packed`
-        // (the Circle path), so the bleed 2nd pass is skipped — intentional: the CPU
-        // runs `render_aquarelle_bleed_pass` unconditionally for Glyph, but blurring
+        // the "draw nothing" contract. Build a glyph-shaped pack with zero orbs so
+        // only the background paints. This routes through `render_packed` (the Circle
+        // path), so the bleed 2nd pass is skipped — intentional: the bleed pass
+        // (`aquarelle::render_aquarelle_bleed_pass`) would run for Glyph, but blurring
         // orber's uniform opaque background is a no-op *up to the omitted paper-grain
-        // noise* (the CPU would jitter that flat background by ±0.05; the GPU leaves it
-        // flat). Both yield a background-only frame within the same noise-omitted
-        // loose-parity contract this pass already accepts.
+        // noise* (the crate algorithm would jitter that flat background by ±0.05; the
+        // GPU leaves it flat). Either way the result is a background-only frame, within
+        // the same noise-omitted behavior this pass already documents.
         let Some((sdf, sdf_size)) =
             crate::glyph::cached_glyph_sdf_for_radius(font, ch, frame_radius)
         else {
@@ -1018,8 +1016,8 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
         );
-        // CPU glyph path applies per-orb saturation too (`render_frame_with_params`
-        // calls `adjust_saturation_pub(color_at_t, saturation)` before drawing).
+        // Apply per-orb saturation, same as the Circle path: the shared WebGL pack
+        // never bakes it in, so the native side runs `adjust_saturation_pub` here.
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         // Upload (or reuse) the glyph SDF, then render with the Glyph pipeline.
@@ -1042,7 +1040,7 @@ impl GpuRenderer {
     }
 
     /// Render one **Image** frame at time `t` from `clusters` + `opts` (#217),
-    /// matching the CPU [`crate::glyph::render_sdf_orb`] fill.
+    /// using the same SDF fill as [`Self::render_frame_glyph`].
     ///
     /// `opts.shape` must be [`OrbShape::Image`]; its `sdf` / `size` are uploaded as
     /// an `R8Unorm` texture and bound to the **same** Glyph pipeline + bleed 2nd pass
@@ -1051,9 +1049,9 @@ impl GpuRenderer {
     /// from outside, one fixed texture for the whole frame) instead of a per-radius
     /// cached font glyph. Per-orb positions / radii / rotation reuse
     /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
-    /// like the glyph path, so the same loose-parity contract (structural + tolerant,
-    /// paper-grain noise omitted on the GPU) applies. Non-Image shapes fall back to
-    /// the Circle path so the call is total.
+    /// like the glyph path, so the same bleed-pass behavior (box-blur / halo /
+    /// intensity match the crate, paper-grain noise omitted on the GPU) applies.
+    /// Non-Image shapes fall back to the Circle path so the call is total.
     pub fn render_frame_image(
         &self,
         clusters: &[Cluster],
@@ -1087,7 +1085,7 @@ impl GpuRenderer {
             .max(if clusters.is_empty() { 0 } else { 1 });
 
         // Empty SDF (all-zero / no contrast slipped through) or wrong length ⇒
-        // background-only frame, matching the CPU "draw nothing" contract.
+        // background-only frame ("draw nothing" contract).
         if sdf_size == 0
             || sdf.len() < (sdf_size as usize) * (sdf_size as usize)
             || sdf.iter().all(|&b| b == 0)
@@ -1123,8 +1121,8 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
         );
-        // CPU image path applies per-orb saturation too (render_sdf_orb receives the
-        // saturation-adjusted rgb in `render_frame_with_params`).
+        // Apply per-orb saturation, same as the Circle / Glyph paths (the shared
+        // WebGL pack never bakes it in).
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
 
         // Upload (or reuse) the image SDF with a content-derived key disjoint from
@@ -1143,25 +1141,24 @@ impl GpuRenderer {
         )
     }
 
-    /// Render one **Aquarelle** frame at time `t` from `clusters` + `opts`,
-    /// matching the CPU [`crate::animate::render_frame`] → `render_frame_aquarelle`
-    /// → `render_static` → `aquarelle::render_aquarelle_orb` path (#216 Phase 1c).
+    /// Render one **Aquarelle** frame at time `t` from `clusters` + `opts`, built on
+    /// the [`aquarelle::render_aquarelle_orb`] four-layer model (#216 Phase 1c).
     ///
     /// `opts.shape` must be [`OrbShape::Aquarelle`]; its [`AquarelleParams`] drive
     /// the four layers. Per-orb positions / radii / colors come from
-    /// [`crate::animate::aquarelle_modulated_clusters`] (the same modulation the CPU
-    /// path uses), then [`Self::pack_aquarelle_orbs`] runs the crate's ChaCha8 RNG
-    /// (`seed = orb index`) + `palette` HSL color math on the CPU to produce the
+    /// [`crate::animate::aquarelle_modulated_clusters`] (the shared per-orb
+    /// modulation), then [`Self::pack_aquarelle_orbs`] runs the crate's ChaCha8 RNG
+    /// (`seed = orb index`) + `palette` HSL color math host-side to produce the
     /// offset center, satellite placements, and boosted/mixed u8 colors. The
     /// `orb_aquarelle.wgsl` shader evaluates the radials and composites SourceOver.
     ///
-    /// # Parity scope (loose — structural + tolerant)
+    /// # Fidelity
     ///
-    /// Bit-exact in the RNG / color math (it reuses the crate's exact arithmetic),
-    /// but the radial fill is analytic where Skia lowp anti-aliases `fill_path`, so
-    /// the residual is the same AA-only difference Circle accepts (±2/channel on
-    /// most hardware, 0 on the real GPU for interior pixels). Non-Aquarelle shapes
-    /// fall back to the Circle path so the call is total.
+    /// The RNG / color math reuse the crate's exact arithmetic (host-side), so those
+    /// are byte-identical to the crate; only the radial fill is analytic where Skia
+    /// lowp anti-aliases `fill_path`, so the residual is an AA-only difference at orb
+    /// edges (the same kind Circle has). Non-Aquarelle shapes fall back to the Circle
+    /// path so the call is total.
     pub fn render_frame_aquarelle(
         &self,
         clusters: &[Cluster],
@@ -1178,12 +1175,12 @@ impl GpuRenderer {
             _ => return self.render_frame(clusters, opts, t),
         };
 
-        // Same per-orb modulation the CPU aquarelle path uses (position wrap, radius
-        // breath, #33/#7 color interpolation). Index order == `render_static` draw
-        // order == `render_aquarelle_orb` seed `i`.
+        // Shared per-orb modulation (position wrap, radius breath, #33/#7 color
+        // interpolation). The cluster index order is the orb draw order and is also
+        // the `render_aquarelle_orb` seed `i`, so RNG consumption stays in step.
         let modulated = crate::animate::aquarelle_modulated_clusters(clusters, opts, t);
 
-        // `base_radius_unit` mirrors `render_static`: min(w,h) * 0.25 * orb_size.
+        // `base_radius_unit` is the standard orb radius unit: min(w,h) * 0.25 * orb_size.
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let saturation = opts.saturation.max(0.0);
 
@@ -1229,7 +1226,7 @@ impl GpuRenderer {
 
         let mut orbs = Vec::with_capacity(n.max(1));
         for (i, cluster) in clusters.iter().take(n).enumerate() {
-            // `render_static`: radius = base_radius_unit * sqrt(weight),
+            // Standard orb geometry: radius = base_radius_unit * sqrt(weight),
             // color = adjust_saturation(cluster.color, saturation),
             // center = clamp(centroid, 0..1) * (width, height).
             let radius = base_radius_unit * cluster.weight.max(0.0).sqrt();
@@ -1487,7 +1484,7 @@ impl GpuRenderer {
         // This is the outermost lock, taken exactly once before any cache Mutex, so
         // it cannot deadlock against the inner pipeline / sized / orb caches. The
         // single-threaded CLI never contends it. It does not change the drawing
-        // result — bit-exact parity is preserved.
+        // result — the same params render byte-identically with or without the lock.
         let _render_guard = self
             .render_guard
             .lock()
@@ -1520,8 +1517,8 @@ impl GpuRenderer {
             alpha_mul: pack[9],
             // header[11] = glyph_rotate (#136), header[12] = edge_softness (#205).
             // Both are Glyph-only; the Circle shader never reads them. `sdf_size`
-            // comes from the Glyph binding (the shader uses it to match the CPU
-            // bilinear convention); Circle leaves it 0.
+            // comes from the Glyph binding (the shader uses it for the SDF bilinear
+            // sampling convention); Circle leaves it 0.
             glyph_rotate: pack[11],
             edge_softness: pack[12],
             sdf_size: glyph.as_ref().map_or(0.0, |g| g.size as f32),
@@ -1739,8 +1736,8 @@ impl GpuRenderer {
     /// Compile the bleed shader once and build its four fragment-entry pipelines,
     /// all sharing one bind-group layout (uniform 0 + `src` texture 1 + `blurred`
     /// texture 2; both textures `filterable: false` because the shader reads them
-    /// with `textureLoad`, keeping the box-blur on exact texel centers like the CPU
-    /// crate). All targets are `Rgba8Unorm`, `blend: None`.
+    /// with `textureLoad`, keeping the box-blur on exact texel centers like the
+    /// `aquarelle` crate). All targets are `Rgba8Unorm`, `blend: None`.
     fn build_bleed_pipelines(&self) -> BleedPipelines {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let bind_group_layout =
@@ -2048,8 +2045,8 @@ fn align_up(value: u32, align: u32) -> u32 {
 /// `pack_render_data_for_webgl` buffer, in place (native GPU path only).
 ///
 /// `pack_render_data_for_webgl` is shared with the WebGL path and intentionally
-/// leaves saturation out, but the CPU oracle applies it per orb, so the native
-/// GPU path re-applies the identical transform here to keep bit-exact parity.
+/// leaves saturation out (the web side has its own knob), so the native GPU path
+/// re-applies the `adjust_saturation_pub` transform per orb here instead.
 /// Color words live at `[off .. off+3]` per orb as `u8 / 255.0`; we round back to
 /// the original u8, run the same HSL adjust, and write the result back the same
 /// way. A factor of `1.0` is the `adjust_saturation_pub` fast-path (no change).
@@ -2305,7 +2302,7 @@ mod tests {
         }
         assert!(
             max_diff <= 2,
-            "{ctx}: max per-channel diff {max_diff} at pixel ({},{}) channel {} (cpu={:?} gpu={:?})",
+            "{ctx}: max per-channel diff {max_diff} at pixel ({},{}) channel {} (a={:?} b={:?})",
             worst.0,
             worst.1,
             worst.2,
@@ -2834,8 +2831,8 @@ mod tests {
         );
     }
 
-    /// #217: an empty (all-zero) image SDF yields a background-only frame, mirroring
-    /// the CPU "draw nothing" contract (no panic).
+    /// #217: an empty (all-zero) image SDF yields a background-only frame
+    /// ("draw nothing" contract, no panic).
     #[test]
     fn gpu_image_empty_sdf_is_background_only() {
         let Some(renderer) = require_or_skip_renderer("gpu_image_empty_sdf_is_background_only")
@@ -3021,8 +3018,8 @@ mod tests {
     }
 
     /// An unknown / unrenderable glyph (pizza emoji, absent from the bundled
-    /// Symbols 2 subset) must yield a background-only frame — no orb fill, matching
-    /// the CPU "draw nothing for tofu" contract.
+    /// Symbols 2 subset) must yield a background-only frame — no orb fill, the
+    /// "draw nothing for tofu" contract.
     #[test]
     fn gpu_glyph_unknown_char_background_only() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_unknown_char_background_only")
@@ -3282,7 +3279,8 @@ mod tests {
     /// #212 (#6): rotation loop closure under stress — ON, MotionSpeed::Fast (high
     /// cycle count) plus high per-orb speed multipliers — the t=0 and t=1 frames
     /// must still match within tolerance. This stresses the WGSL `fract` / `floor`
-    /// wrap (`turns = cycle * speed * t - floor(...)`) against the CPU `rem_euclid`
+    /// wrap (`turns = cycle * speed * t - floor(...)`) against the Rust
+    /// `crate::animate::glyph_rotation_angle` `rem_euclid`
     /// at the largest `cycle * speed` products, where a float-precision mismatch in
     /// the wrap would be most visible. (Loop closure relies on `cycle * speed_mult`
     /// being integral so turns = 0 at t = 1.)
@@ -3524,11 +3522,10 @@ mod tests {
 
     // ---- #214 Phase 1b.5: Glyph bleed/halo 2nd pass (WGSL) ----
 
-    /// A Glyph `AnimateOptions` matching the CPU bleed oracle's setup: a single
-    /// white centered cluster, `orb_size = 1.0`, `softness = Low` (the sharp
-    /// pre-#205 baseline the CPU bleed tests pin so the halo R survives the blur),
-    /// no flow advance / rotation so the glyph sits at the canvas center. Mirrors
-    /// the `orb.rs` `glyph_bleed_produces_halo_around_lit_pixel_cluster` opts.
+    /// A Glyph `AnimateOptions` for the bleed-pass tests: a single white centered
+    /// cluster, `orb_size = 1.0`, `softness = Low` (the sharp pre-#205 baseline, so
+    /// the halo R survives the blur), no flow advance / rotation so the glyph sits
+    /// at the canvas center.
     fn glyph_bleed_opts(w: u32, h: u32) -> AnimateOptions {
         AnimateOptions {
             width: w,
@@ -3553,14 +3550,13 @@ mod tests {
     }
 
     /// #214 (A): the GPU bleed pass must leak a **halo ring** outside the glyph
-    /// body — the direct evidence the box-blur/compose 2nd pass ran. Mirrors the
-    /// CPU oracle `glyph_bleed_produces_halo_around_lit_pixel_cluster`: a single
+    /// body — the direct evidence the box-blur/compose 2nd pass ran. A single
     /// white ☆ at 64×64, `orb_size = 1.0` (radius ≈ 16 px, center (32,32)). The
     /// star body is essentially complete by r ≈ 16; the ring 18..21 px from the
     /// center is outside the body, so any lit (R>0) pixel there must come from the
     /// bleed pass spreading the fill outward. Without the 2nd pass that ring would
-    /// be pure background black. Loose count (`>= 10`) like the CPU oracle (noise
-    /// is omitted on the GPU, so the absolute count differs from the CPU's).
+    /// be pure background black. The count threshold is loose (`>= 10`) because the
+    /// paper-grain noise is omitted on the GPU, so an exact pixel count is not pinned.
     #[test]
     fn gpu_glyph_bleed_produces_halo_ring() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_bleed_produces_halo_ring") else {
@@ -3601,8 +3597,7 @@ mod tests {
     }
 
     /// #214 (A): the bleed pass must not wash the glyph fill out — the lit body
-    /// pixels must survive the box-blur/compose. Mirrors the CPU oracle
-    /// `glyph_lit_pixels_remain_visible_after_bleed` (softness Low ☆, `lit > 32`
+    /// pixels must survive the box-blur/compose (softness Low ☆, `lit > 32`
     /// counted as R > 32). If the compose `intensity` over-weighted the (dimmer)
     /// blurred layer the bright body would collapse below this threshold.
     #[test]
@@ -3648,8 +3643,7 @@ mod tests {
 
     /// #214 (A): a weight-0 cluster yields zero orbs (radius 0 → skipped), so the
     /// glyph fill is empty and the bleed pass has nothing to spread. The frame
-    /// must stay background-only. Mirrors the CPU oracle
-    /// `glyph_zero_weight_cluster_stays_black_after_bleed`.
+    /// must stay background-only.
     #[test]
     fn gpu_glyph_bleed_weight_zero_stays_background() {
         let Some(renderer) =
@@ -4428,8 +4422,8 @@ mod tests {
 
     /// (#7) `saturation=0.0` desaturates every packed layer color: each must equal the
     /// grayscale `adjust_saturation_pub(base, 0.0)` (boosting a gray stays gray, mixing
-    /// a gray toward white stays gray), so the GPU never sees a saturated color the CPU
-    /// oracle desaturated.
+    /// a gray toward white stays gray), so the desaturation is applied in the pack and
+    /// the shader only ever sees already-grayscale colors.
     #[test]
     fn aquarelle_pack_saturation_zero_desaturates_layer_colors() {
         // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter

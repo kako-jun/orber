@@ -755,10 +755,10 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         Err(code) => return code,
     };
 
-    // 4. PNG は「コンベアベルトの一瞬」（t=0）として animate::render_frame 経由で
-    //    描画する。これで --count による orb 数の展開が単発出力でも効く。
-    //    （render_static は count を解釈しないので、count=clusters.len() に固定された
-    //     旧経路にしないよう animate::render_frame を一律に使う。）
+    // 4. PNG は「コンベアベルトの一瞬」（t=0）として GPU レンダラの 1 フレーム描画
+    //    （`renderer.render(.., t=0.0)`）で出力する。AnimateOptions に `count` を
+    //    渡すので --count による orb 数の展開が単発 PNG でも効く（pack_render_data_for_webgl
+    //    が count を解釈する）。
     let (direction, speed) = resolve_motion(cli);
     let frame_opts = orber_core::animate::AnimateOptions {
         width: RenderOptions::default().width,

@@ -19,7 +19,8 @@ use std::sync::Arc;
 /// 個別 orb の描画スタイル。1 フレーム内で混在させる前提。
 ///
 /// `Rim` は中心明 → 中間で少し落として外周フェードのリング感、`Soft` は中心明 →
-/// 外周フェードの単純グラデーション。`render_one_orb` 経由で per-orb に切替できる。
+/// 外周フェードの単純グラデーション。どちらを使うかは seed 由来で orb ごとに割り当て、
+/// pack 経由で GPU(WGSL) の falloff カーブ（`style_bit`）に反映される。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OrbStyle {
     /// リム強調（中間 stop で alpha を一段落として輪郭感を出す）。
@@ -78,7 +79,9 @@ impl PartialEq for OrbShape {
     }
 }
 
-/// 静的 orb 描画のオプション。
+/// orb 描画の解像度・レイアウト定数を束ねる入れ物。実描画は GPU(WGSL) が
+/// [`crate::animate::AnimateOptions`] 経由で行うため、これは主に既定値
+/// （`Default` = 1080×1920）の供給と CLI 既定値の検証基準として使う。
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
     /// 出力幅（ピクセル）

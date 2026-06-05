@@ -9,7 +9,7 @@
 //   - offset 角・satellite の位置/半径・bloom 有無は seed=orb index から決定論的に
 //     決まるので、gpu.rs の pack 段で `ChaCha8Rng::seed_from_u64(i)` を
 //     render_aquarelle_orb と完全同順に回して算出し、専用 data-texture に積む。
-//   - boost_saturation(HSL)/mix_with_white の色も CPU で算出し u8 色として積む
+//   - boost_saturation(HSL)/mix_with_white の色も pack 段（ホスト側）で算出し u8 色として積む
 //     （HSL を WGSL 再実装して divergence を生むのを避ける）。
 //   - よってこのシェーダは「積まれた中心・半径・色で 3-stop radial を最大 5 回
 //     （main + ≤3 satellites + bloom）評価して SourceOver 合成する」だけ。

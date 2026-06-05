@@ -35,7 +35,7 @@ pub(crate) const STYLE_HEIGHT: u32 = 1920;
 /// - blur オフセット: Low=0.0, Mid=+0.25, High=+0.5
 /// - edge softness (Glyph/image アーム smoothstep 幅): Low=0.3, Mid=0.6, High=1.0
 ///
-/// PNG (animate / render_static) と SVG / CSS の全経路で同じ意味で適用する。
+/// PNG / 動画（GPU 描画）と SVG / CSS の全経路で同じ意味で適用する。
 /// edge_softness は WebGL2 fragment shader (`web/src/lib/orberGl.ts`) の Glyph アーム
 /// でのみ参照され、Circle アームには影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
