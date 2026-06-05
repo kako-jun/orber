@@ -138,6 +138,9 @@ jobs:
     name: WASM build
     # wgpu 一重化 (#207) で wasm の健全性が重要になったため、wasm32 ターゲットの
     # orber-wasm が常時ビルド可能かを CI で検証する (#194)。
+    # #230 以降、orber-wasm は wasm32 専用 target dependency で gpu 経路
+    # （orber-core gpu feature + wgpu + web-sys）を常時引くため、この job の
+    # ビルドは自動的に gpu 込みになる（フラグ追加は不要）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,6 +149,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -167,6 +171,12 @@ jobs:
 
       - name: Build orber-wasm for wasm32
         run: cargo build --target wasm32-unknown-unknown -p orber-wasm
+
+      - name: Clippy orber-wasm (wasm32)
+        # #230: src/gpu.rs（WebGPU canvas present 経路）は wasm32 専用 cfg で、
+        # native の clippy job ではコンパイルすらされない。lint 漏れを防ぐため
+        # wasm32 ターゲットでも clippy を回す。
+        run: cargo clippy --target wasm32-unknown-unknown -p orber-wasm -- -D warnings
 
       - name: Build orber-core (gpu feature) for wasm32
         # #229: core の GpuRenderer は wasm32 でもビルド可能を維持する（wgpu の
