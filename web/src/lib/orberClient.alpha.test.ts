@@ -107,7 +107,7 @@ function baseParams(width = 64, height = 48) {
     count: 1,
     orb_size: 1,
     blur: 0,
-    shape: 'circle',
+    shape: 'orb',
   };
 }
 
