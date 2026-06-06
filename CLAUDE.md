@@ -79,10 +79,13 @@ orber/
         │                   #   gpu 経路（orber-core gpu feature + wgpu + web-sys）を常時有効化（#230）
         └── src/
             ├── lib.rs          # データ供給（#225 で CPU 描画 generate_* は撲滅）。
-            │                   #   get_render_data（per-orb パラメータの pack）/
-            │                   #   get_glyph_sdf（フォント文字 → SDF）。実描画は WebGL2 fragment shader 側
+            │                   #   get_render_data（per-orb パラメータの pack。旧 WebGL 経路、PR-B で撤去予定）/
+            │                   #   get_glyph_sdf（フォント文字 → SDF）。本番 Web の実描画は gpu.rs の WGSL 経路（#245）
             └── gpu.rs          # WebGPU canvas present 経路（#230、wasm32 専用 cfg）。
-                                #   gpu_init / gpu_set_render_data / gpu_render / gpu_resize。
+                                #   gpu_init（HTMLCanvasElement: gpu-lab / AbPanel）/
+                                #   gpu_init_offscreen（OffscreenCanvas: Worker 本番経路、#245）/
+                                #   gpu_set_render_data / gpu_render / gpu_resize /
+                                #   gpu_render_rgba（透過 export 用 straight-alpha 非同期 readback、#245）。
                                 #   core の GpuRenderer(WGSL) が canvas surface に直接描く。
                                 #   全 shape 配線済み（#231: orb / glyph / image / aquarelle を
                                 #   opts.shape で render_packed_to_view / render_frame_*_to_view へ分岐）
@@ -117,7 +120,11 @@ web/                        # Web フロントエンド (#37, #38)
     ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）。
     │                           # encodeAnimationToMp4 本体は worker 側で呼ばれる (#75)。
     │                           # ANIM_TOTAL_FRAMES / isWebCodecsSupported は main 側からも import される。
-    ├── lib/orberWorker.ts      # #75 wasm 描画 + WebCodecs を実行する Worker 本体
+    ├── lib/orberWorker.ts      # #75 wasm 描画 + WebCodecs を実行する Worker 本体。
+    │                           # #245 で WebGL2(orberGl.ts) → wasm WebGPU 経路
+    │                           # （gpu_init_offscreen / gpu_set_render_data / gpu_render /
+    │                           #  透過は transparent_background + gpu_render_rgba）に配線替え。
+    │                           # 本番出力は #242+#241 の確定ルック（CLI と同一 WGSL）
     ├── lib/orberClient.ts      # #75 main 側 Worker クライアント（postMessage を Promise 化）
     ├── lib/strings.ts          # i18n 文言集約 + ja/en 自動切替（#62）
     └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
@@ -137,9 +144,9 @@ web/                        # Web フロントエンド (#37, #38)
 - **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
 - **描画バックエンドは GPU(WGSL, wgpu) が唯一（#225 で tiny-skia 撲滅）** — ネイティブ CLI は `crates/core/src/gpu.rs` の `GpuRenderer` が全 shape（Orb / Glyph / Image / Aquarelle）を WGSL で描く。#235 で Orb / Glyph / Image は統一テンプレ `orb.wgsl` の 2 variant（orb=解析距離 / SDF=glyph・image）に集約され、Glyph / Image は単パスで bleed/halo を持たない。CPU(tiny-skia) ピクセル描画・CPU↔GPU parity オラクル・`--renderer cpu`・CPU フォールバックは削除済み。GPU アダプタが取れなければ `GpuRenderer::new` が `None` を返し、CLI は error 終了する（フォールバック無し）。tiny-skia は外部 crate `aquarelle` 経由の推移依存としてのみ残る（orber 自身のコード/マニフェストは tiny-skia フリー）。orb 機構（orb/glyph/image, `orb.wgsl`）の合成は #242 裁定で**旧 WebGL（orberGl.ts）の straight alpha float Source-Over を 1:1 移植**したもの（旧来の Skia lowp 再現 = u8 量子化 → premultiply → source_over は暗部が沈むため撤去）。#241 でその上に**「薄い影」**を重ねた: 最外周フェードセグメントだけ orb 色 rgb を `mix(1.0, 1.0-u, shadow_strength)` 倍に暗化する（旧 lowp の rgb→0 フェードの強度係数化。s=0 で #242 と bit 同一、s=1 ≒ 旧 lowp の暗さ。falloff の r に乗るので全 shape シルエット沿い）。強度は `core::animate::SHADOW_STRENGTH_DEFAULT`（製品定数 0.2 = kako-jun 実機選定・session595）に 1 箇所集約され、pack header[13] → Params uniform で WGSL に届く。チューニングは gpu-lab の shadow スライダー（`WasmParams.shadow_strength`、0..=1 外 reject）のみで、CLI フラグ・Studio UI は無い。aquarelle（`orb_aquarelle.wgsl`）だけは参照アルゴリズムが `aquarelle` crate（Skia lowp）なので lowp 合成を維持し、影の対象外
 - **GpuRenderer は wasm32 + gpu でもビルド可能（#229）** — 出力経路は 2 本: readback 系（`render_frame*` / `render_packed` → `RgbaImage`。blocking poll を使うため native 専用 cfg）と **to_view 系**（`*_to_view`: 外部から渡された `wgpu::TextureView` + `TextureFormat` に全 shape を描いて submit。browser の surface present 用 seam）。core は web-sys / canvas を一切知らず、surface の作成・configure・present は呼び出し側（orber-wasm, #230）が握る。初期化は wasm では async の `new_async()`（`new()` は pollster の native 専用ラッパー）。pipeline cache は `(shader, target format)` キー、glyph bleed の中間テクスチャは両経路とも `Rgba8Unorm` のまま最終 pass だけ format 可変。wasm のバックエンドは wgpu default feature の **webgpu のみ**（`webgl` feature は採らない = WebGPU 必須・fallback 無し）。CI に `cargo build --target wasm32-unknown-unknown -p orber-core --features gpu` あり
-- **per-orb パラメータと WebGL 経路を共有する** — `animate.rs::pack_render_data_for_webgl` が header + per-orb 列を 1 本の `f32` バッファに詰め、ネイティブ GPU(`gpu.rs`) も Web の WebGL2 fragment shader も同じ pack を読む。算術は再実装しない（彩度だけはネイティブ側で後段適用、WebGL は独自ノブ）
+- **per-orb パラメータと WebGL 経路を共有する** — `animate.rs::pack_render_data_for_webgl` が header + per-orb 列を 1 本の `f32` バッファに詰め、ネイティブ GPU(`gpu.rs`) も Web の WebGL2 fragment shader も同じ pack を読む。算術は再実装しない（彩度だけはネイティブ側で後段適用、WebGL は独自ノブ）。**#245 で Web 本番（Worker）は WGSL 経路に移行済み**: `get_render_data`（WebGL pack の JS 返し）を使う本番導線は無くなり、orberGl.ts / AbPanel と一緒に PR-B で撤去する
 - **アニメーション軌道は一方通行コンベア（#41）** — 位相は `seed` から決定論的に散らし、`(cycle * speed_mult * t).fract()` で巻き戻して t=0 と t=1 のフレームをループ閉じさせる（`cycle * speed_mult` が整数なので浮動小数点誤差なく一致）。orb 位置/色の変調は `animate.rs::aquarelle_modulated_clusters` 等で `Cluster` 列を作って pack に渡すだけで、形状側に新 API を増やさない
-- **Web GUI の wasm は Worker で動かす（#75）** — メインスレッドは UI / DOM / Solid signal だけにして、wasm 描画 + WebCodecs エンコード + mp4-muxer は全部 `orberWorker.ts` 内で完結させる。スマホで生成中もタップ・スクロールが反応するためのコア施策。フォールバックパスは作らない（最新ブラウザ前提、死コード化を防ぐ）
+- **Web GUI の wasm は Worker で動かす（#75）** — メインスレッドは UI / DOM / Solid signal だけにして、wasm 描画 + WebCodecs エンコード + mp4-muxer は全部 `orberWorker.ts` 内で完結させる。スマホで生成中もタップ・スクロールが反応するためのコア施策。フォールバックパスは作らない（最新ブラウザ前提、死コード化を防ぐ）。**#245 で Worker の描画は WebGPU(WGSL) のみ**: `gpu_init_offscreen(OffscreenCanvas)` → `gpu_set_render_data` → `gpu_render(t)`、透過 export は `transparent_background` + `gpu_render_rgba`（straight-alpha readback）。WebGPU 非対応ブラウザは sentinel `webgpu-unsupported` → Studio が `webgpuUnsupported` 文言を表示して生成不可（#207 裁定）
 - **プレビューと DL は別解像度で焼き分ける（#73）** — プレビュー 540×960、DL 時に worker で 1080×1920 に再描画。`random_batch_specs(seed, total, still_count)` の決定論性で同じバリエーションを別解像度で再現できる。比率 9:16 / 16:9 厳守
 - **進行は skeleton で 2 段階表現（#71 #80）** — 強い shimmer (`.skeleton`) = タイル未生成、弱い shimmer (`.skeleton-soft`) = 静止 PNG は出たが mp4 化待ち。レイアウトは最初から 12 枚分確定させて伸縮しない
 - **PWA は手書き Service Worker (#148)** — `web/public/sw.js` を直接書き、`@vite-pwa/astro` 等の追加依存は入れない。machigai-salad と同じく `CACHE_NAME = 'orber-__BUILD_DATE__'`、precache は `['/', '/manifest.webmanifest']` のみ。`/_astro/*` (Astro/Vite content-hash 付き immutable asset) は **CacheFirst**、それ以外は **network-first** + キャッシュ fallback。navigation がキャッシュ miss + オフラインなら precache した `/` を返す (shell 戦略)。`blob:` / `data:` は intercept しない（生成結果の DL を握り潰さないため）。`cache.put` は `event.waitUntil()` で SW lifetime に縛る。`npm run build` の `stamp:sw` 段で `dist/sw.js` の `__BUILD_DATE__` を JST 日付に Node 1 行スクリプトで literal 置換する。詳細は DESIGN.md §15
