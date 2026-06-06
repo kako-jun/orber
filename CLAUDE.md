@@ -106,6 +106,11 @@ web/                        # Web フロントエンド (#37, #38)
     ├── components/AbPanel.tsx  # #232 WebGL↔WGSL A/B 比較パネル（検証足場）。?ab=1 のときだけ
     │                           #   Studio 下部にマウント。同一入力で旧 WebGL(orberGl.ts) と
     │                           #   新 WGSL(gpu_*) を canvas 2枚スタックでブリンク比較・init/FPS 計測。
+    │                           #   #242: ?ab=1&abcap=1 = 三者画素比較キャプチャモード（合成ソース・
+    │                           #   orb 固定・t=0 固定で ab-wgsl.png / ab-webgl.png / ab-params.json /
+    │                           #   ab-source.bin を DL。通常 ?ab=1 実行中も「Capture t=0」で実画像版を
+    │                           #   DL 可。CLI 側の再現は crates/wasm/src/ab_harness.rs の ab_dump /
+    │                           #   ab_diff dev テスト）
     │                           #   Phase 3 で WebGL 撤去時に lib/webgpu.ts・strings の ab* と共に削除する
     ├── lib/webgpu.ts           # #232 isWebGpuSupported()（A/B パネル用・Phase 3 で削除）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）

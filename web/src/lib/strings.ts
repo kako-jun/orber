@@ -231,6 +231,22 @@ export const STRINGS = {
   abInitMs: { ja: 'init {ms} ms', en: 'init {ms} ms' },
   abFps: { ja: '{fps} fps', en: '{fps} fps' },
   abError: { ja: 'エラー: {msg}', en: 'Error: {msg}' },
+  // #242: 三者画素比較（CLI / WGSL / WebGL）のキャプチャ足場。?ab=1&abcap=1 の
+  // 合成ソースモードと、通常 ?ab=1 実行中の手動キャプチャボタンで共用する。
+  // これも Phase 3 でパネルごと削除する。
+  abCapNote: {
+    ja: '#242 キャプチャモード: 合成ソース（96×96 決定的パターン）で WGSL / WebGL を t=0 で各1フレーム描画し、ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin をダウンロードします。',
+    en: '#242 capture mode: renders one t=0 frame each (WGSL / WebGL) from a deterministic synthetic 96×96 source and downloads ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin.',
+  },
+  abCapRun: {
+    ja: 'キャプチャ実行（合成ソース・t=0）',
+    en: 'Capture (synthetic source, t=0)',
+  },
+  abCaptureT0: { ja: 'Capture t=0', en: 'Capture t=0' },
+  abCapDone: {
+    ja: '4ファイルをダウンロードしました（ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin）',
+    en: 'Downloaded 4 files (ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin)',
+  },
 } as const;
 
 export function detectLang(): Lang {
