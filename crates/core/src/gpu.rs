@@ -5,9 +5,10 @@
 //! renderer (the CPU pixel path and the CPU↔GPU parity oracle were purged). Since
 //! #235 the orb mechanism is the **only** mechanism for orb / glyph / image: one
 //! unified WGSL template ([`orb.wgsl`](../src/orb.wgsl)) is compiled into two
-//! variants — the plain orb (analytic circle distance, byte-exact with the old
-//! `orb_circle.wgsl`) and the SDF orb (glyph / image: the same orb math fed a
-//! different silhouette via an SDF sample; no bleed/halo). Aquarelle keeps its own
+//! variants — the plain orb (analytic circle distance) and the SDF orb (glyph /
+//! image: the same orb math fed a different silhouette via an SDF sample; no
+//! bleed/halo). Since #242 the shared compositing is the straight-alpha float
+//! Source-Over ported 1:1 from the legacy WebGL shader. Aquarelle keeps its own
 //! WGSL ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Orb,
 //! Glyph, Image, Aquarelle) render on the GPU; the CLI renders every PNG / video /
 //! variation frame through it.
@@ -52,11 +53,15 @@
 //!
 //! ## Compositing contract
 //!
-//! Orbs are composited in **straight sRGB byte space**. The GPU path:
+//! Orbs are composited in **straight sRGB float space** with a plain float
+//! Source-Over — the exact arithmetic of the legacy WebGL fragment shader
+//! (`web/src/lib/orberGl.ts`), adopted as the reference by the #242 ruling
+//! (the previous Skia-lowp u8-quantize/premultiply emulation darkened the
+//! output vs. the WebGL look). The GPU path:
 //!
 //! - renders into an [`wgpu::TextureFormat::Rgba8Unorm`] target (NOT `*Srgb`), so
 //!   no sRGB↔linear conversion happens — the shader's float blend maps to bytes
-//!   by `round(value * 255)`;
+//!   by `round(value * 255)`, the same quantization the WebGL canvas applied;
 //! - feeds the shader the per-orb data the WebGL path also uses
 //!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
 //!   reused, never reimplemented, so the orb positions / radii / alphas match the
@@ -129,25 +134,27 @@ const AQUARELLE_TEX_BYTES_PER_ROW: u32 = AQUARELLE_TEX_WIDTH * ORB_TEX_BYTES_PER
 const HEADER_WORDS: usize = 16;
 const PER_ORB_WORDS: usize = 16;
 
-/// The unified orb WGSL template (`orb.wgsl`, #235). The orb mechanism is now the
-/// **only** mechanism for orb / glyph / image: each pixel's normalized "distance
-/// from the shape" feeds the same 3-axis breath, `falloff_curve`, and Skia-lowp
-/// premultiply compositing. Only the **DISTANCE SOURCE** block differs per shape,
-/// so "feeding the orb a different silhouette" is the literal implementation.
+/// The unified orb WGSL template (`orb.wgsl`, #235 / #242). The orb mechanism is
+/// now the **only** mechanism for orb / glyph / image: each pixel's normalized
+/// "distance from the shape" feeds the same 3-axis breath, `falloff_curve`, and —
+/// since #242 — the **straight-alpha float Source-Over** compositing ported 1:1
+/// from the legacy WebGL fragment shader (`web/src/lib/orberGl.ts`). Only the
+/// **DISTANCE SOURCE** block differs per shape, so "feeding the orb a different
+/// silhouette" is the literal implementation.
 ///
 /// The template carries `//!ORB_*` markers that [`orb_wgsl`] / [`orb_sdf_wgsl`]
 /// substitute to generate the two variants (Rust-side string composition, as the
 /// plan recommends): the orb variant injects the analytic circle distance and
-/// **no** SDF bindings, so its compiled shader is byte-for-byte the old
-/// `orb_circle.wgsl` body (the orb output stays bit-exact); the SDF variant adds
-/// the `R8Unorm` SDF texture + bilinear sampler (bindings 2/3), reads the per-orb
-/// rotation texel (x=3), and computes `r` from the SDF sample.
+/// **no** SDF bindings; the SDF variant adds the `R8Unorm` SDF texture + bilinear
+/// sampler (bindings 2/3), reads the per-orb rotation texel (x=3), and computes
+/// `r` from the SDF sample. Both variants share the falloff / compositing, so the
+/// #242 algorithm switch applies to every shape the template serves.
 const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 
 /// The orb (analytic circle) variant of [`ORB_WGSL_TEMPLATE`]. No SDF bindings,
-/// no rotation; the DISTANCE SOURCE block inlines the same two lines the old
-/// `orb_circle.wgsl` had (`dist = distance(...); r = dist / radius`), so the
-/// compiled shader is identical and the orb output is unchanged (byte-exact).
+/// no rotation; the DISTANCE SOURCE block inlines the analytic circle distance
+/// (`dist = distance(...); r = dist / radius`) — the same two lines the WebGL
+/// orb arm uses, so the orb output matches the legacy WebGL look (#242).
 /// Built once (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the resulting
 /// `&'static str` doubles as the stable pipeline-cache key.
 fn orb_wgsl() -> &'static str {
@@ -250,8 +257,8 @@ fn glyph_rotation_angle(base_angle: f32, rot_speed_signed: f32) -> f32 {\n\
 }";
 
 /// Orb DISTANCE SOURCE: the analytic circle distance, inlined into the loop body
-/// **verbatim** from the old `orb_circle.wgsl` (so the orb shader is byte-exact).
-/// Defines `r` for the shared `falloff_curve` downstream; no rotation, no discard.
+/// (the same two lines the WebGL orb arm computes). Defines `r` for the shared
+/// `falloff_curve` downstream; no rotation, no discard.
 const ORB_DISTANCE_SOURCE_CIRCLE: &str = "\
         let dist = distance(sample_px, vec2<f32>(cx, cy));\n\
         let r = dist / radius;";
@@ -293,7 +300,11 @@ const ORB_DISTANCE_SOURCE_SDF: &str = "\
 /// (separate from the orb data-texture) that evaluates the four
 /// `aquarelle::render_aquarelle_orb` layers analytically: offset main 3-stop
 /// radial, 0..3 bleed satellites, and the bloom core, composited SourceOver in
-/// the same u8-quantize → premultiply → source_over lowp流儀 as `orb.wgsl`.
+/// the u8-quantize → premultiply → source_over lowp流儀 of the reference
+/// `aquarelle` crate (Skia lowp). Unlike `orb.wgsl` (whose reference is the
+/// legacy WebGL shader since the #242 ruling), aquarelle's reference algorithm
+/// is the CPU crate, so it keeps the lowp pipeline and does **not** share the
+/// orb template's float straight Source-Over.
 /// The ChaCha8 RNG / HSL color math is **not** ported to WGSL; `pack_aquarelle_orbs`
 /// runs it on the CPU (bit-identical to the crate) and uploads the resulting
 /// centers / radii / u8 colors.
@@ -1099,8 +1110,9 @@ impl GpuRenderer {
     ///
     /// Since #235 the glyph is just a different silhouette fed to the orb mechanism:
     /// the SDF sample becomes the normalized distance `r = 1 - signed_unit`, which
-    /// feeds the **same** `falloff_curve` / 3-axis breath / Skia-lowp premultiply
-    /// compositing the plain orb uses (`orb.wgsl`, SDF variant). It is **one** pass —
+    /// feeds the **same** `falloff_curve` / 3-axis breath / straight-alpha float
+    /// Source-Over compositing (#242) the plain orb uses (`orb.wgsl`, SDF variant).
+    /// It is **one** pass —
     /// the old aquarelle-derived bleed/halo 2nd pass group is removed, so glyph now
     /// blurs exactly like an orb (a `●` glyph looks like an orb; a `▲` blurs while
     /// keeping its triangular form). "Bleed" is now the領分 of the Aquarelle shape only.
@@ -2954,15 +2966,16 @@ mod tests {
 
     // ---- #235: orb / SDF WGSL variant composition (no GPU needed) -------------
 
-    /// #235 byte-exact土台: the orb variant's loop body must inline the **analytic
-    /// circle distance** — the same two lines the old `orb_circle.wgsl` had —
-    /// `let dist = distance(...);` then `let r = dist / radius;`, and must NOT carry
-    /// any SDF binding, rotation read, or rotation helper. If this drifts, the orb
-    /// variant's compiled shader is no longer the old circle body and the orb output
-    /// is no longer bit-exact. Locks the DISTANCE SOURCE inlining + the absence of
+    /// #235 DISTANCE SOURCE 土台: the orb variant's loop body must inline the
+    /// **analytic circle distance** — the same two lines the WebGL orb arm
+    /// computes — `let dist = distance(...);` then `let r = dist / radius;`, and
+    /// must NOT carry any SDF binding, rotation read, or rotation helper. If this
+    /// drifts, the orb variant no longer feeds the shared falloff / compositing
+    /// the analytic circle distance and the orb look diverges from the WebGL
+    /// reference (#242). Locks the DISTANCE SOURCE inlining + the absence of
     /// SDF-only machinery in one place.
     #[test]
-    fn orb_variant_wgsl_is_byte_exact_with_old_circle_body() {
+    fn orb_variant_wgsl_inlines_analytic_circle_distance() {
         let wgsl = orb_wgsl();
         assert!(
             wgsl.contains("let dist = distance(sample_px, vec2<f32>(cx, cy));"),
@@ -2992,8 +3005,7 @@ mod tests {
 
     /// #235: the orb variant must contain no SDF binding, no per-orb rotation read,
     /// and no texture sample call — proving it is the SDF-free path (a stray
-    /// `textureSampleLevel` would mean an SDF leaked into the orb shader and the
-    /// byte-exact guarantee is gone).
+    /// `textureSampleLevel` would mean an SDF leaked into the orb shader).
     #[test]
     fn orb_variant_has_no_sdf_bindings_or_rot() {
         let wgsl = orb_wgsl();
