@@ -1404,6 +1404,75 @@ mod tests {
         assert!(validate_params(&base_params()).is_ok());
     }
 
+    /// #241 (c): `shadow_strength` の serde 省略 default。フィールドを送らない
+    /// 既存呼び出し（本番 Studio / 旧 ab-params.json）は製品定数 = 製品と同じ
+    /// 見た目にデシリアライズされること。serde_json は serde_wasm_bindgen と同じ
+    /// `Deserialize` 実装を通るので、`#[serde(default = ...)]` の検証として等価。
+    #[test]
+    fn shadow_strength_serde_defaults_to_production_constant() {
+        let json = r#"{
+            "source_rgb": [0, 0, 0],
+            "source_width": 1,
+            "source_height": 1,
+            "k": 1,
+            "width": 8,
+            "height": 8,
+            "seed": 1.0,
+            "direction": "lr",
+            "speed": "slow",
+            "count": 1,
+            "orb_size": 1.0,
+            "blur": 0.5,
+            "shape": "orb"
+        }"#;
+        let p: WasmParams = serde_json::from_str(json).expect("params without shadow_strength");
+        assert_eq!(
+            p.shadow_strength, SHADOW_STRENGTH_DEFAULT,
+            "omitted shadow_strength must default to the production constant"
+        );
+        // 明示指定はそのまま通る（serde 層は範囲を見ない。範囲は validate_params の担務）。
+        let json_explicit = json.replace(
+            r#""shape": "orb""#,
+            r#""shape": "orb", "shadow_strength": 0.85"#,
+        );
+        let p: WasmParams = serde_json::from_str(&json_explicit).expect("explicit shadow_strength");
+        assert_eq!(p.shadow_strength, 0.85);
+    }
+
+    /// #241 (c): `shadow_strength` の範囲検証。0.0 と 1.0 は **inclusive** で受理、
+    /// 範囲外（負 / 1 超 / NaN）は reject。dev チューニングノブなので黙って
+    /// クランプせず明示エラーにする仕様（validate_params）。
+    #[test]
+    fn validate_shadow_strength_range_inclusive_bounds() {
+        // 両端 inclusive。
+        let mut p = base_params();
+        p.shadow_strength = 0.0;
+        assert!(
+            validate_params(&p).is_ok(),
+            "0.0 must be accepted (inclusive)"
+        );
+
+        let mut p = base_params();
+        p.shadow_strength = 1.0;
+        assert!(
+            validate_params(&p).is_ok(),
+            "1.0 must be accepted (inclusive)"
+        );
+
+        // 範囲外は reject。
+        let mut p = base_params();
+        p.shadow_strength = -0.001;
+        assert!(validate_params(&p).is_err(), "negative must be rejected");
+
+        let mut p = base_params();
+        p.shadow_strength = 1.001;
+        assert!(validate_params(&p).is_err(), "above 1.0 must be rejected");
+
+        let mut p = base_params();
+        p.shadow_strength = f32::NAN;
+        assert!(validate_params(&p).is_err(), "NaN must be rejected");
+    }
+
     /// #231 review: image マスク次元も source_rgb と同流儀で MAX_DIM を課す。
     /// 境界（MAX_DIM ちょうど=OK / MAX_DIM+1=Err）を 1 テストで固定する。
     /// validate_params は次元比較だけで mask bytes を確保しないため、MAX_DIM

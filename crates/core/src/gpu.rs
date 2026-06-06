@@ -6329,4 +6329,193 @@ mod tests {
             "pack order must matter (later orb on top): got {got:?}, reversed ref {rev:?}"
         );
     }
+
+    // ---- #241: 薄い影（shadow_strength）の境界ピン --------------------------------
+
+    /// #241 (a) CPU 側: `shadow = 0.0` のオラクルが **#242 直後（影なし）の式に
+    /// bitwise で退化する**こと。影項は `mix(1.0, 1.0-u, s) = 1.0*(1-s) + (1-u)*s`
+    /// で、s=0 なら `1.0*1.0 + (1-u)*0.0 = 1.0` — f32 で丸めなしの厳密な恒等。
+    /// rgb への乗算も `c * 1.0 == c`（IEEE で厳密）なので、s=0 の出力は #242 の
+    /// 出力と bit 同一になる。ここでは #242 当時の alpha-only オラクルをテスト内に
+    /// 再掲し、α の bit 一致と rgb_scale == 1.0（厳密）を全域スイープで固定する。
+    /// GPU 側の実画素ピンは `gpu_straight_shadow_zero_equals_no_shadow_reference`。
+    #[test]
+    fn ref_falloff_shadow_zero_degenerates_bitwise() {
+        // #242 直後の falloff（影項導入前のオラクル、当時の実装の再掲）。
+        fn ref_falloff_242(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> f32 {
+            if opacity <= 0.0 || r_in >= 1.0 {
+                return 0.0;
+            }
+            let r = r_in.max(0.0);
+            if style_bit < 0.5 {
+                let center_a = opacity;
+                let mid_a = opacity * (80.0 / 255.0);
+                let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
+                if r <= mid_stop {
+                    let u = if mid_stop > 0.0 { r / mid_stop } else { 1.0 };
+                    return center_a + (mid_a - center_a) * u;
+                }
+                let denom = (1.0 - mid_stop).max(1e-6);
+                let u = (r - mid_stop) / denom;
+                return mid_a * (1.0 - u);
+            }
+            let hold_stop = (1.0 - blur).clamp(0.05, 0.95);
+            if r <= hold_stop {
+                return opacity;
+            }
+            let denom = (1.0 - hold_stop).max(1e-6);
+            let u = (r - hold_stop) / denom;
+            opacity * (1.0 - u)
+        }
+
+        for style_bit in [0.0f32, 1.0] {
+            for blur in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                for opacity in [0.0f32, 0.1, 0.55, 1.0] {
+                    for i in 0..=120 {
+                        let r = i as f32 / 100.0; // 0.00..=1.20（縁の外側も含む）
+                        let (alpha, scale) = ref_falloff_curve(style_bit, r, blur, opacity, 0.0);
+                        let alpha_242 = ref_falloff_242(style_bit, r, blur, opacity);
+                        assert_eq!(
+                            alpha.to_bits(),
+                            alpha_242.to_bits(),
+                            "alpha must be bitwise identical to the #242 oracle at s=0 \
+                             (style={style_bit}, r={r}, blur={blur}, opacity={opacity})"
+                        );
+                        if alpha > 0.0 {
+                            assert_eq!(
+                                scale.to_bits(),
+                                1.0f32.to_bits(),
+                                "rgb_scale must be exactly 1.0 at s=0 (identity multiply) \
+                                 (style={style_bit}, r={r}, blur={blur}, opacity={opacity})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #241 (a) GPU 側: `shadow_strength = 0.0` の実描画が **影なし（#242 直後）の
+    /// CPU 参照**と全帯域（plateau / フェード帯 / 縁の外）で ±1 一致し、production
+    /// 影（s=0.3）の描画とはフェード帯で実際に差が出ること（ノブが効いている =
+    /// テストが空虚でない）。s=0 の式恒等（bit 同一）は
+    /// `ref_falloff_shadow_zero_degenerates_bitwise` が CPU で厳密に固定済みで、
+    /// ここは「その退化が実 GPU・実パイプラインまで通る」ことの画素ピン
+    /// （GPU float 丸めの ±1 のみ許容）。
+    #[test]
+    fn gpu_straight_shadow_zero_equals_no_shadow_reference() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_straight_shadow_zero_equals_no_shadow_reference")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 95u32);
+        let bg = [10u8, 20, 30, 255];
+        let orbs = [RefOrb {
+            color: [1.0, 1.0, 1.0],
+            weight: 1.0,
+            nx: 32.5 / 96.0,
+            ny: 0.5,
+            style_bit: 1.0, // Soft
+        }];
+        let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 1.0f32);
+        let pack0 = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, 0.0, w);
+        let img0 = renderer.render_packed(&pack0, w, h, 0.0);
+
+        // y=47 行を中心 (32) から縁の外 (66) までスキャン: plateau（r <= 0.5）、
+        // フェード帯（0.5 < r < 1）、r >= 1 の外側を全部 s=0 参照でピンする。
+        for x in 32..=66u32 {
+            let want = ref_pixel_straight(
+                &orbs,
+                bg,
+                base_radius,
+                base_blur,
+                alpha_mul,
+                0.0,
+                w,
+                h,
+                x,
+                47,
+            );
+            assert_px_close(&img0, x, 47, want, "s=0 must match the no-shadow reference");
+        }
+
+        // 同条件で production 影と比較: フェード帯（x=56, r=0.75）には差が出る。
+        // s=0 が「たまたま」一致しているのではなく、ノブが実際に観測されている根拠。
+        let pack_prod = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
+        let img_prod = renderer.render_packed(&pack_prod, w, h, 0.0);
+        let (no_shadow, with_shadow) = (img0.get_pixel(56, 47).0, img_prod.get_pixel(56, 47).0);
+        assert!(
+            no_shadow[0] > with_shadow[0].saturating_add(4),
+            "production shadow must visibly darken the outer fade band vs s=0 \
+             (got s=0 {no_shadow:?} vs s={SHADOW_STRENGTH_DEFAULT} {with_shadow:?})"
+        );
+        // plateau（x=40, r=0.25）は影の対象外なので s に依らず一致する。
+        assert_eq!(
+            img0.get_pixel(40, 47),
+            img_prod.get_pixel(40, 47),
+            "inner segments must be untouched by shadow_strength"
+        );
+    }
+
+    /// #241 (b): `shadow_strength = 1.0` の実描画が、#242 で撤去した**旧 lowp の
+    /// 最外周 rgb→0 フェードの CPU 再現（量子化抜き float 式）**と外周フェード帯で
+    /// ±1 一致すること。旧 lowp は straight color を (1−u) 倍してから合成していた:
+    ///   out_c = c·(1−u)·α + bg_c·(1−α)
+    /// これは #241 の s=1（rgb_scale = mix(1, 1−u, 1) = 1−u）と同式 — 「s=1 ≒ 旧
+    /// lowp の暗さ」の式レベルの根拠をそのまま画素で観測する（u8 量子化・
+    /// premultiply 由来の ±数カウントは復元しないので、一致は float 式に対して）。
+    #[test]
+    fn gpu_straight_shadow_one_matches_old_lowp_outer_fade() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_straight_shadow_one_matches_old_lowp_outer_fade")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 95u32);
+        let bg = [10u8, 20, 30, 255];
+        let orbs = [RefOrb {
+            color: [1.0, 1.0, 1.0],
+            weight: 1.0,
+            nx: 32.5 / 96.0,
+            ny: 0.5,
+            style_bit: 1.0, // Soft
+        }];
+        let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 1.0f32);
+        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, 1.0, w);
+        let img = renderer.render_packed(&pack, w, h, 0.0);
+
+        // フェード帯（hold_stop 0.5 < r < 1）の 3 点: dist = 20 / 24 / 28 →
+        // u = 0.25 / 0.5 / 0.75。旧 lowp 式をテスト内で独立に組んで比較する
+        // （ref_pixel_straight 経由ではなく撤去前式の直接再現、というのが本ピンの主張）。
+        let hold_stop = (1.0f32 - base_blur).clamp(0.05, 0.95);
+        for x in [52u32, 56, 60] {
+            let dist = (x as f32 + 0.5) - 32.5;
+            let r = dist / base_radius;
+            assert!(
+                r > hold_stop && r < 1.0,
+                "test pixel must be in the fade band"
+            );
+            let u = (r - hold_stop) / (1.0 - hold_stop).max(1e-6);
+            let alpha = alpha_mul * (1.0 - u);
+            let got = img.get_pixel(x, 47).0;
+            for c in 0..3 {
+                let faded = 1.0f32 * (1.0 - u); // 旧 lowp: orb 色自体を 0 へフェード
+                let old_lowp = q8(faded * alpha + (bg[c] as f32 / 255.0) * (1.0 - alpha));
+                assert!(
+                    got[c].abs_diff(old_lowp) <= 1,
+                    "s=1 must reproduce the removed lowp rgb→0 fade (float form) at x={x} \
+                     channel {c}: got {got:?}, old lowp ref {old_lowp}"
+                );
+            }
+        }
+    }
 }

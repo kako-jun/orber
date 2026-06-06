@@ -830,6 +830,41 @@ mod tests {
         );
     }
 
+    /// #241: header[13] に shadow_strength がそのまま（ただし 0..=1 クランプで）
+    /// 入ること。WGSL の Params uniform はこの word を読むので、ここがずれると
+    /// 影強度が黙って変わる。クランプは hand-built / 異常入力に対する防衛で、
+    /// production 経路は wasm validate（0..=1 reject）か定数なのでクランプ恒等。
+    #[test]
+    fn pack_header13_carries_clamped_shadow_strength() {
+        let clusters = vec![Cluster {
+            color: [200, 100, 50],
+            centroid: crate::cluster::Centroid { x: 0.5, y: 0.5 },
+            weight: 1.0,
+        }];
+        let pack_with = |s: f32| {
+            pack_render_data_for_webgl(
+                &clusters,
+                [0, 0, 0, 255],
+                32.0,
+                0.5,
+                0.0,
+                2.0,
+                7,
+                1,
+                1.0,
+                0.0,
+                true,
+                0.5,
+                s,
+            )
+        };
+        assert_eq!(pack_with(0.7)[13], 0.7, "in-range value must pass through");
+        assert_eq!(pack_with(0.0)[13], 0.0, "0.0 is inclusive");
+        assert_eq!(pack_with(1.0)[13], 1.0, "1.0 is inclusive");
+        assert_eq!(pack_with(-0.5)[13], 0.0, "below range clamps to 0");
+        assert_eq!(pack_with(1.5)[13], 1.0, "above range clamps to 1");
+    }
+
     /// #225: per-orb パラメータ計算（pack/GPU 共有）が決定論的であること。
     /// `aquarelle_modulated_clusters` の入口 `precompute_orb_params` が同じ seed /
     /// count / clusters で同じ列を返すことを cross_axis / phase 列の一致で固定する。
