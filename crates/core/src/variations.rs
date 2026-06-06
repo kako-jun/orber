@@ -290,6 +290,16 @@ pub mod random_ranges {
 ///
 /// 同じ `seed` なら同じ spec 列が返る（再現性）。GUI からは
 /// `Math.random() * 2**48` を渡してドラッグごとに違う spec 列を引かせる想定。
+///
+/// ## プラットフォーム非依存性（#242）
+///
+/// 同じ seed で **wasm32（ブラウザ）と native（dev ハーネス）が同じ spec 列を
+/// 返す**ことを保証する。rand 0.8 の `usize` 抽選は 32bit / 64bit ターゲットで
+/// 消費バイト数も値も変わる（`UniformInt<usize>` が wasm32 では u32、native では
+/// u64 を引く）ため、整数レンジの抽選は幅固定の `u32` で行う。wasm32 では
+/// `usize` = u32 なので、この固定はブラウザの既存出力と bit-exact 同一
+/// （= 本番 GUI の見た目は一切変わらない）。#242 の三者画素比較ハーネスで、
+/// native 側がブラウザと別シーンを描いてしまう divergence の修正。
 pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<VariationSpec> {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -318,7 +328,11 @@ pub fn random_batch_specs(seed: u64, total: usize, still_count: usize) -> Vec<Va
             } else {
                 MotionSpeed::VerySlow
             };
-            let count = rng.gen_range(random_ranges::COUNT_MIN..=random_ranges::COUNT_MAX);
+            // #242: usize 抽選は 32bit/64bit で RNG 列が割れる（doc コメント参照）。
+            // u32 固定で wasm32（ブラウザ）と native（dev ハーネス）を一致させる。
+            let count = rng
+                .gen_range(random_ranges::COUNT_MIN as u32..=random_ranges::COUNT_MAX as u32)
+                as usize;
             let orb_size = rng.gen_range(random_ranges::ORB_SIZE_MIN..=random_ranges::ORB_SIZE_MAX);
             let blur = rng.gen_range(random_ranges::BLUR_MIN..=random_ranges::BLUR_MAX);
             let spec_seed: u64 = rng.gen();
@@ -606,6 +620,26 @@ mod tests {
             "COUNT_MAX never reached — range may have become exclusive"
         );
         assert!(hit_min, "COUNT_MIN never reached");
+    }
+
+    /// #242: wasm32（ブラウザ）と native で同じ spec 列が出ることのピン留め。
+    ///
+    /// rand 0.8 の `usize` 抽選は 32bit/64bit ターゲットで divergent なため、
+    /// `random_batch_specs` は count 抽選を u32 固定にしている。このピンは
+    /// **wasm32 が従来から返していた値**（= ブラウザの A/B キャプチャ
+    /// seed=42 / n=12 / still=8 実測条件）を native でも返すことを固定する。
+    /// 値を変える変更（レンジ変更・抽選順変更）をしたら、wasm32 側と同時に
+    /// ここも更新すること（プラットフォーム間で割れたらこのテストでは
+    /// 気づけない点に注意。割れの検出は #242 の ab_dump / ab_diff ハーネス）。
+    #[test]
+    fn random_batch_specs_pins_wasm32_sequence() {
+        let specs = random_batch_specs(42, 12, 8);
+        // A/B ハーネスが使う video spec（spec_idx=8）: 配置の根幹 spec.seed と count。
+        assert_eq!(specs[8].count, 38);
+        assert_eq!(specs[8].seed, 0x10cc204f3db50cf9);
+        // 先頭 spec も押さえる（列全体の開始位置がずれたら即検出）。
+        assert_eq!(specs[0].count, 27);
+        assert_eq!(specs[0].seed, 0x49e149d8bcb642b0);
     }
 
     #[test]
