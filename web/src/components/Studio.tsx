@@ -15,6 +15,9 @@ import {
   workerSetSource,
 } from '../lib/orberClient';
 import { t, lang } from '../lib/strings';
+// #245: worker エラー → i18n 文言のマップは workerLogic.ts に切り出し済み
+// （単体テスト用。t() は引数 DI で渡す）。
+import { formatRunBatchError } from '../lib/workerLogic';
 // #232: WebGL↔WGSL A/B 比較パネル（?ab=1 でのみ表示する検証足場）。
 // Phase 3 で WebGL を撤去するときにこの import と下の <Show> ごと削除する。
 import AbPanel from './AbPanel';
@@ -339,22 +342,8 @@ export default function Studio() {
   // 1 frame ぶん描画を挟む（setTimeout(0) より意図が明確）。
   const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 
-  // #169: runBatch から伝播してくる worker エラーを i18n 文言にマップする。
-  // image-shape-no-contrast はシルエット抽出に失敗したことを示す内部 sentinel
-  // (#245 以降は core の image_rgba_to_sdf 失敗を worker がこの sentinel に
-  // 変換する)。webgpu-unsupported は WebGPU 非対応環境 (#245。#207 裁定で
-  // fallback 無し = 生成不可)。`Error` インスタンスなら .message を見て、それ
-  // 以外は String(e) で文字列化する (N2)。
-  const formatRunBatchError = (e: unknown): string => {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes('image-shape-no-contrast')) {
-      return t('imageShapeNoContrast');
-    }
-    if (msg.includes('webgpu-unsupported')) {
-      return t('webgpuUnsupported');
-    }
-    return msg;
-  };
+  // #169: runBatch から伝播してくる worker エラーは workerLogic.ts の
+  // formatRunBatchError(e, t) で i18n 文言にマップする（#245 で切り出し）。
 
   const runBatch = async () => {
     const src = decoded();
@@ -375,7 +364,7 @@ export default function Studio() {
       } catch (e) {
         if (myGen !== runGen) return;
         clearTiles();
-        setErrorMsg(formatRunBatchError(e));
+        setErrorMsg(formatRunBatchError(e, t));
         setPhase('error');
         return;
       }
@@ -417,7 +406,7 @@ export default function Studio() {
       } catch (e) {
         if (myGen !== runGen) return;
         clearTiles();
-        setErrorMsg(formatRunBatchError(e));
+        setErrorMsg(formatRunBatchError(e, t));
         setPhase('error');
         return;
       }
@@ -497,7 +486,7 @@ export default function Studio() {
       // setTimeout 等が動いていても抑止できるよう保守的に維持する。
       runGen += 1;
       clearTiles();
-      setErrorMsg(formatRunBatchError(e));
+      setErrorMsg(formatRunBatchError(e, t));
       setPhase('error');
       return;
     }
@@ -632,7 +621,7 @@ export default function Studio() {
       await runBatch();
     } catch (e) {
       console.error('decode failed', e);
-      setErrorMsg(formatRunBatchError(e));
+      setErrorMsg(formatRunBatchError(e, t));
       setPhase('error');
       // 失敗した画像を「成功扱い」のサムネとしてドロップエリアに残さない。
       const failedThumbUrl = pickedThumbUrl();

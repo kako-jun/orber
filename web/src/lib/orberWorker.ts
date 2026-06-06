@@ -35,20 +35,18 @@
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
 import { generateJsGlyphSdf } from './jsGlyphSdf';
-
-// SDF テクスチャの一辺 (px)。core の DEFAULT_GLYPH_SDF_SIZE = 256 と同値で、
-// wasm の get_glyph_sdf / glyph_sdf_size 検証 (16..=1024) にも収まる。
-// （旧 orberGl.ts の export を引き継いだ worker ローカル定数。#245）
-// SYNC WITH crates/core/src/glyph.rs::DEFAULT_GLYPH_SDF_SIZE
-const GLYPH_SDF_SIZE = 256;
-
-// shape='image' のマスクを worker 内でデコードするときの長辺上限 (px)。
-// SDF は最終的に GLYPH_SDF_SIZE (256) へ contain リサンプルされる
-// (core の image_rgba_to_sdf) ので、4 倍の 1024 あればシルエット品質は
-// 落ちない。フル解像度 (数千 px) のまま持つと、タイルごとの
-// gpu_set_render_data で数十 MB の RGBA が wasm へコピーされ続けるため、
-// デコード時に 1 度だけ縮めて転送量と変換コストを固定する。
-const IMAGE_MASK_TARGET_LONG_EDGE = 1024;
+// #245: params 組立て / マスク寸法計算の純粋ロジックは workerLogic.ts に切り
+// 出し済み（単体テスト用。GLYPH_SDF_SIZE / IMAGE_MASK_TARGET_LONG_EDGE 定数も
+// あちらが正本）。worker はモジュール状態と wasm 関数を束ねて呼ぶだけ。
+import {
+  buildWasmParams,
+  computeMaskSize,
+  IMAGE_MASK_TARGET_LONG_EDGE,
+  type BaseParams,
+  type GlyphSdfCacheRef,
+  type ImageMaskCache,
+  type SourceCache,
+} from './workerLogic';
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -62,7 +60,7 @@ function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-let cachedSource: { rgb: Uint8Array; width: number; height: number } | null = null;
+let cachedSource: SourceCache | null = null;
 
 // WebGPU surface を張った OffscreenCanvas。gpu_init_offscreen は adapter /
 // device の取得を伴い重いので 1 度だけ行い、アスペクト切替や preview / hi-res
@@ -73,13 +71,14 @@ let gpuCanvas: { canvas: OffscreenCanvas; width: number; height: number } | null
 // generateJsGlyphSdf (OS フォントスタックでラスタライズ → EDT) は 1 文字
 // ~数ms だが、バッチ 16 タイルで毎回作り直さないよう ch 単位で持つ。
 // wasm へは WasmParams.glyph_sdf として毎回コピーされる (64KB、許容コスト)。
-let cachedJsGlyphSdf: { ch: string; sdf: Uint8Array } | null = null;
+// 読み書きは workerLogic.buildWasmParams（DI 先）が行う。
+const cachedJsGlyphSdf: GlyphSdfCacheRef = { current: null };
 
 // #160 / #245: shape='image' のマスク RGBA。setImageShape で File →
 // ImageBitmap → 2D canvas デコードして保持し、タイルごとに
 // WasmParams.image_mask_* として wasm に渡す (SDF 化は core の
 // image_rgba_to_sdf、#231 の WGSL 経路と同じ)。
-let cachedImageMask: { rgba: Uint8Array; width: number; height: number } | null = null;
+let cachedImageMask: ImageMaskCache | null = null;
 
 // 透過 export 用の 2D スクラッチ canvas (gpu_render_rgba の RGBA → Blob 化)。
 let alphaScratch: OffscreenCanvas | null = null;
@@ -118,72 +117,27 @@ async function ensureGpuCanvas(width: number, height: number): Promise<Offscreen
   return canvas;
 }
 
-interface BaseParams {
-  k: number;
-  width: number;
-  height: number;
-  seed: number;
-  direction: string;
-  speed: string;
-  count: number;
-  orb_size: number;
-  blur: number;
-  shape: string;
-  // Phase B (#55): UI から流れる advanced 軸。空文字は "未指定（既存挙動）"。
-  glyph_char?: string;
-  count_preset?: string;
-  speed_preset?: string;
-  softness_preset?: string;
-  // #136: Glyph 回転 ON/OFF。`true` 既定で従来挙動、`false` で静止描画。
-  glyph_rotate?: boolean;
-}
-
 /**
  * BaseParams + worker キャッシュ (source / image mask / glyph SDF) から
- * wasm の WasmParams を組む。
- *
- * - shape='glyph': 同梱フォント収録字は wasm の core フォント経路
- *   (glyph_char) に任せる。収録外の字は generateJsGlyphSdf で SDF 化して
- *   glyph_sdf / glyph_sdf_size に乗せる (#231 / #159 と同設計)
- * - shape='image': cachedImageMask を image_mask_* に乗せる (#231)。
- *   SDF 化は core の image_rgba_to_sdf
- * - transparentBackground: 透過 export (#56)。wasm 側で bg.a=0 になる
+ * wasm の WasmParams を組む。純粋部は workerLogic.buildWasmParams（#245 で
+ * 切り出し）。ここでは worker のモジュール状態と wasm / jsGlyphSdf の実体を
+ * DI で束ねるだけ。
  */
-function buildWasmParams(
+function buildParams(
   p: BaseParams,
   opts?: { transparentBackground?: boolean },
 ): Record<string, unknown> {
-  if (!cachedSource) {
-    throw new Error('source not set — call setSource before generate/animate');
-  }
-  const params: Record<string, unknown> = {
-    ...p,
-    source_rgb: cachedSource.rgb,
-    source_width: cachedSource.width,
-    source_height: cachedSource.height,
-  };
-  if (p.shape === 'image') {
-    if (!cachedImageMask) {
-      throw new Error('image shape requires setImageShape before generate');
-    }
-    params.image_mask_rgba = cachedImageMask.rgba;
-    params.image_mask_width = cachedImageMask.width;
-    params.image_mask_height = cachedImageMask.height;
-  } else if (p.shape === 'glyph' && p.glyph_char && !wasm.glyph_supported(p.glyph_char)) {
-    // #159 / #231: 同梱フォント (Noto Sans Symbols 2 サブセット) に無い字は
-    // worker 内 OffscreenCanvas + OS フォントスタックでラスタライズして SDF 化
-    // する。端末ごとに見た目が変わり得るが、「ユーザーが入れた字を尊重して
-    // 描画する」を優先する仕様 (WebGL 時代から不変)。
-    if (!cachedJsGlyphSdf || cachedJsGlyphSdf.ch !== p.glyph_char) {
-      cachedJsGlyphSdf = { ch: p.glyph_char, sdf: generateJsGlyphSdf(p.glyph_char, GLYPH_SDF_SIZE) };
-    }
-    params.glyph_sdf = cachedJsGlyphSdf.sdf;
-    params.glyph_sdf_size = GLYPH_SDF_SIZE;
-  }
-  if (opts?.transparentBackground) {
-    params.transparent_background = true;
-  }
-  return params;
+  return buildWasmParams(
+    p,
+    {
+      source: cachedSource,
+      imageMask: cachedImageMask,
+      glyphSupported: (ch) => wasm.glyph_supported(ch),
+      generateSdf: generateJsGlyphSdf,
+      glyphSdfCache: cachedJsGlyphSdf,
+    },
+    opts,
+  );
 }
 
 /**
@@ -242,15 +196,12 @@ function rgbaToBlob(
  * 長辺 IMAGE_MASK_TARGET_LONG_EDGE まで縮小 (アスペクト維持) して、以降の
  * タイルごとの wasm 転送・SDF 変換コストをソース解像度から切り離す。
  */
-function decodeBitmapToMask(bitmap: ImageBitmap): {
-  rgba: Uint8Array;
-  width: number;
-  height: number;
-} {
-  const longest = Math.max(bitmap.width, bitmap.height);
-  const scale = Math.min(1, IMAGE_MASK_TARGET_LONG_EDGE / Math.max(1, longest));
-  const w = Math.max(1, Math.round(bitmap.width * scale));
-  const h = Math.max(1, Math.round(bitmap.height * scale));
+function decodeBitmapToMask(bitmap: ImageBitmap): ImageMaskCache {
+  const { width: w, height: h } = computeMaskSize(
+    bitmap.width,
+    bitmap.height,
+    IMAGE_MASK_TARGET_LONG_EDGE,
+  );
   const canvas = new OffscreenCanvas(w, h);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('2d context unavailable for image mask decode');
@@ -344,7 +295,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'generateOne': {
-        const params = buildWasmParams(req.params);
+        const params = buildParams(req.params);
         const canvas = await ensureGpuCanvas(req.params.width, req.params.height);
         setRenderData(params, req.n, req.index);
         // gpu_render → convertToBlob は同一タスク内で行うこと: WebGPU canvas の
@@ -358,7 +309,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'animateOne': {
-        const params = buildWasmParams(req.params);
+        const params = buildParams(req.params);
         const width = req.params.width;
         const height = req.params.height;
         const canvas = await ensureGpuCanvas(width, height);
@@ -390,7 +341,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         // #56: 静止画 alpha 経路。non-alpha 経路と同じ spec 解決を辿るが、
         // transparent_background で bg.a だけ 0 になる。`format` で PNG / WebP を
         // 出し分ける。
-        const params = buildWasmParams(req.params, { transparentBackground: true });
+        const params = buildParams(req.params, { transparentBackground: true });
         await ensureGpuCanvas(req.params.width, req.params.height);
         setRenderData(params, req.n, req.index);
         const rgba: Uint8Array = await wasm.gpu_render_rgba(0);
@@ -415,7 +366,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         // 全 frame を flat array で抱え込まないことで メモリと postMessage の
         // 一括コピーコストを抑える。main 側は JS-only MOV muxer に投入する。
         // 進捗 UI は `animateProgress` を流用 (encodeMp4 と同形)。
-        const params = buildWasmParams(req.params, { transparentBackground: true });
+        const params = buildParams(req.params, { transparentBackground: true });
         const width = req.params.width;
         const height = req.params.height;
         await ensureGpuCanvas(width, height);

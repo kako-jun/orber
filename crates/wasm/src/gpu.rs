@@ -354,7 +354,6 @@ fn dispatch_render_to_view(
 /// `gpu_resize` と `params.width/height` を一致させる既存契約のまま）。
 #[wasm_bindgen]
 pub async fn gpu_render_rgba(t: f32) -> Result<js_sys::Uint8Array, JsError> {
-    const BYTES_PER_PIXEL: u32 = 4;
     // フェーズ 1（同期・単一 borrow 内）: 描画 → copy → submit まで終わらせ、
     // await を跨ぐのはローカルの buffer だけにする（RefCell borrow を await
     // 越しに保持しない）。
@@ -392,11 +391,9 @@ pub async fn gpu_render_rgba(t: f32) -> Result<js_sys::Uint8Array, JsError> {
         dispatch_render_to_view(&state.renderer, f, t, &view, format, width, height);
 
         // texture→buffer copy は bytes_per_row の 256 byte alignment が必須
-        // （native readback と同じ padding。読み出し時に行ごとに unpad する）。
-        let unpadded_bytes_per_row = width * BYTES_PER_PIXEL;
-        let padded_bytes_per_row = unpadded_bytes_per_row
-            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        // （native readback と同じ padding。読み出し時に行ごとに unpad する。
+        // 計算は lib.rs の純関数 `padded_bytes_per_row` — #245 でテスト用に切り出し）。
+        let padded_bytes_per_row = crate::padded_bytes_per_row(width);
         let buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orber-wasm-readback-buffer"),
             size: (padded_bytes_per_row as u64) * (height as u64),
@@ -456,16 +453,12 @@ pub async fn gpu_render_rgba(t: f32) -> Result<js_sys::Uint8Array, JsError> {
             ))
         })?;
 
-    // フェーズ 3: 行ごとに padding を落として詰め直す（native readback と同形）。
-    let unpadded_bytes_per_row = (width * BYTES_PER_PIXEL) as usize;
-    let mut out = Vec::with_capacity(unpadded_bytes_per_row * height as usize);
-    {
+    // フェーズ 3: 行ごとに padding を落として詰め直す（native readback と同形。
+    // 変換は lib.rs の純関数 `unpad_rows` — #245 でテスト用に切り出し）。
+    let out = {
         let data = slice.get_mapped_range();
-        for row in 0..height as usize {
-            let start = row * padded_bytes_per_row as usize;
-            out.extend_from_slice(&data[start..start + unpadded_bytes_per_row]);
-        }
-    }
+        crate::unpad_rows(&data, width, height, padded_bytes_per_row)
+    };
     buffer.unmap();
     Ok(js_sys::Uint8Array::from(&out[..]))
 }

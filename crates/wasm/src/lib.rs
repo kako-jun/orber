@@ -1102,6 +1102,53 @@ fn glyph_sdf_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
     v
 }
 
+// ---- #245: gpu_render_rgba（gpu.rs）の readback 行 padding 純関数 ----------
+//
+// texture → buffer copy は bytes_per_row の 256 byte alignment が必須なので、
+// padded 行長の計算と「行ごとに padding を落として詰め直す」変換を gpu.rs の
+// async 経路から切り出して native テスト可能にする（gpu.rs 自体は wasm32 専用
+// cfg のため、native の `cargo test` から届かない）。
+
+/// WebGPU texture→buffer readback の行アライメント（bytes）。
+/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`（= 256）と同値。native の test target は
+/// wgpu を直接依存に持たない（wasm32 専用 target dependency）ため同値の定数を
+/// ここに置き、wasm32 ビルドでは const assert で wgpu 本体との一致を担保する
+/// （drift したらコンパイルエラー）。
+#[cfg(target_arch = "wasm32")]
+const COPY_ROW_ALIGN: u32 = 256;
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(COPY_ROW_ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+
+/// readback 1 ピクセルのバイト数（`Rgba8Unorm` 固定 = 4。gpu_render_rgba は
+/// surface format と独立に常に Rgba8Unorm で読み戻す）。
+#[cfg(target_arch = "wasm32")]
+const READBACK_BYTES_PER_PIXEL: u32 = 4;
+
+/// `width` px の RGBA 1 行を texture→buffer copy するときの padded 行長
+/// （bytes）。`width * 4` を 256 の倍数に切り上げる。
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn padded_bytes_per_row(width: u32) -> u32 {
+    (width * READBACK_BYTES_PER_PIXEL).div_ceil(COPY_ROW_ALIGN) * COPY_ROW_ALIGN
+}
+
+/// padded な readback バッファ（`padded_bytes_per_row * height` bytes）から
+/// 行末 padding を落とし、`width * height * 4` bytes の行優先 RGBA に詰め直す。
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn unpad_rows(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) -> Vec<u8> {
+    let unpadded_bytes_per_row = (width * READBACK_BYTES_PER_PIXEL) as usize;
+    let mut out = Vec::with_capacity(unpadded_bytes_per_row * height as usize);
+    for row in 0..height as usize {
+        let start = row * padded_bytes_per_row as usize;
+        out.extend_from_slice(&data[start..start + unpadded_bytes_per_row]);
+    }
+    out
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
