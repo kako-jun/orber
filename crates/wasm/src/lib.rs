@@ -182,6 +182,15 @@ pub struct WasmParams {
     /// orb 機構の全 shape（orb / glyph / image）に効き、aquarelle は対象外。
     #[serde(default = "default_shadow_strength")]
     pub shadow_strength: f32,
+    /// 透過 export（#56 / #245）: `true` なら解決済み背景色の alpha を 0 に
+    /// 上書きして「透過背景でレンダリングしてくれ」とシェーダに依頼する。
+    /// 旧 WebGL 経路で worker が pack header word 3（bg.a）を JS 側で 0 に
+    /// 書き換えていた `withTransparentBackground` の wasm 入口版（WGSL 経路は
+    /// pack が wasm 内部で完結するため、JS からは触れない）。orb は pack
+    /// header[3]、glyph / image / aquarelle は `AnimateOptions.background[3]`
+    /// 経由で効く。serde default は `false`（既存呼び出しはバイト列不変）。
+    #[serde(default)]
+    pub transparent_background: bool,
 }
 
 /// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
@@ -912,8 +921,14 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
     // kmeans は同じソース画像なら同じ結果になるのでキャッシュする。
     // Android では kmeans が ~3 秒かかり、これがタイル毎に走ることで
     // 12 stills + 4 mp4 = 16 呼び出しで合計 ~50 秒の律速になっていた。
-    let (clusters_full, bg, clusters) = get_or_build_clusters(&mut p)?;
+    let (clusters_full, mut bg, clusters) = get_or_build_clusters(&mut p)?;
     let _ = clusters_full; // 現在は未使用だが将来 spec に diversity 等で使う可能性
+
+    // #245: 透過 export。キャッシュ取得後のローカル値だけを書き換える
+    // （kmeans キャッシュの bg は不透明のまま汚さない）。
+    if p.transparent_background {
+        bg[3] = 0;
+    }
 
     let specs = random_batch_specs(p.seed as u64, total, still_count);
     let spec = specs[spec_idx];
@@ -1360,6 +1375,8 @@ mod tests {
             glyph_sdf_size: 0,
             // #241: 影強度。既定は製品定数（serde default と同じ）。
             shadow_strength: SHADOW_STRENGTH_DEFAULT,
+            // #245: 透過 export。既定は不透過（serde default と同じ）。
+            transparent_background: false,
         }
     }
 
@@ -1911,6 +1928,45 @@ mod tests {
             pack_without, pack_with,
             "build_render_pack (WebGL) must be byte-identical with or without glyph_sdf"
         );
+    }
+
+    // ---- #245: transparent_background（透過 export の wasm 入口） ----
+
+    /// #245 (a): `transparent_background = true` は pack header word 3（bg.a）
+    /// **だけ**を 0 にする。他の全 word は不透過版と完全一致（旧 WebGL worker の
+    /// `withTransparentBackground`＝「word 3 のみ 0 上書き」と同じ契約を wasm
+    /// 入口で固定する）。既定 `false` は従来とバイト列不変。
+    #[test]
+    fn transparent_background_zeroes_only_pack_bg_alpha() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let opaque = build_render_pack(small_source_params(), 12, 3).expect("opaque pack");
+        let mut p = small_source_params();
+        p.transparent_background = true;
+        let transparent = build_render_pack(p, 12, 3).expect("transparent pack");
+        assert_eq!(opaque.len(), transparent.len());
+        assert_ne!(opaque[3], 0.0, "derived bg must be opaque by default");
+        assert_eq!(transparent[3], 0.0, "bg.a must be zeroed");
+        for (i, (a, b)) in opaque.iter().zip(transparent.iter()).enumerate() {
+            if i == 3 {
+                continue;
+            }
+            assert_eq!(a, b, "pack word {i} must be unchanged by transparency");
+        }
+    }
+
+    /// #245 (b): WGSL 経路（glyph / image / aquarelle が読む `AnimateOptions`）
+    /// にも透過が伝播する: `opts.background[3] == 0`。orb pack 側（header[3]）と
+    /// 二経路が同時に透過になることを固定する。
+    #[test]
+    fn transparent_background_propagates_to_animate_options() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "glyph".into();
+        p.glyph_char = "☆".into();
+        p.transparent_background = true;
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("gpu inputs");
+        assert_eq!(gpu.opts.background[3], 0, "opts.background alpha must be 0");
+        assert_eq!(gpu.pack[3], 0.0, "orb pack header bg.a must be 0 too");
     }
 
     /// shape="image" の有効マスク（上半分不透明 / 下半分透明 16×16 RGBA）が

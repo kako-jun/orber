@@ -2224,8 +2224,9 @@ impl GpuRenderer {
     ///
     /// Native only (#229): buffer mapping needs the blocking
     /// `device.poll(wait_indefinitely)`, which does not exist on wasm32 (the
-    /// browser maps buffers asynchronously). The wasm path never reads back — it
-    /// draws into the surface view and presents.
+    /// browser maps buffers asynchronously). Core's wasm path never reads back —
+    /// it draws into the surface view and presents. (orber-wasm has its own
+    /// async-map read-back on top of `*_to_view` for transparent export, #245.)
     #[cfg(not(target_arch = "wasm32"))]
     fn copy_target_and_readback(
         &self,
