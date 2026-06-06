@@ -41,6 +41,18 @@ wgpu = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
 
+# #242: A/B 三者画素比較の dev ハーネス（src/ab_harness.rs、native test 専用）。
+# ブラウザのキャプチャモード（?ab=1&abcap=1）が落とす ab-params.json +
+# ab-source.bin から、`gpu_set_render_data` と同じ入口（build_gpu_render_inputs）
+# + core の readback 経路（render_packed）で CLI 側の同条件 t=0 PNG を再現する
+# `ab_dump` と、2 枚の PNG を比較する `ab_diff` を `#[ignore]` テストで提供する。
+# native 限定の理由: GPU readback（blocking poll）と std::fs を使うため。
+# orber-core の gpu feature はこの dev-dependency でのみ native test に入る
+# （`cargo build -p orber-wasm` の通常ビルドには影響しない）。
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
+serde_json = { workspace = true }
+
 # 注意: per-crate `[profile.release]` は workspace member では指定できない
 # （root の `[profile.release]` が継承される）。
 # wasm 専用の opt-level = "s" 等が必要になったら、root に
