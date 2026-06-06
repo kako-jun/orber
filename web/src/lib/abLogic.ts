@@ -78,8 +78,10 @@ export function buildAbCaptureMeta(
   return meta;
 }
 
-// キャプチャ画像の全画素が真っ黒（RGB=0 かつ A=255）または全透明（A=0）かを
-// 判定する。toBlob / drawImage がレンダ結果を拾えなかった失敗を無言で成功扱い
+// キャプチャ画像の全画素が黒（RGB=0。A は不問 = 半透明黒も黒扱い）または
+// 全透明（A=0）かを判定する。実装は安全側（失敗検出を広めに取る）: A を見ない
+// ぶん「ほぼ黒い正常出力」も失敗扱いになり得るが、dev 足場の誤検知として許容する。
+// toBlob / drawImage がレンダ結果を拾えなかった失敗を無言で成功扱い
 // しないためのガード（WebGPU canvas は同一タスク外で snapshot すると空になる）。
 export function isAllBlackOrTransparent(data: Uint8ClampedArray): boolean {
   for (let i = 0; i < data.length; i += 4) {
@@ -88,6 +90,24 @@ export function isAllBlackOrTransparent(data: Uint8ClampedArray): boolean {
     if (!opaqueBlack && !transparent) return false;
   }
   return true;
+}
+
+// #242: A/B canvas の WebGL / WGSL segmented toggle の disabled 条件（純関数）。
+// AbPanel.tsx の JSX 式から 1:1 で切り出した（挙動は 1 ビットも変えない純移動。
+// abCanStart と同じ前例）:
+//   - 通常モード（captureMode=false）: blink 実行中だけ有効 = !running で disabled
+//   - キャプチャモード（captureMode=true）: キャプチャ成功後（両 canvas に t=0 が
+//     残った状態）だけ有効 = !captured で disabled
+//   - WGSL 側はさらに WebGPU 非対応ブラウザで常に disabled（|| !webgpuOk）
+export function segToggleDisabled(
+  side: 'webgl' | 'wgsl',
+  captureMode: boolean,
+  captured: boolean,
+  running: boolean,
+  webgpuOk: boolean,
+): boolean {
+  const base = captureMode ? !captured : !running;
+  return side === 'wgsl' ? base || !webgpuOk : base;
 }
 
 // 開始可否のガード条件。source（decoded 画像）が必須で、image shape のときは

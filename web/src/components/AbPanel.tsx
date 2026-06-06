@@ -65,6 +65,7 @@ import {
   buildAbCaptureMeta,
   buildSyntheticSourceRgb,
   isAllBlackOrTransparent,
+  segToggleDisabled,
   AB_CAPTURE_SOURCE_W,
   AB_CAPTURE_SOURCE_H,
   CANVAS_W,
@@ -719,14 +720,18 @@ export default function AbPanel(props: AbPanelProps) {
 
       {/* renderer 切替 segmented control（WebGL / WGSL）。#242: キャプチャモード
           では rAF が無いので、キャプチャ成功後（両 canvas に t=0 が残った状態）に
-          有効化して目視比較に使う。通常モードの条件（!running()）は不変。 */}
+          有効化して目視比較に使う。通常モードの条件（!running()）は不変。
+          disabled 条件は abLogic.segToggleDisabled に切り出し済み（純移動）。 */}
       <div class="inline-flex w-full rounded-md overflow-hidden border border-glassBorder">
         <button
           type="button"
           aria-pressed={active() === 'webgl'}
           onClick={() => toggleTo('webgl')}
-          disabled={captureMode ? !captured() : !running()}
-          class={segBtn(active() === 'webgl', captureMode ? !captured() : !running())}
+          disabled={segToggleDisabled('webgl', captureMode, captured(), running(), webgpuOk)}
+          class={segBtn(
+            active() === 'webgl',
+            segToggleDisabled('webgl', captureMode, captured(), running(), webgpuOk),
+          )}
         >
           {t('abRendererWebGL')}
         </button>
@@ -734,11 +739,14 @@ export default function AbPanel(props: AbPanelProps) {
           type="button"
           aria-pressed={active() === 'wgsl'}
           onClick={() => toggleTo('wgsl')}
-          disabled={(captureMode ? !captured() : !running()) || !webgpuOk}
+          disabled={segToggleDisabled('wgsl', captureMode, captured(), running(), webgpuOk)}
           title={!webgpuOk ? t('abWebGpuUnavailable') : undefined}
           class={
             'border-l border-glassBorder ' +
-            segBtn(active() === 'wgsl', (captureMode ? !captured() : !running()) || !webgpuOk)
+            segBtn(
+              active() === 'wgsl',
+              segToggleDisabled('wgsl', captureMode, captured(), running(), webgpuOk),
+            )
           }
         >
           {t('abRendererWGSL')}
