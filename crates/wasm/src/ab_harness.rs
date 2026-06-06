@@ -462,3 +462,339 @@ fn diff_report_dimension_mismatch() {
     let report = diff_report(&a, &b);
     assert!(report.starts_with("DIMENSION MISMATCH"), "got: {report}");
 }
+
+// ---- #242 観点テスト（serde / validate / diff_report 境界） -----------------
+
+/// `AbParams` の全必須フィールドを持つ基準 JSON。各テストはこれを改変して使う。
+fn base_ab_params_json() -> serde_json::Value {
+    serde_json::json!({
+        "source_width": 8,
+        "source_height": 8,
+        "k": 5,
+        "width": 32,
+        "height": 48,
+        "seed": 42.0,
+        "direction": "lr",
+        "speed": "slow",
+        "count": 12,
+        "orb_size": 1.0,
+        "blur": 0.5,
+        "shape": "orb",
+        "glyph_char": "",
+        "glyph_rotate": true,
+        "count_preset": "",
+        "speed_preset": "",
+        "softness_preset": "",
+        "n": 12,
+        "spec_idx": 8,
+        "t": 0.0
+    })
+}
+
+/// ブラウザ側 `buildAbCaptureMeta` は params の未知フィールド（aquarelle_* 等）を
+/// そのまま透過する。Rust 側は serde_json 既定の「未知フィールド無視」で受け流し、
+/// パースは成功すること（将来 web 側に params が増えてもハーネスが壊れない）。
+#[test]
+fn ab_params_ignores_unknown_fields() {
+    let mut v = base_ab_params_json();
+    v["aquarelle_bleed"] = serde_json::json!(0.7);
+    v["image_mask_width"] = serde_json::json!(4);
+    v["some_future_field"] = serde_json::json!("x");
+    let ab: AbParams = serde_json::from_value(v).expect("unknown fields must be ignored");
+    assert_eq!(ab.width, 32);
+    assert_eq!(ab.shape, "orb");
+    assert_eq!(ab.n, 12);
+}
+
+/// 省略可能フィールドの serde default をピンする: `glyph_rotate` は `true`
+/// （`WasmParams::glyph_rotate` の default と同じ向き）、`glyph_char` / 各 preset
+/// は空文字。default の向きが変わると CLI 再現がブラウザと食い違う。
+#[test]
+fn ab_params_optional_fields_default() {
+    let mut v = base_ab_params_json();
+    let obj = v.as_object_mut().unwrap();
+    for k in [
+        "glyph_char",
+        "glyph_rotate",
+        "count_preset",
+        "speed_preset",
+        "softness_preset",
+    ] {
+        obj.remove(k);
+    }
+    let ab: AbParams = serde_json::from_value(v).expect("optional fields must default");
+    assert!(
+        ab.glyph_rotate,
+        "glyph_rotate must default to true (same as WasmParams)"
+    );
+    assert_eq!(ab.glyph_char, "");
+    assert_eq!(ab.count_preset, "");
+    assert_eq!(ab.speed_preset, "");
+    assert_eq!(ab.softness_preset, "");
+}
+
+/// 必須フィールド（t / n / spec_idx / seed）はどれが欠けてもパース失敗すること。
+/// 黙って 0 既定で通ると「別の t / spec の再現 PNG」が無言で出てしまう。
+#[test]
+fn ab_params_missing_required_field_errors() {
+    for key in ["t", "n", "spec_idx", "seed"] {
+        let mut v = base_ab_params_json();
+        v.as_object_mut().unwrap().remove(key);
+        let r: Result<AbParams, _> = serde_json::from_value(v);
+        assert!(r.is_err(), "missing required `{key}` must fail to parse");
+    }
+}
+
+/// seed の f64 round-trip と validate_params の実挙動のピン: 2^48+1（< 2^53 なので
+/// f64 で正確に表現できる）は値を変えずに通り、負値は `validate_params` が reject
+/// する（serde 自体は通る = reject は validate の担務）。
+#[test]
+fn ab_params_seed_f64_round_trip_and_negative_reject() {
+    let big = 281_474_976_710_657.0_f64; // 2^48 + 1
+    let mut v = base_ab_params_json();
+    v["seed"] = serde_json::json!(big);
+    let ab: AbParams = serde_json::from_value(v).expect("2^48+1 seed must parse");
+    assert_eq!(
+        ab.seed, big,
+        "seed must round-trip losslessly through JSON f64"
+    );
+    let p = to_wasm_params(&ab, synthetic_source_rgb(ab.source_width, ab.source_height));
+    validate_params(&p).expect("non-negative finite seed must validate");
+
+    let mut v = base_ab_params_json();
+    v["seed"] = serde_json::json!(-1.0);
+    let ab: AbParams =
+        serde_json::from_value(v).expect("negative seed parses (reject is validate's job)");
+    let p = to_wasm_params(&ab, synthetic_source_rgb(ab.source_width, ab.source_height));
+    assert!(
+        validate_params(&p).is_err(),
+        "negative seed must be rejected by validate_params"
+    );
+}
+
+/// `hist_bucket` の全 6 境界（1/2, 3/4, 7/8, 15/16, 31/32, 63/64）と両端のピン。
+/// 境界が 1 ずれると「量子化系（±1）」と「ガンマ系（数〜十数）」の切り分け表示が
+/// 嘘をつく。
+#[test]
+fn hist_bucket_pins_all_boundaries() {
+    assert_eq!(hist_bucket(0), 0);
+    assert_eq!(hist_bucket(1), 1);
+    assert_eq!(hist_bucket(2), 2);
+    assert_eq!(hist_bucket(3), 2);
+    assert_eq!(hist_bucket(4), 3);
+    assert_eq!(hist_bucket(7), 3);
+    assert_eq!(hist_bucket(8), 4);
+    assert_eq!(hist_bucket(15), 4);
+    assert_eq!(hist_bucket(16), 5);
+    assert_eq!(hist_bucket(31), 5);
+    assert_eq!(hist_bucket(32), 6);
+    assert_eq!(hist_bucket(63), 6);
+    assert_eq!(hist_bucket(64), 7);
+    assert_eq!(hist_bucket(255), 7);
+}
+
+/// 32×32 で「edge_dist がちょうど `ring` の画素だけ R+10」のペアを作る
+/// （edge band 境界テスト用）。
+fn ring_diff_pair(ring: u32) -> (RgbaImage, RgbaImage) {
+    let a = RgbaImage::from_pixel(32, 32, image::Rgba([100, 100, 100, 255]));
+    let b = RgbaImage::from_fn(32, 32, |x, y| {
+        let edge_dist = x.min(y).min(31 - x).min(31 - y);
+        if edge_dist == ring {
+            image::Rgba([110, 100, 100, 255])
+        } else {
+            image::Rgba([100, 100, 100, 255])
+        }
+    });
+    (a, b)
+}
+
+/// 縁バンドの境界画素が正しいバンドに落ちること: edge_dist 2 → 0-2px / 3 → 3-7px
+/// （2/3 境界）、7 → 3-7px / 8 → 8px+（7/8 境界）。リング 1 本だけ差を付けた画像で
+/// 「そのバンドだけ非ゼロ」をレポート文字列で確認する。
+#[test]
+fn diff_report_edge_band_boundaries() {
+    // (ring, 0-2px がゼロか, 3-7px がゼロか, 8px+ がゼロか)
+    let cases = [
+        (2u32, false, true, true),
+        (3, true, false, true),
+        (7, true, false, true),
+        (8, true, true, false),
+    ];
+    for (ring, z0, z1, z2) in cases {
+        let (a, b) = ring_diff_pair(ring);
+        let report = diff_report(&a, &b);
+        let zero = |label: &str| report.contains(&format!("{label}=0.0000"));
+        assert_eq!(zero("0-2px"), z0, "ring {ring}: 0-2px band, got: {report}");
+        assert_eq!(zero("3-7px"), z1, "ring {ring}: 3-7px band, got: {report}");
+        assert_eq!(zero("8px+"), z2, "ring {ring}: 8px+ band, got: {report}");
+    }
+}
+
+/// 20×20 で「edge_dist ≤ 2 の画素のうち走査順で先頭 `n` 個だけ R+1」のペアを作る。
+/// 0-2px バンドは 20²−14² = 204 画素なので、n=102 で縁バンド平均がちょうど 0.5
+/// （interior=0 のとき EDGE 閾値 `interior*3 + 0.5` の右辺そのもの）になる。
+/// 20×20 を使うのは 8px+（interior）バンドが空にならない最小級サイズのため
+/// （小画像だと interior=0 件で別の話になる）。
+fn edge_count_pair(n: usize) -> (RgbaImage, RgbaImage) {
+    let a = RgbaImage::from_pixel(20, 20, image::Rgba([100, 100, 100, 255]));
+    let mut b = a.clone();
+    let mut left = n;
+    'outer: for y in 0..20u32 {
+        for x in 0..20u32 {
+            let edge_dist = x.min(y).min(19 - x).min(19 - y);
+            if edge_dist <= 2 {
+                if left == 0 {
+                    break 'outer;
+                }
+                b.put_pixel(x, y, image::Rgba([101, 100, 100, 255]));
+                left -= 1;
+            }
+        }
+    }
+    assert_eq!(left, 0, "test setup: not enough ring pixels");
+    (a, b)
+}
+
+/// EDGE-CONCENTRATED の閾値は strict `>`: 縁バンド平均が**ちょうど** 0.5
+/// （= interior*3 + 0.5、interior=0）では MIXED のまま、1 画素足して初めて
+/// EDGE に倒れる。閾値が `>=` に変わると「ちょうど」で分類が変わってしまう。
+#[test]
+fn diff_report_edge_threshold_exactly_at_boundary_is_mixed() {
+    let (a, b) = edge_count_pair(102); // 102 / 204 = 0.5 ちょうど
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("MIXED"),
+        "edge mean exactly 0.5 must stay MIXED (strict >), got: {report}"
+    );
+    let (a, b) = edge_count_pair(103); // 1 画素ぶんだけ 0.5 を超える
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("EDGE-CONCENTRATED"),
+        "one more edge pixel must tip to EDGE-CONCENTRATED, got: {report}"
+    );
+}
+
+/// 18×18 の市松ペア: (x+y) 偶数画素は A−B=+9、奇数画素は A−B=−1（R チャネルのみ、
+/// 162 個ずつ）。rgb_signed/rgb_abs = (162·9−162)/(162·9+162) = 0.8 ちょうど。
+/// `flip_one` で奇数画素 (1,0) を +9 側に変えると比が 0.8 を超える。
+/// 市松なので 3×3 グリッドは全セル平均 5 で一様（uniform 成立済み）、縁も一様で
+/// EDGE には倒れない。18×18 を使うのは 8px+ バンドが空にならないため。
+fn checkerboard_pair(flip_one: bool) -> (RgbaImage, RgbaImage) {
+    let mk = move |a_side: bool| {
+        RgbaImage::from_fn(18, 18, move |x, y| {
+            let plus9 = (x + y) % 2 == 0 || (flip_one && x == 1 && y == 0);
+            let v = match (plus9, a_side) {
+                (true, true) => 109,
+                (true, false) => 100,
+                (false, true) => 100,
+                (false, false) => 101,
+            };
+            image::Rgba([v, 100, 100, 255])
+        })
+    };
+    (mk(true), mk(false))
+}
+
+/// UNIFORM-SHIFT の one_sided 閾値は strict `>`: 符号付き/絶対比が**ちょうど** 0.8
+/// （+9 と −1 が同数）では MIXED のまま、1 画素 +9 側に倒すと初めて UNIFORM-SHIFT
+/// になる（grid 一様・縁非優越は両ケースとも成立済み = 比だけが分かれ目）。
+#[test]
+fn diff_report_one_sided_threshold_exactly_at_boundary_is_mixed() {
+    let (a, b) = checkerboard_pair(false);
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("MIXED"),
+        "signed/abs ratio exactly 0.8 must stay MIXED (strict >), got: {report}"
+    );
+    let (a, b) = checkerboard_pair(true);
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("UNIFORM-SHIFT"),
+        "one more one-sided pixel must tip to UNIFORM-SHIFT, got: {report}"
+    );
+}
+
+/// grid_uniform の範囲判定は inclusive（`>=` / `<=`）: 18×18 を 3×3 セルに切り、
+/// 6 セルを +2・3 セルを +8 にすると、セル平均 2 と 8 が全体平均 4 の**ちょうど**
+/// 0.5× と 2×（両端同時等号）に乗る。inclusive なので uniform 成立 → 全面一方向
+/// ズレとして UNIFORM-SHIFT になる（strict だったら MIXED に落ちて検知できる）。
+#[test]
+fn diff_report_grid_uniform_bounds_are_inclusive() {
+    let a = RgbaImage::from_fn(18, 18, |_x, y| {
+        let d = if y >= 12 { 8 } else { 2 };
+        image::Rgba([100 + d, 100, 100, 255])
+    });
+    let b = RgbaImage::from_pixel(18, 18, image::Rgba([100, 100, 100, 255]));
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("UNIFORM-SHIFT"),
+        "inclusive grid bounds must keep uniform at exactly 0.5x / 2x, got: {report}"
+    );
+}
+
+/// 分類の優先順位: edge 優越・grid 一様・one_sided が**同時に**成立するケースでは
+/// if-else 連鎖の先頭である EDGE-CONCENTRATED が勝つことをピンする。
+/// 構成: 全画素 +6、ただし interior バンド（edge_dist ≥ 8 = 中心 2×2 の 4 画素）
+/// だけ差 0 → edge 条件（6 > 0·3+0.5）、grid（中心セルも 32/36·6 ≈ 5.33 で
+/// 0.5×〜2× 内）、one_sided（全部 + 方向）が全部 true。
+#[test]
+fn diff_report_priority_edge_wins_over_uniform_and_one_sided() {
+    let a = RgbaImage::from_fn(18, 18, |x, y| {
+        let edge_dist = x.min(y).min(17 - x).min(17 - y);
+        let d = if edge_dist >= 8 { 0 } else { 6 };
+        image::Rgba([100 + d, 100, 100, 255])
+    });
+    let b = RgbaImage::from_pixel(18, 18, image::Rgba([100, 100, 100, 255]));
+    let report = diff_report(&a, &b);
+    assert!(
+        report.contains("EDGE-CONCENTRATED"),
+        "edge check must win the classification chain, got: {report}"
+    );
+}
+
+/// 1×1 画像でも 0 除算や panic をしない縮退ピン: 同一なら IDENTICAL、差があれば
+/// 全画素が 0-2px バンドに落ちるので EDGE-CONCENTRATED に倒れる（現状挙動のピン）。
+#[test]
+fn diff_report_one_by_one_image_does_not_panic() {
+    let a = RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+    let report = diff_report(&a, &a.clone());
+    assert!(report.starts_with("IDENTICAL"), "got: {report}");
+    let b = RgbaImage::from_pixel(1, 1, image::Rgba([99, 20, 30, 255]));
+    let report = diff_report(&a, &b);
+    assert!(report.starts_with("NOT IDENTICAL"), "got: {report}");
+    assert!(
+        report.contains("EDGE-CONCENTRATED"),
+        "1x1 diff falls into the edge band by construction, got: {report}"
+    );
+}
+
+/// 全画素 A=0 で RGB だけ違う 2 枚は NOT IDENTICAL。これは**仕様**（意図した現状の
+/// ピン）: ハーネスは「見た目の等価」ではなくバイト列の等価を見る。A=0 下の RGB 差
+/// は present 経路の premultiply / clear 色の扱い差を示す手がかりになるので、
+/// 握り潰さずに数える。
+#[test]
+fn diff_report_counts_rgb_diff_under_zero_alpha() {
+    let a = RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 0]));
+    let b = RgbaImage::from_pixel(4, 4, image::Rgba([200, 100, 50, 0]));
+    let report = diff_report(&a, &b);
+    assert!(
+        report.starts_with("NOT IDENTICAL"),
+        "RGB diffs under A=0 must count (byte equality, by design), got: {report}"
+    );
+}
+
+/// 非正方（4×2）の行優先ピン。JS（web/src/lib/abLogic.ts buildSyntheticSourceRgb）
+/// 側のピンと**同一のバイト列**を両側で固定して、width/height の取り違え
+/// （列優先化）を双方向で防ぐ。
+// SYNC WITH web/src/lib/abLogic.test.ts の S3 テスト（4×2 の期待バイトは同一値）
+#[test]
+fn synthetic_source_non_square_is_row_major() {
+    let rgb = synthetic_source_rgb(4, 2);
+    assert_eq!(
+        rgb,
+        vec![
+            0, 0, 0, 7, 11, 13, 14, 22, 26, 21, 33, 39, // y=0: x=0..3
+            13, 5, 7, 20, 16, 20, 27, 27, 33, 34, 38, 46, // y=1: x=0..3
+        ]
+    );
+}
