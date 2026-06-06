@@ -5372,8 +5372,15 @@ mod tests {
     /// diff (≈146 on A18 Pro) concentrated in the soft edge band — that would force
     /// a meaningless threshold near 255. Instead we assert the footprints'
     /// intersection-over-union, which captures "same blob, same place" directly.
-    /// Measured IoU on A18 Pro = 0.957; the `>= 0.85` floor leaves ample headroom
-    /// for per-GPU edge antialiasing without going slack.
+    ///
+    /// #242 裁定（旧 WebGL の見た目を正と採用）による基線引き直し: the float
+    /// straight Source-Over keeps the orb color constant across the outer falloff
+    /// segment (no rgb→0 fade), so the orb's faint outer ring now crosses the
+    /// `px_lit` threshold a few px further out, while the `●`'s SDF mask still
+    /// clips at the silhouette edge — the union grows and the IoU drops by design,
+    /// not by regression. Measured IoU on A18 Pro: 0.957 under the old lowp
+    /// composite, 0.827 under #242. The `>= 0.75` floor keeps the "same blob,
+    /// same place" guarantee with headroom for per-GPU edge antialiasing.
     #[test]
     fn gpu_glyph_bullet_approx_equals_orb() {
         let Some(renderer) = require_or_skip_renderer("gpu_glyph_bullet_approx_equals_orb") else {
@@ -5401,9 +5408,11 @@ mod tests {
         }
         assert!(uni > 0, "neither orb nor glyph painted — vacuous IoU");
         let iou = inter as f32 / uni as f32;
+        // #242 裁定（旧 WebGL の見た目を正と採用）による基線引き直し: 0.85 → 0.75
+        // （旧 lowp 合成での実測 0.957 → #242 float 合成での実測 0.827。doc コメント参照）。
         assert!(
-            iou >= 0.85,
-            "● glyph and orb footprints must overlap heavily (IoU >= 0.85); got {iou:.3} \
+            iou >= 0.75,
+            "● glyph and orb footprints must overlap heavily (IoU >= 0.75); got {iou:.3} \
              (inter={inter}, union={uni})"
         );
         eprintln!("gpu bullet≈orb: IoU = {iou:.3} (inter={inter}, union={uni})");
