@@ -103,6 +103,11 @@ web/                        # Web フロントエンド (#37, #38)
     │                           #  #71 skeleton 先出し, #73 hi-res DL,
     │                           #  #75 worker 経由化, #80 video pending overlay)
     ├── components/Subtitle.tsx # Solid アイランド。用途提案サブタイトル（i18n, #62）
+    ├── components/AbPanel.tsx  # #232 WebGL↔WGSL A/B 比較パネル（検証足場）。?ab=1 のときだけ
+    │                           #   Studio 下部にマウント。同一入力で旧 WebGL(orberGl.ts) と
+    │                           #   新 WGSL(gpu_*) を canvas 2枚スタックでブリンク比較・init/FPS 計測。
+    │                           #   Phase 3 で WebGL 撤去時に lib/webgpu.ts・strings の ab* と共に削除する
+    ├── lib/webgpu.ts           # #232 isWebGpuSupported()（A/B パネル用・Phase 3 で削除）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
     ├── lib/encodeMp4.ts        # WebCodecs + mp4-muxer で MP4 化（#52）。
     │                           # encodeAnimationToMp4 本体は worker 側で呼ばれる (#75)。

@@ -15,6 +15,9 @@ import {
   workerSetSource,
 } from '../lib/orberClient';
 import { t, lang } from '../lib/strings';
+// #232: WebGL↔WGSL A/B 比較パネル（?ab=1 でのみ表示する検証足場）。
+// Phase 3 で WebGL を撤去するときにこの import と下の <Show> ごと削除する。
+import AbPanel from './AbPanel';
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
@@ -146,6 +149,11 @@ export default function Studio() {
   const [imageShapeName, setImageShapeName] = createSignal<string>('');
   const [imageShapeUrl, setImageShapeUrl] = createSignal<string>('');
   const [imageShapeReady, setImageShapeReady] = createSignal<boolean>(false);
+  // #232: A/B 比較パネルに渡す image shape の元 File（検証足場・読み取り専用）。
+  // lastImageFileRef は plain let でリアクティブに読めないため、パネル用に
+  // signal でもミラーする。本番生成経路は lastImageFileRef を使い続ける（不変）。
+  // Phase 3 で A/B パネル撤去時にこの signal も消す。
+  const [imageShapeFile, setImageShapeFile] = createSignal<File | null>(null);
   // #181: シルエット反転トグル (#170) は #174 のレタボ誤判定修正後に
   // 実機検証で効果が視認できないレベルになったため削除。auto-polarity が
   // 外れる画像があれば外部 (magick -negate 等) で反転して再ドロップする。
@@ -754,6 +762,8 @@ export default function Studio() {
   const onImageShapePick = async (file: File, triggerRun = true) => {
     try {
       lastImageFileRef = file;
+      // #232: A/B パネル用に File を signal でもミラーする（検証足場）。
+      setImageShapeFile(file);
       await workerSetImageShape(file);
       const oldUrl = imageShapeUrl();
       if (oldUrl) URL.revokeObjectURL(oldUrl);
@@ -1166,6 +1176,13 @@ export default function Studio() {
     'disabled:cursor-not-allowed';
   const isRunning = () =>
     phase() === 'decoding' || phase() === 'generating' || phase() === 'animating';
+
+  // #232: `?ab=1` のときだけ A/B 比較パネルを出す（本番 UI 不汚染）。SSR では
+  // window が無いので false（client:only マウントなのでクライアントで再評価される）。
+  // Phase 3 で WebGL 撤去時にこの判定と下の <Show> ごと削除する。
+  const showAbPanel =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('ab') === '1';
 
   return (
     <section class="space-y-4" data-lang={lang()}>
@@ -2031,6 +2048,22 @@ export default function Studio() {
             </Show>
           </div>
         )}
+      </Show>
+
+      {/* #232: WebGL↔WGSL A/B 比較パネル（検証足場）。`?ab=1` のときだけ本体 UI の
+          下に控えめに出る。本番導線には現れない。Phase 3 で orberGl.ts と一緒に
+          このブロックごと削除する。 */}
+      <Show when={showAbPanel}>
+        <AbPanel
+          decoded={decoded}
+          shape={shape}
+          glyphChar={glyphChar}
+          glyphRotate={glyphRotate}
+          countPreset={countPreset}
+          speedPreset={speedPreset}
+          softnessPreset={softnessPreset}
+          imageShapeFile={imageShapeFile}
+        />
       </Show>
     </section>
   );
