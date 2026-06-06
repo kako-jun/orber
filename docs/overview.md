@@ -277,7 +277,8 @@ the `OrbShape::Aquarelle` shape:
   pass. As of #235 they are fed to the **same orb mechanism** as `OrbShape::Orb`:
   the SDF sample becomes the normalized distance `r`, which the unified shader
   (`orb.wgsl`, SDF variant) blurs with the orb's `falloff_curve` / 3-axis breath /
-  Skia-lowp compositing in a single pass. The glyph / image silhouette is simply a
+  straight-alpha float Source-Over compositing (#242, ported 1:1 from the legacy
+  WebGL shader) in a single pass. The glyph / image silhouette is simply a
   different shape fed to the orb — a `●` glyph looks like a plain orb, a `▲` blurs
   while keeping its triangular form. The old `render_aquarelle_bleed_pass`-derived
   2nd pass (`orb_glyph_bleed.wgsl`) and its bleed/halo are removed; "bleed" is the
@@ -465,7 +466,8 @@ color. The pipeline:
    mechanism** (#235): the SDF orb variant of `orb.wgsl` bilinear-samples the SDF,
    turns the signed-distance value into the normalized distance `r = 1 - signed_unit`,
    and feeds it to the **same** Rim/Soft `falloff_curve` / 3-axis breath /
-   Skia-lowp premultiply compositing the plain `orb` shape uses. So **`--blur` and
+   straight-alpha float Source-Over compositing (#242, the legacy WebGL
+   arithmetic) the plain `orb` shape uses. So **`--blur` and
    `--softness` affect Glyph mode** with the same edge-falloff meaning rather than a
    hard text fill, and the glyph blurs exactly like an orb. Each orb's rotation
    (#136) is applied to the SDF sample coordinates in the shader (before sampling).

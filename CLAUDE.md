@@ -106,6 +106,11 @@ web/                        # Web フロントエンド (#37, #38)
     ├── components/AbPanel.tsx  # #232 WebGL↔WGSL A/B 比較パネル（検証足場）。?ab=1 のときだけ
     │                           #   Studio 下部にマウント。同一入力で旧 WebGL(orberGl.ts) と
     │                           #   新 WGSL(gpu_*) を canvas 2枚スタックでブリンク比較・init/FPS 計測。
+    │                           #   #242: ?ab=1&abcap=1 = 三者画素比較キャプチャモード（合成ソース・
+    │                           #   orb 固定・t=0 固定で ab-wgsl.png / ab-webgl.png / ab-params.json /
+    │                           #   ab-source.bin を DL。通常 ?ab=1 実行中も「Capture t=0」で実画像版を
+    │                           #   DL 可。CLI 側の再現は crates/wasm/src/ab_harness.rs の ab_dump /
+    │                           #   ab_diff dev テスト）
     │                           #   Phase 3 で WebGL 撤去時に lib/webgpu.ts・strings の ab* と共に削除する
     ├── lib/webgpu.ts           # #232 isWebGpuSupported()（A/B パネル用・Phase 3 で削除）
     ├── lib/decodeImage.ts      # File → RGB バイト列デコード（#38）
@@ -130,7 +135,7 @@ web/                        # Web フロントエンド (#37, #38)
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
 - **`Motion` / `Shape` enum は当面 `main.rs` に置く** — `animate.rs`（#4）で必要になった時点で `pub mod` に昇格させる。今は CLI パース直後にしか使わないので main.rs ローカルで十分
 - **`duration_ms` は `u64` を採用** — `u32` でも 49 日分入って実用上は問題ないが、後段でのフレーム数計算（`duration_ms * fps / 1000` 等）でのオーバーフローを避けるため広めに取っておく
-- **描画バックエンドは GPU(WGSL, wgpu) が唯一（#225 で tiny-skia 撲滅）** — ネイティブ CLI は `crates/core/src/gpu.rs` の `GpuRenderer` が全 shape（Orb / Glyph / Image / Aquarelle）を WGSL で描く。#235 で Orb / Glyph / Image は統一テンプレ `orb.wgsl` の 2 variant（orb=解析距離 / SDF=glyph・image）に集約され、Glyph / Image は単パスで bleed/halo を持たない。CPU(tiny-skia) ピクセル描画・CPU↔GPU parity オラクル・`--renderer cpu`・CPU フォールバックは削除済み。GPU アダプタが取れなければ `GpuRenderer::new` が `None` を返し、CLI は error 終了する（フォールバック無し）。tiny-skia は外部 crate `aquarelle` 経由の推移依存としてのみ残る（orber 自身のコード/マニフェストは tiny-skia フリー）。Skia lowp 互換の合成は WGSL 内で u8 量子化 → premultiply → source_over を再現する
+- **描画バックエンドは GPU(WGSL, wgpu) が唯一（#225 で tiny-skia 撲滅）** — ネイティブ CLI は `crates/core/src/gpu.rs` の `GpuRenderer` が全 shape（Orb / Glyph / Image / Aquarelle）を WGSL で描く。#235 で Orb / Glyph / Image は統一テンプレ `orb.wgsl` の 2 variant（orb=解析距離 / SDF=glyph・image）に集約され、Glyph / Image は単パスで bleed/halo を持たない。CPU(tiny-skia) ピクセル描画・CPU↔GPU parity オラクル・`--renderer cpu`・CPU フォールバックは削除済み。GPU アダプタが取れなければ `GpuRenderer::new` が `None` を返し、CLI は error 終了する（フォールバック無し）。tiny-skia は外部 crate `aquarelle` 経由の推移依存としてのみ残る（orber 自身のコード/マニフェストは tiny-skia フリー）。orb 機構（orb/glyph/image, `orb.wgsl`）の合成は #242 裁定で**旧 WebGL（orberGl.ts）の straight alpha float Source-Over を 1:1 移植**したもの（旧来の Skia lowp 再現 = u8 量子化 → premultiply → source_over は暗部が沈むため撤去）。aquarelle（`orb_aquarelle.wgsl`）だけは参照アルゴリズムが `aquarelle` crate（Skia lowp）なので lowp 合成を維持する
 - **GpuRenderer は wasm32 + gpu でもビルド可能（#229）** — 出力経路は 2 本: readback 系（`render_frame*` / `render_packed` → `RgbaImage`。blocking poll を使うため native 専用 cfg）と **to_view 系**（`*_to_view`: 外部から渡された `wgpu::TextureView` + `TextureFormat` に全 shape を描いて submit。browser の surface present 用 seam）。core は web-sys / canvas を一切知らず、surface の作成・configure・present は呼び出し側（orber-wasm, #230）が握る。初期化は wasm では async の `new_async()`（`new()` は pollster の native 専用ラッパー）。pipeline cache は `(shader, target format)` キー、glyph bleed の中間テクスチャは両経路とも `Rgba8Unorm` のまま最終 pass だけ format 可変。wasm のバックエンドは wgpu default feature の **webgpu のみ**（`webgl` feature は採らない = WebGPU 必須・fallback 無し）。CI に `cargo build --target wasm32-unknown-unknown -p orber-core --features gpu` あり
 - **per-orb パラメータと WebGL 経路を共有する** — `animate.rs::pack_render_data_for_webgl` が header + per-orb 列を 1 本の `f32` バッファに詰め、ネイティブ GPU(`gpu.rs`) も Web の WebGL2 fragment shader も同じ pack を読む。算術は再実装しない（彩度だけはネイティブ側で後段適用、WebGL は独自ノブ）
 - **アニメーション軌道は一方通行コンベア（#41）** — 位相は `seed` から決定論的に散らし、`(cycle * speed_mult * t).fract()` で巻き戻して t=0 と t=1 のフレームをループ閉じさせる（`cycle * speed_mult` が整数なので浮動小数点誤差なく一致）。orb 位置/色の変調は `animate.rs::aquarelle_modulated_clusters` 等で `Cluster` 列を作って pack に渡すだけで、形状側に新 API を増やさない

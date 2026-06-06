@@ -56,6 +56,13 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 pub mod gpu;
 
+/// #242: A/B 三者画素比較（CLI / ブラウザWGSL / ブラウザWebGL）の dev ハーネス。
+/// native test 専用（GPU readback + std::fs を使うため wasm32 では存在しない）。
+/// `--ignored` の `ab_dump`（ブラウザキャプチャの再現 PNG 出力）/ `ab_diff`
+/// （2 枚の PNG の差分レポート）と、合成ソース式・diff 分類の純粋テストを持つ。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ab_harness;
+
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
 const MAX_ORB_COUNT: usize = 1024;
 
@@ -1042,7 +1049,9 @@ mod tests {
     /// native の `cargo test` は既定でテストを並列実行するため、複数テストが同時に
     /// `get_or_build_clusters()` → `borrow_mut()` すると `BorrowMutError` になる
     /// (#220)。production(wasm) は single-thread なのでこの直列化はテスト専用。
-    static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// #242: ab_harness::ab_dump も同じ cache を触るため pub(crate) で共有する
+    /// （`--include-ignored` で並走しても BorrowMutError にならないように）。
+    pub(crate) static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn parse_speed_preset_handles_empty_and_values() {
