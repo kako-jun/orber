@@ -174,6 +174,14 @@ pub struct WasmParams {
     /// 同じ 16..=1024 の範囲のみ受理する。`glyph_sdf` が空のときは無視される。
     #[serde(default)]
     pub glyph_sdf_size: u32,
+    /// #241「薄い影」強度（0..1）の **dev チューニング上書き**。省略時は製品定数
+    /// [`SHADOW_STRENGTH_DEFAULT`]（= 製品と同じ見た目）。0.0..=1.0 の範囲外は
+    /// `validate_params` が reject する（0.0 と 1.0 は inclusive で受理）。
+    /// gpu-lab（`web/src/pages/gpu-lab.astro`）のスライダー専用 — 本番 Studio は
+    /// このフィールドを送らない（製品は定数で固定、kako-jun の実機選定の足場）。
+    /// orb 機構の全 shape（orb / glyph / image）に効き、aquarelle は対象外。
+    #[serde(default = "default_shadow_strength")]
+    pub shadow_strength: f32,
 }
 
 /// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
@@ -185,6 +193,19 @@ fn default_glyph_rotate() -> bool {
 /// および `AquarelleParams::default()` と同じ 0.5（mid-strength preset）。
 fn default_aquarelle_param() -> f32 {
     0.5
+}
+
+/// `shadow_strength` の serde default（#241）。省略時は製品定数 = 製品と同じ見た目。
+fn default_shadow_strength() -> f32 {
+    SHADOW_STRENGTH_DEFAULT
+}
+
+/// #241: 製品定数 [`SHADOW_STRENGTH_DEFAULT`] を JS に公開する。gpu-lab の shadow
+/// スライダーが既定値をこの値に同期するためだけの dev 向け export（値の正本は
+/// core::animate の定数 1 箇所のまま。HTML 側にハードコードして drift させない）。
+#[wasm_bindgen]
+pub fn shadow_strength_default() -> f32 {
+    SHADOW_STRENGTH_DEFAULT
 }
 
 // Pure parsers/validators return String errors so they can be unit-tested on
@@ -581,6 +602,15 @@ fn validate_params(p: &WasmParams) -> Result<(), String> {
             p.image_mask_width, p.image_mask_height
         ));
     }
+    // #241: 影強度は 0.0..=1.0 のみ（両端 inclusive）。NaN は比較が false になり
+    // !contains で reject される。範囲外を黙ってクランプせず明示エラーにする
+    // （dev チューニングノブなので、誤入力は気づける方が良い）。
+    if !(0.0..=1.0).contains(&p.shadow_strength) {
+        return Err(format!(
+            "shadow_strength must be in [0.0, 1.0], got {}",
+            p.shadow_strength
+        ));
+    }
     Ok(())
 }
 
@@ -659,7 +689,9 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 ///   Image は web が SDF を upload するため Glyph と同じ shape_id=1 に乗る。
 /// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
 /// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
-/// - `[13..16]`: 予約（0 詰め）
+/// - `[13]`: shadow_strength (orb 機構の最外周フェード rgb 暗化強度、0..1) — #241。
+///   WGSL（gpu.rs）だけが読む。WebGL（orberGl.ts）はこの word を読まない（不変）
+/// - `[14..16]`: 予約（0 詰め）
 ///
 /// `[16 + 16*i ..]` per orb i:
 /// - `[+0..+3]`: color_rgb (0..1)
@@ -944,8 +976,9 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         softness,
         glyph_rotate: p.glyph_rotate,
         edge_softness,
-        // #241: 製品定数。gpu-lab のチューニング上書きはコミット2（WasmParams）で配線。
-        shadow_strength: SHADOW_STRENGTH_DEFAULT,
+        // #241: 省略時は serde default = 製品定数。gpu-lab のスライダーだけが
+        // 非定数値を送る（validate_params が 0.0..=1.0 を保証済み）。
+        shadow_strength: p.shadow_strength,
         width: p.width,
         height: p.height,
         orb_size: spec.orb_size.max(0.0),
@@ -1325,6 +1358,8 @@ mod tests {
             // #231: glyph SDF フォールバック入力。既定では未使用（同梱フォント経路）。
             glyph_sdf: Vec::new(),
             glyph_sdf_size: 0,
+            // #241: 影強度。既定は製品定数（serde default と同じ）。
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
         }
     }
 
