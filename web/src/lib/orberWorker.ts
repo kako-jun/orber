@@ -1,24 +1,54 @@
-// orber#75 / #112 — wasm + WebGL2 描画 + WebCodecs エンコードを Worker スレッドで実行する。
+// orber#75 / #112 / #245 — wasm + WebGPU(WGSL) 描画 + WebCodecs エンコードを
+// Worker スレッドで実行する。
 //
 // メインスレッドは UI / DOM / Solid signal だけに集中させ、重い計算は全部
 // ここに逃がす。これによりスマホでも生成中にスクロール / タップが死なない。
 //
-// アーキテクチャ:
+// アーキテクチャ (#245 で WebGL2 → WebGPU(WGSL) に配線替え):
 //   main → postMessage({ kind, id, ... }) → worker
-//   worker → wasm.get_render_data → WebGL2 (OffscreenCanvas) 描画 →
+//   worker → wasm.gpu_set_render_data → WebGPU (OffscreenCanvas surface,
+//            orber-core の WGSL シェーダ) 描画 →
 //            convertToBlob (PNG) or VideoEncoder (mp4) → main
+//
+// 旧 WebGL2 経路 (orberGl.ts / get_render_data) との違い:
+//   - 描画は wasm 内部の core WGSL（CLI と同一シェーダ）。pack / SDF の面倒は
+//     全部 wasm 側が見るので、worker は params を渡して t を回すだけ
+//   - glyph / image の入力は #231 の WasmParams 経路（同梱フォント外の字は
+//     glyph_sdf / glyph_sdf_size、image は image_mask_rgba / width / height）。
+//     SDF テクスチャの GPU upload を worker が直接行うことはもう無い
+//   - 透過 export は WasmParams.transparent_background + gpu_render_rgba
+//     （canvas 非経由の straight-alpha readback）。WebGPU canvas の alphaMode は
+//     opaque / premultiplied しかなく、旧 WebGL の「straight alpha のまま
+//     convertToBlob」が成立しないため
+//   - 出力ルックは #242（旧の明るさ）+ #241（薄い影 s=0.2）の確定ルックに変わる
+//     （#245 の目的そのもの）
 //
 // データ転送:
 //   - PNG / mp4 の ArrayBuffer は Transferable で zero-copy 返却
 //   - source RGB は `setSource` で 1 度だけ送って worker 側にキャッシュする
 //
-// 互換性: OffscreenCanvas + WebGL2 + VideoEncoder/VideoFrame in Worker が要る。
-// iOS Safari 16.4+ / Android Chrome / 最近の Firefox。古い端末は対象外。
+// 互換性: OffscreenCanvas + WebGPU + VideoEncoder/VideoFrame in Worker が要る。
+// WebGPU 非対応ブラウザはエラー表示で生成不可（#207 裁定: fallback 無し）。
+// エラーは sentinel `webgpu-unsupported` を前置して main へ返し、Studio 側で
+// i18n 文言（strings.ts `webgpuUnsupported`）にマップする。
 
 import init, * as wasm from '../wasm/orber_wasm.js';
 import { encodeAnimationFromCanvas } from './encodeMp4';
-import { createGlRenderer, GLYPH_SDF_SIZE, type GlRenderer } from './orberGl';
-import { generateImageSdf, generateJsGlyphSdf } from './jsGlyphSdf';
+import { generateJsGlyphSdf } from './jsGlyphSdf';
+
+// SDF テクスチャの一辺 (px)。core の DEFAULT_GLYPH_SDF_SIZE = 256 と同値で、
+// wasm の get_glyph_sdf / glyph_sdf_size 検証 (16..=1024) にも収まる。
+// （旧 orberGl.ts の export を引き継いだ worker ローカル定数。#245）
+// SYNC WITH crates/core/src/glyph.rs::DEFAULT_GLYPH_SDF_SIZE
+const GLYPH_SDF_SIZE = 256;
+
+// shape='image' のマスクを worker 内でデコードするときの長辺上限 (px)。
+// SDF は最終的に GLYPH_SDF_SIZE (256) へ contain リサンプルされる
+// (core の image_rgba_to_sdf) ので、4 倍の 1024 あればシルエット品質は
+// 落ちない。フル解像度 (数千 px) のまま持つと、タイルごとの
+// gpu_set_render_data で数十 MB の RGBA が wasm へコピーされ続けるため、
+// デコード時に 1 度だけ縮めて転送量と変換コストを固定する。
+const IMAGE_MASK_TARGET_LONG_EDGE = 1024;
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -34,46 +64,58 @@ function ensureInit(): Promise<void> {
 
 let cachedSource: { rgb: Uint8Array; width: number; height: number } | null = null;
 
-// OffscreenCanvas + GlRenderer は (width, height) ごとに 1 個だけ作って使い回す。
-// 192 frame の動画化中はもちろん、アスペクト切替や preview / hi-res の解像度
-// 切替でも、同じサイズなら再利用したい。WebGL の context 生成は重い。
-let cachedCanvas: { canvas: OffscreenCanvas; renderer: GlRenderer; width: number; height: number } | null = null;
+// WebGPU surface を張った OffscreenCanvas。gpu_init_offscreen は adapter /
+// device の取得を伴い重いので 1 度だけ行い、アスペクト切替や preview / hi-res
+// の解像度切替は canvas 属性の変更 + gpu_resize（surface 再 configure）で済ます。
+let gpuCanvas: { canvas: OffscreenCanvas; width: number; height: number } | null = null;
 
-// Glyph SDF の wasm 生成 + GPU upload を 1 度だけにする
-// ためのキャッシュ。同じ (ch, size) なら再 upload しない。worker は固定 size
-// (GLYPH_SDF_SIZE) でしか呼ばないので size をキーから外しても良いが、将来
-// 切替の余地を残すために含める。getRenderer で renderer を作り直したときも
-// invalidate する必要がある（テクスチャも一緒に dispose されるため）。
-//
-// #160 / #172: shape='image' のときは ch ではなく ImageBitmap (cachedImageBitmap)
-// を SDF の元にする。`cachedGlyph` の image 分岐は SDF アップロード状態の
-// identity (= どの (bitmap, size) で upload 済か) を表すフラグなので、
-// bitmap reference を再保持する必要は無い: setImageShape で
-// cachedImageBitmap が差し替わるたびに cachedGlyph を null にすれば、次の
-// ensureImageSdfUploaded で必ず再 upload される (#172 N1)。
-// #181: invert flag (#170) は削除済み。
-let cachedGlyph:
-  | { kind: 'char'; ch: string; size: number }
-  | { kind: 'image'; size: number }
-  | null = null;
-let cachedImageBitmap: ImageBitmap | null = null;
+// 同梱フォント外の字 (絵文字 / 漢字 / 任意 Unicode) の JS 生成 SDF キャッシュ。
+// generateJsGlyphSdf (OS フォントスタックでラスタライズ → EDT) は 1 文字
+// ~数ms だが、バッチ 16 タイルで毎回作り直さないよう ch 単位で持つ。
+// wasm へは WasmParams.glyph_sdf として毎回コピーされる (64KB、許容コスト)。
+let cachedJsGlyphSdf: { ch: string; sdf: Uint8Array } | null = null;
 
-function getRenderer(width: number, height: number): { canvas: OffscreenCanvas; renderer: GlRenderer } {
-  if (cachedCanvas && cachedCanvas.width === width && cachedCanvas.height === height) {
-    return { canvas: cachedCanvas.canvas, renderer: cachedCanvas.renderer };
+// #160 / #245: shape='image' のマスク RGBA。setImageShape で File →
+// ImageBitmap → 2D canvas デコードして保持し、タイルごとに
+// WasmParams.image_mask_* として wasm に渡す (SDF 化は core の
+// image_rgba_to_sdf、#231 の WGSL 経路と同じ)。
+let cachedImageMask: { rgba: Uint8Array; width: number; height: number } | null = null;
+
+// 透過 export 用の 2D スクラッチ canvas (gpu_render_rgba の RGBA → Blob 化)。
+let alphaScratch: OffscreenCanvas | null = null;
+
+/**
+ * WebGPU surface 付き OffscreenCanvas を返す。初回は gpu_init_offscreen で
+ * bring-up し、以降のサイズ変更は canvas 属性 + gpu_resize で追従する。
+ *
+ * WebGPU 不在 (navigator.gpu 無し / adapter 拒否) は sentinel
+ * `webgpu-unsupported` を前置した Error で reject する (#207: fallback 無し)。
+ * Studio は formatRunBatchError でこの sentinel を i18n 文言にマップする。
+ */
+async function ensureGpuCanvas(width: number, height: number): Promise<OffscreenCanvas> {
+  if (gpuCanvas) {
+    if (gpuCanvas.width !== width || gpuCanvas.height !== height) {
+      gpuCanvas.canvas.width = width;
+      gpuCanvas.canvas.height = height;
+      wasm.gpu_resize(width, height);
+      gpuCanvas.width = width;
+      gpuCanvas.height = height;
+    }
+    return gpuCanvas.canvas;
   }
-  if (cachedCanvas) {
-    cachedCanvas.renderer.dispose();
-    cachedCanvas = null;
-    // renderer を作り直すとテクスチャも消えるので Glyph / Image
-    // キャッシュも無効化する（次の ensure*SdfUploaded で再 upload）。
-    cachedGlyph = null;
+  if (!('gpu' in navigator)) {
+    throw new Error('webgpu-unsupported: navigator.gpu is not available in this worker');
   }
   const canvas = new OffscreenCanvas(width, height);
-  const renderer = createGlRenderer(canvas);
-  renderer.setResolution(width, height);
-  cachedCanvas = { canvas, renderer, width, height };
-  return { canvas, renderer };
+  try {
+    await wasm.gpu_init_offscreen(canvas);
+  } catch (e) {
+    // navigator.gpu はあるが adapter が取れない環境 (ブロック / ドライバ拒否)
+    // もここに来る。詳細は残しつつ sentinel を前置して main に渡す。
+    throw new Error(`webgpu-unsupported: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  gpuCanvas = { canvas, width, height };
+  return canvas;
 }
 
 interface BaseParams {
@@ -96,72 +138,127 @@ interface BaseParams {
   glyph_rotate?: boolean;
 }
 
-function ensureGlyphSdfUploaded(renderer: GlRenderer, ch: string): void {
-  const size = GLYPH_SDF_SIZE;
-  if (
-    cachedGlyph &&
-    cachedGlyph.kind === 'char' &&
-    cachedGlyph.ch === ch &&
-    cachedGlyph.size === size
-  )
-    return;
-  // #159: wasm 側で同梱フォントから SDF を作れる字 (☆ 等) は wasm 経路を使う
-  // (高速 / 環境非依存)。それ以外 (絵文字 / 漢字 / 任意 Unicode) は worker 内
-  // OffscreenCanvas で OS フォントスタックでラスタライズして SDF 化する。
-  // 後者は端末ごとに見た目が変わり得る (Mac の 🐱 と Windows の 🐱 は別形状)
-  // が、これは「ユーザーが入れた字を尊重して描画する」を優先するための
-  // 仕様。両経路とも出力フォーマット (R8 size×size) は一致しているので
-  // renderer 側の取り扱いは共通で良い。
-  let sdf: Uint8Array;
-  if (wasm.glyph_supported(ch)) {
-    sdf = wasm.get_glyph_sdf(ch, size);
-  } else {
-    sdf = generateJsGlyphSdf(ch, size);
-  }
-  renderer.setGlyphSdf(sdf, size);
-  cachedGlyph = { kind: 'char', ch, size };
-}
-
-// #160: shape='image' 用。Studio 側で `setImageShape` 経由で送られて
-// `cachedImageBitmap` に入っている画像をシルエット化 → SDF 化 → upload。
-// 同じ bitmap (= setImageShape が cachedGlyph を null にしないかぎり) なら
-// 再生成しない。
-//
-// #169: シルエット抽出に失敗 (コントラスト不足) したら専用 Error を投げる。
-// 呼び出し側 (Studio) で `imageShapeNoContrast` 文言の UI に使う。
-function ensureImageSdfUploaded(renderer: GlRenderer): void {
-  const size = GLYPH_SDF_SIZE;
-  if (!cachedImageBitmap) {
-    throw new Error('image shape requires setImageShape before generate');
-  }
-  if (
-    cachedGlyph &&
-    cachedGlyph.kind === 'image' &&
-    cachedGlyph.size === size
-  )
-    return;
-  const result = generateImageSdf(cachedImageBitmap, size);
-  if (!result.ok) {
-    throw new Error('image-shape-no-contrast');
-  }
-  renderer.setGlyphSdf(result.sdf, size);
-  cachedGlyph = { kind: 'image', size };
-}
-
-function mergeParams(p: BaseParams) {
+/**
+ * BaseParams + worker キャッシュ (source / image mask / glyph SDF) から
+ * wasm の WasmParams を組む。
+ *
+ * - shape='glyph': 同梱フォント収録字は wasm の core フォント経路
+ *   (glyph_char) に任せる。収録外の字は generateJsGlyphSdf で SDF 化して
+ *   glyph_sdf / glyph_sdf_size に乗せる (#231 / #159 と同設計)
+ * - shape='image': cachedImageMask を image_mask_* に乗せる (#231)。
+ *   SDF 化は core の image_rgba_to_sdf
+ * - transparentBackground: 透過 export (#56)。wasm 側で bg.a=0 になる
+ */
+function buildWasmParams(
+  p: BaseParams,
+  opts?: { transparentBackground?: boolean },
+): Record<string, unknown> {
   if (!cachedSource) {
     throw new Error('source not set — call setSource before generate/animate');
   }
-  // #172 N2: shape='image' はそのまま wasm へ渡す。wasm 側 get_render_data が
-  // shape='image' を直接受け付け (webgl_shape_id)、Glyph と同じ shape_id=1 に
-  // 乗せる。SDF テクスチャは web が別途 upload する (ensureImageSdfUploaded)。
-  // 以前はダミー glyph_char を当てて 'glyph' に化けさせていたが、その特例は撤去。
-  return {
+  const params: Record<string, unknown> = {
     ...p,
     source_rgb: cachedSource.rgb,
     source_width: cachedSource.width,
     source_height: cachedSource.height,
   };
+  if (p.shape === 'image') {
+    if (!cachedImageMask) {
+      throw new Error('image shape requires setImageShape before generate');
+    }
+    params.image_mask_rgba = cachedImageMask.rgba;
+    params.image_mask_width = cachedImageMask.width;
+    params.image_mask_height = cachedImageMask.height;
+  } else if (p.shape === 'glyph' && p.glyph_char && !wasm.glyph_supported(p.glyph_char)) {
+    // #159 / #231: 同梱フォント (Noto Sans Symbols 2 サブセット) に無い字は
+    // worker 内 OffscreenCanvas + OS フォントスタックでラスタライズして SDF 化
+    // する。端末ごとに見た目が変わり得るが、「ユーザーが入れた字を尊重して
+    // 描画する」を優先する仕様 (WebGL 時代から不変)。
+    if (!cachedJsGlyphSdf || cachedJsGlyphSdf.ch !== p.glyph_char) {
+      cachedJsGlyphSdf = { ch: p.glyph_char, sdf: generateJsGlyphSdf(p.glyph_char, GLYPH_SDF_SIZE) };
+    }
+    params.glyph_sdf = cachedJsGlyphSdf.sdf;
+    params.glyph_sdf_size = GLYPH_SDF_SIZE;
+  }
+  if (opts?.transparentBackground) {
+    params.transparent_background = true;
+  }
+  return params;
+}
+
+/**
+ * gpu_set_render_data の薄いラッパ。wasm 内部のエラー文言を main 側の既存
+ * sentinel にマップする: core の image_rgba_to_sdf がコントラスト不足で
+ * 失敗したら `image-shape-no-contrast` (#169。Studio が i18n 文言に変換)。
+ */
+function setRenderData(params: Record<string, unknown>, n: number, specIdx: number): void {
+  try {
+    wasm.gpu_set_render_data(params, n, specIdx);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('no usable silhouette contrast')) {
+      throw new Error('image-shape-no-contrast');
+    }
+    throw e;
+  }
+}
+
+/**
+ * gpu_render_rgba が返した straight-alpha RGBA を PNG / WebP Blob にする。
+ *
+ * 2D canvas は内部表現が premultiplied のため、putImageData → convertToBlob
+ * の往復で 0 < a < 255 の画素の RGB に ±数値の量子化が乗り得る (alpha と
+ * 合成結果 rgb×a は u8 精度で保たれるので視覚上は同一)。PNG を完全 exact に
+ * したければ wasm 側エンコードに切替える余地があるが、192 frame の透過動画
+ * でブラウザネイティブの PNG エンコーダ速度を優先してこの経路を採る。
+ */
+function rgbaToBlob(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  type: string,
+  quality?: number,
+): Promise<Blob> {
+  if (!alphaScratch || alphaScratch.width !== width || alphaScratch.height !== height) {
+    alphaScratch = new OffscreenCanvas(width, height);
+  }
+  const ctx = alphaScratch.getContext('2d');
+  if (!ctx) throw new Error('2d context unavailable for alpha export');
+  // wasm-bindgen が返す Uint8Array は通常の ArrayBuffer 裏打ちの新規コピー。
+  // ImageData の型 (Uint8ClampedArray<ArrayBuffer>) に合わせて cast する。
+  const img = new ImageData(
+    new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, rgba.byteLength),
+    width,
+    height,
+  );
+  ctx.putImageData(img, 0, 0);
+  return quality === undefined
+    ? alphaScratch.convertToBlob({ type })
+    : alphaScratch.convertToBlob({ type, quality });
+}
+
+/**
+ * #160 / #245: File からデコードした ImageBitmap をマスク RGBA に変換する。
+ * 長辺 IMAGE_MASK_TARGET_LONG_EDGE まで縮小 (アスペクト維持) して、以降の
+ * タイルごとの wasm 転送・SDF 変換コストをソース解像度から切り離す。
+ */
+function decodeBitmapToMask(bitmap: ImageBitmap): {
+  rgba: Uint8Array;
+  width: number;
+  height: number;
+} {
+  const longest = Math.max(bitmap.width, bitmap.height);
+  const scale = Math.min(1, IMAGE_MASK_TARGET_LONG_EDGE / Math.max(1, longest));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = new OffscreenCanvas(w, h);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2d context unavailable for image mask decode');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'medium';
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const data = ctx.getImageData(0, 0, w, h).data;
+  return { rgba: new Uint8Array(data.buffer), width: w, height: h };
 }
 
 type Req =
@@ -183,8 +280,8 @@ type Req =
       totalFrames: number;
     }
   // #56: 透過 PNG または透過 WebP を返す静止画 alpha 経路。`format` で出し分ける。
-  // wasm の get_render_data 出力をそのまま流用し、bg.a だけを 0 に上書きして
-  // canvas を描画する。Orb / Glyph どちらの shape でも straight alpha が残る。
+  // #245: WasmParams.transparent_background で bg.a=0 にし、gpu_render_rgba
+  // (canvas 非経由の straight-alpha readback) で取り出す。
   | {
       kind: 'generateOneAlpha';
       id: number;
@@ -194,13 +291,9 @@ type Req =
       format: 'png' | 'webp';
     }
   // #184/#192: 透過動画用の PNG フレーム列を返す。worker は wasm 経路で各 frame
-  // (透過背景 + orb) を OffscreenCanvas に描画 → PNG 化 → progress message
-  // で 1 枚ずつ main に流す。main 側は JS-only MOV muxer (`movMuxer.ts`) で
-  // PNG-in-MOV に詰める。#184 当時は ffmpeg.wasm を muxer 役に使う構成で、
-  // FFmpeg class が更に内部 worker を spawn する nested-worker パスを避ける
-  // ために worker 側にエンコーダを抱え込まない判断だった。#192 で encoder
-  // 自体が消えたためその制約は無くなったが、責務 (描画 = worker / コンテナ
-  // 組立 = main) の分離は今も自然なのでそのまま維持。
+  // (透過背景 + orb) を readback → PNG 化 → progress message で 1 枚ずつ main に
+  // 流す。main 側は JS-only MOV muxer (`movMuxer.ts`) で PNG-in-MOV に詰める。
+  // 責務 (描画 = worker / コンテナ組立 = main) の分離は #184 以来そのまま維持。
   | {
       kind: 'renderAlphaFrames';
       id: number;
@@ -213,22 +306,11 @@ type Req =
   // 警告表示するための問い合わせ。wasm の has_glyph(NotoSymbols2, ch) を呼ぶ。
   | { kind: 'glyphSupported'; id: number; ch: string }
   // #160: shape='image' で使う画像 (File) を worker にキャッシュする。
-  // worker 側で createImageBitmap(file) を呼んで ImageBitmap 化する。
+  // worker 側で createImageBitmap(file) → マスク RGBA 化する。
   // Transferable を使わず structured-clone で渡す ── main 側が File 参照
   // を保持し続けることで、worker クラッシュ / terminateAndRespawn 後の
   // 再 upload が可能になる。
   | { kind: 'setImageShape'; id: number; file: File };
-
-/// #56: wasm get_render_data の Float32Array header word 3 (= bg.a in 0..1) を 0 に
-/// 上書きして「透過背景でレンダリングしてくれ」と shader に依頼する。元 buffer は
-/// 破壊しないよう新しい Float32Array を返す（同じ params を続けて非透過レンダリング
-/// する将来の経路を壊さないため）。
-function withTransparentBackground(data: Float32Array): Float32Array {
-  const out = new Float32Array(data.length);
-  out.set(data);
-  out[3] = 0;
-  return out;
-}
 
 function post(msg: unknown, transfers: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfers);
@@ -249,57 +331,42 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'setImageShape': {
-        // File を worker 内で ImageBitmap 化する。古い bitmap は close して
-        // GPU メモリを解放してから差し替え。decode 失敗時は呼び出し側に
-        // error を返す (Studio 側で UI 通知)。
-        const newBitmap = await createImageBitmap(req.file);
-        if (cachedImageBitmap && cachedImageBitmap !== newBitmap) {
-          cachedImageBitmap.close();
-        }
-        cachedImageBitmap = newBitmap;
-        // 既存の image SDF キャッシュを invalidate (新 bitmap で再生成させる)。
-        // ensureImageSdfUploaded 側は size 比較だけで済む (#172 N1)。
-        if (cachedGlyph && cachedGlyph.kind === 'image') {
-          cachedGlyph = null;
+        // File を worker 内でデコードしてマスク RGBA 化する (#245: ImageBitmap
+        // 保持から RGBA 保持に変更。SDF 化は wasm/core 側)。decode 失敗時は
+        // 呼び出し側に error を返す (Studio 側で UI 通知)。
+        const bitmap = await createImageBitmap(req.file);
+        try {
+          cachedImageMask = decodeBitmapToMask(bitmap);
+        } finally {
+          bitmap.close();
         }
         post({ id: req.id, ok: true });
         break;
       }
       case 'generateOne': {
-        const params = mergeParams(req.params);
-        const data = wasm.get_render_data(params, req.n, req.index);
-        const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
-        // Glyph 形状なら SDF を 1 度アップロードする。
-        // setRenderData の前に呼ぶことで shape_id=1 の uniform が立つ前から
-        // テクスチャは正しい状態になる（順序依存はないが、明示的に先に行う）。
-        if (req.params.shape === 'image') {
-          ensureImageSdfUploaded(renderer);
-        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
-        }
-        renderer.setRenderData(data);
-        renderer.renderFrame(0);
+        const params = buildWasmParams(req.params);
+        const canvas = await ensureGpuCanvas(req.params.width, req.params.height);
+        setRenderData(params, req.n, req.index);
+        // gpu_render → convertToBlob は同一タスク内で行うこと: WebGPU canvas の
+        // current texture はタスクをまたぐと present されて expire する
+        // (AbPanel のキャプチャ実装と同じ制約。convertToBlob のスナップショット
+        // 自体は呼び出し時点で同期に取られる)。
+        wasm.gpu_render(0);
         const blob = await canvas.convertToBlob({ type: 'image/png' });
         const buf = await blob.arrayBuffer();
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
       }
       case 'animateOne': {
-        const params = mergeParams(req.params);
-        const data = wasm.get_render_data(params, req.n, req.index);
+        const params = buildWasmParams(req.params);
         const width = req.params.width;
         const height = req.params.height;
-        const { canvas, renderer } = getRenderer(width, height);
-        if (req.params.shape === 'image') {
-          ensureImageSdfUploaded(renderer);
-        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
-        }
-        renderer.setRenderData(data);
+        const canvas = await ensureGpuCanvas(width, height);
+        setRenderData(params, req.n, req.index);
         const PROGRESS_STRIDE = 4;
         const blob = await encodeAnimationFromCanvas(
           canvas,
-          (t) => renderer.renderFrame(t),
+          (t) => wasm.gpu_render(t),
           req.totalFrames,
           width,
           height,
@@ -320,26 +387,24 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         break;
       }
       case 'generateOneAlpha': {
-        // #56: 静止画 alpha 経路。non-alpha 経路と同じ wasm get_render_data → setRenderData
-        // を辿るが、bg.a だけ 0 に上書きする。`format` で PNG / WebP を出し分ける。
-        const params = mergeParams(req.params);
-        const data = wasm.get_render_data(params, req.n, req.index);
-        const { canvas, renderer } = getRenderer(req.params.width, req.params.height);
-        if (req.params.shape === 'image') {
-          ensureImageSdfUploaded(renderer);
-        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
-        }
-        renderer.setRenderData(withTransparentBackground(data));
-        renderer.renderFrame(0);
+        // #56: 静止画 alpha 経路。non-alpha 経路と同じ spec 解決を辿るが、
+        // transparent_background で bg.a だけ 0 になる。`format` で PNG / WebP を
+        // 出し分ける。
+        const params = buildWasmParams(req.params, { transparentBackground: true });
+        await ensureGpuCanvas(req.params.width, req.params.height);
+        setRenderData(params, req.n, req.index);
+        const rgba: Uint8Array = await wasm.gpu_render_rgba(0);
         const mime = req.format === 'webp' ? 'image/webp' : 'image/png';
         // WebP は quality 指定で alpha 込みでもサイズが大きく変わる。0.9 を選んだ
         // のは「視覚劣化が体感上識別不能」と「PNG 比でファイルサイズ ~30-50% 削減」
         // の落としどころ。PNG は lossless で quality 引数が無視される。
-        const blob =
-          req.format === 'webp'
-            ? await canvas.convertToBlob({ type: mime, quality: 0.9 })
-            : await canvas.convertToBlob({ type: mime });
+        const blob = await rgbaToBlob(
+          rgba,
+          req.params.width,
+          req.params.height,
+          mime,
+          req.format === 'webp' ? 0.9 : undefined,
+        );
         const buf = await blob.arrayBuffer();
         post({ id: req.id, ok: true, data: buf }, [buf]);
         break;
@@ -347,25 +412,19 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
       case 'renderAlphaFrames': {
         // #184: 透過動画用 PNG フレーム列 (worker → main)。各 frame は
         // `alphaFrame` kind の message で 1 枚ずつ Transferable 経由で送る。
-        // 全 frame を flat array で抱え込まないことで GPU メモリと postMessage の
+        // 全 frame を flat array で抱え込まないことで メモリと postMessage の
         // 一括コピーコストを抑える。main 側は JS-only MOV muxer に投入する。
         // 進捗 UI は `animateProgress` を流用 (encodeMp4 と同形)。
-        const params = mergeParams(req.params);
-        const data = wasm.get_render_data(params, req.n, req.index);
+        const params = buildWasmParams(req.params, { transparentBackground: true });
         const width = req.params.width;
         const height = req.params.height;
-        const { canvas, renderer } = getRenderer(width, height);
-        if (req.params.shape === 'image') {
-          ensureImageSdfUploaded(renderer);
-        } else if (req.params.shape === 'glyph' && req.params.glyph_char) {
-          ensureGlyphSdfUploaded(renderer, req.params.glyph_char);
-        }
-        renderer.setRenderData(withTransparentBackground(data));
+        await ensureGpuCanvas(width, height);
+        setRenderData(params, req.n, req.index);
         const PROGRESS_STRIDE = 4;
         for (let i = 0; i < req.totalFrames; i++) {
           const t = i / req.totalFrames;
-          renderer.renderFrame(t);
-          const blob = await canvas.convertToBlob({ type: 'image/png' });
+          const rgba: Uint8Array = await wasm.gpu_render_rgba(t);
+          const blob = await rgbaToBlob(rgba, width, height, 'image/png');
           const buf = await blob.arrayBuffer();
           post(
             {

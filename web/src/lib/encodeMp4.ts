@@ -1,8 +1,9 @@
 // 後半タイルのアニメーションを WebCodecs + mp4-muxer で mp4 化する。
 //
-// #112 の WebGL 経路では OffscreenCanvas (WebGL2) に 1 frame 描画して
-// `new VideoFrame(canvas)` で直接エンコーダに食わせる。RGBA バッファの GPU→CPU
-// readback が消えるので、CPU 経路 (wasm + ImageData → ImageBitmap →
+// #112 以来の canvas 直結経路: OffscreenCanvas に 1 frame 描画して
+// `new VideoFrame(canvas)` で直接エンコーダに食わせる (#245 で描画側は
+// WebGL2 → WebGPU(WGSL) に置換、この仕組み自体は不変)。RGBA バッファの
+// GPU→CPU readback が消えるので、CPU 経路 (wasm + ImageData → ImageBitmap →
 // VideoFrame) と比べて 1080×1920 × 192 frame で大幅に速い。
 //
 // 互換性: VideoEncoder / VideoFrame(canvas) が要る。
@@ -117,7 +118,7 @@ export async function pickSupportedVideoCodec(
 }
 
 /**
- * OffscreenCanvas (WebGL2) を消費して 1 本の mp4 Blob を返す。
+ * OffscreenCanvas (WebGPU surface, #245) を消費して 1 本の mp4 Blob を返す。
  *
  * `renderFrame(t)` を呼ぶと canvas に t における 1 フレームが描画される前提。
  * このループ側で `t = i / totalFrames` (i = 0..totalFrames) を順に流し、
@@ -188,9 +189,11 @@ export async function encodeAnimationFromCanvas(
     const t = i / totalFrames;
     renderFrame(t);
     // canvas 直渡し: VideoFrame コンストラクタは canvas のピクセルをスナップ
-    // ショットして取り込む。drawArrays 直後でも GL のキューイング順序は
+    // ショットして取り込む。submit 直後でも GPU のキューイング順序は
     // 保たれているので、あとから読み出した時に未描画のフレームが入る心配は
-    // ない（WebGL → VideoFrame の同一スレッド内は順序保証あり）。
+    // ない。WebGPU canvas の current texture は同一タスク内でのみ有効なので、
+    // renderFrame(t) と new VideoFrame(canvas) の間に await を挟まないこと
+    // (#245。このループは現にそうなっている)。
     let frame: VideoFrame;
     try {
       frame = new VideoFrame(canvas as unknown as CanvasImageSource, {
