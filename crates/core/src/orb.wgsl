@@ -1,10 +1,16 @@
-// orber #207 / #235 / #242 — orb の production WGSL（native CLI / wgpu）。
+// orber #207 / #235 / #242 / #241 — orb の production WGSL（native CLI / wgpu）。
 //
 // **orb の機構を全 shape の唯一の機構にしたもの（#235）。** 元は orb_circle.wgsl
 // （`web/src/lib/orberGl.ts` の orb アームを 1:1 で WGSL 化）だったが、#235 で
 // 「orb に別のシルエットを食わせる」形へ一般化した: 各ピクセルの "形からの距離" を
 // 正規化した r を、3 軸呼吸・falloff 曲線・straight alpha の float Source-Over 合成
 // （#242 で旧 WebGL = orberGl.ts のアルゴリズムを 1:1 採用）へ食わせる。
+// #241 で最外周フェードセグメントに「薄い影」= rgb 暗化を強度係数
+// `params.shadow_strength`（0..1）付きで再導入した（kako-jun 裁定「旧ベース +
+// 新のようなアレンジを薄く重ねる」）。s=0 で #242 直後（影なし）と bit 同一、
+// s=1 で #242 が撤去した旧 lowp の rgb→0 フェードと同等の暗さ。式は旧 lowp の
+// straight-color フェード（rgb_scale = 1-u）を `mix(1.0, 1.0-u, s)` に係数化した
+// だけで、新規のカーブは導入していない。
 // この距離の出どころ（DISTANCE SOURCE ブロック）だけが shape ごとに差し替わる:
 //   - orb   : 解析的な円距離（`distance(px, center) / radius`）。
 //   - glyph / image : SDF サンプル（SDF はまさに "形からの距離" そのもの）。回転を
@@ -33,12 +39,15 @@
 //     誤って 64 を同期させないこと。
 //
 // WebGL (orberGl.ts) との対応（#242 裁定: 旧 WebGL の合成アルゴリズムが正）:
-//   - falloff_curve（stop alpha は raw float・orb 色はどのセグメントでも一定）と
-//     straight alpha の float Source-Over 合成を GLSL fragment shader から 1:1 移植。
+//   - falloff_curve（stop alpha は raw float）と straight alpha の float Source-Over
+//     合成を GLSL fragment shader から 1:1 移植。
 //     かつての Skia lowp 再現（stop alpha の u8 量子化・最外周セグメントの rgb→0
 //     フェード・u8 premultiply div255 合成・premul→straight finalize）は #242 で撤去:
 //     最外周フェードの rgb→0 が暗部を一様に沈め、旧 WebGL より暗い出力になっていた
 //     （mean_signed R+30.7/G+23.2/B+24.2、diff は輝度と逆相関 corr=−0.962）。
+//   - #241 で最外周セグメントの rgb フェードだけを強度係数 shadow_strength 付きで
+//     薄く再導入（falloff_curve の doc 参照）。s>0 では WGSL が旧 WebGL より外周帯で
+//     僅かに暗く（= 影が乗って）なるのが正。u8 量子化や premultiply 合成は復活しない。
 //   - saturation は pack_render_data_for_webgl では掛けず（WebGL と共有のため）、
 //     native GPU 側 gpu.rs::render_frame が adjust_saturation_pub を後段適用して揃える。
 //     color/keyframe tracks は GPU pack 未対応で cluster 列経由。
@@ -58,6 +67,7 @@
 //   - 3 軸独立呼吸: radius ±10%, blur ±15, opacity ±5%（sin(TAU*fract(t)+phi)）
 //   - rim: 3-stop（center=opacity, mid=opacity*80/255, mid_stop=clamp(1-blur*0.8,.05,.95)）
 //   - soft: 2-stop（hold=opacity, hold_stop=clamp(1-blur,.05,.95)）
+//   - 影（#241、GLSL には無い上乗せ）: 最外周セグメントで rgb_scale = mix(1, 1-u, s)
 //   - Source-Over（straight alpha）
 
 const TAU: f32 = 6.28318530718;
@@ -79,6 +89,7 @@ struct Params {
     glyph_rotate: f32,     // #136: 1.0=ON / 0.0=OFF（SDF source のみ使用、orb は無視）
     edge_softness: f32,    // #205: 予約（現状未使用）
     sdf_size: f32,         // glyph/image SDF の一辺（texel 数）。orb は 0。
+    shadow_strength: f32,  // #241: 最外周フェードの rgb 暗化強度（0..1）。0 = #242 と bit 同一
 };
 
 // per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
@@ -128,24 +139,32 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
 
 //!ORB_HELPERS
 
-// 旧 WebGL（orberGl.ts）の falloff_curve を 1:1 移植した falloff（#242 裁定）。
+// 旧 WebGL（orberGl.ts）の falloff_curve を 1:1 移植した falloff（#242 裁定）に、
+// #241 の「薄い影」（最外周フェードの rgb 暗化、強度係数付き）を重ねたもの。
 //
-// 返り値は straight alpha (0..1) の **raw float**。stop alpha の u8 量子化は
+// 返り値 `.x` = straight alpha (0..1) の **raw float**。stop alpha の u8 量子化は
 // しない（GLSL は center_a = opacity / mid_a = opacity * 80/255 を float のまま
-// 線形補間する）。orb 色はどのセグメントでも一定で、最外周セグメントの
-// rgb→0 フェードは無い（旧実装の Skia lowp straight-color 補間は #242 で撤去:
-// rgb→0 フェードが暗部を一様に沈め、旧 WebGL より暗くなっていた）。
+// 線形補間する）。
+// 返り値 `.y` = orb 色に掛ける rgb スケール (0..1)。内側セグメントでは常に 1.0
+// （orb 色一定 = #242 の旧 WebGL 式そのまま）。**最外周フェードセグメントだけ**
+// `mix(1.0, 1.0 - u, params.shadow_strength)` — 旧 lowp（#242 で撤去）は同じ場所で
+// rgb_scale = 1-u と rgb を 0 へフェードさせており、これが「新のくっきりした影」の
+// 正体だった。#241 はその旧式を強度係数 s で係数化しただけ:
+//   s=0 → scale = 1.0（#242 直後と bit 同一: mix(1,x,0)=1 の乗算は恒等）
+//   s=1 → scale = 1-u（旧 lowp の straight-color フェードと同等の暗さ。u8 量子化はしない）
+// Rim / Soft とも旧 lowp と同じく最外周セグメントのみ暗化する（内側は不変）。
 //
-//   Rim  stops: [0→center_a, mid_stop→mid_a, 1→0]（alpha のみ補間）
-//   Soft stops: [0→opacity, hold_stop→opacity, 1→0]
+//   Rim  stops: [0→center_a, mid_stop→mid_a, 1→0]（alpha 補間 + 外周帯 rgb 暗化）
+//   Soft stops: [0→opacity, hold_stop→opacity, 1→0]（同上）
 //
 // style_bit < 0.5 が Rim、それ以外が Soft。
 //
 // SDF DISTANCE SOURCE（glyph/image）でも **同じこの falloff_curve** を使う（#235）。
-// 形（r の出どころ）だけが違い、ぼやけ方・rim/soft・合成は orb と完全に共通。
-fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> f32 {
+// 形（r の出どころ）だけが違い、ぼやけ方・rim/soft・合成・影は orb と完全に共通
+// （= 影は quad 矩形ではなく r ベースで自動的にシルエット沿いになる）。
+fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32> {
     if (opacity <= 0.0 || r_in >= 1.0) {
-        return 0.0;
+        return vec2<f32>(0.0, 0.0);
     }
     let r = max(r_in, 0.0);
     if (style_bit < 0.5) {
@@ -157,19 +176,19 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> f32 {
             if (mid_stop > 0.0) {
                 u = r / mid_stop;
             }
-            return mix(center_a, mid_a, u);
+            return vec2<f32>(mix(center_a, mid_a, u), 1.0);
         }
         let denom = max(1.0 - mid_stop, 1e-6);
         let u = (r - mid_stop) / denom;
-        return mix(mid_a, 0.0, u);
+        return vec2<f32>(mix(mid_a, 0.0, u), mix(1.0, 1.0 - u, params.shadow_strength));
     }
     let hold_stop = clampf(1.0 - blur, 0.05, 0.95);
     if (r <= hold_stop) {
-        return opacity;
+        return vec2<f32>(opacity, 1.0);
     }
     let denom = max(1.0 - hold_stop, 1e-6);
     let u = (r - hold_stop) / denom;
-    return mix(opacity, 0.0, u);
+    return vec2<f32>(mix(opacity, 0.0, u), mix(1.0, 1.0 - u, params.shadow_strength));
 }
 
 // サブピクセル位置 `sample_px` での 1 サンプルを **straight alpha の float
@@ -254,15 +273,17 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         //!ORB_DISTANCE_SOURCE
         // === /DISTANCE SOURCE ブロック ===
 
-        // straight alpha（raw float）。orb 色はどのセグメントでも一定。
-        let alpha = falloff_curve(style_bit, r, blur, opacity);
+        // .x = straight alpha（raw float）、.y = rgb スケール（#241 の薄い影:
+        // 最外周フェード帯のみ < 1。shadow_strength=0 なら常に 1.0 = #242 と bit 同一）。
+        let fall = falloff_curve(style_bit, r, blur, opacity);
+        let alpha = fall.x;
 
         if (alpha > 0.0) {
-            // Source-Over（straight alpha）。GLSL と同式:
-            //   out.rgb = src.rgb * src.a + out.rgb * (1 - src.a)
+            // Source-Over（straight alpha）。GLSL と同式 + #241 影スケール:
+            //   out.rgb = (src.rgb * shadow_scale) * src.a + out.rgb * (1 - src.a)
             //   out.a   = src.a + out.a * (1 - src.a)
             let one_minus_a = 1.0 - alpha;
-            acc_rgb = o.color.rgb * alpha + acc_rgb * one_minus_a;
+            acc_rgb = o.color.rgb * fall.y * alpha + acc_rgb * one_minus_a;
             acc_a = alpha + acc_a * one_minus_a;
         }
     }

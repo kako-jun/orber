@@ -346,6 +346,14 @@ struct Params {
     /// sampler's texel space. The orb variant ignores this slot; `0.0` for the orb
     /// path.
     sdf_size: f32,
+    // row 4: shadow_strength + pad (WGSL uniform structs round up to 16-byte rows)
+    /// Thin-shadow strength (#241): rgb darkening factor (0..1) applied in the
+    /// outermost fade segment of the shared `falloff_curve`. `0.0` is bit-identical
+    /// to the post-#242 (no-shadow) output; `1.0` matches the darkness of the
+    /// removed Skia-lowp rgb→0 fade. Read from pack header[13]; every shape on the
+    /// unified template (orb / glyph / image) gets it, aquarelle does not.
+    shadow_strength: f32,
+    _pad: [f32; 3],
 }
 
 /// One orb as the shaders see it: four `vec4`s mirroring `struct Orb` in
@@ -1070,7 +1078,8 @@ impl GpuRenderer {
         let cycle = opts.speed.cycle_count() as f32;
         let n_orbs = Self::resolved_orb_count(clusters, opts);
         // shape_id / glyph_rotate / edge_softness are SDF (glyph / image) inputs; the
-        // plain orb shader ignores them. Pass orb defaults.
+        // plain orb shader ignores them. Pass orb defaults. shadow_strength (#241)
+        // is read by every shape on the unified template, the orb included.
         let mut pack = pack_render_data_for_webgl(
             clusters,
             opts.background,
@@ -1084,6 +1093,7 @@ impl GpuRenderer {
             0.0,  // shape_id = Orb
             true, // glyph_rotate (unused by Orb)
             opts.softness.edge_softness(),
+            opts.shadow_strength,
         );
 
         // `pack_render_data_for_webgl` is shared with the WebGL path and must NOT
@@ -1429,6 +1439,7 @@ impl GpuRenderer {
             1.0, // shape_id = SDF (glyph/image share id 1)
             opts.glyph_rotate,
             opts.softness.edge_softness(),
+            opts.shadow_strength,
         );
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
         pack
@@ -2050,6 +2061,11 @@ impl GpuRenderer {
             glyph_rotate: pack[11],
             edge_softness: pack[12],
             sdf_size: glyph.as_ref().map_or(0.0, |g| g.size as f32),
+            // header[13] = shadow_strength (#241): thin-shadow rgb darkening for the
+            // outermost fade segment, shared by every shape on the unified template.
+            // The packer already clamps to 0..=1.
+            shadow_strength: pack[13],
+            _pad: [0.0; 3],
         };
         let params_buffer = self
             .device
@@ -2440,7 +2456,7 @@ fn glyph_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animate::{AnimateOptions, MotionDirection, MotionSpeed};
+    use crate::animate::{AnimateOptions, MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
     use crate::cluster::{Centroid, Cluster};
     use crate::orb::OrbShape;
     use crate::style::SoftnessPreset;
@@ -2546,6 +2562,7 @@ mod tests {
             shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -2788,6 +2805,7 @@ mod tests {
             0.0,  // shape_id (Orb)
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
+            SHADOW_STRENGTH_DEFAULT,
         );
         // Lie in the header: claim more orbs than the buffer actually carries.
         // The buffer still only has `real_orbs` per-orb rows, so rows
@@ -2812,6 +2830,7 @@ mod tests {
             0.0,
             true,
             0.5,
+            SHADOW_STRENGTH_DEFAULT,
         );
         let honest_img = renderer.render_packed(&honest, w, h, 0.3);
 
@@ -2854,6 +2873,7 @@ mod tests {
             0.0,
             true,
             0.5,
+            SHADOW_STRENGTH_DEFAULT,
         );
         pack[8] = 2000.0;
 
@@ -3123,6 +3143,12 @@ mod tests {
     /// これらの語に言及してよいので、コメントを剥いだコードだけを見る。
     /// 両 variant も同時に確認する（variant は marker 置換でしか差が出ないが、
     /// 置換断片からの再混入も防ぐ）。
+    ///
+    /// 注（#241）: `shadow_strength` による最外周フェード帯の意図的な rgb 暗化
+    /// （falloff の `mix(1.0, 1.0-u, s)` と合成の `* fall.y`）は **lowp 復活では
+    /// ない** — u8 量子化も premultiply/div255 も finalize も伴わない float 乗算
+    /// 1 個で、s=0 で #242 と bit 同一に退化する。よって本ピンの needle には
+    /// 含めない（含まれていたら誤検知）。
     #[test]
     fn orb_wgsl_template_has_no_lowp_composite_residue() {
         for (name, src) in [
@@ -3146,10 +3172,13 @@ mod tests {
         }
     }
 
-    /// #242 裁定の死守（採用側）: 統一テンプレートが旧 WebGL（orberGl.ts）の
-    /// straight alpha float Source-Over をそのまま持つこと — 合成 2 式（rgb / a）と、
-    /// Rim の mid_a 係数 `80.0 / 255.0`（raw float のまま、u8 量子化なし）。
-    /// 式の字面が変わったら GLSL 1:1 移植が崩れた合図。
+    /// #242 裁定の死守（採用側、#241 で影スケール込みに更新）: 統一テンプレートが
+    /// 旧 WebGL（orberGl.ts）の straight alpha float Source-Over をそのまま持つこと —
+    /// 合成 2 式（rgb / a）と、Rim の mid_a 係数 `80.0 / 255.0`（raw float のまま、
+    /// u8 量子化なし）。rgb 式の `fall.y` は #241 の薄い影スケール
+    /// （`shadow_strength=0` で恒等 1.0 = #242 と bit 同一）であって、lowp 合成の
+    /// 復活ではない（量子化も premultiply も伴わない float 乗算 1 個）。
+    /// 式の字面が変わったら GLSL 1:1 移植（+ #241 影項）が崩れた合図。
     #[test]
     fn orb_wgsl_template_pins_straight_source_over_equations() {
         let wgsl = ORB_WGSL_TEMPLATE;
@@ -3158,8 +3187,9 @@ mod tests {
             "template must compute one_minus_a for the straight Source-Over"
         );
         assert!(
-            wgsl.contains("acc_rgb = o.color.rgb * alpha + acc_rgb * one_minus_a;"),
-            "template must composite rgb as src.rgb * a + dst.rgb * (1 - a) (GLSL 1:1)"
+            wgsl.contains("acc_rgb = o.color.rgb * fall.y * alpha + acc_rgb * one_minus_a;"),
+            "template must composite rgb as (src.rgb * shadow_scale) * a + dst.rgb * (1 - a) \
+             (GLSL 1:1 + #241 thin shadow)"
         );
         assert!(
             wgsl.contains("acc_a = alpha + acc_a * one_minus_a;"),
@@ -3168,6 +3198,13 @@ mod tests {
         assert!(
             wgsl.contains("opacity * (80.0 / 255.0)"),
             "rim mid_a must stay the raw float opacity * 80/255 (no u8 quantization)"
+        );
+        // #241: 影は最外周セグメントの mix(1.0, 1.0-u, s) に限る（旧式の係数化）。
+        // 新しいカーブ（pow / smoothstep 等）をここに足したら裁定からの逸脱。
+        assert!(
+            wgsl.contains("mix(1.0, 1.0 - u, params.shadow_strength)"),
+            "the #241 thin shadow must be the strength-scaled old-lowp fade \
+             mix(1.0, 1.0-u, s), not a new curve"
         );
     }
 
@@ -3214,6 +3251,7 @@ mod tests {
             },
             softness: SoftnessPreset::Mid,
             glyph_rotate,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -3596,6 +3634,7 @@ mod tests {
             0.0,  // shape_id = Orb
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
+            SHADOW_STRENGTH_DEFAULT,
         );
         // The single orb lives at off = HEADER_WORDS. The shader reads up to
         // pack[off + 12] (rot_speed_signed), so off + 13 words is the minimal length
@@ -3743,6 +3782,7 @@ mod tests {
             1.0, // shape_id = Glyph
             true,
             0.5,
+            SHADOW_STRENGTH_DEFAULT,
         );
         // (header[9] is already 0.0 from the arg above; re-pin defensively in case
         // the packer ever changes which header slot carries alpha_mul.)
@@ -4030,6 +4070,7 @@ mod tests {
             shape: OrbShape::Aquarelle(params),
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -5347,6 +5388,7 @@ mod tests {
             shape_id,
             false, // glyph_rotate OFF → angle = base_angle = 0
             0.5,
+            SHADOW_STRENGTH_DEFAULT,
         );
         pack[11] = 0.0; // header glyph_rotate OFF (defensive)
         let off = HEADER_WORDS;
@@ -5641,9 +5683,10 @@ mod tests {
         eprintln!("gpu sdf edge: center lit, corners transparent, center run {first}..{last}");
     }
 
-    // ---- #242: float straight Source-Over の CPU 参照ピン（実 GPU 描画） --------
+    // ---- #242/#241: float straight Source-Over + 薄い影の CPU 参照ピン（実 GPU 描画）
     //
-    // orb.wgsl の falloff_curve + straight Source-Over をテスト内 Rust（f32）で
+    // orb.wgsl の falloff_curve + straight Source-Over（#242）に #241 の影項
+    // （最外周フェード帯の rgb 暗化、強度 s）を含めてテスト内 Rust（f32）で
     // 再実装し、既知ジオメトリの単一 / 二重 orb フレームを `render_packed` で実際に
     // GPU 描画して、対象画素を ±1（GPU float 丸め差の許容）でピンする。
     // ジオメトリは [`centered_single_orb_pack`] と同じ流儀（phase 逆算・phi_*=0・
@@ -5651,6 +5694,7 @@ mod tests {
     // 位置を観点ごとに変えるため専用ヘルパを持つ。共通設定: direction=LR、
     // H=95（奇数 → cy = 0.5*95 = 47.5 が行 y=47 の sample 中心に一致し dy=0、
     // dist が dx だけで決まる）、nx = 32.5/W（cx = 32.5 → dx が整数になる）。
+    // s は引数で陽に渡す（既存ピンは production 定数、#241 の新ピンは 0.0 / 1.0）。
 
     /// CPU 参照側の 1 orb 指定。色は 0..1 正規化で直接持つ（pack の per-orb 色
     /// words をこの値で上書きする）。
@@ -5679,12 +5723,14 @@ mod tests {
     /// `RefOrb` 列から direction=LR の手組み pack を作る（production packer で
     /// header を作り、per-orb words を全て決定値で上書き）。phi_* = 0 / 回転なし
     /// なので t=0 の breath 係数は radius=1 / blur_delta=0 / opacity_factor=1。
+    /// `shadow_strength` は #241 の影強度（header[13]）をピンごとに陽に選ぶ。
     fn straight_test_pack(
         orbs: &[RefOrb],
         bg: [u8; 4],
         base_radius: f32,
         base_blur: f32,
         alpha_mul: f32,
+        shadow_strength: f32,
         width: u32,
     ) -> Vec<f32> {
         let clusters: Vec<Cluster> = orbs
@@ -5704,6 +5750,7 @@ mod tests {
             0.0,   // shape_id (Orb)
             false, // glyph_rotate (Orb は無視)
             0.5,   // edge_softness (Orb は無視)
+            shadow_strength,
         );
         for (i, o) in orbs.iter().enumerate() {
             let off = HEADER_WORDS + PER_ORB_WORDS * i;
@@ -5725,30 +5772,43 @@ mod tests {
     }
 
     /// orb.wgsl `falloff_curve` の 1:1 CPU 再実装（テスト内オラクル、f32）。
-    fn ref_falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> f32 {
+    /// 返り値は `(alpha, rgb_scale)`。`rgb_scale` は #241 の影項で、最外周フェード
+    /// セグメントのみ `mix(1.0, 1.0-u, shadow)`、内側は常に 1.0（WGSL と同式）。
+    /// `shadow = 0.0` のとき `rgb_scale = 1.0*1.0 + (1-u)*0.0 = 1.0` は f32 で厳密
+    /// （丸めなし）なので、このオラクルは #242 直後（影なし）のオラクルと bit 同一に
+    /// 退化する（`ref_falloff_shadow_zero_degenerates_bitwise` で検証）。
+    fn ref_falloff_curve(
+        style_bit: f32,
+        r_in: f32,
+        blur: f32,
+        opacity: f32,
+        shadow: f32,
+    ) -> (f32, f32) {
         if opacity <= 0.0 || r_in >= 1.0 {
-            return 0.0;
+            return (0.0, 0.0);
         }
         let r = r_in.max(0.0);
+        // mix(a, b, t) = a*(1-t) + b*t（WGSL mix と同式・同オペランド順）。
+        let mix = |a: f32, b: f32, t: f32| a * (1.0 - t) + b * t;
         if style_bit < 0.5 {
             let center_a = opacity;
             let mid_a = opacity * (80.0 / 255.0);
             let mid_stop = (1.0 - blur * 0.8).clamp(0.05, 0.95);
             if r <= mid_stop {
                 let u = if mid_stop > 0.0 { r / mid_stop } else { 1.0 };
-                return center_a + (mid_a - center_a) * u; // mix(center_a, mid_a, u)
+                return (center_a + (mid_a - center_a) * u, 1.0); // mix(center_a, mid_a, u)
             }
             let denom = (1.0 - mid_stop).max(1e-6);
             let u = (r - mid_stop) / denom;
-            return mid_a * (1.0 - u); // mix(mid_a, 0, u)
+            return (mid_a * (1.0 - u), mix(1.0, 1.0 - u, shadow)); // mix(mid_a, 0, u)
         }
         let hold_stop = (1.0 - blur).clamp(0.05, 0.95);
         if r <= hold_stop {
-            return opacity;
+            return (opacity, 1.0);
         }
         let denom = (1.0 - hold_stop).max(1e-6);
         let u = (r - hold_stop) / denom;
-        opacity * (1.0 - u) // mix(opacity, 0, u)
+        (opacity * (1.0 - u), mix(1.0, 1.0 - u, shadow)) // mix(opacity, 0, u)
     }
 
     /// 0..1 straight 値を Rgba8Unorm 書き込みと同じ round(v*255) で u8 に量子化。
@@ -5758,8 +5818,9 @@ mod tests {
 
     /// orb.wgsl `composite_straight` の 1:1 CPU 再実装で画素 `(px, py)` の期待値を
     /// 出す（direction=LR / t=0 / phi_*=0 固定）。shader と同じ f32 連鎖
-    /// （phase→pos→cx、distance、falloff、Source-Over）を通すので、GPU との差は
-    /// 浮動小数の丸め（±1/255 未満）だけになる。
+    /// （phase→pos→cx、distance、falloff（影項込み）、Source-Over）を通すので、
+    /// GPU との差は浮動小数の丸め（±1/255 未満）だけになる。`shadow` は #241 の
+    /// 影強度（pack 側の `straight_test_pack` に渡した値と揃えること）。
     #[allow(clippy::too_many_arguments)]
     fn ref_pixel_straight(
         orbs: &[RefOrb],
@@ -5767,6 +5828,7 @@ mod tests {
         base_radius: f32,
         base_blur: f32,
         alpha_mul: f32,
+        shadow: f32,
         width: u32,
         height: u32,
         px: u32,
@@ -5797,11 +5859,12 @@ mod tests {
             let opacity = alpha_mul.clamp(0.0, 1.0); // opacity_factor = 1 (t=0)
             let dist = ((sx - cx) * (sx - cx) + (sy - cy) * (sy - cy)).sqrt();
             let r = dist / radius;
-            let alpha = ref_falloff_curve(o.style_bit, r, blur, opacity);
+            let (alpha, rgb_scale) = ref_falloff_curve(o.style_bit, r, blur, opacity, shadow);
             if alpha > 0.0 {
                 let inv = 1.0 - alpha;
                 for (a, c) in acc.iter_mut().zip(o.color.iter()) {
-                    *a = c * alpha + *a * inv;
+                    // #241: src rgb は影スケール込み（WGSL: o.color.rgb * fall.y * alpha）。
+                    *a = c * rgb_scale * alpha + *a * inv;
                 }
                 acc[3] = alpha + acc[3] * inv;
             }
@@ -5841,10 +5904,29 @@ mod tests {
             style_bit: 1.0, // Soft
         }];
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 0.6f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
         // 中心画素 (32, 47): sample (32.5, 47.5) = orb 中心 → r ≈ 0 → α = alpha_mul。
-        let want = ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, 32, 47);
+        let want = ref_pixel_straight(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+            h,
+            32,
+            47,
+        );
         assert!(
             want[0] < 250,
             "reference must actually blend (α < 1), got {want:?}"
@@ -5858,9 +5940,12 @@ mod tests {
         );
     }
 
-    /// #242 暗部沈み回帰の狙い撃ち: 外周フェードセグメント内（hold_stop < r < 1）の
-    /// 画素は straight 参照（orb 色は一定のまま α だけ落ちる）と一致し、撤去した
-    /// 旧 lowp の「rgb→0 フェード」参照値（暗い側）とは大きく不一致であること。
+    /// #242 暗部沈み回帰の狙い撃ち（#241 影項込みに更新）: 外周フェードセグメント内
+    /// （hold_stop < r < 1）の画素は production 影強度の straight 参照（orb 色 rgb が
+    /// `mix(1, 1-u, s)` 倍に薄く暗化 + α フェード）と一致し、撤去した旧 lowp の
+    /// 「rgb→0 フル フェード」参照値（= s=1 相当の暗い側）とは依然大きく不一致で
+    /// あること。#241 の薄い影は**意図的な**部分暗化であり、lowp 暗部沈みの再発
+    /// （フル フェード）とは別物 — その弁別をピクセルで検出する。
     #[test]
     fn gpu_straight_outer_fade_keeps_orb_color_not_lowp_dark() {
         let Some(renderer) =
@@ -5878,28 +5963,51 @@ mod tests {
             style_bit: 1.0, // Soft
         }];
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 1.0f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
 
         // 画素 (56, 47): dist = 24 → r = 0.75（hold_stop 0.5 < r < 1 のフェード内）。
-        let want = ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, 56, 47);
+        let want = ref_pixel_straight(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+            h,
+            56,
+            47,
+        );
         assert_px_close(&img, 56, 47, want, "outer-fade pixel vs straight reference");
 
-        // 旧 lowp の最外周 rgb→0 フェード参照値（撤去済みの挙動の近似、量子化抜きの
-        // float 式）: src_rgb を (1−u) で 0 へ落としてから同じ α で合成した値。
-        // 新合成はこれより大きく明るい（白 orb・u=0.5 で R 差 ≈ 64）ことまで主張して、
-        // 暗部沈みの再発をピクセルで検出する。
+        // 旧 lowp の最外周 rgb→0 フル フェード参照値（撤去済みの挙動の近似、量子化
+        // 抜きの float 式 = #241 の s=1 と同式）: src_rgb を (1−u) で 0 へ落として
+        // から同じ α で合成した値。production 影（s=0.3）はこれより十分明るい
+        // （got − lowp = (1−s)·u·α·255 ≈ 白 orb・u=0.5・α=0.5 で 45）ことまで主張
+        // して、フル暗化（lowp 暗部沈み）の再発をピクセルで検出する。
+        // 注: この ≥16 マージンは s ≤ 0.74 を前提とする（(1−s)·63.75 ≥ 16）。
+        // kako-jun 選定で SHADOW_STRENGTH_DEFAULT を 0.75 以上へ上げる場合は、
+        // このテストの主張自体（薄い影 vs フル lowp の弁別）を見直すこと。
         let hold_stop = (1.0f32 - base_blur).clamp(0.05, 0.95);
         let r = 24.0f32 / base_radius; // = 0.75
         let u = (r - hold_stop) / (1.0 - hold_stop).max(1e-6);
         let alpha = alpha_mul * (1.0 - u);
         let got = img.get_pixel(56, 47).0;
         for c in 0..3 {
-            let faded = 1.0f32 * (1.0 - u); // 旧実装は orb 色自体を 0 へフェードさせていた
+            let faded = 1.0f32 * (1.0 - u); // 旧 lowp は orb 色自体を 0 までフェードさせていた
             let old_lowp = q8(faded * alpha + (bg[c] as f32 / 255.0) * (1.0 - alpha));
             assert!(
                 got[c].abs_diff(old_lowp) >= 16,
-                "outer-fade pixel must NOT match the removed lowp rgb→0 fade \
+                "outer-fade pixel must NOT match the removed lowp full rgb→0 fade \
                  (channel {c}: got {got:?}, lowp ref {old_lowp})"
             );
         }
@@ -5925,7 +6033,15 @@ mod tests {
             style_bit: 1.0, // Soft
         }];
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 1.0f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
 
         // y=47 行で dist = 15 / 16 / 17 → r = hold_stop−ε / ちょうど / +ε。
@@ -5934,8 +6050,18 @@ mod tests {
             (48, "r = hold_stop exactly (boundary, <=)"),
             (49, "r = hold_stop + ε (fade start)"),
         ] {
-            let want =
-                ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, x, 47);
+            let want = ref_pixel_straight(
+                &orbs,
+                bg,
+                base_radius,
+                base_blur,
+                alpha_mul,
+                SHADOW_STRENGTH_DEFAULT,
+                w,
+                h,
+                x,
+                47,
+            );
             assert_px_close(&img, x, 47, want, label);
         }
         // 境界の向き: plateau は dist=16（r = hold_stop）まで full opacity のまま。
@@ -5945,7 +6071,7 @@ mod tests {
         );
         assert!(
             img.get_pixel(49, 47).0[0] <= 245,
-            "one pixel past hold_stop must already fade (expected ≈239)"
+            "one pixel past hold_stop must already fade (expected ≈235 with the #241 shadow)"
         );
     }
 
@@ -5969,7 +6095,15 @@ mod tests {
             style_bit: 1.0, // Soft
         }];
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 1.0f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
 
         // y=47 行で dist = 31 / 32 / 33 → r = 1−ε / 1.0 / 1+ε。
@@ -5978,14 +6112,25 @@ mod tests {
             (64, "r = 1 exactly (transparent, >=)"),
             (65, "r = 1 + ε (outside)"),
         ] {
-            let want =
-                ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, x, 47);
+            let want = ref_pixel_straight(
+                &orbs,
+                bg,
+                base_radius,
+                base_blur,
+                alpha_mul,
+                SHADOW_STRENGTH_DEFAULT,
+                w,
+                h,
+                x,
+                47,
+            );
             assert_px_close(&img, x, 47, want, label);
         }
-        // 縁の内側 1px は確かに点いている（テストが空虚でないこと）。
+        // 縁の内側 1px は確かに点いている（テストが空虚でないこと）。#241 の影で
+        // α=0.0625 の縁は rgb_scale ≈ 0.72 も掛かり ≈11（影なし時代の ≈16 より暗い）。
         assert!(
-            img.get_pixel(63, 47).0[0] >= 10,
-            "just inside the edge must still be faintly lit (≈16)"
+            img.get_pixel(63, 47).0[0] >= 9,
+            "just inside the edge must still be faintly lit (≈11 with the #241 shadow)"
         );
         // r >= 1 は背景のまま（黒 bg なので R = 0 ± 量子化）。
         assert!(
@@ -6014,7 +6159,15 @@ mod tests {
             style_bit: 0.0, // Rim
         }];
         let (base_radius, base_blur, alpha_mul) = (40.0f32, 0.5f32, 1.0f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
 
         for (x, label) in [
@@ -6022,8 +6175,18 @@ mod tests {
             (56, "r = mid_stop exactly (boundary, mix(...,1) == mid_a)"),
             (57, "r = mid_stop + ε (mid→0 segment)"),
         ] {
-            let want =
-                ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, x, 47);
+            let want = ref_pixel_straight(
+                &orbs,
+                bg,
+                base_radius,
+                base_blur,
+                alpha_mul,
+                SHADOW_STRENGTH_DEFAULT,
+                w,
+                h,
+                x,
+                47,
+            );
             assert_px_close(&img, x, 47, want, label);
         }
         // 連続性: 境界画素は両隣の間（単調減少）に収まる。境界で式が食い違って
@@ -6060,9 +6223,28 @@ mod tests {
             style_bit: 1.0, // Soft
         }];
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 0.6f32);
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
-        let want = ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, 32, 47);
+        let want = ref_pixel_straight(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+            h,
+            32,
+            47,
+        );
         assert_px_close(&img, 32, 47, want, "alpha channel vs straight Source-Over");
         // α_out = 0.6 + (128/255)·0.4 ≈ 0.8008 → 204。255（finalize で不透明化）でも
         // 128（bg 素通し）でもない、合成された中間値であることを明示する。
@@ -6101,11 +6283,30 @@ mod tests {
         };
         let (base_radius, base_blur, alpha_mul) = (32.0f32, 0.5f32, 0.6f32);
         let orbs = [red, blue]; // 青が後 = 上
-        let pack = straight_test_pack(&orbs, bg, base_radius, base_blur, alpha_mul, w);
+        let pack = straight_test_pack(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+        );
         let img = renderer.render_packed(&pack, w, h, 0.0);
 
         // 期待値（赤の上に青）: R = 0.6·0.4 = 0.24 → 61、B = 0.6 → 153。
-        let want = ref_pixel_straight(&orbs, bg, base_radius, base_blur, alpha_mul, w, h, 32, 47);
+        let want = ref_pixel_straight(
+            &orbs,
+            bg,
+            base_radius,
+            base_blur,
+            alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
+            w,
+            h,
+            32,
+            47,
+        );
         assert_px_close(&img, 32, 47, want, "two-orb pack-order Source-Over");
 
         // 逆順（青の上に赤 = R 153 / B 61）とは明確に違う = 順序が観測されている。
@@ -6116,6 +6317,7 @@ mod tests {
             base_radius,
             base_blur,
             alpha_mul,
+            SHADOW_STRENGTH_DEFAULT,
             w,
             h,
             32,

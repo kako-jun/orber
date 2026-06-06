@@ -28,7 +28,9 @@
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{pack_render_data_for_webgl, MotionDirection, MotionSpeed};
+use orber_core::animate::{
+    pack_render_data_for_webgl, MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT,
+};
 // AnimateOptions / image_rgba_to_sdf / Arc は GPU(WGSL) 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::animate::AnimateOptions;
@@ -716,6 +718,7 @@ fn build_render_pack(p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, S
         shape_id,
         resolved.glyph_rotate,
         resolved.edge_softness,
+        resolved.shadow_strength,
     );
 
     Ok(buf)
@@ -767,6 +770,7 @@ impl ResolvedFrame {
             shape,
             softness: self.softness,
             glyph_rotate: self.glyph_rotate,
+            shadow_strength: self.shadow_strength,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -807,6 +811,7 @@ fn build_gpu_render_inputs(
         0.0, // shape_id = Orb（pack は orb 専用）
         resolved.glyph_rotate,
         resolved.edge_softness,
+        resolved.shadow_strength,
     );
 
     let opts = resolved.to_animate_options(shape);
@@ -846,6 +851,10 @@ struct ResolvedFrame {
     softness: SoftnessPreset,
     glyph_rotate: bool,
     edge_softness: f32,
+    /// #241「薄い影」強度（0..1）。`WasmParams::shadow_strength`（既定 = 製品定数
+    /// [`SHADOW_STRENGTH_DEFAULT`]）をそのまま運ぶ。orb は pack header[13]、
+    /// glyph / image は `AnimateOptions` 経由で core の pack に乗る。
+    shadow_strength: f32,
     width: u32,
     height: u32,
     orb_size: f32,
@@ -935,6 +944,8 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         softness,
         glyph_rotate: p.glyph_rotate,
         edge_softness,
+        // #241: 製品定数。gpu-lab のチューニング上書きはコミット2（WasmParams）で配線。
+        shadow_strength: SHADOW_STRENGTH_DEFAULT,
         width: p.width,
         height: p.height,
         orb_size: spec.orb_size.max(0.0),
@@ -963,6 +974,7 @@ fn pack_render_data(
     shape_id: f32,
     glyph_rotate: bool,
     edge_softness: f32,
+    shadow_strength: f32,
 ) -> Vec<f32> {
     pack_render_data_for_webgl(
         clusters,
@@ -977,6 +989,7 @@ fn pack_render_data(
         shape_id,
         glyph_rotate,
         edge_softness,
+        shadow_strength,
     )
 }
 
@@ -1541,6 +1554,7 @@ mod tests {
             1.0,
             true,
             softness.edge_softness(),
+            SHADOW_STRENGTH_DEFAULT,
         );
         let expected = pack_render_data_for_webgl(
             &clusters,
@@ -1555,6 +1569,7 @@ mod tests {
             1.0,
             true,
             softness.edge_softness(),
+            SHADOW_STRENGTH_DEFAULT,
         );
         assert_eq!(buf, expected);
     }
@@ -1599,6 +1614,7 @@ mod tests {
                 1.0,
                 true,
                 preset.edge_softness(),
+                SHADOW_STRENGTH_DEFAULT,
             );
             assert!((buf[12] - preset.edge_softness()).abs() < 1e-6);
         }

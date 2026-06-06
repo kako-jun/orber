@@ -1,6 +1,6 @@
 use aquarelle::AquarelleParams;
 use clap::{Parser, ValueEnum};
-use orber_core::animate::{MotionDirection, MotionSpeed};
+use orber_core::animate::{MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
 use orber_core::glyph::{has_glyph, GlyphFontId};
 use orber_core::orb::{OrbShape, RenderOptions};
@@ -774,6 +774,8 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         shape: orb_shape.clone(),
         softness: cli.resolved_softness(),
         glyph_rotate: true,
+        // #241: 薄い影は製品定数（CLI フラグは増やさない）。
+        shadow_strength: SHADOW_STRENGTH_DEFAULT,
         color_tracks: None,
         keyframe_tracks: None,
     };
@@ -933,6 +935,7 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
                 shape: orb_shape,
                 softness: cli.resolved_softness(),
                 glyph_rotate: true,
+                shadow_strength: SHADOW_STRENGTH_DEFAULT,
                 color_tracks: Some(orb_tracks),
                 keyframe_tracks: None,
             };
@@ -1078,6 +1081,7 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
                 shape: orb_shape,
                 softness: cli.resolved_softness(),
                 glyph_rotate: true,
+                shadow_strength: SHADOW_STRENGTH_DEFAULT,
                 color_tracks: None,
                 keyframe_tracks: Some(orb_kf_tracks),
             };
@@ -1227,6 +1231,7 @@ fn render_one_variation(
                 shape: orb_shape.clone(),
                 softness,
                 glyph_rotate: true,
+                shadow_strength: SHADOW_STRENGTH_DEFAULT,
                 color_tracks: None,
                 keyframe_tracks: None,
             };
@@ -1707,6 +1712,7 @@ mod tests {
             shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: None,
             keyframe_tracks: None,
         };
