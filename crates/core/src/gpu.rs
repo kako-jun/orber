@@ -199,8 +199,10 @@ const ORB_EXTRA_BINDINGS_SDF: &str = "\
 @group(0) @binding(2) var sdf_tex: texture_2d<f32>;\n\
 @group(0) @binding(3) var sdf_samp: sampler;";
 
-/// Orb variant `load_orb`: reads only color / phase / misc (3 texels), exactly as
-/// the old `orb_circle.wgsl` did (no `rot` read), keeping the orb shader identical.
+/// Orb variant `load_orb`: reads only color / phase / misc (3 texels), matching
+/// the old `orb_circle.wgsl` layout (no `rot` read). The load itself is unchanged,
+/// but the downstream compositing is no longer the old shader's: #242 replaced it
+/// with the old WebGL float straight Source-Over (`composite_straight`).
 const ORB_LOAD_ORB: &str = "\
 struct Orb {\n\
     color: vec4<f32>, // (r, g, b, weight)\n\

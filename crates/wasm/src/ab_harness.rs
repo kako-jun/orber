@@ -13,6 +13,11 @@
 //! 容疑者を画素差分で切り分けられる。**調査用の足場であり、シェーダや present
 //! 経路の挙動は一切変えない**（読むだけ・描くだけ）。
 //!
+//! 既知の限界（A チャネル）: WGSL 側キャプチャ（WebGPU surface は
+//! alphaMode=Opaque、canvas の drawImage snapshot）は A が常に 255 になる一方、
+//! WebGL 側の readPixels は生の straight alpha を返す。bg 不透明の orb ゲートでは
+//! 実害なしだが、translucent な bg を比較すると A に偽差分が出る（dev 足場の限界）。
+//!
 //! ## 使い方（公開 CLI のサブコマンド / フラグは増やさない: `#[ignore]` テスト）
 //!
 //! ブラウザキャプチャの再現 PNG を出力:

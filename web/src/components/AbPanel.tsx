@@ -245,8 +245,8 @@ export default function AbPanel(props: AbPanelProps) {
 
   // start 再入ガード（世代カウンタ）。start は await を含む async なので、
   // 連続トリガ（props が立て続けに変わる等）で複数の start が並走し得る。
-  // start 冒頭で generation を ++ して captured し、各 await 後に
-  // generation !== captured なら「より新しい start が走った」とみなして中断する。
+  // start 冒頭で generation を ++ して myGen に snapshot し、各 await 後に
+  // myGen !== generation なら「より新しい start が走った」とみなして中断する。
   // これで「最新の start のみ有効」を保証し、古い setup が後勝ちで残るのを防ぐ。
   let generation = 0;
 
@@ -431,7 +431,7 @@ export default function AbPanel(props: AbPanelProps) {
     // 手動 Start の二度押し抑止が外れた経路でも、二重 setup を起こさない）。
     // stop() は generation を進めるので、in-flight だった前の start もここで死ぬ。
     stop();
-    // stop() の後に自分の世代を captured する（stop の generation++ を含めて確定させる）。
+    // stop() の後に自分の世代を myGen に snapshot する（stop の generation++ を含めて確定させる）。
     // これ以降に新しい start / stop が走ると generation が変わるので、各 await の後で
     // 「自分が最新か」を確認できる。
     const myGen = ++generation;
