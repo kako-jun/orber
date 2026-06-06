@@ -100,10 +100,10 @@ impl MotionSpeed {
 /// - `0.0` = 影なし（#242 直後の旧 WebGL 式と bit 同一）
 /// - `1.0` = #242 で撤去した旧 lowp の rgb→0 フェードと同等の暗さ
 ///
-/// **仮の値。** kako-jun が gpu-lab のスライダー（`WasmParams::shadow_strength`）で
-/// 実機選定した値にここを差し替える（#241）。製品（CLI / Studio）はこの定数のみを
+/// kako-jun が gpu-lab のスライダー（`WasmParams::shadow_strength`）で実機選定した
+/// 値（#241、freeza session595: 「０．２」）。製品（CLI / Studio）はこの定数のみを
 /// 使い、調整ノブは外に出さない。値の置き場はこの 1 箇所に集約する。
-pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.3;
+pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
 
 /// アニメーション 1 フレーム描画のオプション。
 ///

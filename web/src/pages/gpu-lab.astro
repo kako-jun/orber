@@ -53,14 +53,14 @@
         <div id="image-info" style="font-size:11px; color:#9a9a9a;">no mask loaded</div>
       </div>
 
-      <!-- #241: 薄い影の強度（0..1、既定 = 製品定数 SHADOW_STRENGTH_DEFAULT = 0.3）。
+      <!-- #241: 薄い影の強度（0..1、既定 = 製品定数 SHADOW_STRENGTH_DEFAULT = 0.2）。
            orb 機構の shape（orb / glyph / image）にだけ効く dev チューニングノブ。
            kako-jun が実機で s を選ぶための足場で、本番 Studio には出さない。 -->
       <div id="shadow-controls" style="display:flex; flex-direction:column; gap:8px;">
         <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
           <span style="width:96px;">shadow</span>
-          <input id="shadow-strength" type="range" min="0" max="1" step="0.05" value="0.3" style="flex:1;" />
-          <span id="shadow-strength-val" style="width:36px; text-align:right;">0.30</span>
+          <input id="shadow-strength" type="range" min="0" max="1" step="0.05" value="0.2" style="flex:1;" />
+          <span id="shadow-strength-val" style="width:36px; text-align:right;">0.20</span>
         </label>
       </div>
 
