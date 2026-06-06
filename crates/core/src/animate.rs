@@ -832,8 +832,9 @@ mod tests {
 
     /// #241: header[13] に shadow_strength がそのまま（ただし 0..=1 クランプで）
     /// 入ること。WGSL の Params uniform はこの word を読むので、ここがずれると
-    /// 影強度が黙って変わる。クランプは hand-built / 異常入力に対する防衛で、
-    /// production 経路は wasm validate（0..=1 reject）か定数なのでクランプ恒等。
+    /// 影強度が黙って変わる。クランプは hand-built な範囲外値への防衛（ただし
+    /// f32::clamp は NaN を素通しする — NaN まで守る趣旨ではない）。production
+    /// 経路は wasm validate（0..=1・NaN reject）か定数なのでクランプ恒等。
     #[test]
     fn pack_header13_carries_clamped_shadow_strength() {
         let clusters = vec![Cluster {

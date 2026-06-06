@@ -344,7 +344,7 @@
 
           // #241: shadow スライダーの既定値を製品定数（core::animate の
           // SHADOW_STRENGTH_DEFAULT、wasm export 経由）へ同期する。HTML の
-          // value="0.3" は wasm ロード前の静的フォールバック表示にすぎない。
+          // value="0.2" は wasm ロード前の静的フォールバック表示にすぎない。
           // ユーザーが先に動かしていた場合は上書きしない。
           if (!shadowStrength.dataset.touched) {
             const s = shadow_strength_default();

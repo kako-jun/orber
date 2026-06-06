@@ -5991,8 +5991,8 @@ mod tests {
 
         // 旧 lowp の最外周 rgb→0 フル フェード参照値（撤去済みの挙動の近似、量子化
         // 抜きの float 式 = #241 の s=1 と同式）: src_rgb を (1−u) で 0 へ落として
-        // から同じ α で合成した値。production 影（s=0.3）はこれより十分明るい
-        // （got − lowp = (1−s)·u·α·255 ≈ 白 orb・u=0.5・α=0.5 で 45）ことまで主張
+        // から同じ α で合成した値。production 影（s=0.2）はこれより十分明るい
+        // （got − lowp = (1−s)·u·α·255 ≈ 白 orb・u=0.5・α=0.5 で 51）ことまで主張
         // して、フル暗化（lowp 暗部沈み）の再発をピクセルで検出する。
         // 注: この ≥16 マージンは s ≤ 0.74 を前提とする（(1−s)·63.75 ≥ 16）。
         // kako-jun 選定で SHADOW_STRENGTH_DEFAULT を 0.75 以上へ上げる場合は、
@@ -6071,7 +6071,7 @@ mod tests {
         );
         assert!(
             img.get_pixel(49, 47).0[0] <= 245,
-            "one pixel past hold_stop must already fade (expected ≈235 with the #241 shadow)"
+            "one pixel past hold_stop must already fade (expected ≈236 with the #241 shadow)"
         );
     }
 
@@ -6127,10 +6127,10 @@ mod tests {
             assert_px_close(&img, x, 47, want, label);
         }
         // 縁の内側 1px は確かに点いている（テストが空虚でないこと）。#241 の影で
-        // α=0.0625 の縁は rgb_scale ≈ 0.72 も掛かり ≈11（影なし時代の ≈16 より暗い）。
+        // α=0.0625 の縁は rgb_scale ≈ 0.81 も掛かり ≈13（影なし時代の ≈16 より暗い）。
         assert!(
             img.get_pixel(63, 47).0[0] >= 9,
-            "just inside the edge must still be faintly lit (≈11 with the #241 shadow)"
+            "just inside the edge must still be faintly lit (≈13 with the #241 shadow)"
         );
         // r >= 1 は背景のまま（黒 bg なので R = 0 ± 量子化）。
         assert!(
@@ -6397,7 +6397,7 @@ mod tests {
 
     /// #241 (a) GPU 側: `shadow_strength = 0.0` の実描画が **影なし（#242 直後）の
     /// CPU 参照**と全帯域（plateau / フェード帯 / 縁の外）で ±1 一致し、production
-    /// 影（s=0.3）の描画とはフェード帯で実際に差が出ること（ノブが効いている =
+    /// 影（s=0.2）の描画とはフェード帯で実際に差が出ること（ノブが効いている =
     /// テストが空虚でない）。s=0 の式恒等（bit 同一）は
     /// `ref_falloff_shadow_zero_degenerates_bitwise` が CPU で厳密に固定済みで、
     /// ここは「その退化が実 GPU・実パイプラインまで通る」ことの画素ピン
@@ -6442,6 +6442,8 @@ mod tests {
 
         // 同条件で production 影と比較: フェード帯（x=56, r=0.75）には差が出る。
         // s=0 が「たまたま」一致しているのではなく、ノブが実際に観測されている根拠。
+        // 注: この可視差主張（> +4）は s ≥ 0.08 を前提とする（差 ≈ 63.75·s）。
+        // kako-jun 選定で SHADOW_STRENGTH_DEFAULT を大きく下げる場合は見直すこと。
         let pack_prod = straight_test_pack(
             &orbs,
             bg,
