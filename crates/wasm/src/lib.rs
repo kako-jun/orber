@@ -28,7 +28,9 @@
 
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{pack_render_data_for_webgl, MotionDirection, MotionSpeed};
+use orber_core::animate::{
+    pack_render_data_for_webgl, MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT,
+};
 // AnimateOptions / image_rgba_to_sdf / Arc は GPU(WGSL) 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::animate::AnimateOptions;
@@ -172,6 +174,14 @@ pub struct WasmParams {
     /// 同じ 16..=1024 の範囲のみ受理する。`glyph_sdf` が空のときは無視される。
     #[serde(default)]
     pub glyph_sdf_size: u32,
+    /// #241「薄い影」強度（0..1）の **dev チューニング上書き**。省略時は製品定数
+    /// [`SHADOW_STRENGTH_DEFAULT`]（= 製品と同じ見た目）。0.0..=1.0 の範囲外は
+    /// `validate_params` が reject する（0.0 と 1.0 は inclusive で受理）。
+    /// gpu-lab（`web/src/pages/gpu-lab.astro`）のスライダー専用 — 本番 Studio は
+    /// このフィールドを送らない（製品は定数で固定、kako-jun の実機選定の足場）。
+    /// orb 機構の全 shape（orb / glyph / image）に効き、aquarelle は対象外。
+    #[serde(default = "default_shadow_strength")]
+    pub shadow_strength: f32,
 }
 
 /// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
@@ -183,6 +193,19 @@ fn default_glyph_rotate() -> bool {
 /// および `AquarelleParams::default()` と同じ 0.5（mid-strength preset）。
 fn default_aquarelle_param() -> f32 {
     0.5
+}
+
+/// `shadow_strength` の serde default（#241）。省略時は製品定数 = 製品と同じ見た目。
+fn default_shadow_strength() -> f32 {
+    SHADOW_STRENGTH_DEFAULT
+}
+
+/// #241: 製品定数 [`SHADOW_STRENGTH_DEFAULT`] を JS に公開する。gpu-lab の shadow
+/// スライダーが既定値をこの値に同期するためだけの dev 向け export（値の正本は
+/// core::animate の定数 1 箇所のまま。HTML 側にハードコードして drift させない）。
+#[wasm_bindgen]
+pub fn shadow_strength_default() -> f32 {
+    SHADOW_STRENGTH_DEFAULT
 }
 
 // Pure parsers/validators return String errors so they can be unit-tested on
@@ -579,6 +602,15 @@ fn validate_params(p: &WasmParams) -> Result<(), String> {
             p.image_mask_width, p.image_mask_height
         ));
     }
+    // #241: 影強度は 0.0..=1.0 のみ（両端 inclusive）。NaN は比較が false になり
+    // !contains で reject される。範囲外を黙ってクランプせず明示エラーにする
+    // （dev チューニングノブなので、誤入力は気づける方が良い）。
+    if !(0.0..=1.0).contains(&p.shadow_strength) {
+        return Err(format!(
+            "shadow_strength must be in [0.0, 1.0], got {}",
+            p.shadow_strength
+        ));
+    }
     Ok(())
 }
 
@@ -657,7 +689,9 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 ///   Image は web が SDF を upload するため Glyph と同じ shape_id=1 に乗る。
 /// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
 /// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
-/// - `[13..16]`: 予約（0 詰め）
+/// - `[13]`: shadow_strength (orb 機構の最外周フェード rgb 暗化強度、0..1) — #241。
+///   WGSL（gpu.rs）だけが読む。WebGL（orberGl.ts）はこの word を読まない（不変）
+/// - `[14..16]`: 予約（0 詰め）
 ///
 /// `[16 + 16*i ..]` per orb i:
 /// - `[+0..+3]`: color_rgb (0..1)
@@ -716,6 +750,7 @@ fn build_render_pack(p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, S
         shape_id,
         resolved.glyph_rotate,
         resolved.edge_softness,
+        resolved.shadow_strength,
     );
 
     Ok(buf)
@@ -767,6 +802,7 @@ impl ResolvedFrame {
             shape,
             softness: self.softness,
             glyph_rotate: self.glyph_rotate,
+            shadow_strength: self.shadow_strength,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -807,6 +843,7 @@ fn build_gpu_render_inputs(
         0.0, // shape_id = Orb（pack は orb 専用）
         resolved.glyph_rotate,
         resolved.edge_softness,
+        resolved.shadow_strength,
     );
 
     let opts = resolved.to_animate_options(shape);
@@ -846,6 +883,10 @@ struct ResolvedFrame {
     softness: SoftnessPreset,
     glyph_rotate: bool,
     edge_softness: f32,
+    /// #241「薄い影」強度（0..1）。`WasmParams::shadow_strength`（既定 = 製品定数
+    /// [`SHADOW_STRENGTH_DEFAULT`]）をそのまま運ぶ。orb は pack header[13]、
+    /// glyph / image は `AnimateOptions` 経由で core の pack に乗る。
+    shadow_strength: f32,
     width: u32,
     height: u32,
     orb_size: f32,
@@ -935,6 +976,9 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         softness,
         glyph_rotate: p.glyph_rotate,
         edge_softness,
+        // #241: 省略時は serde default = 製品定数。gpu-lab のスライダーだけが
+        // 非定数値を送る（validate_params が 0.0..=1.0 を保証済み）。
+        shadow_strength: p.shadow_strength,
         width: p.width,
         height: p.height,
         orb_size: spec.orb_size.max(0.0),
@@ -963,6 +1007,7 @@ fn pack_render_data(
     shape_id: f32,
     glyph_rotate: bool,
     edge_softness: f32,
+    shadow_strength: f32,
 ) -> Vec<f32> {
     pack_render_data_for_webgl(
         clusters,
@@ -977,6 +1022,7 @@ fn pack_render_data(
         shape_id,
         glyph_rotate,
         edge_softness,
+        shadow_strength,
     )
 }
 
@@ -1312,6 +1358,8 @@ mod tests {
             // #231: glyph SDF フォールバック入力。既定では未使用（同梱フォント経路）。
             glyph_sdf: Vec::new(),
             glyph_sdf_size: 0,
+            // #241: 影強度。既定は製品定数（serde default と同じ）。
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
         }
     }
 
@@ -1354,6 +1402,75 @@ mod tests {
     #[test]
     fn validate_accepts_reasonable_params() {
         assert!(validate_params(&base_params()).is_ok());
+    }
+
+    /// #241 (c): `shadow_strength` の serde 省略 default。フィールドを送らない
+    /// 既存呼び出し（本番 Studio / 旧 ab-params.json）は製品定数 = 製品と同じ
+    /// 見た目にデシリアライズされること。serde_json は serde_wasm_bindgen と同じ
+    /// `Deserialize` 実装を通るので、`#[serde(default = ...)]` の検証として等価。
+    #[test]
+    fn shadow_strength_serde_defaults_to_production_constant() {
+        let json = r#"{
+            "source_rgb": [0, 0, 0],
+            "source_width": 1,
+            "source_height": 1,
+            "k": 1,
+            "width": 8,
+            "height": 8,
+            "seed": 1.0,
+            "direction": "lr",
+            "speed": "slow",
+            "count": 1,
+            "orb_size": 1.0,
+            "blur": 0.5,
+            "shape": "orb"
+        }"#;
+        let p: WasmParams = serde_json::from_str(json).expect("params without shadow_strength");
+        assert_eq!(
+            p.shadow_strength, SHADOW_STRENGTH_DEFAULT,
+            "omitted shadow_strength must default to the production constant"
+        );
+        // 明示指定はそのまま通る（serde 層は範囲を見ない。範囲は validate_params の担務）。
+        let json_explicit = json.replace(
+            r#""shape": "orb""#,
+            r#""shape": "orb", "shadow_strength": 0.85"#,
+        );
+        let p: WasmParams = serde_json::from_str(&json_explicit).expect("explicit shadow_strength");
+        assert_eq!(p.shadow_strength, 0.85);
+    }
+
+    /// #241 (c): `shadow_strength` の範囲検証。0.0 と 1.0 は **inclusive** で受理、
+    /// 範囲外（負 / 1 超 / NaN）は reject。dev チューニングノブなので黙って
+    /// クランプせず明示エラーにする仕様（validate_params）。
+    #[test]
+    fn validate_shadow_strength_range_inclusive_bounds() {
+        // 両端 inclusive。
+        let mut p = base_params();
+        p.shadow_strength = 0.0;
+        assert!(
+            validate_params(&p).is_ok(),
+            "0.0 must be accepted (inclusive)"
+        );
+
+        let mut p = base_params();
+        p.shadow_strength = 1.0;
+        assert!(
+            validate_params(&p).is_ok(),
+            "1.0 must be accepted (inclusive)"
+        );
+
+        // 範囲外は reject。
+        let mut p = base_params();
+        p.shadow_strength = -0.001;
+        assert!(validate_params(&p).is_err(), "negative must be rejected");
+
+        let mut p = base_params();
+        p.shadow_strength = 1.001;
+        assert!(validate_params(&p).is_err(), "above 1.0 must be rejected");
+
+        let mut p = base_params();
+        p.shadow_strength = f32::NAN;
+        assert!(validate_params(&p).is_err(), "NaN must be rejected");
     }
 
     /// #231 review: image マスク次元も source_rgb と同流儀で MAX_DIM を課す。
@@ -1541,6 +1658,7 @@ mod tests {
             1.0,
             true,
             softness.edge_softness(),
+            SHADOW_STRENGTH_DEFAULT,
         );
         let expected = pack_render_data_for_webgl(
             &clusters,
@@ -1555,6 +1673,7 @@ mod tests {
             1.0,
             true,
             softness.edge_softness(),
+            SHADOW_STRENGTH_DEFAULT,
         );
         assert_eq!(buf, expected);
     }
@@ -1599,6 +1718,7 @@ mod tests {
                 1.0,
                 true,
                 preset.edge_softness(),
+                SHADOW_STRENGTH_DEFAULT,
             );
             assert!((buf[12] - preset.edge_softness()).abs() < 1e-6);
         }

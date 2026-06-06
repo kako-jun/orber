@@ -53,6 +53,17 @@
         <div id="image-info" style="font-size:11px; color:#9a9a9a;">no mask loaded</div>
       </div>
 
+      <!-- #241: 薄い影の強度（0..1、既定 = 製品定数 SHADOW_STRENGTH_DEFAULT = 0.2）。
+           orb 機構の shape（orb / glyph / image）にだけ効く dev チューニングノブ。
+           kako-jun が実機で s を選ぶための足場で、本番 Studio には出さない。 -->
+      <div id="shadow-controls" style="display:flex; flex-direction:column; gap:8px;">
+        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
+          <span style="width:96px;">shadow</span>
+          <input id="shadow-strength" type="range" min="0" max="1" step="0.05" value="0.2" style="flex:1;" />
+          <span id="shadow-strength-val" style="width:36px; text-align:right;">0.20</span>
+        </label>
+      </div>
+
       <!-- aquarelle: bleed / bloom / offset / halo（0..1、既定 0.5） -->
       <div id="aquarelle-controls" style="display:none; flex-direction:column; gap:8px;">
         <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
@@ -83,7 +94,13 @@
     <div id="fps" style="font-size:12px; color:#9a9a9a;"></div>
 
     <script>
-      import init, { gpu_init, gpu_set_render_data, gpu_render, glyph_supported } from '../wasm/orber_wasm.js';
+      import init, {
+        gpu_init,
+        gpu_set_render_data,
+        gpu_render,
+        glyph_supported,
+        shadow_strength_default,
+      } from '../wasm/orber_wasm.js';
       // #231: 同梱フォント外（ひらがな・漢字・絵文字）の glyph SDF を OS フォントスタックで
       // 作るフォールバック（WebGL 版 #159 と同じ設計）。size は WebGL 版（orberWorker.ts が
       // 使う orberGl.ts の GLYPH_SDF_SIZE）と同じ定数源を参照する（ハードコードしない）。
@@ -102,6 +119,9 @@
       const glyphRotate = document.getElementById('glyph-rotate') as HTMLInputElement;
       const imageFile = document.getElementById('image-file') as HTMLInputElement;
       const imageInfo = document.getElementById('image-info') as HTMLDivElement;
+      const shadowControls = document.getElementById('shadow-controls') as HTMLDivElement;
+      const shadowStrength = document.getElementById('shadow-strength') as HTMLInputElement;
+      const shadowStrengthVal = document.getElementById('shadow-strength-val') as HTMLSpanElement;
 
       const setStatus = (s: string) => {
         statusEl.textContent = s;
@@ -125,6 +145,8 @@
         glyphControls.style.display = shape === 'glyph' ? 'flex' : 'none';
         imageControls.style.display = shape === 'image' ? 'flex' : 'none';
         aquarelleControls.style.display = shape === 'aquarelle' ? 'flex' : 'none';
+        // #241: shadow は orb 機構（orb / glyph / image）にだけ効く。aquarelle では隠す。
+        shadowControls.style.display = shape === 'aquarelle' ? 'none' : 'flex';
       }
 
       // ソース画像は小さなハードコードのグラデーション。kmeans が拾える程度に
@@ -199,6 +221,9 @@
           count_preset: '',
           speed_preset: '',
           softness_preset: '',
+          // #241: 薄い影の強度（0..1）。orb 機構の shape にだけ効く（aquarelle は無視）。
+          // 製品はこのフィールドを送らず serde default（= 製品定数）になる。
+          shadow_strength: parseFloat(shadowStrength.value),
         };
         lastGlyphUsedJsFallback = false;
         lastGlyphSdfEmpty = false;
@@ -295,6 +320,13 @@
           applyRenderData();
         });
       }
+      // #241: shadow スライダー（aquarelle 4 本と同じ流儀: input → 表示更新 → 再構築）。
+      // touched は「start 前にユーザーが動かした値を init 後の既定値同期で潰さない」ため。
+      shadowStrength.addEventListener('input', () => {
+        shadowStrength.dataset.touched = '1';
+        shadowStrengthVal.textContent = parseFloat(shadowStrength.value).toFixed(2);
+        applyRenderData();
+      });
 
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -309,6 +341,16 @@
           }
           setStatus('loading wasm...');
           await init();
+
+          // #241: shadow スライダーの既定値を製品定数（core::animate の
+          // SHADOW_STRENGTH_DEFAULT、wasm export 経由）へ同期する。HTML の
+          // value="0.2" は wasm ロード前の静的フォールバック表示にすぎない。
+          // ユーザーが先に動かしていた場合は上書きしない。
+          if (!shadowStrength.dataset.touched) {
+            const s = shadow_strength_default();
+            shadowStrength.value = s.toFixed(2);
+            shadowStrengthVal.textContent = s.toFixed(2);
+          }
 
           // adapter/device init 時間の計測（CLI 実測 ~0.55s との比較用、#230）。
           setStatus('gpu_init...');

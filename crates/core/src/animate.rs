@@ -94,6 +94,17 @@ impl MotionSpeed {
     }
 }
 
+/// #241「薄い影」の production 既定値。orb 機構（orb / glyph / image）の最外周
+/// フェードセグメントに掛ける rgb 暗化の強度係数（0..1）。
+///
+/// - `0.0` = 影なし（#242 直後の旧 WebGL 式と bit 同一）
+/// - `1.0` = #242 で撤去した旧 lowp の rgb→0 フェードと同等の暗さ
+///
+/// kako-jun が gpu-lab のスライダー（`WasmParams::shadow_strength`）で実機選定した
+/// 値（#241、freeza session595: 「０．２」）。製品（CLI / Studio）はこの定数のみを
+/// 使い、調整ノブは外に出さない。値の置き場はこの 1 箇所に集約する。
+pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
+
 /// アニメーション 1 フレーム描画のオプション。
 ///
 /// `count` は同時可視 orb の総数。`None` の場合は cluster 数と一致させる
@@ -123,6 +134,13 @@ pub struct AnimateOptions {
     /// `false` で全 t において base_angle を保ち、glyph は静止向きで描かれる。
     /// Circle / Aquarelle 経路では使われない。既定 `true` で互換維持。
     pub glyph_rotate: bool,
+    /// #241「薄い影」の強度係数（0..1）。orb 機構（orb / glyph / image）の最外周
+    /// フェードセグメントで orb 色 rgb を `mix(1.0, 1.0-u, s)` 倍に暗化する。
+    /// `0.0` = #242 直後（影なし）と bit 同一、`1.0` = 旧 lowp の rgb→0 フェードと
+    /// 同等。製品は [`SHADOW_STRENGTH_DEFAULT`] 固定（CLI フラグ・Studio UI なし）。
+    /// gpu-lab（dev）だけが `WasmParams::shadow_strength` 経由で上書きする。
+    /// Aquarelle 経路では使われない（参照アルゴリズムが aquarelle crate のため）。
+    pub shadow_strength: f32,
     /// 動画入力（#7）の per-cluster 色トラック。
     ///
     /// `Some(tracks)` のとき、各 orb の `cluster.color` は
@@ -158,6 +176,7 @@ impl Default for AnimateOptions {
             shape: OrbShape::Orb,
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: None,
             keyframe_tracks: None,
         }
@@ -309,6 +328,10 @@ fn unit_from_hash(x: u64) -> f32 {
 /// 連動させるため、`SoftnessPreset::edge_softness()` の値 (0.3 / 0.6 / 1.0) を
 /// shader に流す。Circle アームは Euclidean distance + falloff_curve なので影響を
 /// 受けない。
+///
+/// `shadow_strength` (#241): orb 機構（orb / glyph / image）の最外周フェードの
+/// rgb 暗化強度（0..1、header[13]）。0..1 にクランプして詰める。WGSL（gpu.rs）が
+/// Params uniform に読む。WebGL（orberGl.ts）は header[13] を読まないので不変。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data_for_webgl(
@@ -324,6 +347,7 @@ pub fn pack_render_data_for_webgl(
     shape_id: f32,
     glyph_rotate: bool,
     edge_softness: f32,
+    shadow_strength: f32,
 ) -> Vec<f32> {
     let header_words = 16usize;
     let per_orb_words = 16usize;
@@ -343,8 +367,11 @@ pub fn pack_render_data_for_webgl(
     // #136: header[11] = glyph_rotate (1.0 = ON / 既定, 0.0 = OFF)。既存ヘッダ予約域に追加。
     buf[11] = if glyph_rotate { 1.0 } else { 0.0 };
     // #205: header[12] = edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0)。
-    // Circle アームは参照しない。残り header[13..16] は今後の拡張用に予約。
+    // Circle アームは参照しない。
     buf[12] = edge_softness;
+    // #241: header[13] = shadow_strength（最外周フェードの rgb 暗化強度、0..1 に
+    // クランプ）。WGSL の Params uniform へ。残り header[14..16] は今後の拡張用に予約。
+    buf[13] = shadow_strength.clamp(0.0, 1.0);
 
     if n_orbs == 0 || clusters.is_empty() {
         return buf;
@@ -801,6 +828,42 @@ mod tests {
             max_o - min_o > 1.0,
             "phi_opacity spread too narrow ({min_o} .. {max_o})"
         );
+    }
+
+    /// #241: header[13] に shadow_strength がそのまま（ただし 0..=1 クランプで）
+    /// 入ること。WGSL の Params uniform はこの word を読むので、ここがずれると
+    /// 影強度が黙って変わる。クランプは hand-built な範囲外値への防衛（ただし
+    /// f32::clamp は NaN を素通しする — NaN まで守る趣旨ではない）。production
+    /// 経路は wasm validate（0..=1・NaN reject）か定数なのでクランプ恒等。
+    #[test]
+    fn pack_header13_carries_clamped_shadow_strength() {
+        let clusters = vec![Cluster {
+            color: [200, 100, 50],
+            centroid: crate::cluster::Centroid { x: 0.5, y: 0.5 },
+            weight: 1.0,
+        }];
+        let pack_with = |s: f32| {
+            pack_render_data_for_webgl(
+                &clusters,
+                [0, 0, 0, 255],
+                32.0,
+                0.5,
+                0.0,
+                2.0,
+                7,
+                1,
+                1.0,
+                0.0,
+                true,
+                0.5,
+                s,
+            )
+        };
+        assert_eq!(pack_with(0.7)[13], 0.7, "in-range value must pass through");
+        assert_eq!(pack_with(0.0)[13], 0.0, "0.0 is inclusive");
+        assert_eq!(pack_with(1.0)[13], 1.0, "1.0 is inclusive");
+        assert_eq!(pack_with(-0.5)[13], 0.0, "below range clamps to 0");
+        assert_eq!(pack_with(1.5)[13], 1.0, "above range clamps to 1");
     }
 
     /// #225: per-orb パラメータ計算（pack/GPU 共有）が決定論的であること。

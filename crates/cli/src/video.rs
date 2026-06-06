@@ -14,7 +14,7 @@
 //! - ffmpeg が PATH に無い場合は [`VideoError::FfmpegNotFound`] を返す。
 //!   ユーザー側でインストール案内を出す前提。
 
-use orber_core::animate::{AnimateOptions, MotionDirection, MotionSpeed};
+use orber_core::animate::{AnimateOptions, MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
 use orber_core::cluster::Cluster;
 use orber_core::orb::OrbShape;
 use orber_core::output_mode::OutputMode;
@@ -225,6 +225,8 @@ pub fn render_video(
         shape: opts.shape.clone(),
         softness: opts.softness,
         glyph_rotate: true,
+        // #241: 薄い影は製品定数（CLI フラグは増やさない）。
+        shadow_strength: SHADOW_STRENGTH_DEFAULT,
         color_tracks: opts.color_tracks.clone(),
         keyframe_tracks: opts.keyframe_tracks.clone(),
     };
@@ -344,6 +346,7 @@ mod tests {
             shape: opts.shape.clone(),
             softness: opts.softness,
             glyph_rotate: true,
+            shadow_strength: SHADOW_STRENGTH_DEFAULT,
             color_tracks: opts.color_tracks.clone(),
             keyframe_tracks: opts.keyframe_tracks.clone(),
         }

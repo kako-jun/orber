@@ -18,6 +18,12 @@
 //! WebGL 側の readPixels は生の straight alpha を返す。bg 不透明の orb ゲートでは
 //! 実害なしだが、translucent な bg を比較すると A に偽差分が出る（dev 足場の限界）。
 //!
+//! 既知の差分（#241 の薄い影）: WGSL/CLI は orb 最外周フェード帯に
+//! `shadow_strength`（製品定数）の rgb 暗化を乗せるが、WebGL（orberGl.ts）は
+//! 乗せない（不可侵）。そのため `ab-webgl.png` との比較では**外周フェード帯にだけ
+//! 影分の差が出るのが正**で、byte-exact パリティのゲート（#242 時点の判定）は
+//! もう適用しない。WGSL ↔ CLI readback の比較は引き続き byte-near が正。
+//!
 //! ## 使い方（公開 CLI のサブコマンド / フラグは増やさない: `#[ignore]` テスト）
 //!
 //! ブラウザキャプチャの再現 PNG を出力:
@@ -142,6 +148,10 @@ fn to_wasm_params(ab: &AbParams, source_rgb: Vec<u8>) -> WasmParams {
         aquarelle_halo: 0.5,
         glyph_sdf: Vec::new(),
         glyph_sdf_size: 0,
+        // #241: 影強度は製品定数で再現する（ab-params.json には含まれない）。
+        // 旧キャプチャ（影なし時代の ab-webgl.png）と比べると外周フェード帯に
+        // 影分の差が出るのが正 — モジュール doc の注記参照。
+        shadow_strength: orber_core::animate::SHADOW_STRENGTH_DEFAULT,
     }
 }
 
