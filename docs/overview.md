@@ -278,7 +278,12 @@ the `OrbShape::Aquarelle` shape:
   the SDF sample becomes the normalized distance `r`, which the unified shader
   (`orb.wgsl`, SDF variant) blurs with the orb's `falloff_curve` / 3-axis breath /
   straight-alpha float Source-Over compositing (#242, ported 1:1 from the legacy
-  WebGL shader) in a single pass. The glyph / image silhouette is simply a
+  WebGL shader) in a single pass. Since #241 the outermost fade segment of that
+  shared falloff additionally darkens the orb rgb by a strength-scaled factor
+  (`mix(1.0, 1.0-u, shadow_strength)`, the old lowp fade re-introduced as a
+  coefficient — a thin, silhouette-following shadow; `0` is bit-identical to the
+  plain #242 compositing, the production strength is the single constant
+  `SHADOW_STRENGTH_DEFAULT`). The glyph / image silhouette is simply a
   different shape fed to the orb — a `●` glyph looks like a plain orb, a `▲` blurs
   while keeping its triangular form. The old `render_aquarelle_bleed_pass`-derived
   2nd pass (`orb_glyph_bleed.wgsl`) and its bleed/halo are removed; "bleed" is the
@@ -467,7 +472,10 @@ color. The pipeline:
    turns the signed-distance value into the normalized distance `r = 1 - signed_unit`,
    and feeds it to the **same** Rim/Soft `falloff_curve` / 3-axis breath /
    straight-alpha float Source-Over compositing (#242, the legacy WebGL
-   arithmetic) the plain `orb` shape uses. So **`--blur` and
+   arithmetic) the plain `orb` shape uses, plus the #241 thin shadow (the
+   outermost fade segment scales the orb rgb by `mix(1.0, 1.0-u, shadow_strength)`
+   — subtle, silhouette-following, production strength fixed by the single
+   constant `SHADOW_STRENGTH_DEFAULT`). So **`--blur` and
    `--softness` affect Glyph mode** with the same edge-falloff meaning rather than a
    hard text fill, and the glyph blurs exactly like an orb. Each orb's rotation
    (#136) is applied to the SDF sample coordinates in the shader (before sampling).
