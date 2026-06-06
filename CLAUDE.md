@@ -26,9 +26,12 @@ npm test            # vitest (strings.ts の lang signal 経路など)
 npm run test:watch  # 開発時の watch モード
 ```
 
-`web/` の vitest は #163 で導入。現状は `web/src/lib/strings.test.ts` のみ
-(detectLang() / lang signal / t() 補間の回帰テスト 8 件)。新機能追加時は
-同階層に `*.test.ts` を増やしていく方針 (jsdom 環境、`vitest.config.ts` 参照)。
+`web/` の vitest は #163 で導入。新機能追加時は `web/src/lib/` の同階層に
+`*.test.ts` を増やしていく方針 (jsdom 環境、`vitest.config.ts` 参照)。
+strings / encodeMp4 / jsGlyphSdf / orberClient / abLogic / workerLogic 等を
+単体テスト化済み。worker / Solid コンポーネントに埋まったロジックは、純移動で
+`lib/` の純粋関数に切り出してからテストする（#232 abLogic.ts / #245
+workerLogic.ts の流儀）。
 
 ## ドキュメント
 
@@ -126,6 +129,9 @@ web/                        # Web フロントエンド (#37, #38)
     │                           #  透過は transparent_background + gpu_render_rgba）に配線替え。
     │                           # 本番出力は #242+#241 の確定ルック（CLI と同一 WGSL）
     ├── lib/orberClient.ts      # #75 main 側 Worker クライアント（postMessage を Promise 化）
+    ├── lib/workerLogic.ts      # #245 worker / Studio の純粋ロジック切り出し
+    │                           # （buildWasmParams 引数DI / computeMaskSize /
+    │                           #  formatRunBatchError。vitest 対象）
     ├── lib/strings.ts          # i18n 文言集約 + ja/en 自動切替（#62）
     └── wasm/                   # wasm-pack 出力先（gitignore、.gitkeep のみ追跡）
 ```

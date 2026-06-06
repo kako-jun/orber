@@ -120,6 +120,20 @@ describe('lang signal + t()', () => {
     expect(t('alphaEncodingInProgress')).toMatch(/transparent video/);
   });
 
+  test('webgpuUnsupported キーが ja/en 両方定義されている (#245)', async () => {
+    // #245: worker 本番経路が WebGPU(WGSL) 化され、非対応ブラウザは
+    // formatRunBatchError がこの文言にマップして生成不可を表示する
+    // (#207 裁定: fallback 無し)。キーが消えると非対応環境のエラーが
+    // 生の sentinel 文字列のまま出るため、ja/en 両定義を直接押さえる。
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    const { setLang, t } = await import('./strings');
+    await Promise.resolve();
+    setLang('ja');
+    expect(t('webgpuUnsupported')).toMatch(/WebGPU/);
+    setLang('en');
+    expect(t('webgpuUnsupported')).toMatch(/WebGPU/);
+  });
+
   test('削除済みキー alphaEncoderLoadFailed は STRINGS に存在しない (#192)', async () => {
     // #192 で ffmpeg.wasm を撤去し外部 CDN ロード失敗のシナリオ自体が消滅した。
     // 文言キーが残っていると Studio.tsx 側で復活させて二重管理になるため、

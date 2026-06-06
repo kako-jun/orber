@@ -150,6 +150,9 @@ function setRenderData(params: Record<string, unknown>, n: number, specIdx: numb
     wasm.gpu_set_render_data(params, n, specIdx);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // 'no usable silhouette contrast' は wasm 側 resolve_image_shape の Err
+    // 文言（#169 型の文字列 drift 防止。Rust 側に固定テストあり）。
+    // SYNC WITH crates/wasm/src/lib.rs::resolve_image_shape
     if (msg.includes('no usable silhouette contrast')) {
       throw new Error('image-shape-no-contrast');
     }

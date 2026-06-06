@@ -404,6 +404,11 @@ fn resolve_image_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
     )
     .ok_or_else(|| "image_mask_rgba could not be wrapped as an RgbaImage".to_string())?;
     let size = orber_core::glyph::DEFAULT_GLYPH_SDF_SIZE;
+    // この Err 文言の "no usable silhouette contrast" は Web worker が sentinel
+    // `image-shape-no-contrast` へのマップ判定に includes で使う（#169 型の
+    // 文字列 drift を防ぐため、変えるなら両方同時に変えること。固定テスト:
+    // image_no_contrast_error_wording_is_pinned）。
+    // SYNC WITH web/src/lib/orberWorker.ts::setRenderData
     let sdf = image_rgba_to_sdf(&rgba, size).ok_or_else(|| {
         "image_mask has no usable silhouette contrast (it is blank or a single flat color); \
          provide a mask with a distinct subject vs. background"
@@ -1107,33 +1112,34 @@ fn glyph_sdf_bytes(font: GlyphFontId, ch: char, size: u32) -> Vec<u8> {
 // texture → buffer copy は bytes_per_row の 256 byte alignment が必須なので、
 // padded 行長の計算と「行ごとに padding を落として詰め直す」変換を gpu.rs の
 // async 経路から切り出して native テスト可能にする（gpu.rs 自体は wasm32 専用
-// cfg のため、native の `cargo test` から届かない）。
+// cfg のため、native の `cargo test` から届かない）。`cfg(any(wasm32, test))`
+// は `resolve_orb_shape` 等と同じ共有パターン。
 
 /// WebGPU texture→buffer readback の行アライメント（bytes）。
 /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`（= 256）と同値。native の test target は
 /// wgpu を直接依存に持たない（wasm32 専用 target dependency）ため同値の定数を
 /// ここに置き、wasm32 ビルドでは const assert で wgpu 本体との一致を担保する
 /// （drift したらコンパイルエラー）。
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 const COPY_ROW_ALIGN: u32 = 256;
 #[cfg(target_arch = "wasm32")]
 const _: () = assert!(COPY_ROW_ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
 
 /// readback 1 ピクセルのバイト数（`Rgba8Unorm` 固定 = 4。gpu_render_rgba は
 /// surface format と独立に常に Rgba8Unorm で読み戻す）。
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 const READBACK_BYTES_PER_PIXEL: u32 = 4;
 
 /// `width` px の RGBA 1 行を texture→buffer copy するときの padded 行長
 /// （bytes）。`width * 4` を 256 の倍数に切り上げる。
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn padded_bytes_per_row(width: u32) -> u32 {
     (width * READBACK_BYTES_PER_PIXEL).div_ceil(COPY_ROW_ALIGN) * COPY_ROW_ALIGN
 }
 
 /// padded な readback バッファ（`padded_bytes_per_row * height` bytes）から
 /// 行末 padding を落とし、`width * height * 4` bytes の行優先 RGBA に詰め直す。
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn unpad_rows(
     data: &[u8],
     width: u32,
@@ -2304,5 +2310,214 @@ mod tests {
         assert_eq!(first_char_of("🍕").unwrap(), '🍕');
         // 結合文字列 "e" + U+0301（combining acute）は 2 スカラ。先頭は基底 'e'。
         assert_eq!(first_char_of("e\u{0301}").unwrap(), 'e');
+    }
+
+    // ---- #245: transparent_background の shape 別伝播 / キャッシュ非汚染 /
+    //      serde default ----
+
+    /// 上半分不透明 / 下半分透明のマスク RGBA（コントラストあり = Image に解決
+    /// 可能）。`resolve_orb_shape_image_validates_mask` 等のインラインパターンと
+    /// 同一の共有ヘルパ（#245 で追加テストが増えたため切り出し）。
+    fn half_opaque_mask_rgba(w: u32, h: u32) -> Vec<u8> {
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let a = if y < h / 2 { 255 } else { 0 };
+                rgba[i] = 255;
+                rgba[i + 1] = 255;
+                rgba[i + 2] = 255;
+                rgba[i + 3] = a;
+            }
+        }
+        rgba
+    }
+
+    /// #245 (R1): shape="image" + transparent_background=true で、image が読む
+    /// `AnimateOptions` 経路（render_frame_image_to_view）にも透過が伝播する
+    /// （opts.background[3] == 0）。glyph は既存テストが押さえているので、
+    /// ここでは image の経路を固定する。
+    #[test]
+    fn transparent_background_image_propagates_to_animate_options() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        p.image_mask_width = 16;
+        p.image_mask_height = 16;
+        p.image_mask_rgba = half_opaque_mask_rgba(16, 16);
+        p.transparent_background = true;
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("image GPU inputs");
+        assert_eq!(
+            gpu.opts.background[3], 0,
+            "image opts.background alpha must be 0 when transparent_background is set"
+        );
+    }
+
+    /// #245 (R2): shape="aquarelle" + transparent_background=true でも
+    /// `opts.background[3] == 0`（aquarelle は lowp 合成を維持するが、透過
+    /// export の背景 alpha は orb 機構と同じ `AnimateOptions` 経由で効く）。
+    #[test]
+    fn transparent_background_aquarelle_propagates_to_animate_options() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "aquarelle".into();
+        p.transparent_background = true;
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle GPU inputs");
+        assert_eq!(
+            gpu.opts.background[3], 0,
+            "aquarelle opts.background alpha must be 0 when transparent_background is set"
+        );
+    }
+
+    /// #245 (R3): 透過 → 不透過の順で同一 source を build しても、2 回目の
+    /// bg.a は不透明のまま。`resolve_frame` は kmeans キャッシュ取得後の
+    /// ローカル bg だけを書き換える設計で、キャッシュの bg を透過で汚すと
+    /// この逆順（既存テストは不透過 → 透過の順だけ）で初めて露出する —
+    /// その死角を regression として固定する。
+    #[test]
+    fn transparent_then_opaque_does_not_poison_cluster_cache() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.transparent_background = true;
+        let transparent = build_render_pack(p, 12, 3).expect("transparent pack");
+        assert_eq!(
+            transparent[3], 0.0,
+            "first (transparent) build must have bg.a == 0"
+        );
+        // 2 回目: 同一 source（fingerprint 一致 = キャッシュヒット）の不透過 build。
+        let opaque = build_render_pack(small_source_params(), 12, 3).expect("opaque pack");
+        assert_ne!(
+            opaque[3], 0.0,
+            "second (opaque) build must keep the cached bg opaque (cache must not be poisoned)"
+        );
+    }
+
+    /// #245 (R4): `transparent_background` の serde 省略 default は `false`
+    /// （フィールドを送らない既存呼び出しはバイト列不変）。明示 true はそのまま
+    /// 通る。serde_json は serde_wasm_bindgen と同じ `Deserialize` 実装を通る
+    /// ので `#[serde(default)]` の検証として等価（shadow_strength の前例
+    /// `shadow_strength_serde_defaults_to_production_constant` と同型）。
+    #[test]
+    fn transparent_background_serde_defaults_to_false() {
+        let json = r#"{
+            "source_rgb": [0, 0, 0],
+            "source_width": 1,
+            "source_height": 1,
+            "k": 1,
+            "width": 8,
+            "height": 8,
+            "seed": 1.0,
+            "direction": "lr",
+            "speed": "slow",
+            "count": 1,
+            "orb_size": 1.0,
+            "blur": 0.5,
+            "shape": "orb"
+        }"#;
+        let p: WasmParams =
+            serde_json::from_str(json).expect("params without transparent_background");
+        assert!(
+            !p.transparent_background,
+            "omitted transparent_background must default to false"
+        );
+        // 明示指定はそのまま通る。
+        let json_explicit = json.replace(
+            r#""shape": "orb""#,
+            r#""shape": "orb", "transparent_background": true"#,
+        );
+        let p: WasmParams =
+            serde_json::from_str(&json_explicit).expect("explicit transparent_background");
+        assert!(p.transparent_background);
+    }
+
+    // ---- #245: readback 行 padding 純関数（gpu_render_rgba の土台） ----
+
+    /// #245 (R5): `padded_bytes_per_row` は width*4 を 256 byte alignment に
+    /// 切り上げる。63 (252B → 256) / 64 (256B ちょうど) / 65 (260B → 512) の
+    /// 3 点境界で切り上げ方向を固定する。
+    #[test]
+    fn padded_bytes_per_row_boundaries() {
+        assert_eq!(padded_bytes_per_row(63), 256);
+        assert_eq!(padded_bytes_per_row(64), 256);
+        assert_eq!(padded_bytes_per_row(65), 512);
+    }
+
+    /// #245 (R6): width=63（行末 4B の padding あり）の `unpad_rows` で、
+    /// padding バイトが出力に混入せず、出力長が width*height*4 になる。
+    #[test]
+    fn unpad_rows_drops_row_padding() {
+        let (width, height) = (63u32, 3u32);
+        let padded = padded_bytes_per_row(width);
+        assert_eq!(padded, 256);
+        let unpadded = (width * 4) as usize; // 252
+                                             // 各行: payload は行番号+1、padding は 0xEE のマーカー。
+        let mut data = vec![0xEEu8; padded as usize * height as usize];
+        for row in 0..height as usize {
+            data[row * padded as usize..row * padded as usize + unpadded].fill(row as u8 + 1);
+        }
+        let out = unpad_rows(&data, width, height, padded);
+        assert_eq!(out.len(), unpadded * height as usize);
+        assert!(
+            out.iter().all(|&b| b != 0xEE),
+            "row padding must not leak into the output"
+        );
+        for (row, chunk) in out.chunks_exact(unpadded).enumerate() {
+            assert!(
+                chunk.iter().all(|&b| b == row as u8 + 1),
+                "row {row} payload must be preserved in order"
+            );
+        }
+    }
+
+    /// #245 (R7): width=64 は padded == unpadded（256B ちょうど）で、
+    /// `unpad_rows` は恒等コピーになる。
+    #[test]
+    fn unpad_rows_width64_is_identity_copy() {
+        let (width, height) = (64u32, 2u32);
+        let padded = padded_bytes_per_row(width);
+        assert_eq!(padded, width * 4, "width=64 must have no padding");
+        let data: Vec<u8> = (0..(padded * height) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let out = unpad_rows(&data, width, height, padded);
+        assert_eq!(out, data, "no-padding input must round-trip byte-identical");
+    }
+
+    /// #245 (R8): 最小値 width=1 / height=1。1px 行（4B）が 256B に pad され、
+    /// `unpad_rows` は先頭 4B だけを返す。
+    #[test]
+    fn unpad_rows_minimal_1x1() {
+        let (width, height) = (1u32, 1u32);
+        let padded = padded_bytes_per_row(width);
+        assert_eq!(padded, 256);
+        let mut data = vec![0xEEu8; 256];
+        data[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let out = unpad_rows(&data, width, height, padded);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    /// #245 (R9): image の無コントラスト Err 文言固定。Web worker
+    /// （orberWorker.ts::setRenderData）は 'no usable silhouette contrast' の
+    /// includes で sentinel `image-shape-no-contrast` にマップするため、この
+    /// 部分文字列が変わると Studio の i18n エラー表示が silent に素通り文言へ
+    /// 化ける（#169 型の文字列 drift 事故防止）。
+    /// SYNC WITH web/src/lib/orberWorker.ts::setRenderData
+    #[test]
+    fn image_no_contrast_error_wording_is_pinned() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "image".into();
+        p.image_mask_width = 4;
+        p.image_mask_height = 4;
+        p.image_mask_rgba = vec![0; 4 * 4 * 4]; // 単色 = コントラスト無し
+                                                // GpuRenderInputs は Debug を持たないので unwrap_err でなく match で取り出す。
+        let err = match build_gpu_render_inputs(p, 12, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("a flat (no-contrast) mask must error"),
+        };
+        assert!(
+            err.contains("no usable silhouette contrast"),
+            "worker sentinel mapping depends on this wording, got: {err}"
+        );
     }
 }
