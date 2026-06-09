@@ -158,6 +158,25 @@ enum Shape {
     Image,
 }
 
+/// #239 PoC: bleed geometry for the additive aquarelle layer (blink A/B target).
+/// Hidden flag; production continuous-value / web-slider work is a later phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliBleedMode {
+    /// A案: silhouette-distance driven continuous smear (auto-follows any shape).
+    Continuous,
+    /// B案: seed-derived 3-satellite blob scatter from the silhouette centroid.
+    Blob,
+}
+
+impl From<CliBleedMode> for orber_core::animate::BleedMode {
+    fn from(m: CliBleedMode) -> Self {
+        match m {
+            CliBleedMode::Continuous => orber_core::animate::BleedMode::Continuous,
+            CliBleedMode::Blob => orber_core::animate::BleedMode::Blob,
+        }
+    }
+}
+
 /// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
 fn parse_single_char(s: &str) -> Result<char, String> {
     let mut chars = s.chars();
@@ -335,6 +354,16 @@ struct Cli {
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_halo: f32,
 
+    /// #239 PoC (hidden): bleed geometry for the additive aquarelle layer when
+    /// riding a NON-aquarelle shape (orb / glyph / image). When set, the
+    /// --aquarelle-bleed/bloom/offset/halo sliders feed an additive layer over the
+    /// unified orb mechanism (continuous = shape-following smear, blob = seed
+    /// satellites). This is a blink A/B試作 for picking the look; production
+    /// continuous-value / web-slider work is a later phase. Omit it (default) and
+    /// orb / glyph / image render exactly as before (byte-identical).
+    #[arg(long, value_enum, hide = true)]
+    aquarelle_bleed_mode: Option<CliBleedMode>,
+
     /// Input processing mode (#7 / #33). Only meaningful for video input.
     /// `color-track` = #7 (position fixed, color tracks over time, default).
     /// `keyframe` = #33 (color + position + weight all interpolated between keyframes).
@@ -357,6 +386,26 @@ impl Cli {
             offset: self.aquarelle_offset,
             halo: self.aquarelle_halo,
         }
+    }
+
+    /// #239 PoC: the additive aquarelle bleed config ridden by a non-aquarelle shape.
+    /// `Some` only when `--aquarelle-bleed-mode` is set AND the shape is not
+    /// `Aquarelle` (which has its own dedicated, byte-pinned renderer). Reuses the
+    /// `--aquarelle-bleed/bloom/offset/halo` sliders for the four params. When the
+    /// flag is omitted this returns `None`, so orb / glyph / image render exactly as
+    /// before (byte-identical — the non-regression gate).
+    fn poc_aqua(&self) -> Option<orber_core::animate::AquaBleedConfig> {
+        let mode = self.aquarelle_bleed_mode?;
+        if matches!(self.shape, Shape::Aquarelle) {
+            return None;
+        }
+        Some(orber_core::animate::AquaBleedConfig {
+            bleed: self.aquarelle_bleed,
+            bloom: self.aquarelle_bloom,
+            offset: self.aquarelle_offset,
+            halo: self.aquarelle_halo,
+            mode: mode.into(),
+        })
     }
 
     /// Resolve the `OrbShape` for this run. For `--shape image` this performs I/O:
@@ -763,6 +812,9 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     let frame_opts = orber_core::animate::AnimateOptions {
         width: RenderOptions::default().width,
         height: RenderOptions::default().height,
+        // #239 PoC: additive aquarelle bleed layer when --aquarelle-bleed-mode is
+        // set on a non-aquarelle shape; None (default) = byte-identical existing look.
+        aqua: cli.poc_aqua(),
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
@@ -924,6 +976,8 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239 PoC: additive bleed layer (only when --aquarelle-bleed-mode set).
+                aqua: cli.poc_aqua(),
                 orb_size: cli.orb_size,
                 blur: cli.blur,
                 saturation: cli.saturation,
@@ -1070,6 +1124,8 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239 PoC: additive bleed layer (only when --aquarelle-bleed-mode set).
+                aqua: cli.poc_aqua(),
                 orb_size: cli.orb_size,
                 blur: cli.blur,
                 saturation: cli.saturation,
@@ -1220,6 +1276,8 @@ fn render_one_variation(
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239 PoC: variations presets keep the production look (no aqua layer).
+                aqua: None,
                 orb_size: spec.orb_size,
                 blur: spec.blur,
                 saturation: 1.0,
@@ -1701,6 +1759,7 @@ mod tests {
         let base = AnimateOptions {
             width: 96,
             height: 72,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
