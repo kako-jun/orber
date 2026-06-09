@@ -39,7 +39,8 @@ rand_chacha = { workspace = true }
 orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
 wgpu = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
-web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
+# OffscreenCanvas は #245（Worker 本番生成経路の WGSL 配線）の `gpu_init_offscreen` 用。
+web-sys = { workspace = true, features = ["HtmlCanvasElement", "OffscreenCanvas"] }
 
 # #242: A/B 三者画素比較の dev ハーネス（src/ab_harness.rs、native test 専用）。
 # ブラウザのキャプチャモード（?ab=1&abcap=1）が落とす ab-params.json +

@@ -152,6 +152,8 @@ fn to_wasm_params(ab: &AbParams, source_rgb: Vec<u8>) -> WasmParams {
         // 旧キャプチャ（影なし時代の ab-webgl.png）と比べると外周フェード帯に
         // 影分の差が出るのが正 — モジュール doc の注記参照。
         shadow_strength: orber_core::animate::SHADOW_STRENGTH_DEFAULT,
+        // #245: 透過 export はハーネス対象外（キャプチャは常に不透過背景）。
+        transparent_background: false,
     }
 }
 

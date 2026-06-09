@@ -1,13 +1,19 @@
 //! #230: ブラウザ WebGPU canvas present 経路（#207 Phase 2 スライス 2/5）。
 //!
 //! orber-core の `GpuRenderer`（WGSL）で `<canvas>` に直接描く最小経路。
-//! main thread 配置（Worker 配線の要否は Phase 3 で判断）。公開 API は 4 つ:
+//! main thread（gpu-lab / AbPanel、[`gpu_init`]）と Worker（本番生成経路、
+//! [`gpu_init_offscreen`]、#245）の両方から使う。公開 API:
 //!
 //! - [`gpu_init`]\(canvas\) — async。instance → canvas surface → adapter
 //!   （`compatible_surface` 付き）→ device の順に bring-up し、surface を
 //!   configure して renderer を構築する。WebGPU 不在（adapter 無し）は明確な
 //!   エラーで reject する。**fallback は無い**（#207 方針。wgpu の `webgl`
 //!   feature は採らない）。
+//! - [`gpu_init_offscreen`]\(canvas\) — #245。`OffscreenCanvas` 版の init。
+//!   Worker（`orberWorker.ts`）の本番生成経路用で、bring-up は [`gpu_init`] と
+//!   完全共有（[`init_for_target`]。surface target だけ
+//!   `SurfaceTarget::OffscreenCanvas`）。Worker 内では wgpu が
+//!   `DedicatedWorkerGlobalScope` の `navigator.gpu` を自動で引く。
 //! - [`gpu_set_render_data`]\(params_js, n, spec_idx\) — `get_render_data` と
 //!   同じ spec 解決経路（`build_gpu_render_inputs` → 共有の `resolve_frame`）で
 //!   shape 別の描画入力（clusters + opts + orb 用 pack）を構築して保持する。入力は
@@ -15,6 +21,11 @@
 //! - [`gpu_render`]\(t\) — surface frame を acquire し、保持入力 + `t` で
 //!   `opts.shape` 別の core 経路（`render_packed_to_view` / `render_frame_*_to_view`）
 //!   → present。
+//! - [`gpu_render_rgba`]\(t\) — #245。canvas を経由せず内部テクスチャに 1 フレーム
+//!   描いて **straight-alpha RGBA バイト列**を読み戻す async 経路。透過 export
+//!   （bg.a=0）用: WebGPU canvas の alphaMode は `opaque` / `premultiplied` しか
+//!   なく、straight alpha をそのまま canvas から取り出せないため、native CLI の
+//!   readback と同じ「texture → padded buffer → map」をブラウザ向けに async で行う。
 //! - [`gpu_resize`]\(w, h\) — surface を新サイズで再 configure する。
 //!
 //! ## 形状について（#231 で全 shape 配線）
@@ -52,9 +63,12 @@ use crate::{build_gpu_render_inputs, deserialize_params, err_to_js, WasmSingleTh
 /// `gpu_init` で組み上がる一式。surface の configure（resize / Outdated 回復）
 /// には device が要るが、`GpuRenderer` は device を private に持つため、
 /// ここで clone を別途保持する（`wgpu::Device` は安価な handle clone）。
+/// queue は #245 の readback 経路（`gpu_render_rgba` の texture→buffer copy
+/// submit）用に同じ理由で clone を持つ。
 struct GpuState {
     renderer: GpuRenderer,
     device: wgpu::Device,
+    queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     /// `gpu_set_render_data` が解決した 1 タイル分の描画入力（#231）。spec ごとに
@@ -94,6 +108,31 @@ fn gpu_state() -> &'static WasmSingleThreadCell<Option<GpuState>> {
 /// /gpu-lab は start ボタンの disable でガード済み）。
 #[wasm_bindgen]
 pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsError> {
+    let width = canvas.width().max(1);
+    let height = canvas.height().max(1);
+    init_for_target(wgpu::SurfaceTarget::Canvas(canvas), width, height).await
+}
+
+/// [`gpu_init`] の `OffscreenCanvas` 版（#245）。Worker（`orberWorker.ts`）の
+/// 本番生成経路が使う。bring-up・surface format / alpha mode の選択・エラー
+/// 文言は [`gpu_init`] と完全共有（[`init_for_target`]）で、surface target が
+/// `SurfaceTarget::OffscreenCanvas` になるだけ。`navigator.gpu` は wgpu が
+/// 実行コンテキスト（Window / DedicatedWorkerGlobalScope）から自動で引く。
+#[wasm_bindgen]
+pub async fn gpu_init_offscreen(canvas: web_sys::OffscreenCanvas) -> Result<String, JsError> {
+    let width = canvas.width().max(1);
+    let height = canvas.height().max(1);
+    init_for_target(wgpu::SurfaceTarget::OffscreenCanvas(canvas), width, height).await
+}
+
+/// [`gpu_init`] / [`gpu_init_offscreen`] の共通本体。instance → surface →
+/// adapter（`compatible_surface` 付き）→ device の bring-up と surface
+/// configure を行い、`GpuState` を据える。成功時は adapter 名を返す。
+async fn init_for_target(
+    target: wgpu::SurfaceTarget<'static>,
+    width: u32,
+    height: u32,
+) -> Result<String, JsError> {
     // 再 init 時は、新しい surface を作る前に旧 GpuState（旧 surface）を先に
     // drop する。同一 canvas の GPUCanvasContext を包む新旧 surface の共存を
     // 避けるため（旧 surface が configure 済みのまま新 surface を作らない）。
@@ -106,10 +145,8 @@ pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsEr
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let width = canvas.width().max(1);
-    let height = canvas.height().max(1);
     let surface = instance
-        .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+        .create_surface(target)
         .map_err(|e| JsError::new(&format!("WebGPU: failed to create canvas surface: {e}")))?;
 
     // adapter は compatible_surface 付きで取るのが正道（headless の
@@ -177,10 +214,12 @@ pub async fn gpu_init(canvas: web_sys::HtmlCanvasElement) -> Result<String, JsEr
     };
     surface.configure(&device, &config);
 
-    let renderer = GpuRenderer::from_device_queue(device.clone(), queue, adapter_name.clone());
+    let renderer =
+        GpuRenderer::from_device_queue(device.clone(), queue.clone(), adapter_name.clone());
     *gpu_state().borrow_mut() = Some(GpuState {
         renderer,
         device,
+        queue,
         surface,
         config,
         frame: None,
@@ -262,24 +301,166 @@ pub fn gpu_render(t: f32) -> Result<(), JsError> {
     let format = state.config.format;
     // `frame.is_none()` を上で弾いているので unwrap は安全（同一 borrow 内で値は変わらない）。
     let f = state.frame.as_ref().expect("frame checked above");
-    let renderer = &state.renderer;
-    // shape 別ディスパッチ（CLI の FrameRenderer::render と同じ構造）。Orb は #230 の
-    // pack 経路を温存して見た目を一切変えない。glyph / image / aquarelle は clusters +
-    // opts を core の専用 to_view 経路へ渡す（SDF / aquarelle pack の面倒は core が見る）。
-    match &f.opts.shape {
-        OrbShape::Glyph { .. } => {
-            renderer.render_frame_glyph_to_view(&f.clusters, &f.opts, t, &view, format)
-        }
-        OrbShape::Image { .. } => {
-            renderer.render_frame_image_to_view(&f.clusters, &f.opts, t, &view, format)
-        }
-        OrbShape::Aquarelle(_) => {
-            renderer.render_frame_aquarelle_to_view(&f.clusters, &f.opts, t, &view, format)
-        }
-        OrbShape::Orb => renderer.render_packed_to_view(&f.pack, width, height, t, &view, format),
-    }
+    dispatch_render_to_view(&state.renderer, f, t, &view, format, width, height);
     frame.present();
     Ok(())
+}
+
+/// 保持入力 1 フレーム分を任意の view へ描く shape 別ディスパッチ（CLI の
+/// `FrameRenderer::render` と同じ構造）。Orb は #230 の pack 経路を温存して
+/// 見た目を一切変えない。glyph / image / aquarelle は clusters + opts を core の
+/// 専用 to_view 経路へ渡す（SDF / aquarelle pack の面倒は core が見る）。
+/// [`gpu_render`]（surface present）と [`gpu_render_rgba`]（#245 readback）で共有。
+fn dispatch_render_to_view(
+    renderer: &GpuRenderer,
+    f: &FrameInputs,
+    t: f32,
+    view: &wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) {
+    match &f.opts.shape {
+        OrbShape::Glyph { .. } => {
+            renderer.render_frame_glyph_to_view(&f.clusters, &f.opts, t, view, format)
+        }
+        OrbShape::Image { .. } => {
+            renderer.render_frame_image_to_view(&f.clusters, &f.opts, t, view, format)
+        }
+        OrbShape::Aquarelle(_) => {
+            renderer.render_frame_aquarelle_to_view(&f.clusters, &f.opts, t, view, format)
+        }
+        OrbShape::Orb => renderer.render_packed_to_view(&f.pack, width, height, t, view, format),
+    }
+}
+
+/// 保持入力の時刻 `t` の 1 フレームを **canvas を経由せず**内部テクスチャに
+/// 描き、straight-alpha RGBA バイト列（行優先、`width * height * 4`）として
+/// 読み戻す（#245）。
+///
+/// 透過 export（`WasmParams.transparent_background` で bg.a=0）用の経路。
+/// WebGPU canvas の alphaMode は `opaque`（alpha 破棄）/ `premultiplied`
+/// （straight で書く orber のシェーダ出力と不整合）しかなく、旧 WebGL
+/// （`alpha: true, premultipliedAlpha: false`）のように straight alpha を
+/// canvas からそのまま取り出せない。そこで native CLI の readback
+/// （`render_packed` 系）と同じ texture → padded buffer → map をブラウザ向けに
+/// async（`map_async` + Promise）で行う。シェーダ出力をそのまま返すので
+/// alpha は bit-exact に保たれる。
+///
+/// テクスチャ / バッファは呼び出しごとに作って捨てる: 192 frame の透過動画
+/// でも確保コストは readback 自体に比べ軽微で、`await` を跨いで共有資源を
+/// 持たないことで並行呼び出し（worker の message interleave）にも安全になる。
+/// サイズは surface config と同じ `width × height`（呼び出し側は canvas /
+/// `gpu_resize` と `params.width/height` を一致させる既存契約のまま）。
+#[wasm_bindgen]
+pub async fn gpu_render_rgba(t: f32) -> Result<js_sys::Uint8Array, JsError> {
+    // フェーズ 1（同期・単一 borrow 内）: 描画 → copy → submit まで終わらせ、
+    // await を跨ぐのはローカルの buffer だけにする（RefCell borrow を await
+    // 越しに保持しない）。
+    let (buffer, width, height, padded_bytes_per_row) = {
+        let guard = gpu_state().borrow_mut();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| JsError::new("gpu_render_rgba called before gpu_init"))?;
+        let f = state
+            .frame
+            .as_ref()
+            .ok_or_else(|| JsError::new("gpu_render_rgba called before gpu_set_render_data"))?;
+
+        let width = state.config.width;
+        let height = state.config.height;
+        // readback は常に Rgba8Unorm（native の `build_sized_resources` と同じ）。
+        // surface format（Bgra8Unorm の可能性あり）とは独立で、PNG / ImageData の
+        // RGBA 並びにそのまま渡せる。
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let texture = state.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("orber-wasm-readback-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        dispatch_render_to_view(&state.renderer, f, t, &view, format, width, height);
+
+        // texture→buffer copy は bytes_per_row の 256 byte alignment が必須
+        // （native readback と同じ padding。読み出し時に行ごとに unpad する。
+        // 計算は lib.rs の純関数 `padded_bytes_per_row` — #245 でテスト用に切り出し）。
+        let padded_bytes_per_row = crate::padded_bytes_per_row(width);
+        let buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orber-wasm-readback-buffer"),
+            size: (padded_bytes_per_row as u64) * (height as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orber-wasm-readback-encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        state.queue.submit(Some(encoder.finish()));
+        (buffer, width, height, padded_bytes_per_row)
+    };
+
+    // フェーズ 2: map_async を Promise 化して await。WebGPU バックエンドの
+    // map_async は内部の `GPUBuffer.mapAsync` Promise 解決で callback が
+    // 発火するため、native のような blocking poll は不要。
+    let slice = buffer.slice(..);
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        slice.map_async(wgpu::MapMode::Read, move |res| match res {
+            Ok(()) => {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            }
+            Err(e) => {
+                let _ = reject.call1(&JsValue::UNDEFINED, &JsValue::from_str(&e.to_string()));
+            }
+        });
+    });
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|e| {
+            JsError::new(&format!(
+                "WebGPU: readback buffer map failed: {}",
+                e.as_string().unwrap_or_else(|| format!("{e:?}"))
+            ))
+        })?;
+
+    // フェーズ 3: 行ごとに padding を落として詰め直す（native readback と同形。
+    // 変換は lib.rs の純関数 `unpad_rows` — #245 でテスト用に切り出し）。
+    let out = {
+        let data = slice.get_mapped_range();
+        crate::unpad_rows(&data, width, height, padded_bytes_per_row)
+    };
+    buffer.unmap();
+    Ok(js_sys::Uint8Array::from(&out[..]))
 }
 
 /// surface を新サイズで再 configure する。呼び出し側は canvas の width/height

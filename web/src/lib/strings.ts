@@ -92,6 +92,13 @@ export const STRINGS = {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',
   },
+  // #245: 本番生成経路 (worker) は WebGPU(WGSL)。非対応ブラウザは生成不可
+  // (#207 裁定: fallback 無し)。worker の sentinel `webgpu-unsupported` を
+  // Studio の formatRunBatchError がこの文言にマップする。
+  webgpuUnsupported: {
+    ja: 'お使いのブラウザは WebGPU 非対応です',
+    en: 'Your browser does not support WebGPU',
+  },
   decoding: { ja: '画像をデコード中…', en: 'Decoding image…' },
   generating: { ja: '生成中…', en: 'Generating…' },
   animating: { ja: '動画化中…', en: 'Animating…' },

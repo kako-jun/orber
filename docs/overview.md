@@ -295,7 +295,7 @@ the `OrbShape::Aquarelle` shape:
 
 Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
-- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; production rendering on the web currently runs in WebGL2). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path is wired for **all shapes** (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` / `render_frame_aquarelle_to_view` (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained the four aquarelle parameters plus an image-mask input, and the WebGL path is unchanged (it still explicitly rejects aquarelle and its `get_render_data` byte stream is unaffected). The glyph JS fallback (WebGL #159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`).
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; since #245 production rendering on the web runs through the WebGPU(WGSL) path described below). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path is wired for **all shapes** (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` / `render_frame_aquarelle_to_view` (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained the four aquarelle parameters plus an image-mask input, and the WebGL path is unchanged (it still explicitly rejects aquarelle and its `get_render_data` byte stream is unaffected). The glyph JS fallback (WebGL #159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`). Since #245 (Phase 3 PR-A) the **production Worker uses this WebGPU path** through the new `gpu_init_offscreen(OffscreenCanvas)` entry point (same bring-up as `gpu_init`, worker-context `navigator.gpu`), plus `gpu_render_rgba(t)` — an async straight-alpha RGBA read-back (texture → padded buffer → `map_async`) used for transparent export, because WebGPU canvases only offer `opaque` / `premultiplied` alpha modes — and `WasmParams.transparent_background`, which zeroes the resolved background alpha inside wasm (the WGSL-path equivalent of the old worker-side "patch pack header word 3" trick).
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
@@ -303,36 +303,43 @@ User-facing CLI behavior is unchanged.
 ## Web GUI rendering pipeline
 
 The web frontend (`web/`) renders 12 tiles per drop (8 stills + 4 animated)
-**entirely on the GPU via WebGL2**. wasm is used only for kmeans color
-extraction and for packing per-orb parameters; the per-pixel composition runs
-in a fragment shader. The pipeline is split between a **main thread** (UI +
-DOM) and a **dedicated Worker thread** (wasm + WebGL2 + WebCodecs):
+**entirely on the GPU via WebGPU (WGSL)** — since #245 the production Worker
+draws with the same core WGSL shaders as the native CLI (the #242 + #241
+confirmed look). wasm owns kmeans color extraction, per-orb parameter packing
+**and** the per-pixel composition (core `GpuRenderer`); the Worker only feeds
+params and drives `t`. The pipeline is split between a **main thread** (UI +
+DOM) and a **dedicated Worker thread** (wasm + WebGPU + WebCodecs):
 
 ```
 [main thread]                          [worker thread (orberWorker.ts)]
-  Studio.tsx                             wasm-bindgen loaded once
-   ├ runBatch                            ├ wasm.get_render_data(spec_idx, w, h)
-   │   └ workerGenerateOne(i) ────────→  │   └→ Float32Array (orb params)
-   │                                     ├ OffscreenCanvas + WebGL2 fragment
-   │                                     │  shader renders the t=0 frame
+  Studio.tsx                             wasm-bindgen loaded once,
+   ├ runBatch                            gpu_init_offscreen(OffscreenCanvas) once
+   │   └ workerGenerateOne(i) ────────→  ├ wasm.gpu_set_render_data(params, n, i)
+   │                                     ├ wasm.gpu_render(0)  (core WGSL → canvas)
    │                                     ├ canvas.convertToBlob('image/png')
    │                                     │   └→ PNG bytes (Transferable)
-   ├ animate phase                       ├ wasm.get_render_data(spec_idx, w, h)
+   ├ animate phase                       ├ wasm.gpu_set_render_data(params, n, i)
    │   └ workerAnimateOne(i) ─────────→  │   for i in 0..192:
-   │                                     │     - shader.renderFrame(t = i/192)
+   │                                     │     - wasm.gpu_render(t = i/192)
    │                                     │     - new VideoFrame(canvas) → encode
    │                                     ├ WebCodecs VideoEncoder
    │                                     │   (codec probe: H.264 → VP9 → AV1,
    │                                     │    hwAccel probe: prefer-hardware → no-preference; #196)
    │                                     │   └→ mp4 Blob (Transferable)
+   ├ alpha export                        ├ transparent_background: true →
+   │   └ workerGenerateOneAlpha /        │  wasm.gpu_render_rgba(t) (straight-alpha
+   │     workerAnimateOneAlpha ───────→  │  read-back, no canvas) → PNG/WebP Blob
    └ DL high-res                         └ same APIs, with width/height = 1080×1920
        └ workerGenerateOne / workerAnimateOne (per selected index)
 ```
 
 The source RGB buffer is uploaded once via `workerSetSource` and cached in the
-Worker; subsequent `get_render_data` calls reference the cached kmeans
-clusters, so multi-megabyte arrays are not copied per call. The WebGL2 context
-and OffscreenCanvas are also cached per resolution and reused across calls.
+Worker; subsequent `gpu_set_render_data` calls reference the cached kmeans
+clusters, so multi-megabyte arrays are not copied per call. The WebGPU device
+and OffscreenCanvas surface are brought up once (`gpu_init_offscreen`) and
+resolution switches reuse them via `gpu_resize`. Browsers without WebGPU get a
+clear error (the `webgpuUnsupported` string) — there is no fallback renderer
+(#207 ruling).
 
 **Source downsampling for kmeans.** The dropped image is decoded and immediately
 resized to a longest-edge of 256 px (aspect preserved) before the RGB buffer is
@@ -345,15 +352,18 @@ of scaling with the input photo (4032×3024 was 36MB and the per-tile copy cost
 dominated on Android), kmeans itself runs on a tiny pixel set, and the wasm-side
 `SOURCE_CACHE` fingerprint becomes stable across calls.
 
-**Why WebGL2.** The previous implementation rendered every pixel on the CPU
-inside wasm and ran each animation frame through `RGBA → ImageData →
+**Why a GPU canvas.** The original implementation rendered every pixel on the
+CPU inside wasm and ran each animation frame through `RGBA → ImageData →
 createImageBitmap → VideoFrame` before encoding. At 1080×1920 × 192 frames the
 per-pixel CPU cost dominated and a single download tile took several minutes.
-The fragment shader runs in parallel on the GPU and `new VideoFrame(canvas)`
-hands the rendered surface directly to the encoder, eliminating per-frame
-transfer cost entirely. End-to-end download time for one hi-res animated tile
-drops to a few seconds (encoder flush dominates; renders themselves are
-sub-millisecond).
+A GPU-rendered canvas (WebGL2 from #112, WebGPU/WGSL since #245) runs the
+per-pixel composition in parallel and `new VideoFrame(canvas)` hands the
+rendered surface directly to the encoder, eliminating per-frame transfer cost
+entirely. End-to-end download time for one hi-res animated tile drops to a few
+seconds (encoder flush dominates; renders themselves are sub-millisecond).
+Note the WebGPU canvas constraint: the current texture expires when the task
+ends, so each `gpu_render(t)` and its consumer (`convertToBlob` snapshot /
+`new VideoFrame(canvas)`) must run within the same task — both loops do.
 
 **Preview vs. download resolution.** Tiles are rendered at **540×960** (portrait)
 or **960×540** (landscape) for the preview grid — light enough to keep mobile
@@ -380,11 +390,11 @@ Combined with the assigned speeds above, VerySlow tiles cross the screen once
 in 8 s — slow enough to feel "drifting", appropriate for use as overlay /
 background plates beneath text.
 
-**Browser requirements.** OffscreenCanvas / WebGL2 / VideoEncoder / VideoFrame
-in Worker context. iOS Safari 16.4+, current Android Chrome / Firefox 130+.
-There is no fallback path for older browsers — the GUI shows an error if
-WebCodecs is unavailable. WebGL2 support is a strict superset of WebCodecs in
-practice, so any browser that can run the encoder can also run the renderer.
+**Browser requirements.** OffscreenCanvas / **WebGPU** / VideoEncoder /
+VideoFrame in Worker context (#245). There is no fallback path — if WebGPU is
+unavailable the worker rejects with the `webgpu-unsupported` sentinel and
+Studio shows the `webgpuUnsupported` message (#207 ruling: no `webgl` feature,
+no fallback renderer).
 The animated-tile path requires *some* `VideoEncoder` codec to be available:
 H.264 → VP9 → AV1 are probed in that order via
 `VideoEncoder.isConfigSupported`, falling back from `prefer-hardware` to
@@ -406,7 +416,7 @@ encode throws and Studio surfaces the existing
 **Re-roll cancellation.** When the user re-rolls (or drops a new image / flips
 aspect) while the previous batch is still in flight, `runBatch` terminates the
 Worker (`worker.terminate()`) and respawns it with a fresh wasm instance and
-WebGL2 context. A logical generation guard (`runGen` / `myGen`) alone is not
+WebGPU device/surface. A logical generation guard (`runGen` / `myGen`) alone is not
 enough because the in-flight render + encode loop keeps running to completion
 otherwise, doubling GPU/CPU usage and delaying the new batch. After respawn the cached source RGB is invalidated and re-uploaded on
 the next `workerSetSource`. The cost (a small wasm re-init) is paid only when
@@ -655,11 +665,13 @@ speed / softness without dropping to the terminal.
   same 🐱 may differ between Mac and Windows; this is accepted as the trade
   for accepting any character the user types. The shape segmented control
   has a third option, **Image**, which lets users upload an arbitrary picture
-  (PNG / JPG / WebP / GIF / SVG); the bitmap is silhouetted in-worker (alpha
-  threshold for transparent images, otherwise a luminance threshold whose
-  inside/outside polarity is auto-detected by minority count) and pushed
-  through the same EDT → SDF pipeline as glyph rasterization, so the wasm
-  rendering path is reused unchanged (`web/src/lib/jsGlyphSdf.ts:generateImageSdf`).
+  (PNG / JPG / WebP / GIF / SVG); since #245 the worker only decodes the file
+  to an RGBA mask (longest edge capped at 1024 px) and passes it as
+  `WasmParams.image_mask_*` — the silhouetting (alpha threshold for
+  transparent images, otherwise a luminance threshold whose inside/outside
+  polarity is auto-detected by minority count) and the EDT → SDF conversion
+  happen in core (`image_rgba_to_sdf`, the same heuristic the CLI uses; the
+  JS twin `generateImageSdf` remains only for the A/B scaffold until PR-B).
   Color information is discarded — orber's monochrome pipeline keeps only
   the shape.
 
@@ -706,14 +718,23 @@ intermediate.
 
 Implementation notes:
 
-- The alpha render path is bit-for-bit the same render pipeline as the
-  background-filled path. The worker reuses the existing
-  `wasm.get_render_data(...)` output and only patches header word 3
-  (`bg.a` in 0..1) to `0` before calling `setRenderData`. Same `seed`,
-  same `spec`, same SDF, same shader — only the background plane changes.
-  This guarantees the alpha tile is the *same variation* as the visible
-  preview tile, just unfilled.
-- Encoders: `OffscreenCanvas.convertToBlob({type:'image/png'})` and
+- The alpha render path is the same render pipeline as the
+  background-filled path. Since #245 the worker passes
+  `transparent_background: true` in `WasmParams`, which zeroes the resolved
+  background alpha inside wasm (orb pack header word 3 **and**
+  `AnimateOptions.background[3]` — the wasm-entry version of the old
+  worker-side header patch). Same `seed`, same `spec`, same SDF, same
+  shader — only the background plane changes. This guarantees the alpha
+  tile is the *same variation* as the visible preview tile, just unfilled.
+- Read-out: WebGPU canvases cannot return straight alpha (`opaque` discards
+  it, `premultiplied` mismatches the shader's straight-alpha output), so the
+  worker calls `gpu_render_rgba(t)` — an async wasm read-back that renders to
+  an internal texture and maps the bytes — and converts the RGBA to
+  PNG / WebP via a 2D scratch canvas (`putImageData` → `convertToBlob`).
+  Alpha bytes survive exactly; RGB of partially transparent pixels may shift
+  by a quantum through the 2D canvas premultiply round-trip (the composited
+  product rgb×a is preserved at u8 precision, so visually identical).
+- Encoders: `convertToBlob({type:'image/png'})` and
   `convertToBlob({type:'image/webp', quality:0.9})` for stills; for videos
   the worker renders each frame as a transparent PNG (`renderAlphaFrames`
   RPC, frames streamed to main via Transferable `alphaFrame` messages)
