@@ -2,9 +2,9 @@
 //!
 //! 時間 `t ∈ [0, 1]` における各 orb の位置・呼吸・回転・色割当を決定論的に算出する。
 //! `t = 0` と `t = 1` は同一状態に収束する完全ループ。#225 で CPU のピクセル
-//! 描画は撲滅され、実描画は GPU(WGSL, [`crate::gpu`]) と web(WebGL) が担う。本モジュールは
-//! 両者が共有する **算術と pack** だけを提供する（[`pack_render_data_for_webgl`] /
-//! [`precompute_orb_params`] / [`aquarelle_modulated_clusters`]）。
+//! 描画は撲滅され、実描画は GPU(WGSL, [`crate::gpu`]) がネイティブ CLI と Web wasm の
+//! 両方で担う。本モジュールはそれらが共有する **算術と pack** だけを提供する
+//! （[`pack_render_data`] / [`precompute_orb_params`] / [`aquarelle_modulated_clusters`]）。
 //!
 //! # コンセプト
 //!
@@ -30,7 +30,7 @@
 //! - 呼吸揺らぎは **3 軸独立**で sin。半径 ±10% / blur ±15% / opacity ±5%、
 //!   それぞれ別位相。動画全体で各 1 周。
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・count で
-//!   100% 同一の per-orb 列が返る（GPU / WebGL の決定論性の根拠）。
+//!   100% 同一の per-orb 列が返る（GPU(WGSL) 描画の決定論性の根拠）。
 
 use crate::cluster::{Centroid, Cluster};
 use crate::color_track::interpolate_color_track;
@@ -156,7 +156,7 @@ pub struct AnimateOptions {
     /// で時刻 `t` の補間値に動的に上書きされる。`color_tracks` (#7) と排他で、
     /// 両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の上位互換）。
     /// `None` のときは `color_tracks` に従う。
-    /// WebGL 経路 (`pack_render_data_for_webgl`) は keyframe_tracks を見ない。
+    /// pack 経路 ([`pack_render_data`]) は keyframe_tracks を見ない。
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
@@ -315,11 +315,13 @@ fn unit_from_hash(x: u64) -> f32 {
     bits as f32 / ((1u32 << 24) as f32)
 }
 
-/// WebGL / wasm 向けに per-orb render data を詰めた Float32 words を返す。
+/// per-orb render data を詰めた Float32 words を返す（ネイティブ GPU / CLI と
+/// Web wasm が共有する正規 pack ヘルパ）。
 ///
-/// `orber-wasm` が shape / softness / rotation を CPU 経路と同じ決定論性で
-/// WebGL へ渡すための purpose-built helper。内部 RNG 列や `OrbParams` の
-/// レイアウトは公開しない。
+/// shape / softness / rotation を CPU 経路と同じ決定論性で GPU(WGSL) 描画へ
+/// 渡すための purpose-built helper。内部 RNG 列や `OrbParams` のレイアウトは
+/// 公開しない。#247 で旧称 `pack_render_data_for_webgl` から改名（WebGL レンダラ
+/// 撤去後、これは core GPU / CLI の正規 pack ヘルパであり WebGL 専用ではない）。
 ///
 /// `glyph_rotate` (#136): `false` を渡すと shader 側で per-orb 回転を抑止し、
 /// 全 t で `base_angle` のまま描く。Circle 経路には影響しない。
@@ -330,11 +332,10 @@ fn unit_from_hash(x: u64) -> f32 {
 /// 受けない。
 ///
 /// `shadow_strength` (#241): orb 機構（orb / glyph / image）の最外周フェードの
-/// rgb 暗化強度（0..1、header[13]）。0..1 にクランプして詰める。WGSL（gpu.rs）が
+/// rgb 暗化強度（0..1、`header[13]`）。0..1 にクランプして詰める。WGSL（gpu.rs）が
 /// Params uniform に読む（#241 で追加された word）。
-#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn pack_render_data_for_webgl(
+pub fn pack_render_data(
     clusters: &[Cluster],
     bg: [u8; 4],
     base_radius_unit: f32,
@@ -482,8 +483,9 @@ fn glyph_rotation_angle(
 
 /// `count` の上限。万一おかしな値が来てもメモリ枯渇しないように防衛。
 ///
-/// GPU 経路 (#207) も同じ上限で n_orbs を clamp するため `pub`。WebGL 経路の
-/// `GL_RENDERER_MAX_ORBS`(=64) とは別の、アニメーション側の絶対上限。
+/// GPU 経路 (#207) も同じ上限で n_orbs を clamp するため `pub`。wasm 供給系の
+/// `GL_RENDERER_MAX_ORBS`(=64、旧固定 uniform-array レンダラ由来) とは別の、
+/// アニメーション側の絶対上限。
 pub const MAX_ORB_COUNT: usize = 1024;
 
 /// `seed` / `count` / `clusters.weight` から決定的に算出した per-orb パラメータ列。
@@ -565,7 +567,7 @@ fn modulate_aquarelle_clusters(
 }
 
 /// GPU Aquarelle 経路（#216）が per-orb の変調済み cluster 列を得るための
-/// `#[doc(hidden)]` シーム。`pack_render_data_for_webgl` と同様、内部の `OrbParams`
+/// `#[doc(hidden)]` シーム。[`pack_render_data`] と同様、内部の `OrbParams`
 /// レイアウトや RNG 列は公開しない。
 ///
 /// 返り値の index は `gpu::GpuRenderer::render_frame_aquarelle` の per-orb 描画順
@@ -843,7 +845,7 @@ mod tests {
             weight: 1.0,
         }];
         let pack_with = |s: f32| {
-            pack_render_data_for_webgl(
+            pack_render_data(
                 &clusters,
                 [0, 0, 0, 255],
                 32.0,

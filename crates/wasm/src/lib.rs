@@ -8,10 +8,6 @@
 //!
 //! CPU 描画は撲滅され、wasm は **データ供給と WGSL canvas 描画**を担う。
 //!
-//! - `get_render_data`: バッチ `spec_idx` 番目の per-orb 決定論データ（色 / phase /
-//!   呼吸位相 / cross_axis / style / speed_mult / 回転 + ヘッダ）を `Float32Array`
-//!   1 本にパックして返す。この JS 返し pack は #245 以降は本番導線から未使用だが、
-//!   下記 WGSL canvas-present 経路と同じ spec 解決を共有するため温存している。
 //! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
 //! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
 //!
@@ -19,27 +15,40 @@
 //!
 //! [`gpu`] モジュール（wasm32 専用）が `gpu_init` / `gpu_set_render_data` /
 //! `gpu_render` / `gpu_resize` を公開する。spec / preset / kmeans の解決は
-//! `get_render_data`（WebGL）と同一経路（[`resolve_frame`]）を共有し、#231 で
-//! orb / glyph / image / aquarelle の 4 shape を `OrbShape` まで解決して
-//! [`build_gpu_render_inputs`] が clusters + `AnimateOptions`（+ orb 用 pack）を
-//! 構築する。描画は orber-core の `GpuRenderer`（WGSL）が `opts.shape` 別の
-//! `render_packed_to_view` / `render_frame_*_to_view` で canvas surface の frame view に
-//! 直接行う。WebGPU 必須・fallback 無し（#207 方針）。
+//! [`resolve_frame`] に集約し、#231 で orb / glyph / image / aquarelle の 4 shape を
+//! `OrbShape` まで解決して [`build_gpu_render_inputs`] が clusters +
+//! `AnimateOptions`（+ orb 用 pack）を構築する。描画は orber-core の
+//! `GpuRenderer`（WGSL）が `opts.shape` 別の `render_packed_to_view` /
+//! `render_frame_*_to_view` で canvas surface の frame view に直接行う。
+//! WebGPU 必須・fallback 無し（#207 方針）。
 
+// #247: MAX_DIM を読む validate_params は供給系（wasm32 / test 限定）に閉じたため対象外化。
+#[cfg(any(target_arch = "wasm32", test))]
 const MAX_DIM: u32 = 8192;
 
-use orber_core::animate::{
-    pack_render_data_for_webgl, MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT,
-};
+use orber_core::animate::{MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
+// core の pack ヘルパは #247 で pack_render_data に改名されたが、wasm 側にも同名の
+// 薄いラッパ（下記）があるため import せず完全修飾 orber_core::animate::pack_render_data
+// で呼んで名前衝突を避ける。
 // AnimateOptions / image_rgba_to_sdf / Arc は GPU(WGSL) 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::animate::AnimateOptions;
-use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
+use orber_core::cluster::Cluster;
+// kmeans 系（derive_background_rgba / drop_dominant / extract_clusters）は供給系
+// get_or_build_clusters（wasm32 / test 限定）からのみ使う（#247）。
+#[cfg(any(target_arch = "wasm32", test))]
+use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters};
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::glyph::image_rgba_to_sdf;
 use orber_core::glyph::{has_glyph, render_glyph_sdf, GlyphFontId};
+// OrbShape / AquarelleParams は形状解決（parse_shape / resolve_orb_shape、wasm32 / test
+// 限定）からのみ使う（#247）。
+#[cfg(any(target_arch = "wasm32", test))]
 use orber_core::orb::{AquarelleParams, OrbShape};
 use orber_core::style::SoftnessPreset;
+// spec 再構築・video 領域の固定割当（供給系 resolve_frame / spec_idx ヘルパ、
+// wasm32 / test 限定）からのみ使う（#247）。
+#[cfg(any(target_arch = "wasm32", test))]
 use orber_core::variations::{
     random_batch_specs, VariationSpec, GUI_VIDEO_COUNT_DEFAULT, GUI_VIDEO_DIRECTIONS,
     GUI_VIDEO_SPEEDS,
@@ -59,6 +68,10 @@ use wasm_bindgen::prelude::*;
 pub mod gpu;
 
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
+/// #247: get_render_data 撤去後、この定数を読む供給系（resolve_frame）は
+/// WGSL canvas-present（wasm32）と test だけ。native build では対象外にして
+/// dead_code を避ける（後続の供給系ヘルパも同方針）。
+#[cfg(any(target_arch = "wasm32", test))]
 const MAX_ORB_COUNT: usize = 1024;
 
 /// per-orb pack の本数の上限（旧来の固定 uniform-array レンダラ由来の 64）。
@@ -66,6 +79,8 @@ const MAX_ORB_COUNT: usize = 1024;
 /// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
 /// WGSL canvas-present 経路はデータテクスチャ経路なのでこの上限を必要としないが、
 /// GUI の count 上限（high=30）を十分上回るため当面同一バリデーションで揃えておく。
+/// #247: 読む経路（resolve_frame）が wasm32 / test 限定になったため同様に対象外化。
+#[cfg(any(target_arch = "wasm32", test))]
 const GL_RENDERER_MAX_ORBS: usize = 64;
 
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
@@ -157,8 +172,8 @@ pub struct WasmParams {
     /// WebGL フォールバックと同じ設計＝「ユーザーが入れた字を尊重して描画する」）。非空なら
     /// `resolve_orb_shape` がこの SDF をシルエットとして [`OrbShape::Image`] に解決する
     /// （core 統一機構では glyph も image も同じ SDF 経路、#235）。空なら従来どおり core
-    /// フォント経路（[`OrbShape::Glyph`]）。WebGL 経路（`get_render_data`）はこの
-    /// フィールドを使わない（不変）。
+    /// フォント経路（[`OrbShape::Glyph`]）。spec / preset を解決する [`resolve_frame`] は
+    /// このフィールドを読まない（不変）。
     #[serde(default)]
     pub glyph_sdf: Vec<u8>,
     /// `glyph_sdf` の一辺サイズ（px、#231）。`glyph_sdf.len() == glyph_sdf_size *
@@ -221,6 +236,7 @@ pub fn shadow_strength_default() -> f32 {
 /// - `mid` => `Slow`
 /// - `fast` => `Mid`
 /// - `Fast` は CLI 専用に格下げされ、GUI では露出しない。
+#[cfg(any(target_arch = "wasm32", test))]
 fn parse_speed_preset(s: &str) -> Result<Option<MotionSpeed>, String> {
     match s {
         // identity: spec.speed / GUI_VIDEO_SPEEDS を温存
@@ -237,6 +253,7 @@ fn parse_speed_preset(s: &str) -> Result<Option<MotionSpeed>, String> {
 /// Phase B (#55): count preset 文字列を絶対値に変換。`""` は `Ok(None)` で
 /// 「上書きしない（spec.count を使う）」を意味する。値は GUI 仕様に合わせて
 /// low=10 / mid=20 / high=30 で固定。
+#[cfg(any(target_arch = "wasm32", test))]
 fn parse_count_preset(s: &str) -> Result<Option<usize>, String> {
     match s {
         "" => Ok(None),
@@ -251,6 +268,7 @@ fn parse_count_preset(s: &str) -> Result<Option<usize>, String> {
 
 /// Phase B (#55): softness preset 文字列を `SoftnessPreset` に変換。空文字 /
 /// "mid" は既存挙動と完全同値の `Mid`。
+#[cfg(any(target_arch = "wasm32", test))]
 fn parse_softness_preset(s: &str) -> Result<SoftnessPreset, String> {
     match s {
         "" | "mid" => Ok(SoftnessPreset::Mid),
@@ -281,6 +299,7 @@ fn first_char_of(s: &str) -> Result<char, String> {
 /// [`resolve_orb_shape`] で解決する（`parse_shape` の引数は文字列だけなので image を
 /// 直接扱えない）。`parse_shape` 内で `"image"` を受けると Err にして、必ず
 /// `resolve_orb_shape` 経由を強制する。
+#[cfg(any(target_arch = "wasm32", test))]
 fn parse_shape(s: &str, glyph_char: &str, aquarelle: AquarelleParams) -> Result<OrbShape, String> {
     match s {
         "orb" => Ok(OrbShape::Orb),
@@ -426,37 +445,7 @@ fn aquarelle_params(p: &WasmParams) -> AquarelleParams {
     }
 }
 
-/// WebGL fragment shader 用の shape_id を返す (#172 N2)。
-///
-/// per-orb pack は SDF を持たない（SDF は web が WebGL に直接 upload する）ので、
-/// wasm 側が形状について返すのは shape_id（0=Orb / 1=Glyph・Image）だけで足りる。
-///
-/// - `"image"` (#217): char は不要。web が画像から生成した SDF テクスチャを upload
-///   するため、wasm は SDF を持たず Glyph と同じ SDF サンプル経路に乗せるだけ。
-///   shape_id=1 を直接返す（従来 web が glyph+ダミー字で得ていた値と同一）。
-/// - `"aquarelle"` (#231): WebGL 経路には存在しない shape。WGSL canvas-present
-///   経路（[`gpu`] モジュール）専用なので、ここでは明確に Err で reject する
-///   （`parse_shape` 経由で silent に orb 扱いされるのを防ぐ）。
-/// - それ以外: `parse_shape` に委譲して OrbShape へマップする。これにより
-///   `glyph` の glyph_char 必須バリデーションや不正 shape の reject が維持される。
-fn webgl_shape_id(shape: &str, glyph_char: &str) -> Result<f32, String> {
-    if shape == "image" {
-        return Ok(1.0);
-    }
-    if shape == "aquarelle" {
-        return Err(
-            "shape 'aquarelle' is not available on the WebGL path (WGSL canvas-present only, #231)"
-                .to_string(),
-        );
-    }
-    // aquarelle は上で弾いたので、ここに渡す params は使われない（default で十分）。
-    match parse_shape(shape, glyph_char, AquarelleParams::default())? {
-        OrbShape::Orb => Ok(0.0),
-        OrbShape::Glyph { .. } => Ok(1.0),
-        _ => Ok(0.0),
-    }
-}
-
+#[cfg(any(target_arch = "wasm32", test))]
 fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
     let rgb = std::mem::take(&mut p.source_rgb);
     image::RgbImage::from_raw(p.source_width, p.source_height, rgb).ok_or_else(|| {
@@ -480,6 +469,7 @@ fn build_source_image(p: &mut WasmParams) -> Result<image::RgbImage, String> {
 /// ラッパで `Sync`/`Send` を手動 impl する（unsafe 境界は **このラッパ
 /// 1 か所だけ**に閉じ込める）。worker を複数起動しても各 worker は独立した
 /// wasm モジュールインスタンスを持つので static 共有は発生しない。
+#[cfg(any(target_arch = "wasm32", test))]
 struct CachedClusters {
     fingerprint: u64,
     clusters_full: Vec<Cluster>,
@@ -510,11 +500,13 @@ impl<T> WasmSingleThreadCell<T> {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn source_cache() -> &'static WasmSingleThreadCell<Option<CachedClusters>> {
     static CELL: OnceLock<WasmSingleThreadCell<Option<CachedClusters>>> = OnceLock::new();
     CELL.get_or_init(|| WasmSingleThreadCell::new(None))
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
     // 完全一致は不要。長さ + dims + k + 4 隅サンプルで衝突は実用上ゼロ。
     let mut acc: u64 = 0xcbf29ce484222325; // FNV offset basis
@@ -539,8 +531,10 @@ fn fingerprint(rgb: &[u8], w: u32, h: u32, k: usize) -> u64 {
 ///
 /// レビュー S1: `static mut SOURCE_CACHE` を `OnceLock<WasmSingleThreadCell<...>>`
 /// 経由に切り替え。`unsafe` ブロックも `#[allow(static_mut_refs)]` も不要になる。
+#[cfg(any(target_arch = "wasm32", test))]
 type ClustersBundle = (Vec<Cluster>, [u8; 4], Vec<Cluster>);
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
     let fp = fingerprint(&p.source_rgb, p.source_width, p.source_height, p.k);
     {
@@ -566,6 +560,9 @@ fn get_or_build_clusters(p: &mut WasmParams) -> Result<ClustersBundle, String> {
     Ok((clusters_full, bg, clusters))
 }
 
+// #247: JsValue を受ける入口。呼び出し元は `gpu` モジュール（wasm32 専用）だけに
+// なったため wasm32 限定でコンパイルする（native では JsValue 経路自体が無い）。
+#[cfg(target_arch = "wasm32")]
 fn deserialize_params(params_js: JsValue) -> Result<WasmParams, String> {
     let p: WasmParams = serde_wasm_bindgen::from_value(params_js)
         .map_err(|e| format!("failed to parse params: {e}"))?;
@@ -573,6 +570,7 @@ fn deserialize_params(params_js: JsValue) -> Result<WasmParams, String> {
     Ok(p)
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn validate_params(p: &WasmParams) -> Result<(), String> {
     if !p.seed.is_finite() || p.seed < 0.0 {
         return Err(format!(
@@ -630,7 +628,8 @@ fn err_to_js(s: String) -> JsError {
 /// そのまま使い、動画タイル領域 (`spec_idx >= still_count`) では
 /// `GUI_VIDEO_DIRECTIONS` の対応 index で上書きする。これにより GUI 経路
 /// では動画 4 枚に LR/RL/TB/BT が 1 枚ずつ重複なく割り当てられる。
-/// `get_render_data` から呼ばれ、各 spec_idx の direction を決める。
+/// [`resolve_frame`] から呼ばれ、各 spec_idx の direction を決める。
+#[cfg(any(target_arch = "wasm32", test))]
 fn direction_for_spec_idx(
     spec_idx: usize,
     still_count: usize,
@@ -652,7 +651,8 @@ fn direction_for_spec_idx(
 /// 動画 4 枚は VerySlow / Slow / VerySlow / Slow と必ずばらけて、
 /// 「4 つ全部速い / 全部遅い」のガチャ感低下を防ぐ (#77)。
 ///
-/// `direction_for_spec_idx` と同じ責務分担で、`get_render_data` から呼ばれる。
+/// `direction_for_spec_idx` と同じ責務分担で、[`resolve_frame`] から呼ばれる。
+#[cfg(any(target_arch = "wasm32", test))]
 fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec) -> MotionSpeed {
     if spec_idx >= still_count {
         let video_idx = spec_idx - still_count;
@@ -663,111 +663,12 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
     }
 }
 
-/// バッチ N 枚のうち `spec_idx` 番目の描画に必要な per-orb データをパックして返す。
-///
-/// core で per-orb の決定論パラメータと clusters / 背景色を計算し、Float32Array
-/// 1 本にエンコードして JS に渡す。GPU 側（WebGL2 fragment shader）で各 t における
-/// フレームを per-pixel ループ + Source-Over 合成で描く（#225 で CPU 描画は撲滅。
-/// wasm の担務はこのデータ供給と `get_glyph_sdf`、および #230 の WebGPU canvas
-/// present 経路（[`gpu`] モジュール。pack 構築は [`build_render_pack`] を共有））。
-///
-/// `random_batch_specs(seed, total, still_count)` で spec 列を再構築するので、
-/// `spec_idx` 番目の spec / direction / speed / count / orb_size / blur / seed は
-/// バッチ全体で決定論的に一致する。
-///
-/// per-orb の rng シーケンスは `orber_core::animate::generate_orb_params`
-/// をそのまま使うので、core 側アニメーションと同じ seed なら同じ
-/// (phase, phi_radius, phi_blur, phi_opacity, cross_axis, style, cluster_idx,
-/// speed_mult, base_angle, rot_speed_signed) が得られる。
-///
-/// # Float32Array レイアウト
-///
-/// `[0..16]` ヘッダ:
-/// - `[0..4]`: 背景 RGBA (0..1 正規化)
-/// - `[4]`: base_radius_unit (px) = `min(w, h) * 0.25 * orb_size`
-/// - `[5]`: base_blur (0..1) — `(spec.blur + softness.blur_offset()).clamp(0,1)` で
-///   softness 軸を反映済み
-/// - `[6]`: direction_id (0=LR, 1=RL, 2=TB, 3=BT)
-/// - `[7]`: cycle_count (1 = VerySlow, 2 = Slow, 3 = Mid, 4 = Fast)
-/// - `[8]`: n_orbs (整数を f32 として)
-/// - `[9]`: softness_alpha_mul (0..1) — Phase B (#55)。Mid なら 0.55 (#205 後)
-/// - `[10]`: shape_id (0=Orb, 1=Glyph/Image) — Phase B (#55) / #172 N2。
-///   Image は web が SDF を upload するため Glyph と同じ shape_id=1 に乗る。
-/// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
-/// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
-/// - `[13]`: shadow_strength (orb 機構の最外周フェード rgb 暗化強度、0..1) — #241。
-///   WGSL（gpu.rs）が読む（#241 で追加された word）
-/// - `[14..16]`: 予約（0 詰め）
-///
-/// `[16 + 16*i ..]` per orb i:
-/// - `[+0..+3]`: color_rgb (0..1)
-/// - `[+3]`: cluster_weight (0..1)
-/// - `[+4]`: phase (0..1)
-/// - `[+5]`: phi_radius (0..2π)
-/// - `[+6]`: phi_blur (0..2π)
-/// - `[+7]`: phi_opacity (0..2π)
-/// - `[+8]`: cross_axis (0..1)
-/// - `[+9]`: style_bit (0=rim, 1=soft)
-/// - `[+10]`: speed_mult (1..3)
-/// - `[+11]`: base_angle (0..2π)
-/// - `[+12]`: rot_speed_signed (±1..±3)
-/// - `[+13..+16]`: 予約（0 詰め）
-#[wasm_bindgen]
-pub fn get_render_data(
-    params_js: JsValue,
-    n: u32,
-    spec_idx: u32,
-) -> Result<js_sys::Float32Array, JsError> {
-    let p = deserialize_params(params_js).map_err(err_to_js)?;
-    let buf = build_render_pack(p, n, spec_idx).map_err(err_to_js)?;
-    Ok(js_sys::Float32Array::from(buf.as_slice()))
-}
-
-/// [`get_render_data`] の本体（JS 型変換を除いた純粋部分）。#230 で WebGPU
-/// canvas present 経路（[`gpu`] モジュールの `gpu_set_render_data`）と共有する
-/// ために切り出した。挙動は従来の `get_render_data` と完全同一: spec 列の
-/// 決定論的再構築・preset 上書き・kmeans キャッシュ・`GL_RENDERER_MAX_ORBS`
-/// の早期エラーまで全部ここにある（WebGL / WebGPU で同じ pack・同じ制限を
-/// 共有する。WGSL 側はデータテクスチャ経路で 64 上限が不要だが、GUI の
-/// count 上限 30 を大きく下回るため、Phase 3 で WebGL を撤去するまでは
-/// 同一バリデーションで揃えておく）。
-fn build_render_pack(p: WasmParams, n: u32, spec_idx: u32) -> Result<Vec<f32>, String> {
-    // Phase B (#55) / #172 N2: shape = "orb" | "glyph" | "image"。
-    // glyph_char は Glyph のときに必須（image は char 不要）。webgl_shape_id が
-    // 形状に応じた shape_id を返しつつ glyph のバリデーションを維持する。
-    // aquarelle は WebGL 経路に存在しないため webgl_shape_id が Err で reject する。
-    let shape_id = webgl_shape_id(&p.shape, &p.glyph_char)?;
-    let resolved = resolve_frame(p, n, spec_idx)?;
-
-    // shape_id は webgl_shape_id で算出済み（Orb=0 / Glyph・Image=1）。#172 N2 で
-    // image を wasm 入口へ直接受けるようになり、web 側のダミー glyph_char 受け渡しは廃止。
-    // image の SDF は web が WebGL に upload するので、wasm は Glyph と同じ shape_id=1 に
-    // 乗せて同一の SDF サンプル経路で描かせる（描画結果は従来と不変）。
-    let buf = pack_render_data(
-        &resolved.clusters,
-        resolved.bg,
-        resolved.base_radius_unit,
-        resolved.base_blur,
-        resolved.direction_id,
-        resolved.cycle,
-        resolved.spec_seed,
-        resolved.n_orbs,
-        resolved.alpha_mul,
-        shape_id,
-        resolved.glyph_rotate,
-        resolved.edge_softness,
-        resolved.shadow_strength,
-    );
-
-    Ok(buf)
-}
-
 /// WGSL canvas-present 経路（`gpu::gpu_set_render_data`）が保持する解決済み入力（#231）。
 ///
 /// `clusters` + `opts` を core の `render_frame_*_to_view`（shape 別）へそのまま渡す。
 /// `pack` は **orb shape 専用**: orb の見た目を #230 から一切変えないため、orb は
-/// pack 経由の `render_packed_to_view` を温存する（pack は WebGL と共有の
-/// `pack_render_data_for_webgl` 出力で、saturation を焼かない＝web に saturation ノブが
+/// pack 経由の `render_packed_to_view` を温存する（pack は core の
+/// `pack_render_data` 出力で、saturation を焼かない＝web に saturation ノブが
 /// 無いのと整合する。core の `render_frame_to_view` は saturation を再適用するため、
 /// 万一の HSL 往復誤差で #230 と差が出るのを避ける狙い）。glyph / image / aquarelle は
 /// `opts` 経由で core の専用経路に乗せる。
@@ -815,11 +716,11 @@ impl ResolvedFrame {
     }
 }
 
-/// WGSL canvas-present 経路の入力を構築する（#231）。`build_render_pack` と同じ
-/// `resolve_frame` で spec / preset / kmeans を解決し、形状は `resolve_orb_shape` で
+/// WGSL canvas-present 経路の入力を構築する（#231）。[`resolve_frame`] で
+/// spec / preset / kmeans を解決し、形状は `resolve_orb_shape` で
 /// 全 shape（orb / glyph / image / aquarelle）に解決する。
 ///
-/// orb の pack は `build_render_pack` と同じ shape_id=0.0 で焼く（#230 と同一バイト列）。
+/// orb の pack は shape_id=0.0 で焼く（#230 / #242 のルックを温存する固定バイト列）。
 /// glyph / image / aquarelle は `opts` で core の専用経路に分岐させる（pack は未使用だが、
 /// orb 用に常に作っておく＝分岐は描画時 1 箇所だけにする）。
 #[cfg(any(target_arch = "wasm32", test))]
@@ -834,7 +735,7 @@ fn build_gpu_render_inputs(
     let shape = resolve_orb_shape(&mut p)?;
     let resolved = resolve_frame(p, n, spec_idx)?;
 
-    // orb pack は WebGL と同一の pack_render_data_for_webgl（shape_id=0.0）。
+    // orb pack は shape_id=0.0 の固定バイト列（#230 / #242 のルックを温存）。
     // #230 の `render_packed_to_view` 経路をそのまま温存するための pack。
     let pack = pack_render_data(
         &resolved.clusters,
@@ -860,14 +761,14 @@ fn build_gpu_render_inputs(
     })
 }
 
-/// `build_render_pack`（WebGL 経路）と `build_gpu_render_inputs`（WGSL canvas-present
-/// 経路）が共有する「1 タイルの決定論解決」結果（#231 で切り出し）。
+/// `build_gpu_render_inputs`（WGSL canvas-present 経路）が使う「1 タイルの
+/// 決定論解決」結果（#231 で切り出し）。
 ///
 /// spec 列の再構築・preset 上書き・kmeans キャッシュ・`GL_RENDERER_MAX_ORBS` の
-/// 早期エラーまでを 1 か所に集約し、WebGL は `pack_render_data` でバイト列に、WGSL は
-/// [`AnimateOptions`] + clusters に組み替えるだけにする。spec 解決ロジックを二重実装
-/// しないことで、`build_render_pack_is_deterministic_for_same_inputs` 等のテストが
-/// 守る WebGL 出力の不変性を WGSL 経路でも自動的に共有する。
+/// 早期エラーまでを 1 か所に集約し、WGSL は [`AnimateOptions`] + clusters
+/// （+ orb 用 pack）に組み替えるだけにする。spec 解決ロジックを 1 か所に集約
+/// することで、`build_gpu_render_inputs_*` のテストが守る pack / 入力の不変性を
+/// 単一の経路で保証する。
 ///
 /// 一部フィールド（direction / speed / softness / width / height / orb_size / blur /
 /// direction_id）は GPU 経路の `to_animate_options` だけが読む。native の `cargo build`
@@ -899,10 +800,11 @@ struct ResolvedFrame {
     blur: f32,
 }
 
-/// 1 タイルの spec / preset / kmeans / orb 数を解決する（WebGL・WGSL 共有、#231）。
+/// 1 タイルの spec / preset / kmeans / orb 数を解決する（WGSL canvas-present 経路、#231）。
 ///
-/// 形状解決（shape_id / OrbShape）は呼び出し側に委ねる: WebGL は `webgl_shape_id`、
-/// WGSL は `resolve_orb_shape`。本関数は形状非依存の per-orb スカラだけを返す。
+/// 形状解決（OrbShape）は呼び出し側（`build_gpu_render_inputs` の `resolve_orb_shape`）
+/// に委ねる。本関数は形状非依存の per-orb スカラだけを返す。
+#[cfg(any(target_arch = "wasm32", test))]
 fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFrame, String> {
     let count_override = parse_count_preset(&p.count_preset)?;
     let speed_override = parse_speed_preset(&p.speed_preset)?;
@@ -1001,10 +903,13 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
 /// core 側と共有の `generate_orb_params` 出力を使って、ヘッダ + per-orb
 /// フィールドを Float32 ベクタに詰める。
 ///
-/// WebGL path が core のアニメーションと別 RNG 列を持たないよう、乱数列は
-/// ここで再実装せず `orber_core::animate::generate_orb_params` に委譲する。
+/// wasm 経路が core のアニメーションと別 RNG 列を持たないよう、乱数列は
+/// ここで再実装せず `orber_core::animate::generate_orb_params` に委譲する
+/// （pack の本体は core の [`orber_core::animate::pack_render_data`]）。
 // TODO(orber#future): pack_render_data の引数が 12 個に達した (#205 で edge_softness 追加)。
 // Phase C で orb 形状軸が更に増えるなら struct で受けるリファクタを検討する。
+// #247: 唯一の呼び出し元 build_gpu_render_inputs が wasm32 / test 限定のため同様に対象外化。
+#[cfg(any(target_arch = "wasm32", test))]
 #[allow(clippy::too_many_arguments)]
 fn pack_render_data(
     clusters: &[Cluster],
@@ -1021,7 +926,8 @@ fn pack_render_data(
     edge_softness: f32,
     shadow_strength: f32,
 ) -> Vec<f32> {
-    pack_render_data_for_webgl(
+    // 完全修飾で呼ぶ（この関数自体が同名 `pack_render_data` のため import すると衝突する）。
+    orber_core::animate::pack_render_data(
         clusters,
         bg,
         base_radius_unit,
@@ -1180,7 +1086,7 @@ mod tests {
     }
 
     /// M1: count_preset='' のとき effective_count == spec.count を保つ。
-    /// `parse_count_preset` が `None` を返し、`get_render_data` 内で
+    /// `parse_count_preset` が `None` を返し、`resolve_frame` 内で
     /// `count_override.unwrap_or(spec.count)` がそのまま spec.count を採用する。
     #[test]
     fn count_preset_empty_or_unspecified_uses_spec_count() {
@@ -1200,7 +1106,7 @@ mod tests {
             speed_override.is_none(),
             "speed_preset='' must be identity (None)"
         );
-        // identity 経路: get_render_data の match arm が
+        // identity 経路: resolve_frame の match arm が
         // `speed_for_spec_idx(spec_idx, still_count, &spec)` を採用する。
         let still_count = 8;
         let total = 12;
@@ -1276,23 +1182,6 @@ mod tests {
         // #231: image は parse_shape では受けない（resolve_orb_shape 経由を強制）。
         assert!(parse_shape("image", "", aq).is_err());
         assert!(parse_shape("", "", aq).is_err());
-    }
-
-    /// #172 N2 / #231: webgl_shape_id が shape 文字列を直接 shape_id にマップする。
-    /// image は char 不要で 1.0、orb は 0.0、glyph は char 必須で 1.0。aquarelle は
-    /// WebGL に存在しないため Err。不正 shape / 空 glyph_char も Err。
-    #[test]
-    fn webgl_shape_id_maps_shapes() {
-        // image は glyph_char 不要で shape_id=1（Glyph と同じ SDF サンプル経路）。
-        assert_eq!(webgl_shape_id("image", "").unwrap(), 1.0);
-        assert_eq!(webgl_shape_id("orb", "").unwrap(), 0.0);
-        assert_eq!(webgl_shape_id("glyph", "☆").unwrap(), 1.0);
-        // glyph は glyph_char 必須。空はエラー（parse_shape のバリデーション維持）。
-        assert!(webgl_shape_id("glyph", "").is_err());
-        // #231: aquarelle は WebGL 経路に存在しないので reject。
-        assert!(webgl_shape_id("aquarelle", "").is_err());
-        // 不正 shape も parse_shape 経由で reject される。
-        assert!(webgl_shape_id("bogus", "").is_err());
     }
 
     /// #231: aquarelle_params が WasmParams の 4 フィールドをそのまま AquarelleParams に
@@ -1720,7 +1609,7 @@ mod tests {
             softness.edge_softness(),
             SHADOW_STRENGTH_DEFAULT,
         );
-        let expected = pack_render_data_for_webgl(
+        let expected = orber_core::animate::pack_render_data(
             &clusters,
             bg,
             (64f32.min(64.0)) * 0.25 * spec.orb_size.max(0.0),
@@ -1738,8 +1627,8 @@ mod tests {
         assert_eq!(buf, expected);
     }
 
-    /// #205: get_render_data の header[12] に softness.edge_softness() がそのまま
-    /// 入っていることを担保する。
+    /// #205: pack header[12] に softness.edge_softness() がそのまま
+    /// 入っていることを担保する（wasm pack_render_data ラッパ経由）。
     #[test]
     fn pack_render_data_header_includes_edge_softness() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1784,7 +1673,10 @@ mod tests {
         }
     }
 
-    // ---- #230: build_render_pack（WebGL / WebGPU 共有の pack 構築経路） ----
+    // ---- #230 / #247: build_gpu_render_inputs（WGSL canvas-present 経路）の
+    //      orb pack 不変条件。旧 WebGL 入口 build_render_pack の削除（#247）で、
+    //      この pack 契約は生きている WGSL 経路（build_gpu_render_inputs().pack）
+    //      に対するテストとして引き継ぐ ----
 
     /// #230 のテスト共通: kmeans が決定的に 2 クラスタへ収束する 2x2 赤/青
     /// ソース（`pack_render_data_matches_core_pack_helper` と同じソース）。
@@ -1802,17 +1694,21 @@ mod tests {
         p
     }
 
-    /// #230 (A1): `build_render_pack` は同一 params + n + spec_idx に対して
+    /// #230 (A1) → #247: orb pack は同一 params + n + spec_idx に対して
     /// 完全に決定論的（2 回呼んで `Vec<f32>` が要素単位で完全一致する）。
-    /// WebGL (`get_render_data`) と WebGPU (`gpu_set_render_data`) が同一の
-    /// pack を共有する前提（#232 の A/B 照合の土台）をここで固定する。
+    /// 生きている WGSL 経路（`gpu_set_render_data` が使う `build_gpu_render_inputs`）
+    /// の orb pack に対してこの不変条件を固定する。
     #[test]
-    fn build_render_pack_is_deterministic_for_same_inputs() {
+    fn gpu_orb_pack_is_deterministic_for_same_inputs() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let a = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        let a = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("gpu inputs should build")
+            .pack;
         // 注: 2 回目は cluster キャッシュヒット。kmeans 再計算の決定論は実証範囲外
         // （spec 再構築 / per-orb RNG / pack エンコードの leg は真に再実行される）。
-        let b = build_render_pack(small_source_params(), 12, 3).expect("pack should build");
+        let b = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("gpu inputs should build")
+            .pack;
         assert!(!a.is_empty(), "pack must not be empty");
         assert_eq!(
             a, b,
@@ -1820,34 +1716,36 @@ mod tests {
         );
     }
 
-    /// #230 (A2): spec_idx の範囲チェック境界。n=12（total=12）で 0 / 11 は
-    /// Ok、12 / 100 は Err。エラー文言は旧 `get_render_data`（JsError 時代）と
-    /// 同一の `"spec_idx {i} is out of range [0, {total})"` を一字一句維持する
-    /// （JsError → String 化リファクタで文言が変わっていないことの固定）。
+    /// #230 (A2) → #247: spec_idx の範囲チェック境界。n=12（total=12）で 0 / 11 は
+    /// Ok、12 / 100 は Err。エラー文言は `"spec_idx {i} is out of range [0, {total})"`
+    /// を一字一句維持する。境界検証は `resolve_frame` にあり、生きている WGSL 経路
+    /// （`build_gpu_render_inputs`）がそれを通すので、そちらに対して固定する。
     #[test]
-    fn build_render_pack_spec_idx_boundary_and_error_wording() {
+    fn gpu_render_inputs_spec_idx_boundary_and_error_wording() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Ok 側境界: 0（先頭）と 11（total - 1）。
-        assert!(build_render_pack(small_source_params(), 12, 0).is_ok());
-        assert!(build_render_pack(small_source_params(), 12, 11).is_ok());
+        assert!(build_gpu_render_inputs(small_source_params(), 12, 0).is_ok());
+        assert!(build_gpu_render_inputs(small_source_params(), 12, 11).is_ok());
         // Err 側境界: 12（== total）と範囲外 100。文言まで一致すること。
+        // GpuRenderInputs は Debug 非実装なので unwrap_err は使わず Err を直接取り出す。
         assert_eq!(
-            build_render_pack(small_source_params(), 12, 12).unwrap_err(),
-            "spec_idx 12 is out of range [0, 12)"
+            build_gpu_render_inputs(small_source_params(), 12, 12).err(),
+            Some("spec_idx 12 is out of range [0, 12)".to_string())
         );
         assert_eq!(
-            build_render_pack(small_source_params(), 12, 100).unwrap_err(),
-            "spec_idx 100 is out of range [0, 12)"
+            build_gpu_render_inputs(small_source_params(), 12, 100).err(),
+            Some("spec_idx 100 is out of range [0, 12)".to_string())
         );
     }
 
-    /// #230 (A4): still/video タイル境界（still_count = total -
+    /// #230 (A4) → #247: still/video タイル境界（still_count = total -
     /// GUI_VIDEO_COUNT_DEFAULT）。n=12 なら spec_idx 7 が最後の still、8 が
-    /// 最初の video。両方 pack が生成でき、count_preset="low" で n_orbs を
+    /// 最初の video。両方 orb pack が生成でき、count_preset="low" で n_orbs を
     /// 両者 10 に固定すれば長さは同一・内容は異なる（video 側は direction /
     /// speed が GUI_VIDEO_* 固定割当に切り替わり、spec 自体の seed も違う）。
+    /// 生きている WGSL 経路（`build_gpu_render_inputs`）の orb pack で固定する。
     #[test]
-    fn build_render_pack_still_video_boundary_same_len_different_content() {
+    fn gpu_orb_pack_still_video_boundary_same_len_different_content() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let total = 12u32;
         let still_count = total as usize - GUI_VIDEO_COUNT_DEFAULT; // 8
@@ -1858,10 +1756,12 @@ mod tests {
             p.count_preset = "low".into();
             p
         };
-        let last_still = build_render_pack(params_low(), total, (still_count - 1) as u32)
-            .expect("last still tile pack should build");
-        let first_video = build_render_pack(params_low(), total, still_count as u32)
-            .expect("first video tile pack should build");
+        let last_still = build_gpu_render_inputs(params_low(), total, (still_count - 1) as u32)
+            .expect("last still tile inputs should build")
+            .pack;
+        let first_video = build_gpu_render_inputs(params_low(), total, still_count as u32)
+            .expect("first video tile inputs should build")
+            .pack;
         assert_eq!(
             last_still.len(),
             first_video.len(),
@@ -1875,18 +1775,17 @@ mod tests {
 
     // ---- #231: build_gpu_render_inputs（WGSL canvas-present 経路の入力構築） ----
 
-    /// #231: orb shape の WGSL 入力。`pack` は `build_render_pack`（WebGL 経路）と
-    /// 同一バイト列（#230 の見た目を温存）であること、`opts.shape` が Orb であることを
-    /// 固定する。spec 解決は `resolve_frame` を共有するので、同一 params なら一致する。
+    /// #231: orb shape の WGSL 入力。`opts.shape` が Orb に解決され、orb pack が
+    /// 非空であることを固定する（#230 / #242 のルックを温存する shape_id=0.0 pack）。
     #[test]
-    fn build_gpu_render_inputs_orb_pack_matches_webgl_pack() {
+    fn build_gpu_render_inputs_orb_resolves_shape_and_packs() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let webgl = build_render_pack(small_source_params(), 12, 3).expect("webgl pack");
         let gpu = build_gpu_render_inputs(small_source_params(), 12, 3).expect("gpu inputs");
         assert!(matches!(gpu.opts.shape, OrbShape::Orb));
+        assert!(!gpu.pack.is_empty(), "orb pack must not be empty");
         assert_eq!(
-            gpu.pack, webgl,
-            "orb GPU pack must be byte-identical to the WebGL pack (#230 visuals unchanged)"
+            gpu.pack[10], 0.0,
+            "orb pack header shape_id must be 0 (Orb)"
         );
     }
 
@@ -1933,59 +1832,59 @@ mod tests {
         }
     }
 
-    /// #231: aquarelle は WebGL 経路（build_render_pack）では reject される
-    /// （webgl_shape_id が Err）。WGSL 経路だけが受ける。
+    /// #247: orb pack が `glyph_sdf` を読まない回帰ガード（旧 WebGL `build_render_pack`
+    /// の不変条件を、生きている WGSL 経路 `build_gpu_render_inputs` の `.pack` へ移植）。
+    /// shape="glyph" に有効な `glyph_sdf`（非空・16..=1024 サイズ・len 整合）を与えると
+    /// `opts.shape` は SDF シルエット経路（`OrbShape::Image`）に変わるが、orb pack
+    /// （header + per-orb スカラ）は `resolve_frame` 由来で glyph_sdf を一切読まないため、
+    /// glyph_sdf の有無で `.pack` は byte-identical でなければならない（漏れれば落ちる）。
     #[test]
-    fn build_render_pack_rejects_aquarelle() {
+    fn gpu_orb_pack_ignores_glyph_sdf() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = small_source_params();
-        p.shape = "aquarelle".into();
-        assert!(build_render_pack(p, 12, 0).is_err());
-    }
-
-    /// #231: WebGL 経路（`build_render_pack`）は `glyph_sdf` を一切読まない（回帰ガード）。
-    /// shape="glyph" + 有効な `glyph_sdf`（非空・16..=1024 サイズ・len 整合）を与えても、
-    /// glyph_sdf を空にした場合と pack が byte-identical であることを固定する。WebGL は
-    /// `webgl_shape_id`（shape + glyph_char のみ参照）と `resolve_frame`（glyph_sdf 非読）
-    /// で組み立てるため、JS フォールバック SDF は WGSL 経路（`build_gpu_render_inputs`）
-    /// 専用であり、WebGL 経路に漏れてはならない。漏れれば pack が変わってこのテストが落ちる。
-    #[test]
-    fn build_render_pack_ignores_glyph_sdf() {
-        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // glyph_sdf 無し（従来の WebGL glyph 経路）。
+        // glyph_sdf 無し（core フォント経路の glyph）。
         let mut without = small_source_params();
         without.shape = "glyph".into();
         without.glyph_char = "☆".into();
-        let pack_without = build_render_pack(without, 12, 0).expect("pack (no glyph_sdf)");
+        let pack_without = build_gpu_render_inputs(without, 12, 0)
+            .expect("inputs (no glyph_sdf)")
+            .pack;
 
-        // glyph_sdf 有り（WGSL 専用の JS フォールバック SDF を載せても WebGL は無視する）。
+        // glyph_sdf 有り（JS フォールバック SDF を載せると shape は Image に解決されるが、
+        // orb pack は glyph_sdf を読まないので不変）。
         let mut with = small_source_params();
         with.shape = "glyph".into();
         with.glyph_char = "☆".into();
         let size = 256u32;
         with.glyph_sdf_size = size;
         with.glyph_sdf = vec![128u8; (size * size) as usize];
-        let pack_with = build_render_pack(with, 12, 0).expect("pack (with glyph_sdf)");
+        let pack_with = build_gpu_render_inputs(with, 12, 0)
+            .expect("inputs (with glyph_sdf)")
+            .pack;
 
         assert_eq!(
             pack_without, pack_with,
-            "build_render_pack (WebGL) must be byte-identical with or without glyph_sdf"
+            "orb pack must be byte-identical with or without glyph_sdf (glyph_sdf is shape-only)"
         );
     }
 
     // ---- #245: transparent_background（透過 export の wasm 入口） ----
 
-    /// #245 (a): `transparent_background = true` は pack header word 3（bg.a）
+    /// #245 (a): `transparent_background = true` は orb pack header word 3（bg.a）
     /// **だけ**を 0 にする。他の全 word は不透過版と完全一致（旧 WebGL worker の
     /// `withTransparentBackground`＝「word 3 のみ 0 上書き」と同じ契約を wasm
-    /// 入口で固定する）。既定 `false` は従来とバイト列不変。
+    /// 入口で固定する）。既定 `false` は従来とバイト列不変。生きている WGSL 経路
+    /// （`build_gpu_render_inputs`）の orb pack で固定する（#247）。
     #[test]
     fn transparent_background_zeroes_only_pack_bg_alpha() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let opaque = build_render_pack(small_source_params(), 12, 3).expect("opaque pack");
+        let opaque = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("opaque inputs")
+            .pack;
         let mut p = small_source_params();
         p.transparent_background = true;
-        let transparent = build_render_pack(p, 12, 3).expect("transparent pack");
+        let transparent = build_gpu_render_inputs(p, 12, 3)
+            .expect("transparent inputs")
+            .pack;
         assert_eq!(opaque.len(), transparent.len());
         assert_ne!(opaque[3], 0.0, "derived bg must be opaque by default");
         assert_eq!(transparent[3], 0.0, "bg.a must be zeroed");
@@ -2369,13 +2268,17 @@ mod tests {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = small_source_params();
         p.transparent_background = true;
-        let transparent = build_render_pack(p, 12, 3).expect("transparent pack");
+        let transparent = build_gpu_render_inputs(p, 12, 3)
+            .expect("transparent inputs")
+            .pack;
         assert_eq!(
             transparent[3], 0.0,
             "first (transparent) build must have bg.a == 0"
         );
         // 2 回目: 同一 source（fingerprint 一致 = キャッシュヒット）の不透過 build。
-        let opaque = build_render_pack(small_source_params(), 12, 3).expect("opaque pack");
+        let opaque = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("opaque inputs")
+            .pack;
         assert_ne!(
             opaque[3], 0.0,
             "second (opaque) build must keep the cached bg opaque (cache must not be poisoned)"
