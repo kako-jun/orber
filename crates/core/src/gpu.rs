@@ -151,21 +151,32 @@ const PER_ORB_WORDS: usize = 16;
 /// #242 algorithm switch applies to every shape the template serves.
 const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 
+use crate::animate::BleedMode;
+
 /// The orb (analytic circle) variant of [`ORB_WGSL_TEMPLATE`]. No SDF bindings,
 /// no rotation; the DISTANCE SOURCE block inlines the analytic circle distance
 /// (`dist = distance(...); r = dist / radius`) — the same two lines the WebGL
 /// orb arm uses, so the orb output matches the legacy WebGL look (#242).
-/// Built once (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the resulting
-/// `&'static str` doubles as the stable pipeline-cache key.
-fn orb_wgsl() -> &'static str {
+/// Built once per [`BleedMode`] (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the
+/// resulting `&'static str` doubles as the stable pipeline-cache key. The bleed
+/// geometry (`//!ORB_AQUA_BLEED_GEOM`) is the only difference between the two
+/// modes; when no aqua params are set both compile to a shader whose additive
+/// layer is structurally inert (byte-identical to plain orb).
+fn orb_wgsl(mode: BleedMode) -> &'static str {
     use std::sync::OnceLock;
-    static ORB: OnceLock<String> = OnceLock::new();
-    ORB.get_or_init(|| {
+    static ORB_CONTINUOUS: OnceLock<String> = OnceLock::new();
+    static ORB_BLOB: OnceLock<String> = OnceLock::new();
+    let cell = match mode {
+        BleedMode::Continuous => &ORB_CONTINUOUS,
+        BleedMode::Blob => &ORB_BLOB,
+    };
+    cell.get_or_init(|| {
         ORB_WGSL_TEMPLATE
             .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_NONE)
             .replace("//!ORB_LOAD", ORB_LOAD_ORB)
             .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
             .replace("//!ORB_DISTANCE_SOURCE", ORB_DISTANCE_SOURCE_CIRCLE)
+            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom(mode))
     })
 }
 
@@ -176,17 +187,64 @@ fn orb_wgsl() -> &'static str {
 /// remap preserved). The DISTANCE SOURCE is the only difference from the orb
 /// variant; the falloff / breath / compositing are the **same** orb math, so
 /// glyph / image now blur exactly like orb (no bleed/halo). Built once (`OnceLock`).
-fn orb_sdf_wgsl() -> &'static str {
+fn orb_sdf_wgsl(mode: BleedMode) -> &'static str {
     use std::sync::OnceLock;
-    static SDF: OnceLock<String> = OnceLock::new();
-    SDF.get_or_init(|| {
+    static SDF_CONTINUOUS: OnceLock<String> = OnceLock::new();
+    static SDF_BLOB: OnceLock<String> = OnceLock::new();
+    let cell = match mode {
+        BleedMode::Continuous => &SDF_CONTINUOUS,
+        BleedMode::Blob => &SDF_BLOB,
+    };
+    cell.get_or_init(|| {
         ORB_WGSL_TEMPLATE
             .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_SDF)
             .replace("//!ORB_LOAD", ORB_LOAD_ORB_WITH_ROT)
             .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
             .replace("//!ORB_DISTANCE_SOURCE", ORB_DISTANCE_SOURCE_SDF)
+            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom(mode))
     })
 }
+
+/// #239 PoC: the WGSL fragment substituted into `//!ORB_AQUA_BLEED_GEOM`. Both
+/// arms add `bleed * term * orb_rgb` (and `bleed * term * k` to alpha) so they
+/// vanish when `bleed == 0` (the additive layer stays inert and the output is
+/// byte-identical to plain orb). The only difference is the geometry of `term`:
+/// `Continuous` reads the silhouette distance `r` (shape-following); `Blob` sums
+/// three seed-placed satellite blobs in `sample_px` space.
+fn aqua_bleed_geom(mode: BleedMode) -> &'static str {
+    match mode {
+        BleedMode::Continuous => ORB_AQUA_BLEED_CONTINUOUS,
+        BleedMode::Blob => ORB_AQUA_BLEED_BLOB,
+    }
+}
+
+/// A案 bleed: シルエット距離 `r` 駆動の連続にじみ。`r` は SDF では真の形状距離なので
+/// edge(`r=1`) の外側へ伸びる対称グラデがどんな形にも自動追従する。`bleed=0` で消える。
+const ORB_AQUA_BLEED_CONTINUOUS: &str = "\
+        let bleed_spread = 0.6;\n\
+        let bleed_term_a = max(0.0, 1.0 - abs(r - 1.0) / bleed_spread);\n\
+        add_rgb += bleed * bleed_term_a * orb_rgb;\n\
+        add_a += bleed * bleed_term_a * 0.45;";
+
+/// B案 bleed: per-orb seed(`phase`)由来の角度・距離で 3 衛星 blob を centroid(`center`)
+/// 起点に放射する。各衛星は `sample_px` 空間の円。非凸文字では blob が形外へ出ることが
+/// ある（#239 で意図的に blink 比較対象）。`bleed=0` で消える。
+const ORB_AQUA_BLEED_BLOB: &str = "\
+        var bleed_term_b = 0.0;\n\
+        for (var bs: u32 = 0u; bs < 3u; bs = bs + 1u) {\n\
+            let bf = f32(bs);\n\
+            let sat_ang = (phase + bf * 0.37) * TAU;\n\
+            let sat_dist = radius * (0.45 + 0.2 * fract(phase * 3.0 + bf));\n\
+            let sat_rad = radius * (0.25 + 0.15 * fract(phase * 7.0 + bf)) * (0.5 + 0.5 * bleed);\n\
+            let sc = center + vec2<f32>(cos(sat_ang), sin(sat_ang)) * sat_dist;\n\
+            var sd = 2.0;\n\
+            if (sat_rad > 0.0) {\n\
+                sd = distance(sample_px, sc) / sat_rad;\n\
+            }\n\
+            bleed_term_b += max(0.0, 1.0 - sd);\n\
+        }\n\
+        add_rgb += bleed * bleed_term_b * orb_rgb;\n\
+        add_a += bleed * bleed_term_b * 0.4;";
 
 /// No extra bindings (orb variant): the analytic circle needs only the params
 /// uniform (0) and the orb data-texture (1) the template already declares.
@@ -353,6 +411,18 @@ struct Params {
     /// removed Skia-lowp rgb→0 fade. Read from pack header[13]; every shape on the
     /// unified template (orb / glyph / image) gets it, aquarelle does not.
     shadow_strength: f32,
+    // row 5: aquarelle bleed params (#239 PoC) — the additive layer's 4 sliders.
+    /// #239 PoC: aquarelle にじみ 4 パラメータ（各 0..1）を統一機構の上の加算レイヤーへ
+    /// 流す。全 4 値 0 のとき WGSL の `additive_bleed` は 0 を返し、出力は plain orb と
+    /// byte 一致する（非回帰ゲート）。aquarelle 以外の shape の既存描画では
+    /// `pack_orb_frame` / `pack_sdf_frame` が 0 を入れるので不変。A/B の幾何差は
+    /// シェーダ variant（`//!ORB_AQUA_BLEED_GEOM` 置換）で表すので mode フラグは持たない。
+    aqua_bleed: f32,
+    aqua_bloom: f32,
+    aqua_offset: f32,
+    aqua_halo: f32,
+    // WGSL rounds the uniform struct up to a 16-byte row boundary; `aqua_halo` ends
+    // at byte 84, so pad to 96 to match the shader's expected binding size.
     _pad: [f32; 3],
 }
 
@@ -1018,7 +1088,10 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         let pack = Self::pack_orb_frame(clusters, opts, width, height);
-        self.render_packed(&pack, width, height, t)
+        // #239 PoC: `opts.aqua` rides the orb (no SDF) variant of the unified shader.
+        // `None` (the production default) is the plain orb path, byte-identical to
+        // pre-#239.
+        self.render_packed_inner(&pack, width, height, t, None, opts.aqua)
     }
 
     /// [`Self::render_frame`], but drawing into an externally supplied
@@ -1052,7 +1125,8 @@ impl GpuRenderer {
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
         let pack = Self::pack_orb_frame(clusters, opts, width, height);
-        self.render_packed_to_view(&pack, width, height, t, view, format);
+        // #239 PoC: `opts.aqua` rides the orb variant; `None` is the plain orb path.
+        self.render_packed_inner_to_view(&pack, width, height, t, None, opts.aqua, view, format);
     }
 
     /// Build the plain orb pack buffer for one frame: derive the pack-buffer
@@ -1165,6 +1239,7 @@ impl GpuRenderer {
                     sdf_view: &sdf_view,
                     size,
                 }),
+                opts.aqua,
             ),
         }
     }
@@ -1209,6 +1284,7 @@ impl GpuRenderer {
                     sdf_view: &sdf_view,
                     size,
                 }),
+                opts.aqua,
                 view,
                 format,
             ),
@@ -1313,6 +1389,7 @@ impl GpuRenderer {
                     sdf_view: &sdf_view,
                     size,
                 }),
+                opts.aqua,
             ),
         }
     }
@@ -1354,6 +1431,7 @@ impl GpuRenderer {
                     sdf_view: &sdf_view,
                     size,
                 }),
+                opts.aqua,
                 view,
                 format,
             ),
@@ -1887,7 +1965,9 @@ impl GpuRenderer {
     /// [`Self::render_packed_to_view`] instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn render_packed(&self, pack: &[f32], width: u32, height: u32, t: f32) -> RgbaImage {
-        self.render_packed_inner(pack, width, height, t, None)
+        // No glyph SDF, no aqua bleed layer: the plain orb path (byte-identical to
+        // pre-#239 output).
+        self.render_packed_inner(pack, width, height, t, None, None)
     }
 
     /// Render one **plain orb** frame from a raw `pack_render_data` buffer
@@ -1908,7 +1988,7 @@ impl GpuRenderer {
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
     ) {
-        self.render_packed_inner_to_view(pack, width, height, t, None, view, format);
+        self.render_packed_inner_to_view(pack, width, height, t, None, None, view, format);
     }
 
     /// Shared core of the orb / glyph / image read-back paths (#235). `glyph =
@@ -1926,6 +2006,7 @@ impl GpuRenderer {
         height: u32,
         t: f32,
         glyph: Option<GlyphBindings<'_>>,
+        aqua: Option<crate::animate::AquaBleedConfig>,
     ) -> RgbaImage {
         // Serialize the whole GPU body below (orb/params upload → pass record →
         // submit → readback). Concurrent `render_frame` on one shared renderer
@@ -1946,17 +2027,20 @@ impl GpuRenderer {
         let height = height.max(1);
         let t = t.clamp(0.0, 1.0);
 
-        let (params_buffer, orb_view) = self.upload_packed_frame(pack, width, height, t, &glyph);
+        let (params_buffer, orb_view) =
+            self.upload_packed_frame(pack, width, height, t, &glyph, aqua);
 
         // Pipeline (shader compile) cached per (shader source, target format);
         // target / read-back cached per size; orb texture grows as needed. Only the
         // small params uniform / bind group are rebuilt per frame. The SDF variant
         // selects a different shader source + adds the SDF texture / sampler
         // bindings (2/3) but draws the same single pass. The read-back path always
-        // targets `Rgba8Unorm`.
+        // targets `Rgba8Unorm`. #239 PoC: the bleed `mode` (default Continuous) picks
+        // the WGSL variant; the additive layer stays inert when aqua params are 0.
+        let mode = aqua.map(|a| a.mode).unwrap_or_default();
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(), true),
-            None => (orb_wgsl(), false),
+            Some(_) => (orb_sdf_wgsl(mode), true),
+            None => (orb_wgsl(mode), false),
         };
         self.pipeline(
             shader,
@@ -1991,6 +2075,7 @@ impl GpuRenderer {
         height: u32,
         t: f32,
         glyph: Option<GlyphBindings<'_>>,
+        aqua: Option<crate::animate::AquaBleedConfig>,
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
     ) {
@@ -2005,14 +2090,17 @@ impl GpuRenderer {
         let height = height.max(1);
         let t = t.clamp(0.0, 1.0);
 
-        let (params_buffer, orb_view) = self.upload_packed_frame(pack, width, height, t, &glyph);
+        let (params_buffer, orb_view) =
+            self.upload_packed_frame(pack, width, height, t, &glyph, aqua);
 
         // Both orb and SDF draw straight into the caller's view, so the pipeline
         // targets `format` either way (the SDF variant just binds the SDF
-        // texture / sampler and runs a different shader source).
+        // texture / sampler and runs a different shader source). #239 PoC: bleed
+        // `mode` (default Continuous) selects the WGSL variant.
+        let mode = aqua.map(|a| a.mode).unwrap_or_default();
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(), true),
-            None => (orb_wgsl(), false),
+            Some(_) => (orb_sdf_wgsl(mode), true),
+            None => (orb_wgsl(mode), false),
         };
         self.pipeline(shader, is_glyph, format, |cached| {
             let bind_group =
@@ -2033,12 +2121,25 @@ impl GpuRenderer {
         height: u32,
         t: f32,
         glyph: &Option<GlyphBindings<'_>>,
+        aqua: Option<crate::animate::AquaBleedConfig>,
     ) -> (wgpu::Buffer, wgpu::TextureView) {
         assert!(
             pack.len() >= HEADER_WORDS,
             "pack buffer too short: {} < {HEADER_WORDS}",
             pack.len()
         );
+
+        // #239 PoC: the additive bleed layer's 4 sliders. `None` (every existing
+        // path: plain orb / glyph / image with no aqua) ⇒ all 0, so `additive_bleed`
+        // returns 0 and the output is byte-identical to plain orb. Clamp to 0..=1
+        // (the WGSL terms assume that range; out-of-range values would over-add).
+        let aqua = aqua.unwrap_or(crate::animate::AquaBleedConfig {
+            bleed: 0.0,
+            bloom: 0.0,
+            offset: 0.0,
+            halo: 0.0,
+            mode: BleedMode::Continuous,
+        });
 
         // Header → Params. Layout per `pack_render_data` doc-comment.
         // count is clamped to MAX_ORB_COUNT (1024); the data-texture grows to hold
@@ -2066,6 +2167,12 @@ impl GpuRenderer {
             // outermost fade segment, shared by every shape on the unified template.
             // The packer already clamps to 0..=1.
             shadow_strength: pack[13],
+            // #239 PoC: the additive bleed layer's 4 sliders. 0 (the default `None`
+            // path) keeps the layer inert (byte-identical to plain orb).
+            aqua_bleed: aqua.bleed.clamp(0.0, 1.0),
+            aqua_bloom: aqua.bloom.clamp(0.0, 1.0),
+            aqua_offset: aqua.offset.clamp(0.0, 1.0),
+            aqua_halo: aqua.halo.clamp(0.0, 1.0),
             _pad: [0.0; 3],
         };
         let params_buffer = self
@@ -2553,6 +2660,7 @@ mod tests {
         AnimateOptions {
             width: w,
             height: h,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
@@ -2971,7 +3079,7 @@ mod tests {
     /// drifting out of sync (which would shift the glyph UV mapping and break parity).
     #[test]
     fn glyph_wgsl_content_span_matches_rust() {
-        let wgsl = orb_sdf_wgsl();
+        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
         // Find the literal after `GLYPH_SDF_CONTENT_SPAN: f32 = ` in the shader.
         let needle = "GLYPH_SDF_CONTENT_SPAN: f32 = ";
         let start = wgsl
@@ -3000,7 +3108,7 @@ mod tests {
     /// SDF-only machinery in one place.
     #[test]
     fn orb_variant_wgsl_inlines_analytic_circle_distance() {
-        let wgsl = orb_wgsl();
+        let wgsl = orb_wgsl(BleedMode::Continuous);
         assert!(
             wgsl.contains("let dist = distance(sample_px, vec2<f32>(cx, cy));"),
             "orb variant must inline the analytic circle distance line"
@@ -3032,7 +3140,7 @@ mod tests {
     /// `textureSampleLevel` would mean an SDF leaked into the orb shader).
     #[test]
     fn orb_variant_has_no_sdf_bindings_or_rot() {
-        let wgsl = orb_wgsl();
+        let wgsl = orb_wgsl(BleedMode::Continuous);
         assert!(
             !wgsl.contains("@binding(2)") && !wgsl.contains("@binding(3)"),
             "orb variant must declare only bindings 0 (params) and 1 (orb_tex)"
@@ -3054,7 +3162,7 @@ mod tests {
     /// together they pin that the two variants differ exactly by the SDF source.
     #[test]
     fn sdf_variant_has_sdf_bindings_and_rot() {
-        let wgsl = orb_sdf_wgsl();
+        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
         assert!(
             wgsl.contains("sdf_tex") && wgsl.contains("sdf_samp"),
             "SDF variant must declare the SDF texture + sampler bindings"
@@ -3092,7 +3200,7 @@ mod tests {
     /// inclusive forms are absent.
     #[test]
     fn wgsl_clip_uses_strict_inequality() {
-        let wgsl = orb_sdf_wgsl();
+        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
         assert!(
             wgsl.contains("if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {"),
             "SDF UV clip must use strict < 0.0 / > 1.0 inequalities"
@@ -3155,8 +3263,8 @@ mod tests {
     fn orb_wgsl_template_has_no_lowp_composite_residue() {
         for (name, src) in [
             ("template", ORB_WGSL_TEMPLATE),
-            ("orb variant", orb_wgsl()),
-            ("sdf variant", orb_sdf_wgsl()),
+            ("orb variant", orb_wgsl(BleedMode::Continuous)),
+            ("sdf variant", orb_sdf_wgsl(BleedMode::Continuous)),
         ] {
             let code = wgsl_code_only(src);
             for needle in [
@@ -3210,6 +3318,161 @@ mod tests {
         );
     }
 
+    // ---- #239 PoC: aquarelle additive bleed layer (structure + non-regression) ----
+
+    /// #239 PoC structure: both bleed-geometry variants substitute the
+    /// `//!ORB_AQUA_BLEED_GEOM` marker away (a leftover marker would not compile),
+    /// the Continuous arm reads the silhouette distance `r`, and the Blob arm
+    /// scatters seed satellites — checked on both the orb and SDF variants so the
+    /// additive layer rides every shape the unified template serves.
+    #[test]
+    fn aqua_bleed_variants_substitute_geometry_marker() {
+        for mode in [BleedMode::Continuous, BleedMode::Blob] {
+            for (name, src) in [("orb", orb_wgsl(mode)), ("sdf", orb_sdf_wgsl(mode))] {
+                assert!(
+                    !src.contains("//!ORB_AQUA_BLEED_GEOM"),
+                    "{name}/{mode:?}: the aqua bleed geometry marker must be substituted away"
+                );
+                assert!(
+                    src.contains("fn additive_bleed("),
+                    "{name}/{mode:?}: the additive bleed layer must be present"
+                );
+            }
+            let continuous_present = orb_wgsl(BleedMode::Continuous).contains("bleed_term_a");
+            let blob_present = orb_wgsl(BleedMode::Blob).contains("bleed_term_b");
+            assert!(
+                continuous_present,
+                "Continuous arm must use the r-driven term"
+            );
+            assert!(blob_present, "Blob arm must use the satellite term");
+        }
+    }
+
+    /// #239 PoC non-regression structure: the additive layer must be written so the
+    /// four sliders are `coef * term` and an all-zero early-out exists, the documented
+    /// guarantee that all-params=0 is structurally identity (the byte-match gate's
+    /// compile-time half). If someone rewrites the layer to a non-`coef*term` form
+    /// this catches it before the (GPU-gated) byte test even runs.
+    #[test]
+    fn aqua_additive_layer_is_coef_times_term() {
+        let wgsl = ORB_WGSL_TEMPLATE;
+        // The all-zero early-out (so the plain orb path never touches the add math).
+        assert!(
+            wgsl.contains("if (bleed <= 0.0 && bloom <= 0.0 && offset <= 0.0 && halo <= 0.0) {"),
+            "additive_bleed must early-out (return 0) when all four params are 0"
+        );
+        // Each slider scales its term (coef * term) so it vanishes at 0.
+        for needle in [
+            "add_rgb += halo * halo_term * orb_rgb;",
+            "add_rgb += bloom * bloom_term * bloom_rgb;",
+        ] {
+            assert!(
+                wgsl.contains(needle),
+                "additive_bleed must add `{needle}` (coef * term, vanishes at 0)"
+            );
+        }
+        // offset only shifts the additive layer's own distance `ra`, never the base
+        // `r` fed to falloff_curve — so offset alone (other coefs 0) is identity.
+        assert!(
+            wgsl.contains("let shift = offset * radius * 0.25;"),
+            "offset must only scale the additive-layer shift (base r untouched)"
+        );
+    }
+
+    /// #239 PoC ★最重要ゲート: with **all four aqua params = 0**, the additive-layer
+    /// shader output is **byte-identical** to the plain orb (`aqua: None`) output —
+    /// for both bleed modes (Continuous / Blob), across several seeds and cluster
+    /// counts. This is the structural non-regression guarantee: the new layer can
+    /// never change an existing orb / glyph / image render unless a slider is moved.
+    #[test]
+    fn aqua_zero_params_byte_match_plain_orb() {
+        let Some(renderer) = require_or_skip_renderer("aqua_zero_params_byte_match_plain_orb")
+        else {
+            return;
+        };
+        let (w, h) = (64u32, 48u32);
+        // Vary seed and cluster count: a different RNG stream / orb population must
+        // not break the identity (the additive layer is consumption-free).
+        for &seed in &[0u64, 42, 99] {
+            for &n in &[1usize, 8, 64] {
+                let clusters: Vec<Cluster> = (0..n)
+                    .map(|i| {
+                        let f = i as f32 / n.max(1) as f32;
+                        cluster(
+                            [
+                                (40 + (i * 37) % 200) as u8,
+                                (60 + (i * 53) % 180) as u8,
+                                (80 + (i * 71) % 160) as u8,
+                            ],
+                            0.15 + 0.7 * f,
+                            0.2 + 0.6 * ((i * 13 % 100) as f32 / 100.0),
+                            0.2 + 0.3 * ((i % 5) as f32 / 5.0),
+                        )
+                    })
+                    .collect();
+                let mut base = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+                base.seed = seed;
+                base.count = Some(n);
+
+                let plain = renderer.render_frame(&clusters, &base, 0.37);
+
+                for mode in [BleedMode::Continuous, BleedMode::Blob] {
+                    let mut zeroed = base.clone();
+                    zeroed.aqua = Some(crate::animate::AquaBleedConfig {
+                        bleed: 0.0,
+                        bloom: 0.0,
+                        offset: 0.0,
+                        halo: 0.0,
+                        mode,
+                    });
+                    let via_aqua = renderer.render_frame(&clusters, &zeroed, 0.37);
+                    assert_eq!(
+                        via_aqua.as_raw(),
+                        plain.as_raw(),
+                        "aqua zero ({mode:?}) must be byte-identical to plain orb \
+                         (seed={seed}, n={n})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #239 PoC: with a **non-zero** slider the additive layer must actually change
+    /// the output (so the byte-match gate above is not passing by a dead code path).
+    /// A positive `halo` adds an outer glow, so the lit-pixel count must rise versus
+    /// the zero-param render. Verified on the orb shape (circle silhouette).
+    #[test]
+    fn aqua_nonzero_params_change_output() {
+        let Some(renderer) = require_or_skip_renderer("aqua_nonzero_params_change_output") else {
+            return;
+        };
+        let (w, h) = (64u32, 48u32);
+        let clusters = sample_clusters();
+        let base = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        let plain = renderer.render_frame(&clusters, &base, 0.37);
+
+        for mode in [BleedMode::Continuous, BleedMode::Blob] {
+            let mut lit = base.clone();
+            lit.aqua = Some(crate::animate::AquaBleedConfig {
+                bleed: 0.7,
+                bloom: 0.5,
+                offset: 0.3,
+                halo: 0.6,
+                mode,
+            });
+            let via_aqua = renderer.render_frame(&clusters, &lit, 0.37);
+            assert_ne!(
+                via_aqua.as_raw(),
+                plain.as_raw(),
+                "non-zero aqua ({mode:?}) must change the output (else the layer is dead)"
+            );
+            assert!(
+                lit_vs_bg(&via_aqua, base.background, 8) > lit_vs_bg(&plain, base.background, 8),
+                "the additive glow ({mode:?}) must light more pixels than plain orb"
+            );
+        }
+    }
+
     /// #242 裁定の境界の死守: aquarelle（`orb_aquarelle.wgsl`）の参照アルゴリズムは
     /// `aquarelle` crate（Skia lowp）のままなので、orb 機構の #242 置換に巻き込まれず
     /// lowp 合成（`div255` / `composite_premul`）を**維持**していること。ここが
@@ -3239,6 +3502,7 @@ mod tests {
         AnimateOptions {
             width: w,
             height: h,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
@@ -3799,6 +4063,7 @@ mod tests {
                 sdf_view: &sdf_view,
                 size: sdf_size,
             }),
+            None,
         );
         assert_eq!(img.dimensions(), (w, h));
         let lit = lit_vs_bg(&img, bg, 1);
@@ -4060,6 +4325,7 @@ mod tests {
         AnimateOptions {
             width: w,
             height: h,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
@@ -5426,6 +5692,7 @@ mod tests {
                 sdf_view: &sdf_view,
                 size: sdf_size,
             }),
+            None,
         )
     }
 
@@ -5463,6 +5730,7 @@ mod tests {
             dim,
             dim,
             0.0,
+            None,
             None,
         );
         let orb_lit: Vec<(i32, i32)> = (0..dim)
@@ -5526,6 +5794,7 @@ mod tests {
             dim,
             dim,
             0.0,
+            None,
             None,
         );
         let (mut inter, mut uni) = (0usize, 0usize);
@@ -5646,6 +5915,7 @@ mod tests {
                 sdf_view: &sdf_view,
                 size: sdf_size,
             }),
+            None,
         );
         let cx = dim / 2;
         let cy = dim / 2;

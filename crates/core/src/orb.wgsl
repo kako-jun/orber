@@ -90,6 +90,14 @@ struct Params {
     edge_softness: f32,    // #205: 予約（現状未使用）
     sdf_size: f32,         // glyph/image SDF の一辺（texel 数）。orb は 0。
     shadow_strength: f32,  // #241: 最外周フェードの rgb 暗化強度（0..1）。0 = #242 と bit 同一
+    // #239 PoC: aquarelle のにじみ 4 パラメータ（各 0..1 連続値）。土台 falloff の
+    // 上に乗る加算レイヤーを駆動する。**全 4 値 = 0 のとき加算項は厳密に 0** になり、
+    // 出力は plain orb と byte 一致する（非回帰ゲート）。aquarelle 以外の shape
+    // （orb / glyph / image）の既存描画では gpu.rs が 0 を流すので不変。
+    aqua_bleed: f32,       // 衛星/外周にじみの強さ（A=連続グラデ / B=seed 放射 blob）
+    aqua_bloom: f32,       // 内側コアの白寄りグロー
+    aqua_offset: f32,      // 加算レイヤー中心の seed 方向ずらし（base r には効かない）
+    aqua_halo: f32,        // 外周の彩度/輝度ブースト（加算グロー）
 };
 
 // per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
@@ -191,6 +199,82 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32
     return vec2<f32>(mix(opacity, 0.0, u), mix(1.0, 1.0 - u, params.shadow_strength));
 }
 
+// #239 PoC — aquarelle にじみの「加算レイヤー」。
+//
+// 設計（kako-jun 裁定 #239）: #235 統一機構（距離源 r + falloff + 呼吸 + 合成）を
+// **土台**にして、aquarelle の bleed / bloom / offset / halo を土台の falloff 結果に
+// 加算合成する。各層は `coef * term(r)` の形で、coef=0 のとき項が**厳密に消える**。
+// よって 4 パラメータ全 0 で本関数は vec4(0) を返し、合成は plain orb と byte 一致する
+// （非回帰の構造保証）。`r` は orb なら円距離 / SDF なら 1 - signed_unit で、どちらも
+// 「0=中心/深部、1=edge、>1=外側」の意味を持つ共通の正規化距離。
+//
+// offset の恒等性: 中心ずらしは**加算レイヤー専用の距離 `ra`**にだけ効かせ、土台の
+// `r`（falloff へ渡す）には一切触れない。offset=0 なら shift=0 で ra==r になり、
+// さらに bleed/bloom/halo の coef がすべて 0 なら本関数は 0 を返すので、offset を
+// 動かしても出力は変わらない（現行 aquarelle のように θ 消費で座標が動く非恒等性を
+// 作らない。RNG も消費しない＝完全決定論）。
+//
+// bleed の幾何だけが A/B 2 変種で違う（下の AQUA_BLEED_GEOM マーカーが gpu.rs で差し替わる）:
+//   - A=continuous: シルエット距離 ra 駆動の連続にじみ（edge 外側へ対称グラデ。形に自動追従）
+//   - B=blob       : per-orb seed（phase）由来の角度・距離で 3 衛星 blob を centroid 起点に放射
+// halo（外周彩度ブースト）/ bloom（内側コア）/ 合成は両変種で共通。
+//
+// 返り値: `.rgb` = 土台 acc へ足す加算色（**straight・pre-add**、合成側で alpha 重みを掛ける）、
+//         `.a`   = 加算アルファ（土台 acc_a に source-over で足す前の生の被覆）。
+fn additive_bleed(
+    r: f32,            // 土台の正規化距離（falloff と同じ。0=中心,1=edge,>1=外側）
+    sample_px: vec2<f32>,
+    center: vec2<f32>, // orb 中心（= SDF では silhouette centroid 近似）
+    radius: f32,       // px 半径（呼吸後）
+    orb_rgb: vec3<f32>,
+    phase: f32,        // per-orb seed 由来の決定論スカラ（衛星角・offset 角の種）
+) -> vec4<f32> {
+    let bleed = params.aqua_bleed;
+    let bloom = params.aqua_bloom;
+    let offset = params.aqua_offset;
+    let halo = params.aqua_halo;
+
+    // 全 0 早期 return（構造保証の駄目押し。coef 形でも 0 になるが、ここで切ると
+    // plain orb 経路は加算演算自体を踏まない）。
+    if (bleed <= 0.0 && bloom <= 0.0 && offset <= 0.0 && halo <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // offset: 加算レイヤー中心を seed 方向へ最大 25% radius ずらす（offset=0 で shift=0）。
+    // ずらすのは加算用距離 ra のためのサンプル原点だけ。土台 r は不変。
+    let off_angle = phase * TAU;
+    let shift = offset * radius * 0.25;
+    let oc = center + vec2<f32>(cos(off_angle), sin(off_angle)) * shift;
+    // ra = ずらした中心からの正規化距離（0=ずらし中心, 1=edge 相当, >1=外側）。
+    var ra = r;
+    if (radius > 0.0) {
+        ra = distance(sample_px, oc) / radius;
+    }
+
+    var add_rgb = vec3<f32>(0.0, 0.0, 0.0);
+    var add_a = 0.0;
+
+    // --- halo（両変種共通）: edge 近傍（ra≈1）の対称グロー。orb 色を加算。coef=halo。
+    // term は ra=1 をピークに内外へ落ちる釣鐘。halo=0 で項ごと消える。
+    let halo_band = 0.35;
+    let halo_term = max(0.0, 1.0 - abs(ra - 1.0) / halo_band);
+    add_rgb += halo * halo_term * orb_rgb;
+    add_a += halo * halo_term * 0.5;
+
+    // --- bloom（両変種共通）: 内側コア（ra→0）の白寄りグロー。coef=bloom。
+    // ra<0.5 で中心ほど強い。bloom=0 で消える。
+    let bloom_term = max(0.0, 1.0 - ra / 0.5);
+    let white = vec3<f32>(1.0, 1.0, 1.0);
+    let bloom_rgb = mix(orb_rgb, white, 0.7);
+    add_rgb += bloom * bloom_term * bloom_rgb;
+    add_a += bloom * bloom_term * 0.6;
+
+    // --- bleed（A/B で幾何が違う。gpu.rs が差し替える）: coef=bleed。bleed=0 で消える。
+    //!ORB_AQUA_BLEED_GEOM
+
+    return vec4<f32>(add_rgb, add_a);
+}
+
 // サブピクセル位置 `sample_px` での 1 サンプルを **straight alpha の float
 // Source-Over**（旧 WebGL の GLSL と同式、#242）で合成する。
 // 背景 → 全 orb の Source-Over まで。量子化・premultiply・finalize は無い。
@@ -285,6 +369,22 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             let one_minus_a = 1.0 - alpha;
             acc_rgb = o.color.rgb * fall.y * alpha + acc_rgb * one_minus_a;
             acc_a = alpha + acc_a * one_minus_a;
+        }
+
+        // #239 PoC: aquarelle にじみの加算レイヤーを土台の上に重ねる。
+        // 全パラメータ 0 のとき additive_bleed は vec4(0) を返し、下の被覆 `aa` も 0 に
+        // なるので合成は素通り（plain orb と byte 一致）。これは falloff 早期 return
+        // （alpha<=0）で skip された外側ピクセルにも乗るので、加算層は最後に評価する。
+        let add = additive_bleed(
+            r, sample_px, vec2<f32>(cx, cy), radius, o.color.rgb, phase
+        );
+        let aa = clampf(add.a, 0.0, 1.0);
+        if (aa > 0.0) {
+            // 加算グローを straight Source-Over で重ねる。add.rgb は pre-add 色なので
+            // ここで被覆 aa を掛けて足す（土台の式と同じ流儀。aa=0 で恒等）。
+            let inv_aa = 1.0 - aa;
+            acc_rgb = add.rgb * aa + acc_rgb * inv_aa;
+            acc_a = aa + acc_a * inv_aa;
         }
     }
 

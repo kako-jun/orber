@@ -115,6 +115,12 @@ pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
 pub struct AnimateOptions {
     pub width: u32,
     pub height: u32,
+    /// #239 PoC: aquarelle のにじみ（bleed/bloom/offset/halo）を統一機構の上の加算
+    /// レイヤーとして任意の shape（orb/glyph/image）に乗せる試作設定。`None`（既定）の
+    /// とき加算層のパラメータは全 0 = plain orb と byte 一致（既存挙動を一切変えない）。
+    /// `Some(cfg)` のとき非 0 パラメータと A/B 幾何 mode を GPU 経路へ流す。
+    /// production の連続値化・Web スライダー・#233 統合は後フェーズ。
+    pub aqua: Option<AquaBleedConfig>,
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
@@ -160,11 +166,41 @@ pub struct AnimateOptions {
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
+/// #239 PoC: the aquarelle "additive bleed" config carried on [`AnimateOptions`].
+/// The four sliders feed the additive layer over the unified orb mechanism; `mode`
+/// selects the bleed geometry (A=continuous / B=blob). All four at `0.0` makes the
+/// layer structurally inert (byte-identical to plain orb) regardless of `mode` —
+/// the non-regression gate. Carried as `Option` on `AnimateOptions` so the default
+/// (`None`) path is exactly the existing behaviour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AquaBleedConfig {
+    pub bleed: f32,
+    pub bloom: f32,
+    pub offset: f32,
+    pub halo: f32,
+    pub mode: BleedMode,
+}
+
+/// #239 PoC: which geometry the additive **bleed** layer uses. Defined here (not in
+/// the feature-gated `gpu` module) so [`AnimateOptions`] can carry it unconditionally;
+/// the GPU path matches on it to pick the WGSL variant. Both modes share the same
+/// non-regression-safe additive base — only the bleed term's geometry differs, so
+/// they are blink-comparison variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BleedMode {
+    /// A案: silhouette-distance driven continuous smear (auto-follows any shape).
+    #[default]
+    Continuous,
+    /// B案: seed-derived 3-satellite blob scatter from the silhouette centroid.
+    Blob,
+}
+
 impl Default for AnimateOptions {
     fn default() -> Self {
         Self {
             width: 1080,
             height: 1920,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
