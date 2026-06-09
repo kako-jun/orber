@@ -218,7 +218,7 @@ pub fn select_specs(n: usize, mode: VariationMode) -> Vec<VariationSpec> {
 
 /// GUI のバッチ後半を `VariationKind::Mp4` 枠にする件数の既定値。
 ///
-/// `crates/wasm` の `get_render_data`（`direction_for_spec_idx` / `speed_for_spec_idx`）と
+/// `crates/wasm` の `resolve_frame`（`direction_for_spec_idx` / `speed_for_spec_idx`）と
 /// Web フロント (`web/src/components/Studio.tsx`) の両方が参照する。GUI は
 /// #61 で 12 枚統一になったため、後半 4 タイル (= 12 - 4 = 8 枚静止 + 4 枚
 /// 動画) を動画枠で固定する。この定数を軸に各層が

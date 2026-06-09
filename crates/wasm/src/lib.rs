@@ -27,10 +27,9 @@
 const MAX_DIM: u32 = 8192;
 
 use orber_core::animate::{MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
-// pack_render_data_for_webgl は wasm 側 pack_render_data ラッパ（wasm32 / test 限定）からのみ
-// 呼ぶため同じ cfg で取り込む（#247）。
-#[cfg(any(target_arch = "wasm32", test))]
-use orber_core::animate::pack_render_data_for_webgl;
+// core の pack ヘルパは #247 で pack_render_data に改名されたが、wasm 側にも同名の
+// 薄いラッパ（下記）があるため import せず完全修飾 orber_core::animate::pack_render_data
+// で呼んで名前衝突を避ける。
 // AnimateOptions / image_rgba_to_sdf / Arc は GPU(WGSL) 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::animate::AnimateOptions;
@@ -668,8 +667,8 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 ///
 /// `clusters` + `opts` を core の `render_frame_*_to_view`（shape 別）へそのまま渡す。
 /// `pack` は **orb shape 専用**: orb の見た目を #230 から一切変えないため、orb は
-/// pack 経由の `render_packed_to_view` を温存する（pack は WebGL と共有の
-/// `pack_render_data_for_webgl` 出力で、saturation を焼かない＝web に saturation ノブが
+/// pack 経由の `render_packed_to_view` を温存する（pack は core の
+/// `pack_render_data` 出力で、saturation を焼かない＝web に saturation ノブが
 /// 無いのと整合する。core の `render_frame_to_view` は saturation を再適用するため、
 /// 万一の HSL 往復誤差で #230 と差が出るのを避ける狙い）。glyph / image / aquarelle は
 /// `opts` 経由で core の専用経路に乗せる。
@@ -927,7 +926,8 @@ fn pack_render_data(
     edge_softness: f32,
     shadow_strength: f32,
 ) -> Vec<f32> {
-    pack_render_data_for_webgl(
+    // 完全修飾で呼ぶ（この関数自体が同名 `pack_render_data` のため import すると衝突する）。
+    orber_core::animate::pack_render_data(
         clusters,
         bg,
         base_radius_unit,
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     /// M1: count_preset='' のとき effective_count == spec.count を保つ。
-    /// `parse_count_preset` が `None` を返し、`get_render_data` 内で
+    /// `parse_count_preset` が `None` を返し、`resolve_frame` 内で
     /// `count_override.unwrap_or(spec.count)` がそのまま spec.count を採用する。
     #[test]
     fn count_preset_empty_or_unspecified_uses_spec_count() {
@@ -1106,7 +1106,7 @@ mod tests {
             speed_override.is_none(),
             "speed_preset='' must be identity (None)"
         );
-        // identity 経路: get_render_data の match arm が
+        // identity 経路: resolve_frame の match arm が
         // `speed_for_spec_idx(spec_idx, still_count, &spec)` を採用する。
         let still_count = 8;
         let total = 12;
@@ -1609,7 +1609,7 @@ mod tests {
             softness.edge_softness(),
             SHADOW_STRENGTH_DEFAULT,
         );
-        let expected = pack_render_data_for_webgl(
+        let expected = orber_core::animate::pack_render_data(
             &clusters,
             bg,
             (64f32.min(64.0)) * 0.25 * spec.orb_size.max(0.0),
@@ -1627,8 +1627,8 @@ mod tests {
         assert_eq!(buf, expected);
     }
 
-    /// #205: get_render_data の header[12] に softness.edge_softness() がそのまま
-    /// 入っていることを担保する。
+    /// #205: pack header[12] に softness.edge_softness() がそのまま
+    /// 入っていることを担保する（wasm pack_render_data ラッパ経由）。
     #[test]
     fn pack_render_data_header_includes_edge_softness() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1783,7 +1783,10 @@ mod tests {
         let gpu = build_gpu_render_inputs(small_source_params(), 12, 3).expect("gpu inputs");
         assert!(matches!(gpu.opts.shape, OrbShape::Orb));
         assert!(!gpu.pack.is_empty(), "orb pack must not be empty");
-        assert_eq!(gpu.pack[10], 0.0, "orb pack header shape_id must be 0 (Orb)");
+        assert_eq!(
+            gpu.pack[10], 0.0,
+            "orb pack header shape_id must be 0 (Orb)"
+        );
     }
 
     /// #231: glyph shape の WGSL 入力。opts.shape が Glyph に解決され、glyph_rotate が

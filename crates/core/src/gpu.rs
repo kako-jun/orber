@@ -39,8 +39,8 @@
 //! - **saturation reflected**: [`GpuRenderer::render_frame`] re-applies
 //!   [`adjust_saturation_pub`](crate::orb::adjust_saturation_pub) with
 //!   `opts.saturation` to each packed orb color after
-//!   [`pack_render_data_for_webgl`] (which itself never applies saturation,
-//!   because it is shared with the WebGL path);
+//!   [`pack_render_data`] (which itself never applies saturation,
+//!   because it is shared with the Web wasm path, which has no saturation knob);
 //! - **count up to [`MAX_ORB_COUNT`] (1024)**: per-orb data is uploaded as a
 //!   **data-texture** (`Rgba32Float`, read with `textureLoad`) — not a fixed-size
 //!   uniform array — so the WGSL has **no 64-orb cap** (#210 Phase 1a). (The 64
@@ -62,8 +62,8 @@
 //! - renders into an [`wgpu::TextureFormat::Rgba8Unorm`] target (NOT `*Srgb`), so
 //!   no sRGB↔linear conversion happens — the shader's float blend maps to bytes
 //!   by `round(value * 255)`, the same quantization the WebGL canvas applied;
-//! - feeds the shader the per-orb data the WebGL path also uses
-//!   ([`crate::animate::pack_render_data_for_webgl`]): the parameter arithmetic is
+//! - feeds the shader the per-orb data the Web wasm path also uses
+//!   ([`crate::animate::pack_render_data`]): the parameter arithmetic is
 //!   reused, never reimplemented, so the orb positions / radii / alphas match the
 //!   web result. The per-orb data goes up as a `Rgba32Float` data-texture
 //!   (4 texels wide × N orbs tall) so float precision is preserved exactly;
@@ -85,7 +85,7 @@ use std::collections::HashMap;
 use image::RgbaImage;
 use wgpu::util::DeviceExt;
 
-use crate::animate::{pack_render_data_for_webgl, AnimateOptions, MotionDirection, MAX_ORB_COUNT};
+use crate::animate::{pack_render_data, AnimateOptions, MotionDirection, MAX_ORB_COUNT};
 use crate::cluster::Cluster;
 use crate::orb::adjust_saturation_pub;
 
@@ -129,7 +129,7 @@ const AQUARELLE_TEX_WIDTH: u32 = 9;
 /// exempt from row-alignment, so this tight value is used directly.
 const AQUARELLE_TEX_BYTES_PER_ROW: u32 = AQUARELLE_TEX_WIDTH * ORB_TEX_BYTES_PER_TEXEL;
 
-/// Header words / per-orb words in the `pack_render_data_for_webgl` layout.
+/// Header words / per-orb words in the `pack_render_data` layout.
 /// Kept in sync with that function (header 16 words, per-orb 16 words).
 const HEADER_WORDS: usize = 16;
 const PER_ORB_WORDS: usize = 16;
@@ -358,7 +358,7 @@ struct Params {
 
 /// One orb as the shaders see it: four `vec4`s mirroring `struct Orb` in
 /// `orb.wgsl` (color+weight, phase quartet, misc, rotation). Filled from the
-/// `pack_render_data_for_webgl` per-orb words. One `GpuOrb` packs to one row of
+/// `pack_render_data` per-orb words. One `GpuOrb` packs to one row of
 /// the `Rgba32Float` orb data-texture (4 texels = 64 bytes); the shader reads it
 /// back with `textureLoad`s.
 ///
@@ -989,7 +989,7 @@ impl GpuRenderer {
 
     /// Render one plain orb frame at time `t` from `clusters` + `opts`.
     ///
-    /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
+    /// The per-orb data is computed by [`pack_render_data`] — the same
     /// arithmetic the wasm data-supply pack uses — so the orb positions /
     /// radii / alphas match the web result. `opts.width` / `opts.height` give the
     /// output size; `t` is clamped to `0.0..=1.0`.
@@ -1055,11 +1055,12 @@ impl GpuRenderer {
         self.render_packed_to_view(&pack, width, height, t, view, format);
     }
 
-    /// Build the plain orb pack buffer for one frame: derive the WebGL pack-buffer
-    /// scalars exactly as `get_render_data` (the wasm/WebGL entry) does, reuse
-    /// [`pack_render_data_for_webgl`] (so the per-orb arithmetic is never
-    /// reimplemented), then re-apply per-orb saturation. Shared by the read-back
-    /// ([`Self::render_frame`]) and to_view ([`Self::render_frame_to_view`]) paths.
+    /// Build the plain orb pack buffer for one frame: derive the pack-buffer
+    /// scalars exactly as the Web wasm entry (`build_gpu_render_inputs` →
+    /// `resolve_frame`) does, reuse [`pack_render_data`] (so the per-orb arithmetic
+    /// is never reimplemented), then re-apply per-orb saturation. Shared by the
+    /// read-back ([`Self::render_frame`]) and to_view
+    /// ([`Self::render_frame_to_view`]) paths.
     fn pack_orb_frame(
         clusters: &[Cluster],
         opts: &AnimateOptions,
@@ -1080,7 +1081,7 @@ impl GpuRenderer {
         // shape_id / glyph_rotate / edge_softness are SDF (glyph / image) inputs; the
         // plain orb shader ignores them. Pass orb defaults. shadow_strength (#241)
         // is read by every shape on the unified template, the orb included.
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             clusters,
             opts.background,
             base_radius_unit,
@@ -1096,9 +1097,9 @@ impl GpuRenderer {
             opts.shadow_strength,
         );
 
-        // `pack_render_data_for_webgl` is shared with the WebGL path and must NOT
-        // bake in saturation (the web side has its own knob). The native CLI has no
-        // separate saturation knob, so we apply
+        // `pack_render_data` is shared with the Web wasm path and must NOT
+        // bake in saturation (the web side has no saturation knob). The native CLI
+        // has no separate saturation knob either, so we apply
         // `adjust_saturation_pub(color_at_t, saturation)` per orb here, in native
         // GPU land only, over the packed color words.
         //
@@ -1113,8 +1114,8 @@ impl GpuRenderer {
     /// #235).
     ///
     /// `opts.shape` must be [`OrbShape::Glyph`]; the glyph `ch` / `font` select the
-    /// SDF. The per-orb arithmetic reuses [`pack_render_data_for_webgl`] (so
-    /// positions / radii / rotation match the WebGL path), saturation is re-applied
+    /// SDF. The per-orb arithmetic reuses [`pack_render_data`] (so
+    /// positions / radii / rotation match the Web wasm path), saturation is re-applied
     /// per orb (the native CLI has no separate saturation knob), the glyph SDF is
     /// uploaded as an `R8Unorm` texture, and the SDF orb shader bilinear-samples it.
     ///
@@ -1278,7 +1279,7 @@ impl GpuRenderer {
     /// [`Self::render_frame_glyph`] is the SDF source: an image silhouette (supplied
     /// from outside, one fixed texture for the whole frame) instead of a per-radius
     /// cached font glyph. Per-orb positions / radii / rotation reuse
-    /// [`pack_render_data_for_webgl`] and saturation is re-applied per orb, exactly
+    /// [`pack_render_data`] and saturation is re-applied per orb, exactly
     /// like the glyph path. Since #235 it is a single pass that feeds the SDF to
     /// the orb mechanism — the image silhouette blurs like an orb (no bleed/halo).
     /// Non-Image shapes fall back to the plain orb path so the call is total.
@@ -1426,7 +1427,7 @@ impl GpuRenderer {
             MotionDirection::BottomToTop => 3.0,
         };
         let cycle = opts.speed.cycle_count() as f32;
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             clusters,
             opts.background,
             base_radius_unit,
@@ -1875,10 +1876,10 @@ impl GpuRenderer {
         }
     }
 
-    /// Render one **plain orb** frame from a raw `pack_render_data_for_webgl` buffer.
+    /// Render one **plain orb** frame from a raw `pack_render_data` buffer.
     ///
     /// `pack` must be the header(16) + per-orb(16 × n_orbs) layout produced by
-    /// [`pack_render_data_for_webgl`]. `t` is the normalized time written into the
+    /// [`pack_render_data`]. `t` is the normalized time written into the
     /// shader's `u_t`; it is clamped to `0.0..=1.0`. Glyph / image rendering uses the
     /// private `render_packed_inner` with an SDF binding instead.
     ///
@@ -1889,7 +1890,7 @@ impl GpuRenderer {
         self.render_packed_inner(pack, width, height, t, None)
     }
 
-    /// Render one **plain orb** frame from a raw `pack_render_data_for_webgl` buffer
+    /// Render one **plain orb** frame from a raw `pack_render_data` buffer
     /// into an externally supplied `view` of `format` (#229). This is the
     /// pack-level surface-present seam the browser WebGPU path shares: the caller
     /// owns the surface (creation / configure / present); core only draws into the
@@ -2039,7 +2040,7 @@ impl GpuRenderer {
             pack.len()
         );
 
-        // Header → Params. Layout per `pack_render_data_for_webgl` doc-comment.
+        // Header → Params. Layout per `pack_render_data` doc-comment.
         // count is clamped to MAX_ORB_COUNT (1024); the data-texture grows to hold
         // it, so there is no 64-orb cap here anymore (#210).
         let n_orbs_packed = pack[8].max(0.0) as usize;
@@ -2315,11 +2316,11 @@ fn align_up(value: u32, align: u32) -> u32 {
 }
 
 /// Apply `adjust_saturation_pub` to the per-orb color words of a
-/// `pack_render_data_for_webgl` buffer, in place (native GPU path only).
+/// `pack_render_data` buffer, in place (native GPU path only).
 ///
-/// `pack_render_data_for_webgl` is shared with the WebGL path and intentionally
-/// leaves saturation out (the web side has its own knob), so the native GPU path
-/// re-applies the `adjust_saturation_pub` transform per orb here instead.
+/// `pack_render_data` is shared with the Web wasm path and intentionally
+/// leaves saturation out (the web side has no saturation knob), so the native GPU
+/// path re-applies the `adjust_saturation_pub` transform per orb here instead.
 /// Color words live at `[off .. off+3]` per orb as `u8 / 255.0`; we round back to
 /// the original u8, run the same HSL adjust, and write the result back the same
 /// way. A factor of `1.0` is the `adjust_saturation_pub` fast-path (no change).
@@ -2793,7 +2794,7 @@ mod tests {
         let (w, h) = (40u32, 28u32);
         // A valid 8-orb pack via the production packer (header + 8 per-orb rows).
         let real_orbs = 8usize;
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             &clusters,
             [12, 18, 28, 255],
             1.0,
@@ -2818,7 +2819,7 @@ mod tests {
         let short = renderer.render_packed(&pack, w, h, 0.3);
 
         // Oracle: an honest pack that declares exactly its real orb count.
-        let honest = pack_render_data_for_webgl(
+        let honest = pack_render_data(
             &clusters,
             [12, 18, 28, 255],
             1.0,
@@ -2861,7 +2862,7 @@ mod tests {
         let clusters = sample_clusters();
         let (w, h) = (40u32, 28u32);
         // An honest 1024-orb pack, then a lying header claiming 2000 orbs.
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             &clusters,
             [12, 18, 28, 255],
             1.0,
@@ -3622,7 +3623,7 @@ mod tests {
         let (w, h) = (40u32, 28u32);
         let bg = [12u8, 18, 28, 255];
         // One orb, real packed words (header 16 + per-orb 16 = 32 words total).
-        let full = pack_render_data_for_webgl(
+        let full = pack_render_data(
             &clusters,
             bg,
             1.0,
@@ -3770,7 +3771,7 @@ mod tests {
         };
         // Build a real 4-orb glyph pack, then force alpha_mul (header[9]) to 0 so
         // every orb's fill alpha = opacity * alpha_mul = 0 → no fill anywhere.
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             &clusters,
             bg,
             base_radius_unit,
@@ -5376,7 +5377,7 @@ mod tests {
         let extent = 1.0 + 2.0 * r_norm;
         // nx = phase*extent - r_norm = 0.5  ⇒ phase = (0.5 + r_norm) / extent.
         let phase = (0.5 + r_norm) / extent;
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             &[cluster([255, 255, 255], 0.5, 0.5, weight)],
             bg,
             base_radius_unit,
@@ -5738,7 +5739,7 @@ mod tests {
             .iter()
             .map(|_| cluster([255, 255, 255], 0.5, 0.5, 1.0))
             .collect();
-        let mut pack = pack_render_data_for_webgl(
+        let mut pack = pack_render_data(
             &clusters,
             bg,
             base_radius,
