@@ -394,8 +394,11 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             //!ORB_AQUA_BLEED_GEOM
             // blur_px は radius にスケール。bleed>0 で必ず下限（min_px）を持たせ「常にぼやけ」を担保
             // （crisp 寄りの中間を作らない）。bleed=1 でフルブラー（radius スケール）まで広げる。
+            // kako-jun「0.5まででいいくらい」: 上限は formless な雲ではなく「ほどよくぼけた
+            // 星」に収める。旧 max(radius*1.15)=bleed1.0 で完全溶解だったが、旧 bleed=0.5 相当
+            // （mix(0.18,1.15,0.5)=0.66*radius）を新しい上限にし、スライダー全域を使える良域に。
             let min_px = radius * 0.18;
-            let max_px = radius * 1.15;
+            let max_px = radius * 0.66;
             let blur_px = mix(min_px, max_px, params.aqua_bleed) * aqua_blur_scale;
             cov = blurred_coverage(
                 style_bit, sample_px, cx, cy, radius, blur, opacity, angle, blur_px, phase
