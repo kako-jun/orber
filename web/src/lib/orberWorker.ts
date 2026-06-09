@@ -318,6 +318,11 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         const canvas = await ensureGpuCanvas(width, height);
         setRenderData(params, req.n, req.index);
         const PROGRESS_STRIDE = 4;
+        // gpu_render は present の取得失敗（Timeout/Occluded/Outdated）を Ok で
+        // 黙ってスキップする設計（gpu-lab の rAF present 用）。ここでスキップが起きると
+        // その MOV/MP4 フレームが直前フレームの複製になる。OffscreenCanvas surface は
+        // 合成されない（→Occluded 無し）・ループ中サイズ固定（→Outdated 無し）ので
+        // worker では実質到達しない前提に依存している（#245）。
         const blob = await encodeAnimationFromCanvas(
           canvas,
           (t) => wasm.gpu_render(t),
