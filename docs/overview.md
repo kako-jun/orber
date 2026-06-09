@@ -295,7 +295,7 @@ the `OrbShape::Aquarelle` shape:
 
 Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
-- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; since #245 production rendering on the web runs through the WebGPU(WGSL) path described below). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path is wired for **all shapes** (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` / `render_frame_aquarelle_to_view` (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained the four aquarelle parameters plus an image-mask input, and the WebGL path is unchanged (it still explicitly rejects aquarelle and its `get_render_data` byte stream is unaffected). The glyph JS fallback (WebGL #159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`). Since #245 (Phase 3 PR-A) the **production Worker uses this WebGPU path** through the new `gpu_init_offscreen(OffscreenCanvas)` entry point (same bring-up as `gpu_init`, worker-context `navigator.gpu`), plus `gpu_render_rgba(t)` — an async straight-alpha RGBA read-back (texture → padded buffer → `map_async`) used for transparent export, because WebGPU canvases only offer `opaque` / `premultiplied` alpha modes — and `WasmParams.transparent_background`, which zeroes the resolved background alpha inside wasm (the WGSL-path equivalent of the old worker-side "patch pack header word 3" trick).
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; since #245 production rendering on the web runs through the WebGPU(WGSL) path described below). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path is wired for **all shapes** (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` / `render_frame_aquarelle_to_view` (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained the four aquarelle parameters plus an image-mask input, and the legacy WebGL path (since removed in #245 PR-B) was left unchanged at the time (its `get_render_data` byte stream was unaffected). The glyph JS fallback (#159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`). Since #245 (Phase 3 PR-A) the **production Worker uses this WebGPU path** through the new `gpu_init_offscreen(OffscreenCanvas)` entry point (same bring-up as `gpu_init`, worker-context `navigator.gpu`), plus `gpu_render_rgba(t)` — an async straight-alpha RGBA read-back (texture → padded buffer → `map_async`) used for transparent export, because WebGPU canvases only offer `opaque` / `premultiplied` alpha modes — and `WasmParams.transparent_background`, which zeroes the resolved background alpha inside wasm (the WGSL-path equivalent of the old worker-side "patch pack header word 3" trick).
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
@@ -356,7 +356,7 @@ dominated on Android), kmeans itself runs on a tiny pixel set, and the wasm-side
 CPU inside wasm and ran each animation frame through `RGBA → ImageData →
 createImageBitmap → VideoFrame` before encoding. At 1080×1920 × 192 frames the
 per-pixel CPU cost dominated and a single download tile took several minutes.
-A GPU-rendered canvas (WebGL2 from #112, WebGPU/WGSL since #245) runs the
+A GPU-rendered canvas (WebGL2 from #112 until #245, WebGPU/WGSL since #245) runs the
 per-pixel composition in parallel and `new VideoFrame(canvas)` hands the
 rendered surface directly to the encoder, eliminating per-frame transfer cost
 entirely. End-to-end download time for one hi-res animated tile drops to a few
@@ -560,21 +560,20 @@ which projects to roughly the following fraction of orb radius:
 | `mid` | 0.6 | ~15% of orb radius | ~7.5% |
 | `high` | 1.0 | ~25% of orb radius | ~12.5% |
 
-Note: edge_softness is consumed only by the WebGL2 fragment shader
-(Glyph/image arm). The native WGSL Glyph/image path achieves the analogous
-softness via `blur_offset` and the post-render aquarelle bleed pass
-(#195/#199). The two shader implementations differ slightly but target the
-same visual goal.
+Note: edge_softness is consumed by the GPU(WGSL) shader's Glyph/image (SDF)
+arm as the smoothstep threshold (#205); the plain `orb` arm uses Euclidean
+distance + `falloff_curve` and is unaffected by it. Since #235 glyph/image
+draw in a single SDF pass with no separate bleed/halo pass.
 
 The preset is implemented as `SoftnessPreset { Low, Mid, High }` in
-`crates/core/src/style.rs`. The values flow into the WebGL2 path via
+`crates/core/src/style.rs`. The values flow into the GPU(WGSL) path via
 `pack_render_data_for_webgl` header slots 9 (`alpha_mul`), 5 (base blur after
 `+ blur_offset`), and 12 (`edge_softness`, #205).
 
 ## Phase B — Web GUI parity (#55)
 
-Phase B propagates the four CLI advanced axes to the Studio surface and
-WebGL2 fragment-shader path so a browser user can drive shape / count /
+Phase B propagates the four CLI advanced axes to the Studio surface and the
+GPU(WGSL) render path so a browser user can drive shape / count /
 speed / softness without dropping to the terminal.
 
 - `WasmParams` gains four optional string fields (`glyph_char`, `count_preset`,
