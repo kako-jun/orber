@@ -113,8 +113,8 @@ pub fn soft_hold_stop(blur: f32) -> f32 {
 
 /// `r`（0=中心/深部、1=edge、>1=外側）から alpha を返す共通 falloff。
 ///
-/// WebGL Glyph SDF 経路は、glyph 形状から得た signed-distance をこの `r` に変換して
-/// Circle と同じ減衰式へ流し込む。`opacity` は中心 alpha の倍率。
+/// GPU(WGSL) の Glyph / Image（SDF）経路は、形状から得た signed-distance をこの `r` に
+/// 変換して orb と同じ減衰式へ流し込む。`opacity` は中心 alpha の倍率。
 #[inline]
 pub fn falloff_curve(profile: FalloffProfile, r: f32, blur: f32, opacity: f32) -> f32 {
     let opacity = opacity.clamp(0.0, 1.0);

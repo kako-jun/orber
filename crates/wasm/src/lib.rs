@@ -6,12 +6,12 @@
 //!
 //! ## API の責務分離（#225 以降）
 //!
-//! CPU 描画は撲滅され、wasm は **データ供給だけ**を担う。実描画は
-//! ブラウザ側の WebGL2/WebGPU が行う:
+//! CPU 描画は撲滅され、wasm は **データ供給と WGSL canvas 描画**を担う。
 //!
 //! - `get_render_data`: バッチ `spec_idx` 番目の per-orb 決定論データ（色 / phase /
 //!   呼吸位相 / cross_axis / style / speed_mult / 回転 + ヘッダ）を `Float32Array`
-//!   1 本にパックして返す。WebGL fragment shader が各 t のフレームを描く。
+//!   1 本にパックして返す。この JS 返し pack は #245 以降は本番導線から未使用だが、
+//!   下記 WGSL canvas-present 経路と同じ spec 解決を共有するため温存している。
 //! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
 //! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
 //!

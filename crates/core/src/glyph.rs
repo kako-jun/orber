@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ttf_parser::{Face, OutlineBuilder, Rect};
 use zeno::{Command, Mask, Point};
 
-/// WebGL / preview path で使う既定 Glyph SDF texture size。
+/// Web preview / JS フォールバック path で使う既定 Glyph SDF texture size。
 pub const DEFAULT_GLYPH_SDF_SIZE: u32 = 256;
 const MAX_GLYPH_SDF_SIZE: u32 = 1024;
 const GLYPH_SDF_RADIUS_FACTOR: f32 = 0.45;
@@ -539,7 +539,7 @@ mod tests {
         assert!(path.is_some(), "☆ outline should produce a non-empty path");
     }
 
-    // Glyph SDF の単体テスト群。WebGL / CPU の両 glyph 経路で使う canonical texture。
+    // Glyph SDF の単体テスト群。glyph SDF 経路で使う canonical texture。
 
     /// size を変えれば長さが size² になる。基本契約。
     #[test]
@@ -571,7 +571,7 @@ mod tests {
     }
 
     /// 未収録文字（絵文字 U+1F355 ピザ等）で全ピクセル 0。
-    /// tofu 出力ではなく「何も描かない」が Phase A の方針。WebGL 経路でも
+    /// tofu 出力ではなく「何も描かない」が Phase A の方針。描画経路でも
     /// 同じ契約を保つことで、shape='glyph' + 未収録文字 = 完全透明 orb になる。
     #[test]
     fn glyph_sdf_unknown_char_returns_empty_or_zero() {
