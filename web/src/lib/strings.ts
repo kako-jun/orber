@@ -212,48 +212,6 @@ export const STRINGS = {
   },
   installBtn: { ja: 'インストール', en: 'Install' },
   installDismiss: { ja: '閉じる', en: 'Dismiss' },
-  // #232: WebGL↔WGSL A/B 比較パネル（?ab=1 でのみ表示する検証足場）。
-  // Phase 3 で WebGL を撤去するときにパネルごと削除する。文言は検証用なので
-  // 最小限。本番 UI には出ないが、命名流儀（camelCase キー / ja・en 対称）に揃える。
-  abPanelTitle: {
-    ja: 'A/B 比較（WebGL ↔ WGSL）',
-    en: 'A/B compare (WebGL ↔ WGSL)',
-  },
-  abPanelNote: {
-    ja: '同じ入力で新旧レンダラを切替えてブリンク比較する検証用パネルです。',
-    en: 'Blink-compare the old/new renderers on identical input (dev only).',
-  },
-  abRendererWebGL: { ja: 'WebGL（旧）', en: 'WebGL (old)' },
-  abRendererWGSL: { ja: 'WGSL（新）', en: 'WGSL (new)' },
-  abWebGpuUnavailable: {
-    ja: 'このブラウザは WebGPU 非対応です（WGSL 側は使えません）',
-    en: 'WebGPU is unavailable in this browser (WGSL side disabled)',
-  },
-  abNeedSource: {
-    ja: '先に画像を読み込んでください',
-    en: 'Load an image first',
-  },
-  abStart: { ja: '開始', en: 'Start' },
-  abStop: { ja: '停止', en: 'Stop' },
-  abInitMs: { ja: 'init {ms} ms', en: 'init {ms} ms' },
-  abFps: { ja: '{fps} fps', en: '{fps} fps' },
-  abError: { ja: 'エラー: {msg}', en: 'Error: {msg}' },
-  // #242: 三者画素比較（CLI / WGSL / WebGL）のキャプチャ足場。?ab=1&abcap=1 の
-  // 合成ソースモードと、通常 ?ab=1 実行中の手動キャプチャボタンで共用する。
-  // これも Phase 3 でパネルごと削除する。
-  abCapNote: {
-    ja: '#242 キャプチャモード: 合成ソース（96×96 決定的パターン）で WGSL / WebGL を t=0 で各1フレーム描画し、ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin をダウンロードします。',
-    en: '#242 capture mode: renders one t=0 frame each (WGSL / WebGL) from a deterministic synthetic 96×96 source and downloads ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin.',
-  },
-  abCapRun: {
-    ja: 'キャプチャ実行（合成ソース・t=0）',
-    en: 'Capture (synthetic source, t=0)',
-  },
-  abCaptureT0: { ja: 'Capture t=0', en: 'Capture t=0' },
-  abCapDone: {
-    ja: '4ファイルをダウンロードしました（ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin）',
-    en: 'Downloaded 4 files (ab-wgsl.png / ab-webgl.png / ab-params.json / ab-source.bin)',
-  },
 } as const;
 
 export function detectLang(): Lang {

@@ -18,9 +18,6 @@ import { t, lang } from '../lib/strings';
 // #245: worker エラー → i18n 文言のマップは workerLogic.ts に切り出し済み
 // （単体テスト用。t() は引数 DI で渡す）。
 import { formatRunBatchError } from '../lib/workerLogic';
-// #232: WebGL↔WGSL A/B 比較パネル（?ab=1 でのみ表示する検証足場）。
-// Phase 3 で WebGL を撤去するときにこの import と下の <Show> ごと削除する。
-import AbPanel from './AbPanel';
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
@@ -1171,13 +1168,6 @@ export default function Studio() {
   const isRunning = () =>
     phase() === 'decoding' || phase() === 'generating' || phase() === 'animating';
 
-  // #232: `?ab=1` のときだけ A/B 比較パネルを出す（本番 UI 不汚染）。SSR では
-  // window が無いので false（client:only マウントなのでクライアントで再評価される）。
-  // Phase 3 で WebGL 撤去時にこの判定と下の <Show> ごと削除する。
-  const showAbPanel =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('ab') === '1';
-
   return (
     <section class="space-y-4" data-lang={lang()}>
       <label
@@ -2042,22 +2032,6 @@ export default function Studio() {
             </Show>
           </div>
         )}
-      </Show>
-
-      {/* #232: WebGL↔WGSL A/B 比較パネル（検証足場）。`?ab=1` のときだけ本体 UI の
-          下に控えめに出る。本番導線には現れない。Phase 3 で orberGl.ts と一緒に
-          このブロックごと削除する。 */}
-      <Show when={showAbPanel}>
-        <AbPanel
-          decoded={decoded}
-          shape={shape}
-          glyphChar={glyphChar}
-          glyphRotate={glyphRotate}
-          countPreset={countPreset}
-          speedPreset={speedPreset}
-          softnessPreset={softnessPreset}
-          imageShapeFile={imageShapeFile}
-        />
       </Show>
     </section>
   );

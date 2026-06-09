@@ -4,13 +4,13 @@
 // メインスレッドは UI / DOM / Solid signal だけに集中させ、重い計算は全部
 // ここに逃がす。これによりスマホでも生成中にスクロール / タップが死なない。
 //
-// アーキテクチャ (#245 で WebGL2 → WebGPU(WGSL) に配線替え):
+// アーキテクチャ (#245 で旧 GPU 経路から WebGPU(WGSL) に配線替え):
 //   main → postMessage({ kind, id, ... }) → worker
 //   worker → wasm.gpu_set_render_data → WebGPU (OffscreenCanvas surface,
 //            orber-core の WGSL シェーダ) 描画 →
 //            convertToBlob (PNG) or VideoEncoder (mp4) → main
 //
-// 旧 WebGL2 経路 (orberGl.ts / get_render_data) との違い:
+// #245 以前の旧描画経路との違い:
 //   - 描画は wasm 内部の core WGSL（CLI と同一シェーダ）。pack / SDF の面倒は
 //     全部 wasm 側が見るので、worker は params を渡して t を回すだけ
 //   - glyph / image の入力は #231 の WasmParams 経路（同梱フォント外の字は
@@ -18,7 +18,7 @@
 //     SDF テクスチャの GPU upload を worker が直接行うことはもう無い
 //   - 透過 export は WasmParams.transparent_background + gpu_render_rgba
 //     （canvas 非経由の straight-alpha readback）。WebGPU canvas の alphaMode は
-//     opaque / premultiplied しかなく、旧 WebGL の「straight alpha のまま
+//     opaque / premultiplied しかなく、旧経路の「straight alpha のまま
 //     convertToBlob」が成立しないため
 //   - 出力ルックは #242（旧の明るさ）+ #241（薄い影 s=0.2）の確定ルックに変わる
 //     （#245 の目的そのもの）
@@ -303,8 +303,7 @@ self.addEventListener('message', async (e: MessageEvent<Req>) => {
         setRenderData(params, req.n, req.index);
         // gpu_render → convertToBlob は同一タスク内で行うこと: WebGPU canvas の
         // current texture はタスクをまたぐと present されて expire する
-        // (AbPanel のキャプチャ実装と同じ制約。convertToBlob のスナップショット
-        // 自体は呼び出し時点で同期に取られる)。
+        // (convertToBlob のスナップショット自体は呼び出し時点で同期に取られる)。
         wasm.gpu_render(0);
         const blob = await canvas.convertToBlob({ type: 'image/png' });
         const buf = await blob.arrayBuffer();

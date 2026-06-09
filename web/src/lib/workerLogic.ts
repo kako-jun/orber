@@ -1,8 +1,8 @@
 // orber#245 — orberWorker.ts / Studio.tsx の純粋ロジック切り出し。
 //
 // Worker のクロージャ / Solid コンポーネントに埋まっていた純粋ロジックを、
-// 単体テスト可能にするためここへ切り出した（#232 abLogic.ts / #242 と同じ
-// 流儀。挙動は元実装と 1 ビットも変えていない＝純粋な移動）:
+// 単体テスト可能にするためここへ切り出した（#242 までの純移動と同じ流儀。
+// 挙動は元実装と 1 ビットも変えていない＝純粋な移動）:
 //
 // - `buildWasmParams`: BaseParams + worker キャッシュ → WasmParams 組立て。
 //   worker のモジュール状態（source / image mask / glyph SDF キャッシュ）と
@@ -16,7 +16,7 @@
 
 // SDF テクスチャの一辺 (px)。core の DEFAULT_GLYPH_SDF_SIZE = 256 と同値で、
 // wasm の get_glyph_sdf / glyph_sdf_size 検証 (16..=1024) にも収まる。
-// （旧 orberGl.ts の export を引き継いだ定数。#245）
+// gpu-lab.astro と worker 本番経路が共有する単一定義（#245）。
 // SYNC WITH crates/core/src/glyph.rs::DEFAULT_GLYPH_SDF_SIZE
 export const GLYPH_SDF_SIZE = 256;
 
@@ -121,7 +121,7 @@ export function buildWasmParams(
     // #159 / #231: 同梱フォント (Noto Sans Symbols 2 サブセット) に無い字は
     // worker 内 OffscreenCanvas + OS フォントスタックでラスタライズして SDF 化
     // する。端末ごとに見た目が変わり得るが、「ユーザーが入れた字を尊重して
-    // 描画する」を優先する仕様 (WebGL 時代から不変)。
+    // 描画する」を優先する仕様 (#159 以来不変)。
     const cache = deps.glyphSdfCache;
     if (!cache.current || cache.current.ch !== p.glyph_char) {
       cache.current = { ch: p.glyph_char, sdf: deps.generateSdf(p.glyph_char, GLYPH_SDF_SIZE) };
