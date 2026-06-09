@@ -14,10 +14,10 @@
 //!   完全共有（[`init_for_target`]。surface target だけ
 //!   `SurfaceTarget::OffscreenCanvas`）。Worker 内では wgpu が
 //!   `DedicatedWorkerGlobalScope` の `navigator.gpu` を自動で引く。
-//! - [`gpu_set_render_data`]\(params_js, n, spec_idx\) — `get_render_data` と
-//!   同じ spec 解決経路（`build_gpu_render_inputs` → 共有の `resolve_frame`）で
-//!   shape 別の描画入力（clusters + opts + orb 用 pack）を構築して保持する。入力は
-//!   spec ごとに静的で、モーションは `t` がシェーダ内で駆動する（WebGL 版と同じ構造）。
+//! - [`gpu_set_render_data`]\(params_js, n, spec_idx\) — spec 解決経路
+//!   （`build_gpu_render_inputs` → `resolve_frame`）で shape 別の描画入力
+//!   （clusters + opts + orb 用 pack）を構築して保持する。入力は spec ごとに静的で、
+//!   モーションは `t` がシェーダ内で駆動する。
 //! - [`gpu_render`]\(t\) — surface frame を acquire し、保持入力 + `t` で
 //!   `opts.shape` 別の core 経路（`render_packed_to_view` / `render_frame_*_to_view`）
 //!   → present。
@@ -31,8 +31,8 @@
 //! ## 形状について（#231 で全 shape 配線）
 //!
 //! `gpu_set_render_data` は orb / glyph / image / aquarelle の 4 shape を受ける。
-//! `build_gpu_render_inputs` が `build_render_pack`（WebGL）と同じ `resolve_frame`
-//! で spec / preset / kmeans を解決し、形状を `OrbShape` まで解決して
+//! `build_gpu_render_inputs` が `resolve_frame` で spec / preset / kmeans を解決し、
+//! 形状を `OrbShape` まで解決して
 //! [`AnimateOptions`] + clusters（+ orb 用 pack）を保持する。`gpu_render(t)` は
 //! `opts.shape` で core の公開 API へ分岐する（CLI の `FrameRenderer::render` と
 //! 同じ分岐構造 = parity）:
@@ -228,9 +228,9 @@ async fn init_for_target(
 }
 
 /// バッチ `spec_idx` 番目の描画入力を構築して保持する（#231 で全 shape 配線）。
-/// `get_render_data` と同じ spec 解決経路（[`build_gpu_render_inputs`] → 共有の
-/// `resolve_frame`: spec 再構築・preset 上書き・kmeans キャッシュ込み）なので、
-/// 同じ params なら WebGL 版と同一の spec / per-orb 解決になる。形状は
+/// spec 解決経路は [`build_gpu_render_inputs`] → `resolve_frame`（spec 再構築・
+/// preset 上書き・kmeans キャッシュ込み）。同じ params なら決定論的に同一の
+/// spec / per-orb 解決になる。形状は
 /// `resolve_orb_shape` で全 shape（orb / glyph / image / aquarelle）に解決する。
 /// モーションは入力に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
 #[wasm_bindgen]
