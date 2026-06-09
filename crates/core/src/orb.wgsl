@@ -240,26 +240,33 @@ fn additive_bleed(
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // offset: 加算レイヤー中心を seed 方向へ最大 25% radius ずらす（offset=0 で shift=0）。
-    // ずらすのは加算用距離 ra のためのサンプル原点だけ。土台 r は不変。
+    // ★#239 fix（kako-jun 指摘「もとの図形を生かさず、かならず丸になる」の根治）:
+    // にじみ用距離 ra は **必ずシルエット距離 r**（orb=円 / glyph・image=SDF）にする。
+    // 旧 PoC は `radius > 0.0`（= 常に真）で ra を「ずらし中心からのユークリッド円距離」に
+    // 置換していたため、星でも雪でも halo/bloom が必ず丸くなっていた。円距離は二度と使わない。
+    // r=1 が輪郭・r<1 が内側・r>1 が外側なので、halo は輪郭沿い＝シルエット形のリングになる。
+    let ra = r;
+    // offset: 「中心ずらし＝円専用概念」を廃し、形追従のにじみを seed 方向へ非対称に寄せる
+    // 方向スカラ asym に作り替える。シルエット追従の項に掛けるだけなので形は壊れない。
+    // offset=0 で asym=1（無変化）→ 全0 byte 一致ゲートも維持。
     let off_angle = phase * TAU;
-    let shift = offset * radius * 0.25;
-    let oc = center + vec2<f32>(cos(off_angle), sin(off_angle)) * shift;
-    // ra = ずらした中心からの正規化距離（0=ずらし中心, 1=edge 相当, >1=外側）。
-    var ra = r;
-    if (radius > 0.0) {
-        ra = distance(sample_px, oc) / radius;
+    let to_px = sample_px - center;
+    var dir_cos = 0.0;
+    if (length(to_px) > 0.0) {
+        dir_cos = cos(atan2(to_px.y, to_px.x) - off_angle);
     }
+    let asym = max(0.0, 1.0 + offset * 0.8 * dir_cos);
 
     var add_rgb = vec3<f32>(0.0, 0.0, 0.0);
     var add_a = 0.0;
 
-    // --- halo（両変種共通）: edge 近傍（ra≈1）の対称グロー。orb 色を加算。coef=halo。
-    // term は ra=1 をピークに内外へ落ちる釣鐘。halo=0 で項ごと消える。
+    // --- halo（両変種共通）: 輪郭近傍（ra≈1=シルエット境界）の形追従グロー。orb 色を加算。
+    // term は ra=1（=形の輪郭）をピークに内外へ落ちる釣鐘なので、星なら星形のリングになる。
+    // offset の方向スカラ asym を掛けて seed 方向に寄せる（形は保ったまま非対称化）。halo=0 で消える。
     let halo_band = 0.35;
     let halo_term = max(0.0, 1.0 - abs(ra - 1.0) / halo_band);
-    add_rgb += halo * halo_term * orb_rgb;
-    add_a += halo * halo_term * 0.5;
+    add_rgb += halo * halo_term * orb_rgb * asym;
+    add_a += halo * halo_term * 0.5 * asym;
 
     // --- bloom（両変種共通）: 内側コア（ra→0）の白寄りグロー。coef=bloom。
     // ra<0.5 で中心ほど強い。bloom=0 で消える。

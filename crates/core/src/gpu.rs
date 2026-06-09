@@ -3363,7 +3363,7 @@ mod tests {
         );
         // Each slider scales its term (coef * term) so it vanishes at 0.
         for needle in [
-            "add_rgb += halo * halo_term * orb_rgb;",
+            "add_rgb += halo * halo_term * orb_rgb * asym;",
             "add_rgb += bloom * bloom_term * bloom_rgb;",
         ] {
             assert!(
@@ -3371,11 +3371,18 @@ mod tests {
                 "additive_bleed must add `{needle}` (coef * term, vanishes at 0)"
             );
         }
-        // offset only shifts the additive layer's own distance `ra`, never the base
-        // `r` fed to falloff_curve — so offset alone (other coefs 0) is identity.
+        // #239 fix: the additive distance `ra` IS the silhouette distance `r` (orb=circle
+        // / glyph・image=SDF), never a circular Euclidean recompute — so halo/bloom follow
+        // any shape (the regression that made glyphs always render a round halo).
         assert!(
-            wgsl.contains("let shift = offset * radius * 0.25;"),
-            "offset must only scale the additive-layer shift (base r untouched)"
+            wgsl.contains("let ra = r;"),
+            "additive bleed distance must be the silhouette r (no circular recompute)"
+        );
+        // offset is a directional asymmetry scalar `asym` (not a circular center shift);
+        // asym == 1 at offset == 0, so offset alone (other coefs 0) stays identity.
+        assert!(
+            wgsl.contains("let asym = max(0.0, 1.0 + offset * 0.8 * dir_cos);"),
+            "offset must be a directional asymmetry scalar (asym=1 at offset=0)"
         );
     }
 
