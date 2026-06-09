@@ -698,6 +698,9 @@ impl ResolvedFrame {
         AnimateOptions {
             width: self.width,
             height: self.height,
+            // #239 PoC: the web path keeps the production look (no additive bleed
+            // layer); the PoC is native-CLI only for blink A/B selection.
+            aqua: None,
             orb_size: self.orb_size,
             blur: self.blur,
             saturation: 1.0,

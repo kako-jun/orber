@@ -213,6 +213,8 @@ pub fn render_video(
     let frame_opts = AnimateOptions {
         width: VIDEO_WIDTH,
         height: VIDEO_HEIGHT,
+        // #239 PoC: video output keeps the production look (no additive bleed layer).
+        aqua: None,
         orb_size: opts.orb_size,
         blur: opts.blur,
         saturation: opts.saturation,
@@ -335,6 +337,7 @@ mod tests {
         AnimateOptions {
             width: w,
             height: h,
+            aqua: None,
             orb_size: opts.orb_size,
             blur: opts.blur,
             saturation: opts.saturation,
