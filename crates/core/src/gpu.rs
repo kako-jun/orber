@@ -205,12 +205,13 @@ fn orb_sdf_wgsl(mode: BleedMode) -> &'static str {
     })
 }
 
-/// #239 PoC: the WGSL fragment substituted into `//!ORB_AQUA_BLEED_GEOM`. Both
-/// arms add `bleed * term * orb_rgb` (and `bleed * term * k` to alpha) so they
-/// vanish when `bleed == 0` (the additive layer stays inert and the output is
-/// byte-identical to plain orb). The only difference is the geometry of `term`:
-/// `Continuous` reads the silhouette distance `r` (shape-following); `Blob` sums
-/// three seed-placed satellite blobs in `sample_px` space.
+/// #239: the WGSL fragment substituted into `//!ORB_AQUA_BLEED_GEOM`. The bleed is
+/// now a single "how much the silhouette dissolves" value (star → formless cloud),
+/// so the only A/B difference is how aggressively `watercolor_bleed` morphs the
+/// SDF shape into a circle (`aqua_roundness_boost`) and how much it warps the edge
+/// with fbm noise (`aqua_warp_boost`). Both define those two `let`s; neither adds a
+/// rim/halo/blob. The watercolor path is only reached when `aqua_bleed > 0`, so
+/// `bleed == 0` is still byte-identical to plain orb.
 fn aqua_bleed_geom(mode: BleedMode) -> &'static str {
     match mode {
         BleedMode::Continuous => ORB_AQUA_BLEED_CONTINUOUS,
@@ -218,33 +219,17 @@ fn aqua_bleed_geom(mode: BleedMode) -> &'static str {
     }
 }
 
-/// A案 bleed: シルエット距離 `r` 駆動の連続にじみ。`r` は SDF では真の形状距離なので
-/// edge(`r=1`) の外側へ伸びる対称グラデがどんな形にも自動追従する。`bleed=0` で消える。
+/// A案 bleed (Continuous): bleed の smoothstep で SDF（星形）→ 円へ滑らかにモーフし、
+/// 縁を fbm で控えめに揺らす標準の溶け方。`bleed=0` で watercolor 経路に入らないので消える。
 const ORB_AQUA_BLEED_CONTINUOUS: &str = "\
-        let bleed_spread = 0.6;\n\
-        let bleed_term_a = max(0.0, 1.0 - abs(r - 1.0) / bleed_spread);\n\
-        add_rgb += bleed * bleed_term_a * orb_rgb;\n\
-        add_a += bleed * bleed_term_a * 0.45;";
+            let aqua_roundness_boost = 1.0;\n\
+            let aqua_warp_boost = 1.0;";
 
-/// B案 bleed: per-orb seed(`phase`)由来の角度・距離で 3 衛星 blob を centroid(`center`)
-/// 起点に放射する。各衛星は `sample_px` 空間の円。非凸文字では blob が形外へ出ることが
-/// ある（#239 で意図的に blink 比較対象）。`bleed=0` で消える。
+/// B案 bleed (Blob): morph を弱めて（roundness を抑え）形を残しつつ、fbm の warp を強めて
+/// 縁を粒立たせ気味にする変種（blink 比較用）。`bleed=0` で消える。
 const ORB_AQUA_BLEED_BLOB: &str = "\
-        var bleed_term_b = 0.0;\n\
-        for (var bs: u32 = 0u; bs < 3u; bs = bs + 1u) {\n\
-            let bf = f32(bs);\n\
-            let sat_ang = (phase + bf * 0.37) * TAU;\n\
-            let sat_dist = radius * (0.45 + 0.2 * fract(phase * 3.0 + bf));\n\
-            let sat_rad = radius * (0.25 + 0.15 * fract(phase * 7.0 + bf)) * (0.5 + 0.5 * bleed);\n\
-            let sc = center + vec2<f32>(cos(sat_ang), sin(sat_ang)) * sat_dist;\n\
-            var sd = 2.0;\n\
-            if (sat_rad > 0.0) {\n\
-                sd = distance(sample_px, sc) / sat_rad;\n\
-            }\n\
-            bleed_term_b += max(0.0, 1.0 - sd);\n\
-        }\n\
-        add_rgb += bleed * bleed_term_b * orb_rgb;\n\
-        add_a += bleed * bleed_term_b * 0.4;";
+            let aqua_roundness_boost = 0.7;\n\
+            let aqua_warp_boost = 1.8;";
 
 /// No extra bindings (orb variant): the analytic circle needs only the params
 /// uniform (0) and the orb data-texture (1) the template already declares.
@@ -341,20 +326,43 @@ const ORB_DISTANCE_SOURCE_SDF: &str = "\
         let ry = sin_a * dx + cos_a * dy;\n\
         let u = rx / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;\n\
         let v = ry / (2.0 * radius) * GLYPH_SDF_CONTENT_SPAN + 0.5;\n\
-        if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {\n\
-            continue;\n\
-        }\n\
-        // SDF bilinear サンプルの規約に合わせる: coord = clamp(u,0,1)*(size-1) の格子点を\n\
-        // 線形補間。GPU sampler は uv*size-0.5 の texel 空間で補間するので、\n\
-        //   uv_gpu = (u*(size-1) + 0.5) / size\n\
-        // と remap すると同じ格子点・同じ重みで補間し、半 texel ずれを消せる。\n\
-        let s = params.sdf_size;\n\
-        let uu = (clampf(u, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
-        let vv = (clampf(v, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
-        // bilinear sample（sampler が線形補間）。R8Unorm なので .r に SDF が入る。\n\
-        let sdf01 = textureSampleLevel(sdf_tex, sdf_samp, vec2<f32>(uu, vv), 0.0).r;\n\
-        let signed_unit = sdf01 * 2.0 - 1.0;\n\
-        let r = 1.0 - signed_unit;";
+        var r: f32;\n\
+        let out_of_box = (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0);\n\
+        if (out_of_box) {\n\
+            // SDF サンプル箱（square）の外。plain 経路では orb がこのピクセルを覆わない\n\
+            // ので従来どおり skip。ただし #239 にじみ(bleed>0)のときは skip すると\n\
+            // watercolor の雲が square に切り取られてしまう（箱の縁がそのまま角ばった\n\
+            // 輪郭として残る）。箱の外では真の形状距離は不明だが「形から十分外側」なので\n\
+            // 円距離で近似し、r = 円距離（>1 になり plain falloff は 0、watercolor は\n\
+            // roundness 無関係に r_circle 主体で滑らかに拡散する）。\n\
+            if (params.aqua_bleed <= 0.0) {\n\
+                continue;\n\
+            }\n\
+            r = distance(sample_px, vec2<f32>(cx, cy)) / radius;\n\
+        } else {\n\
+            // SDF bilinear サンプルの規約に合わせる: coord = clamp(u,0,1)*(size-1) の格子点を\n\
+            // 線形補間。GPU sampler は uv*size-0.5 の texel 空間で補間するので、\n\
+            //   uv_gpu = (u*(size-1) + 0.5) / size\n\
+            // と remap すると同じ格子点・同じ重みで補間し、半 texel ずれを消せる。\n\
+            let s = params.sdf_size;\n\
+            let uu = (clampf(u, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
+            let vv = (clampf(v, 0.0, 1.0) * (s - 1.0) + 0.5) / s;\n\
+            // bilinear sample（sampler が線形補間）。R8Unorm なので .r に SDF が入る。\n\
+            let sdf01 = textureSampleLevel(sdf_tex, sdf_samp, vec2<f32>(uu, vv), 0.0).r;\n\
+            let signed_unit = sdf01 * 2.0 - 1.0;\n\
+            r = 1.0 - signed_unit;\n\
+            // #239: にじみ(bleed>0)のとき、SDF サンプル箱(square)の縁付近で in-box の r(SDF)\n\
+            // を out-of-box の r=円距離へ滑らかに寄せる。こうしないと箱の境界で r が不連続に\n\
+            // なり、watercolor が square の薄い枠として現れる（b=0.4 付近で角ばった halo）。\n\
+            // 箱の中心(0.5,0.5)から縁(0/1)への近さ edge_prox を作り、縁ほど r_circle 寄せ。\n\
+            // plain 経路の byte 一致は aqua_bleed<=0 では分岐しないので不変。\n\
+            if (params.aqua_bleed > 0.0) {\n\
+                let r_circle_box = distance(sample_px, vec2<f32>(cx, cy)) / radius;\n\
+                let edge_uv = max(abs(u - 0.5), abs(v - 0.5)) * 2.0;\n\
+                let edge_prox = smoothstep(0.6, 1.0, edge_uv);\n\
+                r = mix(r, r_circle_box, edge_prox);\n\
+            }\n\
+        }";
 
 /// The Aquarelle orb WGSL (#216 Phase 1c). A dedicated pipeline + data-texture
 /// (separate from the orb data-texture) that evaluates the four
@@ -413,7 +421,7 @@ struct Params {
     shadow_strength: f32,
     // row 5: aquarelle bleed params (#239 PoC) — the additive layer's 4 sliders.
     /// #239 PoC: aquarelle にじみ 4 パラメータ（各 0..1）を統一機構の上の加算レイヤーへ
-    /// 流す。全 4 値 0 のとき WGSL の `additive_bleed` は 0 を返し、出力は plain orb と
+    /// 流す。bleed=0 のとき WGSL の watercolor 経路に入らず、出力は plain orb と
     /// byte 一致する（非回帰ゲート）。aquarelle 以外の shape の既存描画では
     /// `pack_orb_frame` / `pack_sdf_frame` が 0 を入れるので不変。A/B の幾何差は
     /// シェーダ variant（`//!ORB_AQUA_BLEED_GEOM` 置換）で表すので mode フラグは持たない。
@@ -2129,10 +2137,10 @@ impl GpuRenderer {
             pack.len()
         );
 
-        // #239 PoC: the additive bleed layer's 4 sliders. `None` (every existing
-        // path: plain orb / glyph / image with no aqua) ⇒ all 0, so `additive_bleed`
-        // returns 0 and the output is byte-identical to plain orb. Clamp to 0..=1
-        // (the WGSL terms assume that range; out-of-range values would over-add).
+        // #239: the watercolor bleed sliders. `None` (every existing path: plain orb /
+        // glyph / image with no aqua) ⇒ all 0, so the watercolor path is gated off
+        // (aqua_bleed == 0) and the output is byte-identical to plain orb. Clamp to
+        // 0..=1 (the WGSL morph/ramp assume that range; out-of-range would over-spread).
         let aqua = aqua.unwrap_or(crate::animate::AquaBleedConfig {
             bleed: 0.0,
             bloom: 0.0,
@@ -3180,7 +3188,7 @@ mod tests {
             "SDF variant must bilinear-sample the SDF texture"
         );
         assert!(
-            wgsl.contains("let r = 1.0 - signed_unit;"),
+            wgsl.contains("r = 1.0 - signed_unit;"),
             "SDF variant must convert the signed SDF sample to r = 1 - signed_unit"
         );
         // Mirror of the orb variant's residue check: every template marker must be
@@ -3202,7 +3210,7 @@ mod tests {
     fn wgsl_clip_uses_strict_inequality() {
         let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
         assert!(
-            wgsl.contains("if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {"),
+            wgsl.contains("(u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0)"),
             "SDF UV clip must use strict < 0.0 / > 1.0 inequalities"
         );
         assert!(
@@ -3296,8 +3304,16 @@ mod tests {
             wgsl.contains("let one_minus_a = 1.0 - alpha;"),
             "template must compute one_minus_a for the straight Source-Over"
         );
+        // The rgb composite is GLSL 1:1 + #241 thin shadow. `rgb_scale` defaults to
+        // `fall.y` (the #241 shadow scale) and only deviates when the #239 watercolor
+        // bleed is active (aqua_bleed > 0), so for the plain orb path (aqua_bleed == 0)
+        // this is still exactly `src.rgb * fall.y * a + dst.rgb * (1 - a)`.
         assert!(
-            wgsl.contains("acc_rgb = o.color.rgb * fall.y * alpha + acc_rgb * one_minus_a;"),
+            wgsl.contains("var rgb_scale = fall.y;"),
+            "rgb_scale must default to the #241 shadow scale fall.y (plain orb path identity)"
+        );
+        assert!(
+            wgsl.contains("acc_rgb = o.color.rgb * rgb_scale * alpha + acc_rgb * one_minus_a;"),
             "template must composite rgb as (src.rgb * shadow_scale) * a + dst.rgb * (1 - a) \
              (GLSL 1:1 + #241 thin shadow)"
         );
@@ -3320,11 +3336,12 @@ mod tests {
 
     // ---- #239 PoC: aquarelle additive bleed layer (structure + non-regression) ----
 
-    /// #239 PoC structure: both bleed-geometry variants substitute the
-    /// `//!ORB_AQUA_BLEED_GEOM` marker away (a leftover marker would not compile),
-    /// the Continuous arm reads the silhouette distance `r`, and the Blob arm
-    /// scatters seed satellites — checked on both the orb and SDF variants so the
-    /// additive layer rides every shape the unified template serves.
+    /// #239 structure: both bleed variants substitute the `//!ORB_AQUA_BLEED_GEOM`
+    /// marker away (a leftover marker would not compile) and define the two morph-tuning
+    /// `let`s (`aqua_roundness_boost` / `aqua_warp_boost`) the watercolor path reads —
+    /// checked on both the orb and SDF variants so the bleed rides every shape the
+    /// unified template serves. The Continuous arm morphs fully (boost 1.0); the Blob
+    /// arm keeps more shape but warps harder (boost 0.7 / 1.8).
     #[test]
     fn aqua_bleed_variants_substitute_geometry_marker() {
         for mode in [BleedMode::Continuous, BleedMode::Blob] {
@@ -3334,55 +3351,63 @@ mod tests {
                     "{name}/{mode:?}: the aqua bleed geometry marker must be substituted away"
                 );
                 assert!(
-                    src.contains("fn additive_bleed("),
-                    "{name}/{mode:?}: the additive bleed layer must be present"
+                    src.contains("fn watercolor_bleed("),
+                    "{name}/{mode:?}: the watercolor bleed function must be present"
+                );
+                assert!(
+                    src.contains("let aqua_roundness_boost =")
+                        && src.contains("let aqua_warp_boost ="),
+                    "{name}/{mode:?}: the geometry marker must define the morph-tuning lets"
                 );
             }
-            let continuous_present = orb_wgsl(BleedMode::Continuous).contains("bleed_term_a");
-            let blob_present = orb_wgsl(BleedMode::Blob).contains("bleed_term_b");
-            assert!(
-                continuous_present,
-                "Continuous arm must use the r-driven term"
-            );
-            assert!(blob_present, "Blob arm must use the satellite term");
         }
+        // The two modes differ only in the morph-tuning constants (no rim/halo/blob).
+        assert!(
+            orb_wgsl(BleedMode::Continuous).contains("let aqua_roundness_boost = 1.0;"),
+            "Continuous arm must morph fully (roundness boost 1.0)"
+        );
+        assert!(
+            orb_wgsl(BleedMode::Blob).contains("let aqua_roundness_boost = 0.7;"),
+            "Blob arm must keep more shape (roundness boost 0.7)"
+        );
     }
 
-    /// #239 PoC non-regression structure: the additive layer must be written so the
-    /// four sliders are `coef * term` and an all-zero early-out exists, the documented
-    /// guarantee that all-params=0 is structurally identity (the byte-match gate's
-    /// compile-time half). If someone rewrites the layer to a non-`coef*term` form
+    /// #239 non-regression structure: the bleed must be a single "dissolve amount"
+    /// that morphs plain → watercolor via `mix(plain_alpha, wc_alpha, ramp)` and is
+    /// only entered when `aqua_bleed > 0`, the documented guarantee that all-params=0
+    /// (and especially `bleed == 0`) is structurally identity (the byte-match gate's
+    /// compile-time half). If someone rewrites the layer to add a rim/halo/blob ring
     /// this catches it before the (GPU-gated) byte test even runs.
     #[test]
     fn aqua_additive_layer_is_coef_times_term() {
         let wgsl = ORB_WGSL_TEMPLATE;
-        // The all-zero early-out (so the plain orb path never touches the add math).
+        // The watercolor path is gated on bleed > 0, so the plain orb path (and
+        // aqua=None, which sets aqua_bleed=0) never touches the watercolor math.
         assert!(
-            wgsl.contains("if (bleed <= 0.0 && bloom <= 0.0 && offset <= 0.0 && halo <= 0.0) {"),
-            "additive_bleed must early-out (return 0) when all four params are 0"
+            wgsl.contains("if (params.aqua_bleed > 0.0) {"),
+            "the watercolor bleed must be gated on aqua_bleed > 0 (else byte-match breaks)"
         );
-        // Each slider scales its term (coef * term) so it vanishes at 0.
-        for needle in [
-            "add_rgb += halo * halo_term * orb_rgb * asym;",
-            "add_rgb += bloom * bloom_term * bloom_rgb;",
-        ] {
-            assert!(
-                wgsl.contains(needle),
-                "additive_bleed must add `{needle}` (coef * term, vanishes at 0)"
-            );
-        }
-        // #239 fix: the additive distance `ra` IS the silhouette distance `r` (orb=circle
-        // / glyph・image=SDF), never a circular Euclidean recompute — so halo/bloom follow
-        // any shape (the regression that made glyphs always render a round halo).
+        // bleed=0 yields plain_alpha exactly (ramp(0)=0); the blend is a single mix.
         assert!(
-            wgsl.contains("let ra = r;"),
-            "additive bleed distance must be the silhouette r (no circular recompute)"
+            wgsl.contains("alpha = mix(plain_alpha, wc_alpha, ramp);"),
+            "bleed must morph plain → watercolor via mix(plain_alpha, wc_alpha, ramp)"
         );
-        // offset is a directional asymmetry scalar `asym` (not a circular center shift);
-        // asym == 1 at offset == 0, so offset alone (other coefs 0) stays identity.
+        // The watercolor function itself early-outs at bleed<=0 (defence in depth).
         assert!(
-            wgsl.contains("let asym = max(0.0, 1.0 + offset * 0.8 * dir_cos);"),
-            "offset must be a directional asymmetry scalar (asym=1 at offset=0)"
+            wgsl.contains("if (bleed <= 0.0 || radius <= 0.0 || opacity <= 0.0) {"),
+            "watercolor_bleed must early-out (return 0) when bleed is 0"
+        );
+        // The dissolve is a SDF→circle morph (no rim/halo ring): r_eff interpolates
+        // the silhouette distance r toward the circle distance r_circle by roundness.
+        assert!(
+            wgsl.contains("var r_eff = mix(r, r_circle, roundness);"),
+            "the dissolve must morph silhouette r toward circle r_circle (no ring)"
+        );
+        // The falloff is a monotone-decreasing soft tail (peak at the center r_eff→0),
+        // never a band peaked at the edge r≈1 (the rejected frame-ring bug).
+        assert!(
+            wgsl.contains("let falloff = clampf(1.0 - r_eff / edge1, 0.0, 1.0);"),
+            "the watercolor falloff must be a monotone center-peaked tail (no edge ring)"
         );
     }
 

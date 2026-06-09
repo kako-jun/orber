@@ -15,8 +15,10 @@
 //   - orb   : 解析的な円距離（`distance(px, center) / radius`）。
 //   - glyph / image : SDF サンプル（SDF はまさに "形からの距離" そのもの）。回転を
 //             SDF サンプル前に適用し、signed 距離 → 正規化 r に変換して **同じ**
-//             falloff_curve / composite_straight へ渡す。にじみ（bleed/halo）の追加
-//             パスは持たない（#235 で撲滅。にじみは aquarelle shape の領分）。
+//             falloff_curve / composite_straight へ渡す。#239 で aquarelle のにじみ
+//             （bleed=シルエットが溶ける量）を統一機構の上の watercolor モーフとして
+//             全 shape に乗せた（後述 watercolor_bleed）。bleed=0 では経路に入らないので
+//             plain orb / glyph / image の既存描画は byte 不変（非回帰ゲート）。
 //
 // このシェーダは Rust 側（gpu.rs::orb_wgsl / orb_sdf_wgsl）で DISTANCE SOURCE ブロック /
 // 追加 binding を文字列合成して 2 variant を生成する。共通部（header / per-orb 算術 /
@@ -90,14 +92,15 @@ struct Params {
     edge_softness: f32,    // #205: 予約（現状未使用）
     sdf_size: f32,         // glyph/image SDF の一辺（texel 数）。orb は 0。
     shadow_strength: f32,  // #241: 最外周フェードの rgb 暗化強度（0..1）。0 = #242 と bit 同一
-    // #239 PoC: aquarelle のにじみ 4 パラメータ（各 0..1 連続値）。土台 falloff の
-    // 上に乗る加算レイヤーを駆動する。**全 4 値 = 0 のとき加算項は厳密に 0** になり、
-    // 出力は plain orb と byte 一致する（非回帰ゲート）。aquarelle 以外の shape
-    // （orb / glyph / image）の既存描画では gpu.rs が 0 を流すので不変。
-    aqua_bleed: f32,       // 衛星/外周にじみの強さ（A=連続グラデ / B=seed 放射 blob）
-    aqua_bloom: f32,       // 内側コアの白寄りグロー
-    aqua_offset: f32,      // 加算レイヤー中心の seed 方向ずらし（base r には効かない）
-    aqua_halo: f32,        // 外周の彩度/輝度ブースト（加算グロー）
+    // #239: aquarelle のにじみ。`aqua_bleed` は「シルエットが溶ける量」の連続値で、
+    // 0=素のグリフ（plain orb と byte 一致）→ 1=形のない柔らかい色の雲 を連続モーフする。
+    // **bleed=0 のとき watercolor 経路に入らない**ので非回帰ゲートを満たす。aquarelle
+    // 以外の shape（orb / glyph / image）の既存描画では gpu.rs が 0 を流すので不変。
+    // bloom / offset / halo は受け口だけ維持の no-op（今回は溶け一本に集中）。
+    aqua_bleed: f32,       // シルエットが溶ける量（0=素の形 → 1=formless な雲）
+    aqua_bloom: f32,       // 予約（現状 no-op）
+    aqua_offset: f32,      // 予約（現状 no-op）
+    aqua_halo: f32,        // 予約（現状 no-op）
 };
 
 // per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
@@ -199,87 +202,106 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32
     return vec2<f32>(mix(opacity, 0.0, u), mix(1.0, 1.0 - u, params.shadow_strength));
 }
 
-// #239 PoC — aquarelle にじみの「加算レイヤー」。
+// #239 — aquarelle にじみ（bleed = 「シルエットが溶ける量」の連続値）。
 //
-// 設計（kako-jun 裁定 #239）: #235 統一機構（距離源 r + falloff + 呼吸 + 合成）を
-// **土台**にして、aquarelle の bleed / bloom / offset / halo を土台の falloff 結果に
-// 加算合成する。各層は `coef * term(r)` の形で、coef=0 のとき項が**厳密に消える**。
-// よって 4 パラメータ全 0 で本関数は vec4(0) を返し、合成は plain orb と byte 一致する
-// （非回帰の構造保証）。`r` は orb なら円距離 / SDF なら 1 - signed_unit で、どちらも
-// 「0=中心/深部、1=edge、>1=外側」の意味を持つ共通の正規化距離。
+// 設計（kako-jun 確定 spec #239）: bleed 1 本で「素のグリフ → formless な柔らかい色の雲」を
+// **連続モーフ**する。前回の「輪郭に枠リングを足す」加算レイヤー（halo/bloom/blob）は
+// kako-jun に却下されたため**撤去**した。今回は溶け（bleed）一本に集中する。
+//   - bleed=0      : 素のシルエット（星なら星）。plain orb と **byte 一致**（非回帰ゲート）
+//   - bleed 小0.2  : シルエットが多少ぼやける（形は明確）
+//   - bleed 中0.5  : かなり柔らかく、形が崩れ始める
+//   - bleed 大1.0  : 形が完全に消え、中心が濃く外へ柔らかく拡散する formless な色の雲
 //
-// offset の恒等性: 中心ずらしは**加算レイヤー専用の距離 `ra`**にだけ効かせ、土台の
-// `r`（falloff へ渡す）には一切触れない。offset=0 なら shift=0 で ra==r になり、
-// さらに bleed/bloom/halo の coef がすべて 0 なら本関数は 0 を返すので、offset を
-// 動かしても出力は変わらない（現行 aquarelle のように θ 消費で座標が動く非恒等性を
-// 作らない。RNG も消費しない＝完全決定論）。
+// モデル（3 段 + 有機ノイズ）:
+//   1. モーフ（形を溶かす）: 円距離 r_circle を用意し r_eff = mix(r, r_circle, roundness)。
+//      roundness = smoothstep(0,1,bleed) で bleed が上がるほど SDF（星形）→ 円へ。星のトゲが消える。
+//   2. ぼかし広げ（柔らかく）: bleed が上がるほど falloff の遷移帯 spread を広げ、中心 r_eff→0 を
+//      濃く、外へ連続的に薄く 0 へ落とす単調減少 falloff。**輪郭 r≈1 にピークを作らない**（枠バグ厳禁）。
+//   3. 有機的な不規則さ: per-orb seed（phase）由来の滑らかな value noise / fbm で r_eff を
+//      domain-warp し、にじみの縁を不規則に揺らす。離散の粒は作らない。warp 量も bleed に比例。
 //
-// bleed の幾何だけが A/B 2 変種で違う（下の AQUA_BLEED_GEOM マーカーが gpu.rs で差し替わる）:
-//   - A=continuous: シルエット距離 ra 駆動の連続にじみ（edge 外側へ対称グラデ。形に自動追従）
-//   - B=blob       : per-orb seed（phase）由来の角度・距離で 3 衛星 blob を centroid 起点に放射
-// halo（外周彩度ブースト）/ bloom（内側コア）/ 合成は両変種で共通。
+// 返り値: watercolor 経路の straight alpha（0..1）。中心が濃く外へ単調に薄れる雲の被覆。
+// 合成側（composite_straight）が ramp(bleed) で plain falloff の alpha と mix する:
+//   ramp(0)=0 → bleed=0 は完全に plain（byte 一致）。bleed 小は plain にわずかに watercolor を
+//   混ぜた=少しぼやけた星になり連続的。
 //
-// 返り値: `.rgb` = 土台 acc へ足す加算色（**straight・pre-add**、合成側で alpha 重みを掛ける）、
-//         `.a`   = 加算アルファ（土台 acc_a に source-over で足す前の生の被覆）。
-fn additive_bleed(
-    r: f32,            // 土台の正規化距離（falloff と同じ。0=中心,1=edge,>1=外側）
+// bleed の幾何は A/B 2 変種でモーフ係数だけ違う（AQUA_BLEED_GEOM マーカーが gpu.rs で差し替わる）:
+//   - A=continuous: roundness を bleed の smoothstep で滑らかに上げる（標準）
+//   - B=blob       : roundness を弱め、noise の warp を強めて縁を粒立たせ気味にする（blink 比較用）。
+// bloom / offset / halo は今回 no-op（受け口だけ維持。全0 で plain の byte 一致ゲートのため）。
+
+// 2D value noise（hash → bilinear smoothstep 補間）。seed をオフセットに混ぜて per-orb で変える。
+fn aqua_hash2(p: vec2<f32>) -> f32 {
+    let h = dot(p, vec2<f32>(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
+}
+fn aqua_value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let a = aqua_hash2(i + vec2<f32>(0.0, 0.0));
+    let b = aqua_hash2(i + vec2<f32>(1.0, 0.0));
+    let c = aqua_hash2(i + vec2<f32>(0.0, 1.0));
+    let d = aqua_hash2(i + vec2<f32>(1.0, 1.0));
+    let u = f * f * (3.0 - 2.0 * f); // smoothstep
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// fbm（2 オクターブ）。-1..1 程度に正規化して domain-warp の変位に使う。
+fn aqua_fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var pp = p;
+    for (var o: u32 = 0u; o < 3u; o = o + 1u) {
+        v = v + amp * (aqua_value_noise(pp) * 2.0 - 1.0);
+        pp = pp * 2.0;
+        amp = amp * 0.5;
+    }
+    return v;
+}
+
+// watercolor の straight alpha を返す。`r` はシルエット距離（0=中心,1=edge,>1=外側）。
+// `r_circle` は同ピクセルの円距離（中心からのユークリッド距離 / radius）。bleed が上がるほど
+// r_eff が r_circle 寄りになり（形が溶ける）、falloff の裾が外へ広がる（柔らかく拡散）。
+// roundness_boost: A/B 変種で morph の強さを変える係数。
+fn watercolor_bleed(
+    r: f32,
+    r_circle: f32,
     sample_px: vec2<f32>,
-    center: vec2<f32>, // orb 中心（= SDF では silhouette centroid 近似）
-    radius: f32,       // px 半径（呼吸後）
-    orb_rgb: vec3<f32>,
-    phase: f32,        // per-orb seed 由来の決定論スカラ（衛星角・offset 角の種）
-) -> vec4<f32> {
+    center: vec2<f32>,
+    radius: f32,
+    phase: f32,
+    opacity: f32,
+    roundness_boost: f32,
+    warp_boost: f32,
+) -> f32 {
     let bleed = params.aqua_bleed;
-    let bloom = params.aqua_bloom;
-    let offset = params.aqua_offset;
-    let halo = params.aqua_halo;
-
-    // 全 0 早期 return（構造保証の駄目押し。coef 形でも 0 になるが、ここで切ると
-    // plain orb 経路は加算演算自体を踏まない）。
-    if (bleed <= 0.0 && bloom <= 0.0 && offset <= 0.0 && halo <= 0.0) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (bleed <= 0.0 || radius <= 0.0 || opacity <= 0.0) {
+        return 0.0;
     }
 
-    // ★#239 fix（kako-jun 指摘「もとの図形を生かさず、かならず丸になる」の根治）:
-    // にじみ用距離 ra は **必ずシルエット距離 r**（orb=円 / glyph・image=SDF）にする。
-    // 旧 PoC は `radius > 0.0`（= 常に真）で ra を「ずらし中心からのユークリッド円距離」に
-    // 置換していたため、星でも雪でも halo/bloom が必ず丸くなっていた。円距離は二度と使わない。
-    // r=1 が輪郭・r<1 が内側・r>1 が外側なので、halo は輪郭沿い＝シルエット形のリングになる。
-    let ra = r;
-    // offset: 「中心ずらし＝円専用概念」を廃し、形追従のにじみを seed 方向へ非対称に寄せる
-    // 方向スカラ asym に作り替える。シルエット追従の項に掛けるだけなので形は壊れない。
-    // offset=0 で asym=1（無変化）→ 全0 byte 一致ゲートも維持。
-    let off_angle = phase * TAU;
+    // 1. モーフ: bleed が上がるほど SDF（星形）→ 円。roundness は smoothstep で滑らかに。
+    let roundness = clampf(smoothstep(0.0, 1.0, bleed) * roundness_boost, 0.0, 1.0);
+    var r_eff = mix(r, r_circle, roundness);
+
+    // 3. 有機的な不規則さ: per-orb seed と方向で fbm を引き、r_eff を warp する。
+    // 縁を不規則に揺らす（連続な有機フチ。離散の粒にしない）。warp 量は bleed に比例（bleed=0 で 0）。
     let to_px = sample_px - center;
-    var dir_cos = 0.0;
-    if (length(to_px) > 0.0) {
-        dir_cos = cos(atan2(to_px.y, to_px.x) - off_angle);
-    }
-    let asym = max(0.0, 1.0 + offset * 0.8 * dir_cos);
+    let seed = phase * 17.0;
+    let warp_freq = 2.2;
+    let np = to_px / max(radius, 1.0) * warp_freq + vec2<f32>(seed, seed * 1.7);
+    let n = aqua_fbm(np); // -1..1 付近
+    let warp_amt = bleed * 0.35 * warp_boost;
+    r_eff = max(0.0, r_eff + n * warp_amt);
 
-    var add_rgb = vec3<f32>(0.0, 0.0, 0.0);
-    var add_a = 0.0;
+    // 2. ぼかし広げ: 中心 r_eff→0 が濃く、外へ単調減少して 0 へ。bleed が上がるほど裾 spread を
+    // 広げ、外側（r_eff>1）へ薄く拡散させる。**輪郭 r≈1 にピークを作らない**（枠バグ厳禁）。
+    // edge0=濃い領域の終端、edge1=完全に 0 になる外端。bleed で edge1 を外へ押し広げる。
+    let spread = mix(0.55, 1.7, bleed);
+    let edge1 = 1.0 + spread;          // ここで alpha=0
+    let falloff = clampf(1.0 - r_eff / edge1, 0.0, 1.0);
+    // smoothstep 状の柔らかい裾（指数で中心寄りを膨らませる）。中心ほど濃い単調減少。
+    let soft = falloff * falloff * (3.0 - 2.0 * falloff);
 
-    // --- halo（両変種共通）: 輪郭近傍（ra≈1=シルエット境界）の形追従グロー。orb 色を加算。
-    // term は ra=1（=形の輪郭）をピークに内外へ落ちる釣鐘なので、星なら星形のリングになる。
-    // offset の方向スカラ asym を掛けて seed 方向に寄せる（形は保ったまま非対称化）。halo=0 で消える。
-    let halo_band = 0.35;
-    let halo_term = max(0.0, 1.0 - abs(ra - 1.0) / halo_band);
-    add_rgb += halo * halo_term * orb_rgb * asym;
-    add_a += halo * halo_term * 0.5 * asym;
-
-    // --- bloom（両変種共通）: 内側コア（ra→0）の白寄りグロー。coef=bloom。
-    // ra<0.5 で中心ほど強い。bloom=0 で消える。
-    let bloom_term = max(0.0, 1.0 - ra / 0.5);
-    let white = vec3<f32>(1.0, 1.0, 1.0);
-    let bloom_rgb = mix(orb_rgb, white, 0.7);
-    add_rgb += bloom * bloom_term * bloom_rgb;
-    add_a += bloom * bloom_term * 0.6;
-
-    // --- bleed（A/B で幾何が違う。gpu.rs が差し替える）: coef=bleed。bleed=0 で消える。
-    //!ORB_AQUA_BLEED_GEOM
-
-    return vec4<f32>(add_rgb, add_a);
+    return opacity * soft;
 }
 
 // サブピクセル位置 `sample_px` での 1 サンプルを **straight alpha の float
@@ -367,31 +389,42 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         // .x = straight alpha（raw float）、.y = rgb スケール（#241 の薄い影:
         // 最外周フェード帯のみ < 1。shadow_strength=0 なら常に 1.0 = #242 と bit 同一）。
         let fall = falloff_curve(style_bit, r, blur, opacity);
-        let alpha = fall.x;
+        let plain_alpha = fall.x;
+
+        // #239: aquarelle にじみ（溶け）。watercolor の straight alpha を計算し、
+        // plain falloff の alpha と ramp(bleed) で **連続モーフ**する。ramp(0)=0 なので
+        // bleed=0（および aqua=None で aqua_bleed=0）は完全に plain（byte 一致ゲート）。
+        // bleed 小は plain にわずかに watercolor を混ぜた=少しぼやけた星。bleed 大は
+        // watercolor 主体の formless な雲。色は orb 色のまま（枠リング・白コアを足さない）。
+        // r_circle = 円距離（モーフで星形 SDF → 円へ溶かすのに使う）。
+        var alpha = plain_alpha;
+        if (params.aqua_bleed > 0.0) {
+            let r_circle = distance(sample_px, vec2<f32>(cx, cy)) / radius;
+            //!ORB_AQUA_BLEED_GEOM
+            let wc_alpha = watercolor_bleed(
+                r, r_circle, sample_px, vec2<f32>(cx, cy), radius, phase, opacity,
+                aqua_roundness_boost, aqua_warp_boost
+            );
+            // ramp: bleed=0 で 0（完全に plain=byte一致）、bleed が上がるほど watercolor 主体へ。
+            // smoothstep(0,0.75) で **bleed≈0.75 までに plain（くっきりした形）を消し切る**。
+            // こうしないと mix に plain_alpha が残り、雲の中に crisp な星の芯が透けてしまう
+            // （b=0.8 でも星がはっきり見える不具合）。連続かつ ramp(0)=0 は維持。
+            let ramp = smoothstep(0.0, 0.75, params.aqua_bleed);
+            alpha = mix(plain_alpha, wc_alpha, ramp);
+        }
 
         if (alpha > 0.0) {
             // Source-Over（straight alpha）。GLSL と同式 + #241 影スケール:
             //   out.rgb = (src.rgb * shadow_scale) * src.a + out.rgb * (1 - src.a)
             //   out.a   = src.a + out.a * (1 - src.a)
+            // watercolor 経路では影スケール(fall.y)は使わない（雲は均一な orb 色）。
+            var rgb_scale = fall.y;
+            if (params.aqua_bleed > 0.0) {
+                rgb_scale = mix(fall.y, 1.0, smoothstep(0.0, 0.75, params.aqua_bleed));
+            }
             let one_minus_a = 1.0 - alpha;
-            acc_rgb = o.color.rgb * fall.y * alpha + acc_rgb * one_minus_a;
+            acc_rgb = o.color.rgb * rgb_scale * alpha + acc_rgb * one_minus_a;
             acc_a = alpha + acc_a * one_minus_a;
-        }
-
-        // #239 PoC: aquarelle にじみの加算レイヤーを土台の上に重ねる。
-        // 全パラメータ 0 のとき additive_bleed は vec4(0) を返し、下の被覆 `aa` も 0 に
-        // なるので合成は素通り（plain orb と byte 一致）。これは falloff 早期 return
-        // （alpha<=0）で skip された外側ピクセルにも乗るので、加算層は最後に評価する。
-        let add = additive_bleed(
-            r, sample_px, vec2<f32>(cx, cy), radius, o.color.rgb, phase
-        );
-        let aa = clampf(add.a, 0.0, 1.0);
-        if (aa > 0.0) {
-            // 加算グローを straight Source-Over で重ねる。add.rgb は pre-add 色なので
-            // ここで被覆 aa を掛けて足す（土台の式と同じ流儀。aa=0 で恒等）。
-            let inv_aa = 1.0 - aa;
-            acc_rgb = add.rgb * aa + acc_rgb * inv_aa;
-            acc_a = aa + acc_a * inv_aa;
         }
     }
 
