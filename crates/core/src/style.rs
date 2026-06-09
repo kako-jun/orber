@@ -36,8 +36,8 @@ pub(crate) const STYLE_HEIGHT: u32 = 1920;
 /// - edge softness (Glyph/image アーム smoothstep 幅): Low=0.3, Mid=0.6, High=1.0
 ///
 /// PNG / 動画（GPU 描画）と SVG / CSS の全経路で同じ意味で適用する。
-/// edge_softness は WebGL2 fragment shader (`web/src/lib/orberGl.ts`) の Glyph アーム
-/// でのみ参照され、Circle アームには影響しない。
+/// edge_softness は GPU(WGSL) シェーダ (`orb.wgsl`) の Glyph / Image（SDF）アーム
+/// でのみ参照され、Circle / Orb アームには影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum SoftnessPreset {
     /// 最も sharp。新スケールの baseline (旧 Mid 相当)。
@@ -75,7 +75,7 @@ impl SoftnessPreset {
 
     /// Glyph / image アームの輪郭 smoothstep 幅（#205）。
     ///
-    /// WebGL2 fragment shader (`web/src/lib/orberGl.ts`) の Glyph アームで
+    /// GPU(WGSL) シェーダ (`orb.wgsl`) の Glyph / Image（SDF）アームで
     /// `smoothstep(-edge_softness, edge_softness * 0.5, signed_unit)` の閾値として
     /// 使う。値域は `[0.3, 1.0]` で、対応するスクリーン幅は概ね 4% 〜 17% 程度。
     /// Circle アームは Euclidean distance + falloff_curve なのでこの値の影響を受けない。

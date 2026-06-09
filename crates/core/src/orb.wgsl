@@ -1,10 +1,10 @@
 // orber #207 / #235 / #242 / #241 — orb の production WGSL（native CLI / wgpu）。
 //
 // **orb の機構を全 shape の唯一の機構にしたもの（#235）。** 元は orb_circle.wgsl
-// （`web/src/lib/orberGl.ts` の orb アームを 1:1 で WGSL 化）だったが、#235 で
+// （旧 WebGL の orb アームを 1:1 で WGSL 化）だったが、#235 で
 // 「orb に別のシルエットを食わせる」形へ一般化した: 各ピクセルの "形からの距離" を
 // 正規化した r を、3 軸呼吸・falloff 曲線・straight alpha の float Source-Over 合成
-// （#242 で旧 WebGL = orberGl.ts のアルゴリズムを 1:1 採用）へ食わせる。
+// （#242 で旧 WebGL のアルゴリズムを 1:1 採用）へ食わせる。
 // #241 で最外周フェードセグメントに「薄い影」= rgb 暗化を強度係数
 // `params.shadow_strength`（0..1）付きで再導入した（kako-jun 裁定「旧ベース +
 // 新のようなアレンジを薄く重ねる」）。s=0 で #242 直後（影なし）と bit 同一、
@@ -34,11 +34,11 @@
 //   - このシェーダは per-orb データを uniform 固定配列ではなく **data-texture**
 //     (Rgba32Float, textureLoad) で読むため、**64 制限を持たない**。動的 count
 //     (= params.n_orbs、≤ MAX_ORB_COUNT(1024)) までフラグメントループで描ける。
-//   - 旧 64 制限は WebGL GLSL 経路（web/src/lib/orberGl.ts::MAX_ORBS /
-//     crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS）だけのもので、この WGSL とは無関係。
+//   - 旧 64 制限は固定 uniform-array レンダラ
+//     （crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS）だけのもので、この WGSL とは無関係。
 //     誤って 64 を同期させないこと。
 //
-// WebGL (orberGl.ts) との対応（#242 裁定: 旧 WebGL の合成アルゴリズムが正）:
+// 旧 WebGL との対応（#242 裁定: 旧 WebGL の合成アルゴリズムが正）:
 //   - falloff_curve（stop alpha は raw float）と straight alpha の float Source-Over
 //     合成を GLSL fragment shader から 1:1 移植。
 //     かつての Skia lowp 再現（stop alpha の u8 量子化・最外周セグメントの rgb→0
@@ -100,7 +100,7 @@ struct Params {
 //   x=2: misc  = (cross_axis, style_bit, speed_mult, _)
 //   x=3: rot   = (base_angle, rot_speed_signed, _, _)  ← SDF source（glyph/image）専用、orb は無視
 //   y  : orb index
-// 並びは orberGl.ts の u_orb_color / u_orb_phase / u_orb_misc と同じ。
+// 並びは旧 WebGL の u_orb_color / u_orb_phase / u_orb_misc と同じ。
 //
 // sampler は持たず textureLoad（texelFetch 相当）のみで読むので linear filtering に
 // 依存しない（gpu.rs の sample_type は Float{ filterable: false }）。これにより
@@ -139,7 +139,7 @@ fn clampf(x: f32, a: f32, b: f32) -> f32 {
 
 //!ORB_HELPERS
 
-// 旧 WebGL（orberGl.ts）の falloff_curve を 1:1 移植した falloff（#242 裁定）に、
+// 旧 WebGL の falloff_curve を 1:1 移植した falloff（#242 裁定）に、
 // #241 の「薄い影」（最外周フェードの rgb 暗化、強度係数付き）を重ねたもの。
 //
 // 返り値 `.x` = straight alpha (0..1) の **raw float**。stop alpha の u8 量子化は
@@ -192,7 +192,7 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32
 }
 
 // サブピクセル位置 `sample_px` での 1 サンプルを **straight alpha の float
-// Source-Over**（旧 WebGL = orberGl.ts の GLSL と同式、#242）で合成する。
+// Source-Over**（旧 WebGL の GLSL と同式、#242）で合成する。
 // 背景 → 全 orb の Source-Over まで。量子化・premultiply・finalize は無い。
 fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
     // 進行軸長（LR/RL=width, TB/BT=height）。GLSL: u_direction < 1.5。

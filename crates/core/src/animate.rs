@@ -331,7 +331,7 @@ fn unit_from_hash(x: u64) -> f32 {
 ///
 /// `shadow_strength` (#241): orb 機構（orb / glyph / image）の最外周フェードの
 /// rgb 暗化強度（0..1、header[13]）。0..1 にクランプして詰める。WGSL（gpu.rs）が
-/// Params uniform に読む。WebGL（orberGl.ts）は header[13] を読まないので不変。
+/// Params uniform に読む（#241 で追加された word）。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data_for_webgl(

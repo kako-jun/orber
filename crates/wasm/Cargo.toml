@@ -42,16 +42,12 @@ wasm-bindgen-futures = { workspace = true }
 # OffscreenCanvas は #245（Worker 本番生成経路の WGSL 配線）の `gpu_init_offscreen` 用。
 web-sys = { workspace = true, features = ["HtmlCanvasElement", "OffscreenCanvas"] }
 
-# #242: A/B 三者画素比較の dev ハーネス（src/ab_harness.rs、native test 専用）。
-# ブラウザのキャプチャモード（?ab=1&abcap=1）が落とす ab-params.json +
-# ab-source.bin から、`gpu_set_render_data` と同じ入口（build_gpu_render_inputs）
-# + core の readback 経路（render_packed）で CLI 側の同条件 t=0 PNG を再現する
-# `ab_dump` と、2 枚の PNG を比較する `ab_diff` を `#[ignore]` テストで提供する。
-# native 限定の理由: GPU readback（blocking poll）と std::fs を使うため。
-# orber-core の gpu feature はこの dev-dependency でのみ native test に入る
-# （`cargo build -p orber-wasm` の通常ビルドには影響しない）。
+# native test 専用。lib.rs の serde テスト（#245: transparent_background /
+# shadow_strength の serde default を JSON で検証）が serde_json を使う。
+# serde-wasm-bindgen は native test では組めないため、同じ `Deserialize` 実装を
+# JSON 経由で通す。orber-core の gpu feature を要する native test は #245 PR-B で
+# ab ハーネスを撤去したため、ここでは不要（gpu 経路は wasm32 専用の src/gpu.rs のみ）。
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
 serde_json = { workspace = true }
 
 # 注意: per-crate `[profile.release]` は workspace member では指定できない
