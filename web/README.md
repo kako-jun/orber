@@ -5,9 +5,10 @@ Astro 4 + Solid.js + Tailwind + WASM frontend for orber.
 ## UI flow
 
 画像をドロップ → worker に `source_rgb` を 1 回送る →
-`orber-wasm.get_render_data` + OffscreenCanvas WebGL renderer で
+wasm の WebGPU(WGSL) 経路（`gpu_init_offscreen(OffscreenCanvas)` →
+`gpu_set_render_data` → `gpu_render(t)`、CLI と同一の core WGSL シェーダ）で
 12 枚の静止プレビュー (PNG) を順次生成 →
-後半 4 タイル（#59, GUI_VIDEO_COUNT_DEFAULT）を同じ renderer + WebCodecs
+後半 4 タイル（#59, GUI_VIDEO_COUNT_DEFAULT）を同じ経路 + WebCodecs
 `VideoEncoder` で H.264 mp4 化 →
 **4 枚揃った時点で一斉に `<video>.play()` を発火**（#61）→ コーナーマーカー
 トグルで気に入ったタイルを選択 → DL（1 枚は拡張子に応じた直接 DL、複数は
@@ -33,8 +34,8 @@ direction は wasm 側 `direction_for_spec_idx` / `GUI_VIDEO_DIRECTIONS` が
 **LR / RL / TB / BT を 1 枚ずつ重複なく固定割当**
 する（#59）。フロー:
 
-1. `wasm.get_render_data(params, n, spec_idx)` で 1 spec 分の render data を取得
-2. worker 内 WebGL renderer が `renderFrame(t)` を 96 回描き、
+1. `wasm.gpu_set_render_data(params, n, spec_idx)` で 1 spec 分の描画データを wasm に渡す
+2. worker 内の WGSL 経路が `gpu_render(t)` を 96 回 OffscreenCanvas に描き、
    各 frame を `VideoFrame` にして WebCodecs に流す
 3. `mp4-muxer` の `ArrayBufferTarget` に詰めて `finalize()` → mp4 Blob
 4. Solid signal 経由で該当タイルの `videoBlobUrl` を埋めて `<video>` を mount

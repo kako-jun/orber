@@ -44,9 +44,9 @@
 //! - **count up to [`MAX_ORB_COUNT`] (1024)**: per-orb data is uploaded as a
 //!   **data-texture** (`Rgba32Float`, read with `textureLoad`) — not a fixed-size
 //!   uniform array — so the WGSL has **no 64-orb cap** (#210 Phase 1a). (The 64
-//!   limit only ever applied to the WebGL GLSL path —
-//!   `web/src/lib/orberGl.ts::MAX_ORBS` / `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS`
-//!   — which is untouched until Phase 3; do not re-sync a 64 cap onto this path.)
+//!   limit only ever applied to the legacy fixed-uniform-array renderer —
+//!   `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS` — do not re-sync a 64 cap onto
+//!   this path.)
 //!
 //! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not yet folded into
 //! the GPU pack; animated color/position tracks come in via the cluster列 instead.
@@ -54,8 +54,8 @@
 //! ## Compositing contract
 //!
 //! Orbs are composited in **straight sRGB float space** with a plain float
-//! Source-Over — the exact arithmetic of the legacy WebGL fragment shader
-//! (`web/src/lib/orberGl.ts`), adopted as the reference by the #242 ruling
+//! Source-Over — the exact arithmetic of the legacy WebGL fragment shader,
+//! adopted as the reference by the #242 ruling
 //! (the previous Skia-lowp u8-quantize/premultiply emulation darkened the
 //! output vs. the WebGL look). The GPU path:
 //!
@@ -138,7 +138,7 @@ const PER_ORB_WORDS: usize = 16;
 /// now the **only** mechanism for orb / glyph / image: each pixel's normalized
 /// "distance from the shape" feeds the same 3-axis breath, `falloff_curve`, and —
 /// since #242 — the **straight-alpha float Source-Over** compositing ported 1:1
-/// from the legacy WebGL fragment shader (`web/src/lib/orberGl.ts`). Only the
+/// from the legacy WebGL fragment shader. Only the
 /// **DISTANCE SOURCE** block differs per shape, so "feeding the orb a different
 /// silhouette" is the literal implementation.
 ///
@@ -990,7 +990,7 @@ impl GpuRenderer {
     /// Render one plain orb frame at time `t` from `clusters` + `opts`.
     ///
     /// The per-orb data is computed by [`pack_render_data_for_webgl`] — the same
-    /// arithmetic the WebGL path (`orberGl.ts`) uses — so the orb positions /
+    /// arithmetic the wasm data-supply pack uses — so the orb positions /
     /// radii / alphas match the web result. `opts.width` / `opts.height` give the
     /// output size; `t` is clamped to `0.0..=1.0`.
     ///
@@ -3123,7 +3123,7 @@ mod tests {
         );
     }
 
-    // ---- #242: float straight Source-Over 合成（旧 WebGL = orberGl.ts 1:1）------
+    // ---- #242: float straight Source-Over 合成（旧 WebGL 1:1）------
 
     /// WGSL ソースから `//` 行コメントを落とし、コード部分だけを返す。#242 の
     /// lowp 撤去ピンが「撤去の経緯を説明する doc コメント内の語」（例: 冒頭の
@@ -3174,7 +3174,7 @@ mod tests {
     }
 
     /// #242 裁定の死守（採用側、#241 で影スケール込みに更新）: 統一テンプレートが
-    /// 旧 WebGL（orberGl.ts）の straight alpha float Source-Over をそのまま持つこと —
+    /// 旧 WebGL の straight alpha float Source-Over をそのまま持つこと —
     /// 合成 2 式（rgb / a）と、Rim の mid_a 係数 `80.0 / 255.0`（raw float のまま、
     /// u8 量子化なし）。rgb 式の `fall.y` は #241 の薄い影スケール
     /// （`shadow_strength=0` で恒等 1.0 = #242 と bit 同一）であって、lowp 合成の

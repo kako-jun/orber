@@ -1,7 +1,7 @@
 //! #230: ブラウザ WebGPU canvas present 経路（#207 Phase 2 スライス 2/5）。
 //!
 //! orber-core の `GpuRenderer`（WGSL）で `<canvas>` に直接描く最小経路。
-//! main thread（gpu-lab / AbPanel、[`gpu_init`]）と Worker（本番生成経路、
+//! main thread（gpu-lab dev ページ、[`gpu_init`]）と Worker（本番生成経路、
 //! [`gpu_init_offscreen`]、#245）の両方から使う。公開 API:
 //!
 //! - [`gpu_init`]\(canvas\) — async。instance → canvas surface → adapter
@@ -47,8 +47,8 @@
 //! 選ぶ。orber のシェーダは sRGB エンコード済みの値をそのまま書く（core の
 //! compositing contract）ため、sRGB format だと二重エンコードになる
 //! （core 側 `debug_assert` の契約）。alpha mode は `Opaque` 優先 — orber の
-//! 背景は不透明で、WebGL 版 (`orberGl.ts`) も `alpha: false` 相当の不透明
-//! canvas なので、#232 の A/B 照合でも合成条件が揃う。
+//! 背景は不透明なので不透明 canvas で合成条件が揃う（透過 export は canvas
+//! 非経由の `gpu_render_rgba` straight-alpha readback で別途行う、#245）。
 
 use std::sync::OnceLock;
 

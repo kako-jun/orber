@@ -6,12 +6,12 @@
 //!
 //! ## API の責務分離（#225 以降）
 //!
-//! CPU 描画は撲滅され、wasm は **データ供給だけ**を担う。実描画は
-//! ブラウザ側の WebGL2/WebGPU が行う:
+//! CPU 描画は撲滅され、wasm は **データ供給と WGSL canvas 描画**を担う。
 //!
 //! - `get_render_data`: バッチ `spec_idx` 番目の per-orb 決定論データ（色 / phase /
 //!   呼吸位相 / cross_axis / style / speed_mult / 回転 + ヘッダ）を `Float32Array`
-//!   1 本にパックして返す。WebGL fragment shader が各 t のフレームを描く。
+//!   1 本にパックして返す。この JS 返し pack は #245 以降は本番導線から未使用だが、
+//!   下記 WGSL canvas-present 経路と同じ spec 解決を共有するため温存している。
 //! - `get_glyph_sdf`: グリフ 1 文字の SDF テクスチャ（`Uint8Array`）を返す。
 //! - `glyph_supported`: 同梱フォントに文字が収録されているかの判定。
 //!
@@ -58,22 +58,14 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 pub mod gpu;
 
-/// #242: A/B 三者画素比較（CLI / ブラウザWGSL / ブラウザWebGL）の dev ハーネス。
-/// native test 専用（GPU readback + std::fs を使うため wasm32 では存在しない）。
-/// `--ignored` の `ab_dump`（ブラウザキャプチャの再現 PNG 出力）/ `ab_diff`
-/// （2 枚の PNG の差分レポート）と、合成ソース式・diff 分類の純粋テストを持つ。
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod ab_harness;
-
 /// orb 数の上限。core::animate::MAX_ORB_COUNT と一致させる必要がある。
 const MAX_ORB_COUNT: usize = 1024;
 
-/// WebGL2 fragment shader 側の uniform array サイズ上限
-/// (`web/src/lib/orberGl.ts::MAX_ORBS`)。ここで超過を早期エラーにし、
-/// shader アップロード時に黙って切り詰められるのを防ぐ。GUI の
+/// per-orb pack の本数の上限（旧来の固定 uniform-array レンダラ由来の 64）。
+/// ここで超過を早期エラーにし、黙って切り詰められるのを防ぐ。GUI の
 /// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
-/// 将来 GUI の COUNT_MAX を増やす場合は両方同時に上げること。
-// SYNC WITH web/src/lib/orberGl.ts::MAX_ORBS
+/// WGSL canvas-present 経路はデータテクスチャ経路なのでこの上限を必要としないが、
+/// GUI の count 上限（high=30）を十分上回るため当面同一バリデーションで揃えておく。
 const GL_RENDERER_MAX_ORBS: usize = 64;
 
 /// パニック時にブラウザコンソールへスタックトレースを出すためのフック。
@@ -704,7 +696,7 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 /// - `[11]`: glyph_rotate (1.0 = ON / 0.0 = OFF) — #136
 /// - `[12]`: edge_softness (Glyph/image アーム smoothstep 幅、0.3..=1.0) — #205
 /// - `[13]`: shadow_strength (orb 機構の最外周フェード rgb 暗化強度、0..1) — #241。
-///   WGSL（gpu.rs）だけが読む。WebGL（orberGl.ts）はこの word を読まない（不変）
+///   WGSL（gpu.rs）が読む（#241 で追加された word）
 /// - `[14..16]`: 予約（0 詰め）
 ///
 /// `[16 + 16*i ..]` per orb i:
@@ -961,15 +953,15 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         .min(MAX_ORB_COUNT)
         .max(if clusters.is_empty() { 0 } else { 1 });
 
-    // review S2: WebGL fragment shader の uniform 配列上限を超えると黙って
-    // 切り詰められて視覚パリティが壊れる。発見が遅れないよう wasm 側で
-    // 早期 throw する。Phase B でも GL_RENDERER_MAX_ORBS=64 を超えうる
-    // count_preset (high=30) は未満。将来 high を 64 超に上げるならここを更新。
-    // WGSL canvas-present 経路はデータテクスチャ経路で 64 上限は不要だが、GUI の
-    // count 上限 30 を下回るため Phase 3 まで同一バリデーションで揃えておく。
+    // review S2: 旧来の固定 uniform-array レンダラの上限を超えると黙って切り詰め
+    // られて視覚パリティが壊れていた。発見が遅れないよう wasm 側で早期 throw する。
+    // count_preset (high=30) は GL_RENDERER_MAX_ORBS=64 未満。将来 high を 64 超に
+    // 上げるならここを更新する。WGSL canvas-present 経路はデータテクスチャ経路で
+    // この上限を必要としないが、GUI の count 上限 30 を十分上回るため当面同一
+    // バリデーションで揃えておく。
     if n_orbs > GL_RENDERER_MAX_ORBS {
         return Err(format!(
-            "n_orbs {n_orbs} exceeds WebGL renderer limit {GL_RENDERER_MAX_ORBS} (orberGl.ts MAX_ORBS と同期して上げること)"
+            "n_orbs {n_orbs} exceeds renderer orb-count cap {GL_RENDERER_MAX_ORBS}"
         ));
     }
 
@@ -1163,9 +1155,7 @@ mod tests {
     /// native の `cargo test` は既定でテストを並列実行するため、複数テストが同時に
     /// `get_or_build_clusters()` → `borrow_mut()` すると `BorrowMutError` になる
     /// (#220)。production(wasm) は single-thread なのでこの直列化はテスト専用。
-    /// #242: ab_harness::ab_dump も同じ cache を触るため pub(crate) で共有する
-    /// （`--include-ignored` で並走しても BorrowMutError にならないように）。
-    pub(crate) static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CACHE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn parse_speed_preset_handles_empty_and_values() {

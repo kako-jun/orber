@@ -630,7 +630,8 @@ mod tests {
     /// seed=42 / n=12 / still=8 実測条件）を native でも返すことを固定する。
     /// 値を変える変更（レンジ変更・抽選順変更）をしたら、wasm32 側と同時に
     /// ここも更新すること（プラットフォーム間で割れたらこのテストでは
-    /// 気づけない点に注意。割れの検出は #242 の ab_dump / ab_diff ハーネス）。
+    /// 気づけない点に注意。実機 blink での割れ検出に使った #242 の
+    /// ab_dump / ab_diff ハーネスは Phase 3 完了（#245）で削除済み）。
     #[test]
     fn random_batch_specs_pins_wasm32_sequence() {
         let specs = random_batch_specs(42, 12, 8);

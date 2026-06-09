@@ -2,7 +2,7 @@
 //
 // #112 以来の canvas 直結経路: OffscreenCanvas に 1 frame 描画して
 // `new VideoFrame(canvas)` で直接エンコーダに食わせる (#245 で描画側は
-// WebGL2 → WebGPU(WGSL) に置換、この仕組み自体は不変)。RGBA バッファの
+// WebGPU(WGSL) に配線替えされたが、この仕組み自体は不変)。RGBA バッファの
 // GPU→CPU readback が消えるので、CPU 経路 (wasm + ImageData → ImageBitmap →
 // VideoFrame) と比べて 1080×1920 × 192 frame で大幅に速い。
 //
