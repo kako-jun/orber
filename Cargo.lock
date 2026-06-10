@@ -108,9 +108,9 @@ dependencies = [
 
 [[package]]
 name = "aquarelle"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0df3fb948be0148000c954d04d5878bcfb949f938e436923d4ac07ac8a7364fe"
+checksum = "99393539a4012c9d0b3f20a1bd31390cd63d9bc8de482b1ab804db34eeb9bff3"
 dependencies = [
  "palette",
  "rand 0.8.6",
