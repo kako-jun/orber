@@ -51,9 +51,8 @@
 //   - #241 で最外周セグメントの rgb フェードだけを強度係数 shadow_strength 付きで
 //     薄く再導入（falloff_curve の doc 参照）。s>0 では WGSL が旧 WebGL より外周帯で
 //     僅かに暗く（= 影が乗って）なるのが正。u8 量子化や premultiply 合成は復活しない。
-//   - saturation は pack_render_data_for_webgl では掛けず（WebGL と共有のため）、
-//     native GPU 側 gpu.rs::render_frame が adjust_saturation_pub を後段適用して揃える。
-//     color/keyframe tracks は GPU pack 未対応で cluster 列経由。
+//   - saturation は pack では掛けず、native GPU 側 gpu.rs::render_frame が
+//     adjust_saturation_pub を後段適用して揃える。
 //
 // 座標系:
 //   GLSL は gl_FragCoord(bottom-left) を `px.y = H - px.y` で top-left に直してから
@@ -75,6 +74,37 @@
 
 const TAU: f32 = 6.28318530718;
 const BREATH_RADIUS_MAX_FACTOR: f32 = 1.10;
+// #260: procedural な位置揺らぎ（入力データに依存しない per-orb サイン）。cross 軸を
+// ゆるく揺らす。`WOBBLE_CYCLES` は loop あたりのサイン周期数（整数 ⇒ t=0≡t=1 でループ
+// 閉じ）。`WOBBLE_AMP` は振幅（cross 次元に対する正規化、kako-jun が blink で微調）。
+// 呼吸（radius/blur/opacity の sin）と同じ仕組みで、サインなので本質的に滑らか
+// （旧 #255 の直線補間が生んだカクつきが原理的に出ない）。
+const WOBBLE_AMP: f32 = 0.010;
+const WOBBLE_CYCLES: f32 = 1.0;
+// #261: procedural な色の脈動（(b)案）。各 orb の色相を per-orb 位相でゆっくり回す
+// （入力データ非依存）。静止画は色のネタが 1 枚分しか無いので、抽出色を基準に hue を
+// ゆるく回して「色変化」を作る。`HUE_PULSE_AMP` は回転角の振幅（ラジアン、blink で微調）、
+// `HUE_PULSE_CYCLES` は loop あたりの周期数（整数 ⇒ t=0≡t=1 でループ閉じ）。
+const HUE_PULSE_AMP: f32 = 0.25;
+const HUE_PULSE_CYCLES: f32 = 1.0;
+
+// 輝度を保ったまま hue を `a` ラジアン回す（YIQ ベースの標準行列、列優先）。
+fn hue_rotate(rgb: vec3<f32>, a: f32) -> vec3<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    let m = mat3x3<f32>(
+        vec3<f32>(0.299 + 0.701 * c + 0.168 * s,
+                  0.299 - 0.299 * c - 0.328 * s,
+                  0.299 - 0.300 * c + 1.250 * s),
+        vec3<f32>(0.587 - 0.587 * c + 0.330 * s,
+                  0.587 + 0.413 * c + 0.035 * s,
+                  0.587 - 0.588 * c - 1.050 * s),
+        vec3<f32>(0.114 - 0.114 * c - 0.497 * s,
+                  0.114 - 0.114 * c + 0.292 * s,
+                  0.114 + 0.886 * c - 0.203 * s),
+    );
+    return clamp(m * rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+}
 // 1/√2。crate::glyph::GLYPH_SDF_CONTENT_SPAN と同期（SDF DISTANCE SOURCE 用）。Rust 側
 // から override せずここに定数で持つ（Rust 側の値と同値であることを gpu.rs のテストで担保）。
 const GLYPH_SDF_CONTENT_SPAN: f32 = 0.70710678;
@@ -406,10 +436,10 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         let cross_axis = o.misc.x;
         let style_bit = o.misc.y; // 0=rim, 1=soft
         let speed_mult = o.misc.z;
-        // #255: cross 軸 重心ドリフト delta（B案）。一様散布(cross_axis)は保持したまま、
-        // この cluster の重心が t=0 から動いた分だけを cross 側に加算する。0 = 位置
-        // トラック無し＝従来と完全一致（byte 一致ゲート）。clamp/wrap はしない（PoC）。
-        let cross_drift = o.misc.w;
+        // #260: procedural 位置揺らぎ。per-orb サインを cross 軸に上乗せ。位相は belt 位相
+        // `phase` からずらして組織的に（全 orb が同位相だと不自然）。WOBBLE_CYCLES が整数
+        // なので t_frac=0 と 1 で同値＝ループ閉じ。入力（静止画/動画）に依らず常に効く。
+        let wobble = WOBBLE_AMP * sin(TAU * (WOBBLE_CYCLES * t_frac + phase));
 
         let r_pixels_max = params.base_radius * sqrt(max(weight, 0.0)) * BREATH_RADIUS_MAX_FACTOR;
         var r_normalized = 0.0;
@@ -428,15 +458,15 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         var ny: f32;
         if (params.direction < 0.5) {        // LR
             nx = pos;
-            ny = cross_axis + cross_drift;
+            ny = cross_axis + wobble;
         } else if (params.direction < 1.5) { // RL
             nx = 1.0 - pos;
-            ny = cross_axis + cross_drift;
+            ny = cross_axis + wobble;
         } else if (params.direction < 2.5) { // TB
-            nx = cross_axis + cross_drift;
+            nx = cross_axis + wobble;
             ny = pos;
         } else {                             // BT
-            nx = cross_axis + cross_drift;
+            nx = cross_axis + wobble;
             ny = 1.0 - pos;
         }
 
@@ -520,9 +550,15 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             // でゲートする。bleed=0（水彩オフ）のときは bloom/halo が何であろうと素の色のまま＝
             // plain と crisp に byte 一致。これで内部上級者 flag が bleed=0 のまま bloom/halo を
             // 0.5 に流しても（製品 UI も「にじみなし」のとき 3 軸 disabled）crisp が保たれる。
-            var src_rgb = o.color.rgb;
+            // #261: procedural 色の脈動。抽出色を基準に per-orb 位相でゆっくり hue 回転。
+            // 位相は phi_opacity からとり wobble(phase)/breathing(phi_radius) と非同期。
+            // 整数周期なので t_frac=0/1 で同値＝ループ閉じ。静止画/動画どちらでも常に効く。
+            var src_rgb = hue_rotate(
+                o.color.rgb,
+                HUE_PULSE_AMP * sin(TAU * (HUE_PULSE_CYCLES * t_frac + phi_opacity)),
+            );
             if (params.aqua_bleed > 0.0) {
-                src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);
+                src_rgb = aqua_character(src_rgb, alpha, params.aqua_bloom, params.aqua_halo);
             }
             // Source-Over（straight alpha）。GLSL と同式 + #241 影スケール:
             //   out.rgb = (src.rgb * shadow_scale) * src.a + out.rgb * (1 - src.a)

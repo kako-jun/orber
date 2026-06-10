@@ -1,12 +1,11 @@
 # orber overview
 
-`orber` turns a photo or short video into an abstract **orb mood** rendition — colorful, blurry light spheres that drift slowly. The original subject is intentionally lost; what survives is the *vibe* of the colors.
+`orber` turns a photo into an abstract **orb mood** rendition — colorful, blurry light spheres that drift slowly. The original subject is intentionally lost; what survives is the *vibe* of the colors.
 
 ## Pipeline
 
 ```
-input image / video
-  ├─ (video only) extract representative frames via ffmpeg
+input image (still only)
   ├─ extract color clusters       → N representative colors  [implemented]
   ├─ place orbs                   → position, size, base color per orb  [implemented]
   ├─ (glyph / image) build SDF    → font outline or image silhouette → signed-distance field  [implemented]
@@ -103,8 +102,9 @@ Auto-derived backgrounds are always opaque (alpha = 255), so animated outputs
 ## Motion model (v0.3.0)
 
 Animated outputs use a **one-way conveyor belt**. The whole clip flows in exactly one
-direction (`lr` / `rl` / `tb` / `bt`); orbs do not reflect, oscillate, or return to
-their start. When an orb exits one edge, a fresh orb enters from the opposite edge
+direction (`lr` / `rl` / `tb` / `bt`); orbs do not reflect or reverse along the flow
+(the belt is one-way — the only cross-axis motion is the gentle wobble below). When an
+orb exits one edge, a fresh orb enters from the opposite edge
 — but the seam happens **fully off-screen**: each orb's progress range is `[-r, 1+r]`
 where `r` is its radius normalized by the progress-axis length, so orbs spawn and
 despawn beyond the canvas edge and never visibly pop in or out. Each orb has a
@@ -117,6 +117,22 @@ phase offset and looping once per clip duration:
 - radius: ±10%
 - blur: ±15%
 - opacity: ±5%
+
+Two further **procedural ambient effects** are likewise applied to every orb
+automatically, each a per-orb seed-phased sine that loops once per clip (so the
+`t = 0 ≡ t = 1` seam stays closed):
+
+- **position wobble** (#260): a gentle sine displacement on the **cross axis**
+  (perpendicular to the flow — vertical for `lr` / `rl`). Because it is a pure sine
+  (not piecewise-linear), the motion is smooth, and the per-orb phases make the field
+  shimmer rather than translate as a block.
+- **color pulse** (#261): a slow per-orb **hue rotation** of the orb's extracted color,
+  so the palette drifts subtly over the clip.
+
+These are **input-independent** (derived from the seed, not from any input frames), so
+they apply to still-image input and run identically in the Web (wasm) build. They
+replaced the removed video-input color / position tracks (#7 / #33 / #251 / #255), which
+only worked from a decoded input video and never reached the Web build.
 
 Each orb is also assigned an integer **speed multiplier** (`1x` / `2x` / `3x`)
 deterministically from the seed, so individual orbs visibly travel at different
@@ -183,97 +199,6 @@ Stills are not a separate static-only code path — they are the `t = 0` frame o
 conveyor, so orbs are phase-scattered and the off-screen wrap buffer means a fraction
 of the requested `--count` will sit just outside the visible area, matching the
 visual language of the videos.
-
-## Video input — color track (#7)
-
-When `--input` is a video file (`.mp4` / `.webm` / `.mov` / `.mkv` / `.m4v` / `.avi`),
-orber switches to a **color-track** path. The orb **positions stay frozen** (decided
-once from the first frame's k-means cluster centroids); only the **colors evolve**
-over the output duration.
-
-How it works:
-
-1. `ffprobe` reads the video duration; `ffmpeg` is invoked once per sample to write
-   `N = 20` PNG frames evenly spaced in time (`t_i = i / (N-1) * duration`).
-   Frames are written to a `tempfile::TempDir` that is deleted on function exit.
-2. The first sample is k-means clustered (k = 6) to produce the **template clusters**
-   (= position / weight basis for the orb pool).
-3. Each subsequent sample is k-means clustered, and its clusters are **greedy-matched
-   to the template by LAB ΔE76 distance**. The matched colors form one **color track**
-   per template cluster (`tracks[cluster_idx][sample_idx]`).
-4. The CLI renders the output through the existing animate pipeline with
-   `AnimateOptions.color_tracks = Some(tracks)`. For each frame at output time
-   `t ∈ [0, 1]`, every orb's `cluster.color` is replaced by
-   `interpolate_color_track(tracks[cluster_idx], t)` (linear lerp between adjacent
-   samples, endpoints clamped).
-
-Critically, **input duration only sizes the color sample sequence** — the output
-length is set independently by `--duration-ms`. A 3-minute clip rendered as a
-30-second orb will play the input's color evolution at 6× speed; a 10-second clip
-rendered as a 5-minute orb will play at 0.5× speed. Position and motion (`--speed`
-/ `--direction` / `--count`) remain unaffected.
-
-`--output FILE.mp4` / `FILE.webm` produces a video; `FILE.png` produces a single
-frame at `t=0` (= first sampled frame's color). Other modes are rejected with a
-clear error. Static-image input continues to flow through the unchanged image
-path; no regression for existing callers.
-
-## Video input — keyframe interpolation (#33)
-
-`--input-mode keyframe` switches the video pipeline to a **keyframe** path that
-interpolates **color + position + weight** between sampled keyframes, rather than
-just colors with positions frozen (what is actually rendered is detailed below —
-color and position drift are, weight is not). Pass `--keyframes N` to control how many
-keyframes are sampled (default 8, clamped to a minimum of 2 since one keyframe
-cannot be interpolated).
-
-How it differs from the color-track path (#7):
-
-1. The video is sampled at `N` evenly-spaced keyframe times rather than 20 fixed
-   color samples. Each keyframe is independently k-means clustered (k = 6).
-2. Clusters are tracked across keyframes by LAB ΔE76 greedy matching against the
-   first keyframe's cluster colors. If a match is missing for some keyframe, the
-   previous keyframe's `(color, centroid, weight)` is held in place (**hold-last
-   fallback**) so interpolation does not break; the next successful match
-   resumes normal lerp.
-3. At output time `t ∈ [0, 1]`, each orb's `(color, centroid, weight)` is taken
-   from `interpolate_keyframe_track(tracks[cluster_idx], t)` — a pure linear lerp
-   between the two adjacent keyframes by the keyframe's stored normalized time
-   (endpoints clamped, NaN-safe, divide-by-zero defended). Note: all three channels
-   are interpolated; **color** and **position** (centroid drift) reach the renderer,
-   while `weight` is intentionally not applied (see below).
-
-What is rendered today (color + position drift), and what is not (weight):
-
-- The keyframe **color** track *is* rendered by the unified WGSL renderer — since
-  #251 the per-frame color is packed and the output video's orb colors change over
-  time across **orb / glyph / image** alike. (#239 Phase 1 had temporarily left this
-  dead because the only consumer was the removed aquarelle path; #251 re-wired it.)
-- The `centroid` (position) **drift** *is* rendered too, since **#255** (B-plan): the
-  uniform `cross_axis` scatter is kept, and each cluster's centroid wobble is added as a
-  per-cluster delta on the **cross axis**. The output is a loop (`t=0 ≡ t=1`), so the
-  drift is the centroid's **detrended deviation** — its offset from the straight line
-  joining the `t=0` and `t=1` centroids — not the raw `cross(t) − cross(0)` shift. This
-  closes the loop (`drift(0) = drift(1) = 0`, no seam jump) and makes a linear one-way
-  sweep contribute nothing (only true wobble survives). The deviation is scaled by a
-  subtle gain (`animate::KEYFRAME_DRIFT_GAIN`, blink-tuned). `animate::keyframe_cross_drift`
-  computes the per-cluster delta, `pack_render_data` carries it on per-orb word `off+13`
-  (`cross_drift`), and `orb.wgsl` adds it as `misc.w` to the cross axis. This applies to
-  **orb / glyph / image** alike. With no tracks it is `None` ⇒ byte-identical to before;
-  the Web (wasm) path always passes `None`, so position drift is **CLI/core only**.
-- `weight` is **intentionally not modulated** (decided in #255): restoring it would make
-  the weight-proportional per-cluster color assignment (`cluster_idx`) wander over time
-  and the orb colors would flicker. This is a deliberate design choice, not a missing
-  feature.
-
-Output length is still set entirely by `--duration-ms`. A 3-minute clip
-rendered as a 10-second orb compresses the input's mood; a 10-second clip
-rendered as a 1-minute orb stretches it. Determinism: same input + same
-`--duration-ms` + same `--seed` produces the same output bytes.
-
-`--input-mode keyframe` requires video input — passing it with a still image
-yields an explicit error rather than silently degrading. The default
-`--input-mode color-track` keeps existing #7 behavior.
 
 ## Use cases
 

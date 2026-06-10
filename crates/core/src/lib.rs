@@ -2,7 +2,6 @@
 
 pub mod animate;
 pub mod cluster;
-pub mod color_track;
 pub mod glyph;
 /// wgpu (Rust + WGSL) production render path (#207). Behind the `gpu` feature so
 /// the default wasm32 build stays minimal. Since #225 this is the **only**
@@ -14,7 +13,6 @@ pub mod glyph;
 /// API stays native-only.
 #[cfg(feature = "gpu")]
 pub mod gpu;
-pub mod keyframe_track;
 pub mod orb;
 pub mod output_mode;
 pub mod style;

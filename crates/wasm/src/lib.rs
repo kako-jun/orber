@@ -726,8 +726,8 @@ impl ResolvedFrame {
     /// base_blur / direction / speed / seed / n_orbs を再計算できるよう、
     /// 元のスカラと逆算可能な形（orb_size / blur / softness / count）で詰める。
     ///
-    /// `saturation = 1.0`（web は saturation ノブを持たない＝恒等）。
-    /// `color_tracks` / `keyframe_tracks` は GUI バッチ経路では None。
+    /// `saturation = 1.0`（web は saturation ノブを持たない＝恒等）。入力は静止画
+    /// のみ（per-orb 色は抽出クラスタ固定）。
     fn to_animate_options(&self, shape: OrbShape) -> AnimateOptions {
         AnimateOptions {
             width: self.width,
@@ -757,8 +757,6 @@ impl ResolvedFrame {
             softness: self.softness,
             glyph_rotate: self.glyph_rotate,
             shadow_strength: self.shadow_strength,
-            color_tracks: None,
-            keyframe_tracks: None,
         }
     }
 }
@@ -1006,8 +1004,7 @@ fn pack_render_data(
     shadow_strength: f32,
 ) -> Vec<f32> {
     // 完全修飾で呼ぶ（この関数自体が同名 `pack_render_data` のため import すると衝突する）。
-    // #255 は CLI/core 側のみ（位置追従は web では出さない）。cross_drift は常に
-    // `None` を渡して off+13 を 0.0 に保ち、Web の pack を byte 一致のまま維持する。
+    // 入力は静止画のみ。off+13 は core 側で常に 0.0 に保たれる（`misc.w` 未使用）。
     orber_core::animate::pack_render_data(
         clusters,
         bg,
@@ -1022,7 +1019,6 @@ fn pack_render_data(
         glyph_rotate,
         edge_softness,
         shadow_strength,
-        None,
     )
 }
 
@@ -1690,7 +1686,6 @@ mod tests {
             true,
             softness.edge_softness(),
             SHADOW_STRENGTH_DEFAULT,
-            None, // #255: wasm wrapper も None を渡すので一致する
         );
         assert_eq!(buf, expected);
     }
