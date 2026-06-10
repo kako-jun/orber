@@ -191,7 +191,9 @@ pub enum BleedMode {
     /// A案: silhouette-distance driven continuous smear (auto-follows any shape).
     #[default]
     Continuous,
-    /// B案: seed-derived 3-satellite blob scatter from the silhouette centroid.
+    /// B案: a wider bleed — the same continuous smear with a larger blur radius
+    /// (`aqua_blur_scale = 1.4`). The seed-derived 3-satellite blob model was dropped
+    /// in the #239 redesign; the two modes now differ only in blur width (blink A/B).
     Blob,
 }
 

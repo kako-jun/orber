@@ -52,6 +52,8 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
   no bleed (crisp, byte-identical to plain orb / glyph / image). Numbers are intentionally hidden in the
   product UI (internally `weak=0.15` / `mid=0.3` / `strong=0.5`). The legacy expert knobs
   `--aquarelle-bleed-mode` / `--aquarelle-bleed <float>` remain but are mutually exclusive with `--bleed`.
+  Currently the watercolor layer applies to **PNG output only**; video output (mp4 / webm) keeps the plain
+  orb look and ignores `--bleed/--bloom/--halo/--offset` (the CLI warns to stderr when you ask for both).
 - `--bloom` / `--halo` / `--offset` — the bleed's understated *character* axes, each a `weak` / `mid` /
   `strong` button (=`0.3` / `0.6` / `0.9`) layered on top of the bleed (#239). `--bloom` is a bright
   central core (capped at `BLOOM_MAX = 0.45`), `--halo` is a peripheral saturation boost (color only — no

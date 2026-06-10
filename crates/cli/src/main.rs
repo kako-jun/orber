@@ -164,7 +164,9 @@ enum Shape {
 enum CliBleedMode {
     /// A案: silhouette-distance driven continuous smear (auto-follows any shape).
     Continuous,
-    /// B案: seed-derived 3-satellite blob scatter from the silhouette centroid.
+    /// B案: a wider bleed — the same continuous smear with a larger blur radius
+    /// (`aqua_blur_scale = 1.4`). The seed-derived 3-satellite blob model was dropped
+    /// in the #239 redesign; the two modes now differ only in blur width (blink A/B).
     Blob,
 }
 
@@ -444,8 +446,8 @@ struct Cli {
     /// #239 PoC (hidden): bleed geometry for the additive aquarelle layer when
     /// riding a NON-aquarelle shape (orb / glyph / image). When set, the
     /// --aquarelle-bleed/bloom/offset/halo sliders feed an additive layer over the
-    /// unified orb mechanism (continuous = shape-following smear, blob = seed
-    /// satellites). This is a blink A/B試作 for picking the look; production
+    /// unified orb mechanism (continuous = shape-following smear, blob = the same
+    /// smear with a wider blur radius). This is a blink A/B試作 for picking the look; production
     /// continuous-value / web-slider work is a later phase. Omit it (default) and
     /// orb / glyph / image render exactly as before (byte-identical).
     ///
@@ -745,6 +747,21 @@ fn warn_if_aquarelle_count_ignored(cli: &Cli) {
     }
 }
 
+/// #239: the additive aquarelle にじみ (`--bleed/--bloom/--halo/--offset`、内部
+/// `--aquarelle-bleed-mode`) は現状 **PNG 出力のみ**で効く。動画出力 (mp4 / webm) は
+/// 製品ルックを維持するため additive bleed レイヤーを通さない (`video::render_video`
+/// が `aqua: None` を固定)。にじみが要求されているのに動画出力へ落ちると黙って無視
+/// されて驚くので、`warn_if_aquarelle_count_ignored` に倣い stderr に警告する。
+/// `poc_aqua()` が `Some` = にじみが engage 要求された (かつ shape が aquarelle でない)。
+fn warn_if_aqua_ignored_for_video(cli: &Cli) {
+    if cli.poc_aqua().is_some() {
+        eprintln!(
+            "orber: warning: --bleed/--bloom/--halo/--offset are applied to PNG output only; \
+             video output (mp4/webm) ignores them and keeps the plain orb look"
+        );
+    }
+}
+
 /// `cli.orb_shape()` を解決し、エラー（`--shape image` の mask 欠如 / 読込失敗 /
 /// コントラスト無し等）なら stderr に出して `Err(ExitCode)` を返す。各 render 経路の
 /// 先頭で 1 度だけ呼び、Image の I/O デコードを多重に走らせない。panic はしない。
@@ -837,6 +854,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     let orb_clusters = drop_dominant(&clusters);
     warn_if_orb_pool_empty(&orb_clusters);
     warn_if_aquarelle_count_ignored(cli);
+    warn_if_aqua_ignored_for_video(cli);
 
     // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
     let orb_shape = match resolve_orb_shape(cli) {
@@ -1048,6 +1066,7 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
 
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        warn_if_aqua_ignored_for_video(cli);
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
@@ -1195,6 +1214,7 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
 
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        warn_if_aqua_ignored_for_video(cli);
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
@@ -1992,6 +2012,30 @@ mod tests {
         assert!(
             cli.poc_aqua().is_none(),
             "--shape aquarelle has its own renderer; --bleed must not engage the additive layer"
+        );
+    }
+
+    /// #239 should 2: にじみ flag (`--bleed` 等) は現状 PNG 出力のみで効き、動画出力では
+    /// 黙って無視される。`warn_if_aqua_ignored_for_video` は `poc_aqua()` が `Some` の
+    /// ときだけ警告する設計なので、その判定キー（にじみ要求の有無）を直接押さえる:
+    /// にじみ指定 → Some（=警告する）、未指定 → None（=黙る）。
+    #[test]
+    fn aqua_video_warn_predicate_keys_on_poc_aqua() {
+        // にじみが要求されている → 動画出力では警告すべき（predicate = Some）。
+        assert!(
+            try_parse(&["--shape", "glyph", "--bleed", "mid"])
+                .unwrap()
+                .poc_aqua()
+                .is_some(),
+            "--bleed must make the video-ignore warning fire (poc_aqua Some)"
+        );
+        // にじみ未指定 → 動画出力でも何も無視していないので黙る（predicate = None）。
+        assert!(
+            try_parse(&["--shape", "glyph"])
+                .unwrap()
+                .poc_aqua()
+                .is_none(),
+            "without --bleed there is nothing to warn about for video output (poc_aqua None)"
         );
     }
 
