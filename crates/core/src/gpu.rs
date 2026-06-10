@@ -2866,6 +2866,33 @@ mod tests {
         );
     }
 
+    /// #260 / #261: the procedural effect **amplitudes must be non-zero**. The loop-close
+    /// test (t=0 == t=1) would still pass if `WOBBLE_AMP` / `HUE_PULSE_AMP` were accidentally
+    /// set to `0.0` (a no-op effect), so guard the actual const values here by parsing them
+    /// out of the template. blink-tuned values: wobble 0.010, hue pulse 0.25 rad.
+    #[test]
+    fn orb_wgsl_procedural_amplitudes_are_nonzero() {
+        let wgsl = ORB_WGSL_TEMPLATE;
+        for (name, prefix) in [
+            ("WOBBLE_AMP", "const WOBBLE_AMP: f32 = "),
+            ("HUE_PULSE_AMP", "const HUE_PULSE_AMP: f32 = "),
+        ] {
+            let line = wgsl
+                .lines()
+                .map(str::trim_start)
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{name} const not found in template"));
+            let val: f32 = line
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.trim().trim_end_matches(';').trim().parse().ok())
+                .unwrap_or_else(|| panic!("could not parse {name} value from `{line}`"));
+            assert!(
+                val > 0.0,
+                "{name} must be > 0 — a 0 amplitude makes the procedural effect a no-op"
+            );
+        }
+    }
+
     /// #260 / #261: the procedural effects are loop-periodic — a plain still-image orb render
     /// at t=0 and t=1 must be **byte-identical**, so the output video seam (t=1 → t=0) does
     /// not jump. Both effects (and breathing / conveyor) return to their t=0 value at t=1

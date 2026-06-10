@@ -265,7 +265,7 @@ fn parse_saturation(s: &str) -> Result<f32, String> {
 #[derive(Debug, Parser)]
 #[command(name = "orber")]
 #[command(version)]
-#[command(about = "Turn photos and videos into abstract orb mood output")]
+#[command(about = "Turn a still image into abstract orb mood output (image / video / SVG / CSS)")]
 struct Cli {
     /// Input image file (still only). Raster formats (PNG / JPEG / WebP / …).
     #[arg(short, long)]
@@ -632,7 +632,10 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -680,7 +683,10 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -747,7 +753,10 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -832,7 +841,10 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
