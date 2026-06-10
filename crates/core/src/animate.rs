@@ -105,6 +105,13 @@ impl MotionSpeed {
 /// 使い、調整ノブは外に出さない。値の置き場はこの 1 箇所に集約する。
 pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
 
+/// #255: 位置追従（[`keyframe_cross_drift`]）のドリフト量を抑える係数（0..1）。
+///
+/// デトレンドした重心の揺らぎ（端点を結ぶ直線からの偏差）にこの係数を掛けて、
+/// **ごく微妙な揺らぎ**に抑える。blink（A-B ライブ比較）で微調する想定の値。
+/// `1.0` ならデトレンド生値そのまま、`0.0` ならドリフト無効（pack の `off+13` が常に 0）。
+pub const KEYFRAME_DRIFT_GAIN: f32 = 0.25;
+
 /// アニメーション 1 フレーム描画のオプション。
 ///
 /// `count` は同時可視 orb の総数。`None` の場合は cluster 数と一致させる
@@ -164,8 +171,10 @@ pub struct AnimateOptions {
     /// 上位互換）。`None` のときは `color_tracks` に従う。
     /// 位置追従（centroid の cross 軸ドリフト）は #255 で実装済み。ただし
     /// [`apply_color_tracks_at_t`] は色だけを扱い、ドリフトは別関数
-    /// [`keyframe_cross_drift`] が per-cluster の delta を算出して pack の `off+13` に載せる
-    /// （`orb.wgsl` が `misc.w` として cross 軸に加算）。`weight` 変調は色割当の安定のため
+    /// [`keyframe_cross_drift`] が per-cluster の delta（**デトレンドした重心揺らぎ ×
+    /// [`KEYFRAME_DRIFT_GAIN`]**）を算出して pack の `off+13` に載せる（`orb.wgsl` が
+    /// `misc.w` として cross 軸に加算）。正味スイープは除去されループが閉じる
+    /// （`t=0 ≡ t=1` で 0）、直線トラックは 0。`weight` 変調は色割当の安定のため
     /// 意図的に適用しない（#255 で確定）。位置 wrap / breathing は `orb.wgsl` 自身がやるので、
     /// 補間 centroid をそのまま戻すと二重適用になる（だから散布保持 + delta 加算の B 案）。
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
@@ -357,10 +366,11 @@ fn unit_from_hash(x: u64) -> f32 {
 /// Params uniform に読む（#241 で追加された word）。
 ///
 /// `cross_drift` (#255): per-cluster の cross 軸 重心ドリフト delta（B 案、動画 #33
-/// キーフレームの位置追従）。index は cluster index、各 orb は `cluster_idx` で引く。
-/// per-orb word `off+13`（従来 0.0 埋めの空き）に書く。`None`（tracks 無し）のとき
-/// 0.0 ＝ **従来と byte 完全一致**（非回帰ゲート）。delta なので `t=0` でも 0 になる
-/// （[`keyframe_cross_drift`] が算出。centroid 絶対値は使わない＝縞を出さない）。
+/// キーフレームの位置追従）。**デトレンドした重心揺らぎ × [`KEYFRAME_DRIFT_GAIN`]**。
+/// index は cluster index、各 orb は `cluster_idx` で引く。per-orb word `off+13`
+/// （従来 0.0 埋めの空き）に書く。`None`（tracks 無し）のとき 0.0 ＝ **従来と byte
+/// 完全一致**（非回帰ゲート）。正味スイープは除去されループが閉じる（`t=0 ≡ t=1` で 0）、
+/// 直線トラックは 0（[`keyframe_cross_drift`] が算出。centroid 絶対値は使わない＝縞を出さない）。
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data(
     clusters: &[Cluster],
@@ -495,16 +505,29 @@ pub fn apply_color_tracks_at_t(
 /// 動画入力（#33 キーフレーム）の **cross 軸 重心ドリフト delta** を per-cluster で返す。
 ///
 /// B 案（#255）: 一様散布（`OrbParams::cross_axis`）は保持したまま、その cluster の
-/// 重心が `t=0` から動いた分（cross 軸の差分）だけを上に**加算**するためのスカラー列。
-/// 各 orb は `cluster_idx` でこの列を引き、同色の群れが塊ごとにドリフトする
-/// （縞＝同色 orb が 1 帯に吸着、は出さない）。
+/// 重心の **デトレンドした揺らぎ × [`KEYFRAME_DRIFT_GAIN`]** だけを上に**加算**する
+/// ためのスカラー列。各 orb は `cluster_idx` でこの列を引き、同色の群れが塊ごとに
+/// ドリフトする（縞＝同色 orb が 1 帯に吸着、は出さない）。
+///
+/// orber 出力は**ループ動画**（`t=0 ≡ t=1`）。素の `cross(t) − cross(0)` は片道
+/// スイープ成分を含み、継ぎ目（`t=1→0`）で跳ねてループを壊す。そこで端点を結ぶ直線を
+/// 差し引く（デトレンド）:
+///
+/// ```text
+/// detrended = cross(t) − (cross(0)·(1−t) + cross(1)·t)
+/// slot      = KEYFRAME_DRIFT_GAIN · detrended
+/// ```
+///
+/// これにより `drift(0) = drift(1) = 0`（ループ閉じ）。直線的な片道スイープ
+/// （2 キーの linear track）は全 `t` で `detrended = 0` ＝ 正味移動を乗せない（正しい）。
+/// 揺らぎ（3 キー以上で中点が直線から外れる動き）にだけ反応する。
 ///
 /// - `keyframe_tracks` が `None` または空なら `None` を返す。呼び出し側はこれを
 ///   `pack_render_data` に `None` として渡し、`misc.w = 0` ＝ **従来と byte 一致**にする。
 /// - `Some` のとき、長さ `n_clusters` の `Vec<f32>` を返す。各 index について
-///   [`interpolate_keyframe_track`] の centroid を `t` と `0.0` で取り、
-///   **cross 軸座標の delta = cross(t) − cross(0)** を入れる。delta なので `t=0` で
-///   必ず 0（＝従来と一致）。centroid の**絶対値は使わない**（A 案＝縞を避ける）。
+///   [`interpolate_keyframe_track`] の centroid を `t` / `0.0` / `1.0` で取り、
+///   上式の **cross 軸座標のデトレンド偏差 × gain** を入れる。centroid の
+///   **絶対値は使わない**（A 案＝縞を避ける）。
 /// - cross 軸は direction 依存: LR/RL（`direction_id < 1.5`）→ centroid.y、
 ///   TB/BT（`>= 1.5`）→ centroid.x。
 /// - track が無い / 空の cluster index は delta = 0.0。
@@ -523,18 +546,25 @@ pub fn keyframe_cross_drift(
     }
     // cross 軸の選択: LR/RL → y、TB/BT → x。
     let cross_is_y = direction_id < 1.5;
+    let cross = |c: &crate::cluster::Centroid| if cross_is_y { c.y } else { c.x };
+    // デトレンドの直線は `t`/`1−t` を掛けるので、NaN t を素通しすると drift が NaN に
+    // なる（interpolate 側の NaN→先頭クランプだけでは防げない）。NaN は先頭時刻 0.0
+    // 相当（drift 0、跳ねなし）に正規化する。
+    let t = if t.is_nan() { 0.0 } else { t };
     let mut drift = vec![0.0f32; n_clusters];
     for (idx, slot) in drift.iter_mut().enumerate() {
         let Some(track) = tracks.get(idx).filter(|track| !track.is_empty()) else {
             continue; // track 無し / 空 → delta = 0.0。
         };
-        let (_color, c_t, _weight) = interpolate_keyframe_track(track, t);
-        let (_color0, c_0, _weight0) = interpolate_keyframe_track(track, 0.0);
-        *slot = if cross_is_y {
-            c_t.y - c_0.y
-        } else {
-            c_t.x - c_0.x
-        };
+        let (_color, cen_t, _weight) = interpolate_keyframe_track(track, t);
+        let (_color0, cen_0, _weight0) = interpolate_keyframe_track(track, 0.0);
+        let (_color1, cen_1, _weight1) = interpolate_keyframe_track(track, 1.0);
+        let (c_t, c_0, c_1) = (cross(&cen_t), cross(&cen_0), cross(&cen_1));
+        // 端点を結ぶ直線からの偏差（デトレンド）。t=0/t=1 で必ず 0 ＝ ループ閉じ。
+        // 直線スイープ（2 キー linear）は全 t で 0、揺らぎだけが残る。NaN t は
+        // interpolate が先頭値クランプするので panic しない。
+        let detrended = c_t - (c_0 * (1.0 - t) + c_1 * t);
+        *slot = KEYFRAME_DRIFT_GAIN * detrended;
     }
     Some(drift)
 }
@@ -1052,9 +1082,9 @@ mod tests {
         );
     }
 
-    /// #255 A3: drift is a **delta** from `t=0`, so at `t=0` every cluster's delta is
-    /// ~0 (the orb sits exactly where the still image would — byte-identical motion
-    /// onset). track[0].time = 0.0 so c_t and c_0 coincide.
+    /// #255 A3 (loop): drift is **detrended** from the line joining the endpoints, so
+    /// at `t=0` every cluster's drift is ~0 (`drift(0)=0` is one half of the loop-close
+    /// guarantee; the orb sits exactly where the still image would). track[0].time=0.0.
     #[test]
     fn keyframe_cross_drift_t0_is_all_zero_delta() {
         let opts = drift_opts(Some(vec![
@@ -1063,70 +1093,172 @@ mod tests {
         ]));
         let drift = keyframe_cross_drift(&opts, 0.0, 0.0, 2).expect("Some at t=0");
         for (i, d) in drift.iter().enumerate() {
-            approx(*d, 0.0, &format!("t=0 delta for cluster {i}"));
+            approx(*d, 0.0, &format!("t=0 drift for cluster {i}"));
         }
     }
 
-    /// #255 A4: LR (direction_id=0.0) ⇒ cross axis = **y**. With centroid.y sweeping
-    /// 0.2→0.8 the delta is 0.6 at t=1 and 0.3 at t=0.5. Moving x must NOT change the
-    /// result (LR ignores x).
+    /// #255 A4a: a straight one-way sweep (2-key linear track, y:0.2→0.8) is fully
+    /// removed by the detrend at **every** `t` ⇒ drift ≈ 0 everywhere. This pins that
+    /// the net sweep carries no position offset (loops cannot pick up a one-way drift).
     #[test]
-    fn keyframe_cross_drift_lr_uses_centroid_y() {
-        // x fixed at 0.5: y is the only thing that moves.
-        let fixed_x = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
-        let d1 = keyframe_cross_drift(&fixed_x, 1.0, 0.0, 1).expect("Some")[0];
-        let dh = keyframe_cross_drift(&fixed_x, 0.5, 0.0, 1).expect("Some")[0];
-        approx(d1, 0.6, "LR t=1 y-delta");
-        approx(dh, 0.3, "LR t=0.5 y-delta");
-
-        // Same y sweep but x now also moves: LR must give the identical y-delta.
-        let moving_x = drift_opts(Some(vec![vec![kfp(0.1, 0.2, 0.0), kfp(0.95, 0.8, 1.0)]]));
-        let d1_mx = keyframe_cross_drift(&moving_x, 1.0, 0.0, 1).expect("Some")[0];
-        approx(d1_mx, 0.6, "LR delta must be x-invariant");
+    fn keyframe_cross_drift_linear_track_is_zero_after_detrend() {
+        let opts = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
+        for &t in &[0.0f32, 0.5, 1.0] {
+            let d = keyframe_cross_drift(&opts, t, 0.0, 1).expect("Some")[0];
+            approx(
+                d,
+                0.0,
+                &format!("linear LR sweep must detrend to 0 at t={t}"),
+            );
+        }
     }
 
-    /// #255 A5: TB (direction_id=2.0) ⇒ cross axis = **x**. centroid.x 0.2→0.8 gives
-    /// delta 0.6 at t=1; moving y must not change it.
+    /// #255 A4b: LR (direction_id=0.0) ⇒ cross axis = **y**. A 3-key wobble
+    /// (y: 0.2→0.8→0.2) leaves the line at the midpoint: detrended(0.5)=0.8−0.2=0.6,
+    /// ×gain 0.25 ⇒ **0.15**; endpoints 0. Moving x must NOT change it (LR ignores x).
+    #[test]
+    fn keyframe_cross_drift_lr_wobble_uses_centroid_y() {
+        // x fixed: only y wobbles.
+        let fixed_x = drift_opts(Some(vec![vec![
+            kfp(0.5, 0.2, 0.0),
+            kfp(0.5, 0.8, 0.5),
+            kfp(0.5, 0.2, 1.0),
+        ]]));
+        approx(
+            keyframe_cross_drift(&fixed_x, 0.5, 0.0, 1).expect("Some")[0],
+            0.15,
+            "LR t=0.5 y-wobble (0.6 detrended × 0.25)",
+        );
+        approx(
+            keyframe_cross_drift(&fixed_x, 0.0, 0.0, 1).expect("Some")[0],
+            0.0,
+            "LR t=0 wobble drift",
+        );
+        approx(
+            keyframe_cross_drift(&fixed_x, 1.0, 0.0, 1).expect("Some")[0],
+            0.0,
+            "LR t=1 wobble drift",
+        );
+
+        // Same y wobble but x now also moves: LR must give the identical y-drift.
+        let moving_x = drift_opts(Some(vec![vec![
+            kfp(0.1, 0.2, 0.0),
+            kfp(0.95, 0.8, 0.5),
+            kfp(0.1, 0.2, 1.0),
+        ]]));
+        approx(
+            keyframe_cross_drift(&moving_x, 0.5, 0.0, 1).expect("Some")[0],
+            0.15,
+            "LR wobble drift must be x-invariant",
+        );
+    }
+
+    /// #255 A5: TB (direction_id=2.0) ⇒ cross axis = **x**. A 3-key wobble
+    /// (x: 0.2→0.8→0.2) gives 0.15 at t=0.5, 0 at the endpoints; moving y must not
+    /// change it (TB ignores y).
     #[test]
     fn keyframe_cross_drift_tb_uses_centroid_x() {
-        let fixed_y = drift_opts(Some(vec![vec![kfp(0.2, 0.5, 0.0), kfp(0.8, 0.5, 1.0)]]));
+        let fixed_y = drift_opts(Some(vec![vec![
+            kfp(0.2, 0.5, 0.0),
+            kfp(0.8, 0.5, 0.5),
+            kfp(0.2, 0.5, 1.0),
+        ]]));
+        approx(
+            keyframe_cross_drift(&fixed_y, 0.5, 2.0, 1).expect("Some")[0],
+            0.15,
+            "TB t=0.5 x-wobble",
+        );
+        approx(
+            keyframe_cross_drift(&fixed_y, 0.0, 2.0, 1).expect("Some")[0],
+            0.0,
+            "TB t=0 drift",
+        );
         approx(
             keyframe_cross_drift(&fixed_y, 1.0, 2.0, 1).expect("Some")[0],
-            0.6,
-            "TB t=1 x-delta",
+            0.0,
+            "TB t=1 drift",
         );
-        let moving_y = drift_opts(Some(vec![vec![kfp(0.2, 0.1, 0.0), kfp(0.8, 0.95, 1.0)]]));
+        let moving_y = drift_opts(Some(vec![vec![
+            kfp(0.2, 0.1, 0.0),
+            kfp(0.8, 0.95, 0.5),
+            kfp(0.2, 0.1, 1.0),
+        ]]));
         approx(
-            keyframe_cross_drift(&moving_y, 1.0, 2.0, 1).expect("Some")[0],
-            0.6,
-            "TB delta must be y-invariant",
+            keyframe_cross_drift(&moving_y, 0.5, 2.0, 1).expect("Some")[0],
+            0.15,
+            "TB wobble drift must be y-invariant",
         );
     }
 
-    /// #255 A6: the axis switch happens at direction_id 1.5. One track whose x and y
-    /// both move (x:0.2→0.7 ⇒ Δx=0.5, y:0.1→0.9 ⇒ Δy=0.8): RL(1.0, below 1.5) must
-    /// pick the y-delta, TB(2.0, above 1.5) the x-delta. Contrasted in one test so a
-    /// flipped boundary is caught.
+    /// #255 A6: the axis switch happens at direction_id 1.5. One wobble track whose x
+    /// and y both deviate from their endpoint line at the midpoint
+    /// (x:0.2→0.7→0.2 ⇒ Δx=0.5, y:0.1→0.9→0.1 ⇒ Δy=0.8): RL(1.0, below 1.5) must pick
+    /// the y-wobble (0.8×0.25=0.2), TB(2.0, above 1.5) the x-wobble (0.5×0.25=0.125).
+    /// Contrasted at t=0.5 in one test so a flipped boundary is caught.
     #[test]
     fn keyframe_cross_drift_axis_switch_boundary_rl_vs_tb() {
-        let opts = drift_opts(Some(vec![vec![kfp(0.2, 0.1, 0.0), kfp(0.7, 0.9, 1.0)]]));
-        let rl = keyframe_cross_drift(&opts, 1.0, 1.0, 1).expect("Some")[0]; // RL → y
-        let tb = keyframe_cross_drift(&opts, 1.0, 2.0, 1).expect("Some")[0]; // TB → x
-        approx(rl, 0.8, "RL (<1.5) ⇒ y-delta");
-        approx(tb, 0.5, "TB (>=1.5) ⇒ x-delta");
+        let opts = drift_opts(Some(vec![vec![
+            kfp(0.2, 0.1, 0.0),
+            kfp(0.7, 0.9, 0.5),
+            kfp(0.2, 0.1, 1.0),
+        ]]));
+        let rl = keyframe_cross_drift(&opts, 0.5, 1.0, 1).expect("Some")[0]; // RL → y
+        let tb = keyframe_cross_drift(&opts, 0.5, 2.0, 1).expect("Some")[0]; // TB → x
+        approx(rl, 0.2, "RL (<1.5) ⇒ y-wobble × gain (0.8×0.25)");
+        approx(tb, 0.125, "TB (>=1.5) ⇒ x-wobble × gain (0.5×0.25)");
     }
 
-    /// #255 A7: an empty per-cluster track yields delta 0 for that index, while a
-    /// real track at another index drifts. Index 0 empty, index 1 real.
+    /// #255: loop-close guarantee — for **any** wobble track, `drift(0)` and `drift(1)`
+    /// are both ≈0 so the loop seam (`t=1→0`) does not jump. Several clusters with
+    /// distinct wobble shapes so this is not an accident of one track.
+    #[test]
+    fn keyframe_cross_drift_loop_closes_t0_and_t1_are_zero() {
+        let opts = drift_opts(Some(vec![
+            // asymmetric wobble (peak off-center), endpoints differ.
+            vec![kfp(0.5, 0.1, 0.0), kfp(0.5, 0.9, 0.3), kfp(0.5, 0.4, 1.0)],
+            // x-and-y wobble.
+            vec![kfp(0.2, 0.2, 0.0), kfp(0.7, 0.8, 0.5), kfp(0.3, 0.1, 1.0)],
+        ]));
+        for &dir in &[0.0f32, 2.0] {
+            let d0 = keyframe_cross_drift(&opts, 0.0, dir, 2).expect("Some");
+            let d1 = keyframe_cross_drift(&opts, 1.0, dir, 2).expect("Some");
+            for c in 0..2 {
+                approx(d0[c], 0.0, &format!("loop-close dir={dir} cluster {c} t=0"));
+                approx(d1[c], 0.0, &format!("loop-close dir={dir} cluster {c} t=1"));
+            }
+        }
+    }
+
+    /// #255: the gain constant is applied exactly once. A wobble whose raw detrended
+    /// value at t=0.5 is 0.6 must come back as 0.6 × [`KEYFRAME_DRIFT_GAIN`] (=0.15),
+    /// pinning that the const is not mis-multiplied (e.g. squared, or omitted).
+    #[test]
+    fn keyframe_cross_drift_applies_subtle_gain() {
+        let opts = drift_opts(Some(vec![vec![
+            kfp(0.5, 0.2, 0.0),
+            kfp(0.5, 0.8, 0.5),
+            kfp(0.5, 0.2, 1.0),
+        ]]));
+        let got = keyframe_cross_drift(&opts, 0.5, 0.0, 1).expect("Some")[0];
+        let raw_detrended = 0.6f32; // 0.8 − (0.2·0.5 + 0.2·0.5)
+        approx(
+            got,
+            KEYFRAME_DRIFT_GAIN * raw_detrended,
+            "gain applied once",
+        );
+    }
+
+    /// #255 A7: an empty per-cluster track yields drift 0 for that index, while a
+    /// real wobble track at another index drifts. Index 0 empty, index 1 wobble.
     #[test]
     fn keyframe_cross_drift_empty_track_index_is_zero() {
         let opts = drift_opts(Some(vec![
-            vec![],                                       // cluster 0: no track → delta 0
-            vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)], // cluster 1: y 0.2→0.8
+            vec![], // cluster 0: no track → drift 0
+            vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 0.5), kfp(0.5, 0.2, 1.0)], // y wobble
         ]));
-        let drift = keyframe_cross_drift(&opts, 1.0, 0.0, 2).expect("Some");
-        approx(drift[0], 0.0, "empty track ⇒ delta 0");
-        approx(drift[1], 0.6, "real track ⇒ y-delta");
+        let drift = keyframe_cross_drift(&opts, 0.5, 0.0, 2).expect("Some");
+        approx(drift[0], 0.0, "empty track ⇒ drift 0");
+        approx(drift[1], 0.15, "real wobble ⇒ y-drift 0.15 at t=0.5");
     }
 
     /// #255 A8: the output length is always `n_clusters`, independent of the number
@@ -1134,31 +1266,40 @@ mod tests {
     /// more tracks than clusters ⇒ the surplus tracks are ignored.
     #[test]
     fn keyframe_cross_drift_output_len_is_n_clusters_not_tracks_len() {
-        // 1 track, 3 clusters → len 3, only index 0 drifts.
-        let few = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
-        let d = keyframe_cross_drift(&few, 1.0, 0.0, 3).expect("Some");
+        // 1 wobble track, 3 clusters → len 3, only index 0 drifts (at t=0.5).
+        let few = drift_opts(Some(vec![vec![
+            kfp(0.5, 0.2, 0.0),
+            kfp(0.5, 0.8, 0.5),
+            kfp(0.5, 0.2, 1.0),
+        ]]));
+        let d = keyframe_cross_drift(&few, 0.5, 0.0, 3).expect("Some");
         assert_eq!(d.len(), 3, "len must equal n_clusters");
-        approx(d[0], 0.6, "cluster 0 drifts");
+        approx(d[0], 0.15, "cluster 0 wobbles");
         approx(d[1], 0.0, "no track ⇒ 0");
         approx(d[2], 0.0, "no track ⇒ 0");
 
-        // 3 tracks, 2 clusters → len 2 (surplus track ignored, no panic).
+        // 3 tracks, 2 clusters → len 2 (surplus track ignored, no panic). Length is
+        // axis/value-independent so plain 2-key tracks suffice here.
         let many = drift_opts(Some(vec![
             vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)],
             vec![kfp(0.5, 0.1, 0.0), kfp(0.5, 0.5, 1.0)],
             vec![kfp(0.5, 0.0, 0.0), kfp(0.5, 1.0, 1.0)],
         ]));
-        let d = keyframe_cross_drift(&many, 1.0, 0.0, 2).expect("Some");
+        let d = keyframe_cross_drift(&many, 0.5, 0.0, 2).expect("Some");
         assert_eq!(d.len(), 2, "len must be n_clusters, surplus tracks ignored");
     }
 
-    /// #255 A9: a NaN `t` must not panic. `interpolate_keyframe_track` returns the
-    /// head value for NaN, and head==t=0 head ⇒ delta ~0.
+    /// #255 A9: a NaN `t` must not panic. `interpolate_keyframe_track` clamps NaN to
+    /// the head value, so `c_t` equals `c_0` and the detrend yields ~0 (no jump).
     #[test]
     fn keyframe_cross_drift_nan_t_does_not_panic_and_is_zero() {
-        let opts = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
+        let opts = drift_opts(Some(vec![vec![
+            kfp(0.5, 0.2, 0.0),
+            kfp(0.5, 0.8, 0.5),
+            kfp(0.5, 0.2, 1.0),
+        ]]));
         let d = keyframe_cross_drift(&opts, f32::NAN, 0.0, 1).expect("Some");
-        approx(d[0], 0.0, "NaN t ⇒ head value both ends ⇒ delta 0");
+        approx(d[0], 0.0, "NaN t ⇒ head value clamped ⇒ drift 0");
     }
 
     // ---- #255: pack_render_data off+13 carries the per-cluster drift ----

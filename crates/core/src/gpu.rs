@@ -3575,12 +3575,16 @@ mod tests {
         )
     }
 
-    /// A keyframe track whose centroid sweeps along an axis (color/weight fixed so
-    /// only position drives the drift), applied to every cluster.
+    /// A 3-key **wobble** track: centroid goes `ends → mid → ends`, so the midpoint
+    /// (t=0.5) deviates from the endpoint line while t=0 / t=1 sit on it. After the
+    /// detrend (#255) only the wobble survives: drift is 0 at the endpoints and peaks
+    /// at the midpoint. A plain 2-key linear track would detrend to 0 everywhere, so
+    /// the GPU drift tests must use this shape. Color/weight fixed so only position
+    /// drives the drift; applied to every cluster.
     fn drift_tracks(
         clusters: &[Cluster],
-        from: Centroid,
-        to: Centroid,
+        ends: Centroid,
+        mid: Centroid,
     ) -> Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>> {
         let key = |c: Centroid, time: f32| crate::keyframe_track::KeyframeClusterPoint {
             color: [220, 220, 220],
@@ -3588,7 +3592,7 @@ mod tests {
             weight: 0.5,
             time,
         };
-        vec![vec![key(from, 0.0), key(to, 1.0)]; clusters.len()]
+        vec![vec![key(ends, 0.0), key(mid, 0.5), key(ends, 1.0)]; clusters.len()]
     }
 
     /// #255 C14: a drift of all-zeros is a no-op vs no drift at all. Render a hand-built
@@ -3640,10 +3644,11 @@ mod tests {
         );
     }
 
-    /// #255 C15: a non-zero drift actually moves the orbs. An LR track whose centroid
-    /// sweeps in y (0.2→0.8) renders a drifted frame at t=1 that differs significantly
-    /// from the un-drifted frame at t=0 (where the delta is 0). Asserts the bytes
-    /// differ well beyond tolerance — misc.w reaches the shader and shifts position.
+    /// #255 C15: a non-zero (detrended) drift actually moves the orbs. An LR wobble
+    /// track in y (0.2→0.8→0.2) gives drift 0 at the endpoint t=0 but a peak drift at
+    /// the midpoint t=0.5. The midpoint frame must differ significantly from the t=0
+    /// frame — misc.w reaches the shader and shifts position. (A plain linear sweep
+    /// would detrend to 0 at every t, so a wobble is required here.)
     #[test]
     fn gpu_cross_drift_shifts_orbs_along_cross_axis() {
         let Some(renderer) =
@@ -3653,15 +3658,15 @@ mod tests {
         };
         let clusters = sample_clusters();
         let mut opts = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        // Large y sweep so the cross-axis (y, for LR) shift is unmistakable.
+        // Large y wobble so the cross-axis (y, for LR) midpoint shift is unmistakable.
         opts.keyframe_tracks = Some(drift_tracks(
             &clusters,
-            Centroid { x: 0.5, y: 0.2 },
-            Centroid { x: 0.5, y: 0.8 },
+            Centroid { x: 0.5, y: 0.2 }, // endpoints (drift 0)
+            Centroid { x: 0.5, y: 0.8 }, // midpoint (peak drift)
         ));
 
-        let at0 = renderer.render_frame(&clusters, &opts, 0.0); // delta 0
-        let at1 = renderer.render_frame(&clusters, &opts, 1.0); // delta = +0.6 in y
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0); // detrended drift 0
+        let at_half = renderer.render_frame(&clusters, &opts, 0.5); // peak y drift
         assert!(
             lit_vs_bg(&at0, opts.background, 8) > 0,
             "drift frame must have lit pixels"
@@ -3669,7 +3674,7 @@ mod tests {
         // Count how many pixels differ beyond tolerance: a real position shift moves
         // far more than the color sweep alone could (color/weight are fixed here).
         let (mut differing, total) = (0usize, (at0.width() * at0.height()) as usize);
-        for (a, b) in at0.pixels().zip(at1.pixels()) {
+        for (a, b) in at0.pixels().zip(at_half.pixels()) {
             if (0..4).any(|c| a.0[c].abs_diff(b.0[c]) > 2) {
                 differing += 1;
             }
@@ -3680,8 +3685,9 @@ mod tests {
         );
     }
 
-    /// #255 C16: the cross axis is **y for LR** and **x for TB**. Give the same-size
-    /// drift to an LR run (y sweep) and a TB run (x sweep) and confirm the lit mass
+    /// #255 C16: the cross axis is **y for LR** and **x for TB**. Give a wobble to an
+    /// LR run (y wobble) and a TB run (x wobble) and confirm that from the endpoint
+    /// frame (t=0, drift 0) to the midpoint frame (t=0.5, peak drift) the lit mass
     /// shifts down (y grows) for LR but barely in x, and right (x grows) for TB but
     /// barely in y. RL/BT share the wgsl branch shape so they are not retested.
     #[test]
@@ -3693,37 +3699,66 @@ mod tests {
         let clusters = sample_clusters();
         let bg = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow).background;
 
-        // LR: cross axis = y. A y-sweep should push the lit centroid downward (y up).
+        // LR: cross axis = y. A y-wobble should push the lit centroid downward (y up)
+        // at the midpoint relative to the endpoint frame.
         let mut lr = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
         lr.keyframe_tracks = Some(drift_tracks(
             &clusters,
-            Centroid { x: 0.5, y: 0.3 },
-            Centroid { x: 0.5, y: 0.8 },
+            Centroid { x: 0.5, y: 0.3 }, // endpoints
+            Centroid { x: 0.5, y: 0.8 }, // midpoint
         ));
         let lr0 = lit_centroid(&renderer.render_frame(&clusters, &lr, 0.0), bg, 8);
-        let lr1 = lit_centroid(&renderer.render_frame(&clusters, &lr, 1.0), bg, 8);
-        let lr_dy = lr1.1 - lr0.1;
-        let lr_dx = (lr1.0 - lr0.0).abs();
+        let lr_mid = lit_centroid(&renderer.render_frame(&clusters, &lr, 0.5), bg, 8);
+        let lr_dy = lr_mid.1 - lr0.1;
+        let lr_dx = (lr_mid.0 - lr0.0).abs();
         assert!(
             lr_dy > 0.05 && lr_dy > lr_dx,
             "LR drift must move lit mass mainly in y (dy={lr_dy:.3}, dx={lr_dx:.3})"
         );
 
-        // TB: cross axis = x. An x-sweep should push the lit centroid rightward (x up).
+        // TB: cross axis = x. An x-wobble should push the lit centroid rightward (x up).
         let mut tb = orb_opts(64, 48, MotionDirection::TopToBottom, MotionSpeed::Slow);
         tb.keyframe_tracks = Some(drift_tracks(
             &clusters,
-            Centroid { x: 0.3, y: 0.5 },
-            Centroid { x: 0.8, y: 0.5 },
+            Centroid { x: 0.3, y: 0.5 }, // endpoints
+            Centroid { x: 0.8, y: 0.5 }, // midpoint
         ));
         let tb0 = lit_centroid(&renderer.render_frame(&clusters, &tb, 0.0), bg, 8);
-        let tb1 = lit_centroid(&renderer.render_frame(&clusters, &tb, 1.0), bg, 8);
-        let tb_dx = tb1.0 - tb0.0;
-        let tb_dy = (tb1.1 - tb0.1).abs();
+        let tb_mid = lit_centroid(&renderer.render_frame(&clusters, &tb, 0.5), bg, 8);
+        let tb_dx = tb_mid.0 - tb0.0;
+        let tb_dy = (tb_mid.1 - tb0.1).abs();
         assert!(
             tb_dx > 0.05 && tb_dx > tb_dy,
             "TB drift must move lit mass mainly in x (dx={tb_dx:.3}, dy={tb_dy:.3})"
         );
+    }
+
+    /// #255 C17 (loop close): with a wobble keyframe track, the t=0 and t=1 frames must
+    /// match within tolerance — the drift component returns to 0 at both ends and the
+    /// orb motion / color are loop-periodic, so the seam does not jump. This is the
+    /// e2e counterpart of `keyframe_cross_drift_loop_closes_t0_and_t1_are_zero`.
+    #[test]
+    fn gpu_keyframe_position_loop_closes() {
+        let Some(renderer) = require_or_skip_renderer("gpu_keyframe_position_loop_closes") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        // Use an integer-cycle speed so the orb sweep itself is loop-periodic (t=0≡t=1),
+        // leaving the drift as the only thing that could break the seam. The wobble
+        // colors are identical at t=0 and t=1 (endpoints), so color closes too.
+        let mut opts = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        opts.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.2 }, // endpoints (t=0 and t=1)
+            Centroid { x: 0.5, y: 0.8 }, // midpoint
+        ));
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0);
+        let at1 = renderer.render_frame(&clusters, &opts, 1.0);
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "loop-close frame must have lit pixels"
+        );
+        assert_within_tolerance(&at1, &at0, "keyframe wobble loop closure t=0 vs t=1");
     }
 
     /// #251: a color track also animates the **glyph / image** path (`pack_sdf_frame`,
