@@ -88,6 +88,14 @@ export const STRINGS = {
   softnessOptionLow: { ja: '弱め', en: 'Low' },
   softnessOptionMid: { ja: '標準', en: 'Standard' },
   softnessOptionHigh: { ja: '強め', en: 'High' },
+  // #239 Phase 1: にじみ (watercolor bleed) の 3 段ボタン。「なし」はくっきり
+  // （水彩オフ）で wasm 側 aqua = None。弱/中/強 は内部 aqua_bleed 0.15/0.3/0.5。
+  // 数字は出さない（kako-jun 確定）。en も weak/mid/strong で数字を露出しない。
+  bleedLabel: { ja: 'にじみ', en: 'Bleed' },
+  bleedOptionOff: { ja: 'なし', en: 'Off' },
+  bleedOptionWeak: { ja: '弱', en: 'Weak' },
+  bleedOptionMid: { ja: '中', en: 'Mid' },
+  bleedOptionStrong: { ja: '強', en: 'Strong' },
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',

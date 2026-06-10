@@ -33,6 +33,10 @@ use orber_core::animate::{MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT}
 // AnimateOptions / image_rgba_to_sdf / Arc は GPU(WGSL) 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::animate::AnimateOptions;
+// #239 Phase 1: 製品の 3 段にじみボタンを GPU(WGSL) 経路の AnimateOptions.aqua に
+// 流すための型。GPU 経路専用（wasm32 / test のみ）。
+#[cfg(any(target_arch = "wasm32", test))]
+use orber_core::animate::{AquaBleedConfig, BleedMode};
 use orber_core::cluster::Cluster;
 // kmeans 系（derive_background_rgba / drop_dominant / extract_clusters）は供給系
 // get_or_build_clusters（wasm32 / test 限定）からのみ使う（#247）。
@@ -129,6 +133,16 @@ pub struct WasmParams {
     /// `softness` の preset。`""` で `Mid` (既存挙動と同値)。Phase B (#55) で追加。
     #[serde(default)]
     pub softness_preset: String,
+    /// #239 Phase 1: にじみ (watercolor bleed) の製品 3 段ボタン preset。
+    /// CLI の `--bleed weak|mid|strong` と同義で、`"weak" | "mid" | "strong"` を
+    /// 内部 `aqua_bleed` 0.15 / 0.3 / 0.5 に写像し、orb / glyph / image どの shape
+    /// にも空間ブラーを乗せる。`""`（既定）は「にじみオフ＝くっきり」で、
+    /// `AnimateOptions.aqua` を `None` に保つ＝従来の Web 出力と byte-identical
+    /// （非リグレッションゲート）。`shape == "aquarelle"` の専用レンダラには
+    /// 効かない（CLI の `--bleed` と同じく additive レイヤを engage しない）。
+    /// bloom / offset / halo は本フェーズでは既定 0.5 固定（後フェーズ）。
+    #[serde(default)]
+    pub bleed_preset: String,
     /// Glyph 形状時に per-orb 回転をアニメーションさせるか（#136）。
     /// `true` で従来挙動、`false` で全 t において base_angle を保つ静止描画。
     /// Orb 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
@@ -276,6 +290,27 @@ fn parse_softness_preset(s: &str) -> Result<SoftnessPreset, String> {
         "high" => Ok(SoftnessPreset::High),
         other => Err(format!(
             "invalid softness_preset: {other} (expected one of '' / low / mid / high)"
+        )),
+    }
+}
+
+/// #239 Phase 1: にじみ (watercolor bleed) preset 文字列を内部 `aqua_bleed` 量へ
+/// 写像する。`""`（既定）は識別子なし＝「にじみオフ（くっきり）」で `Ok(None)`、
+/// `AnimateOptions.aqua` が `None` のまま従来の Web 出力を byte-identical に保つ
+/// （非リグレッションゲート）。`weak | mid | strong` を CLI の
+/// `CliBleedPreset::to_bleed` と同じ 0.15 / 0.3 / 0.5 に写す（数字を出さない製品
+/// UI ではこの対応表だけがにじみ強さの正本）。GPU(WGSL) 経路専用（wasm32 / test
+/// のみコンパイル）。
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_bleed_preset(s: &str) -> Result<Option<f32>, String> {
+    match s {
+        // identity: にじみオフ（くっきり）。aqua = None を保つ。
+        "" => Ok(None),
+        "weak" => Ok(Some(0.15)),
+        "mid" => Ok(Some(0.3)),
+        "strong" => Ok(Some(0.5)),
+        other => Err(format!(
+            "invalid bleed_preset: {other} (expected one of '' / weak / mid / strong)"
         )),
     }
 }
@@ -698,9 +733,26 @@ impl ResolvedFrame {
         AnimateOptions {
             width: self.width,
             height: self.height,
-            // #239 PoC: the web path keeps the production look (no additive bleed
-            // layer); the PoC is native-CLI only for blink A/B selection.
-            aqua: None,
+            // #239 Phase 1: 製品の 3 段にじみボタンを Web GPU 経路へ流す。`aqua_bleed`
+            // が `Some` かつ shape が Aquarelle でないときだけ additive ブラーレイヤを
+            // engage する（Aquarelle は専用 byte-pinned レンダラを持つので無視＝CLI の
+            // poc_aqua と同じ責務）。`None`（にじみオフ）のとき従来の Web 出力と
+            // byte-identical（非リグレッションゲート）。bloom/offset/halo は CLI の
+            // `--bleed` 既定と同じ 0.5、mode は唯一の製品ジオメトリ Continuous で、
+            // `bleed weak` の出力が CLI の `--bleed weak` と一致する。
+            aqua: self.aqua_bleed.and_then(|bleed| {
+                if matches!(shape, OrbShape::Aquarelle(_)) {
+                    None
+                } else {
+                    Some(AquaBleedConfig {
+                        bleed,
+                        bloom: 0.5,
+                        offset: 0.5,
+                        halo: 0.5,
+                        mode: BleedMode::Continuous,
+                    })
+                }
+            }),
             orb_size: self.orb_size,
             blur: self.blur,
             saturation: 1.0,
@@ -801,6 +853,12 @@ struct ResolvedFrame {
     height: u32,
     orb_size: f32,
     blur: f32,
+    /// #239 Phase 1: 製品の 3 段にじみボタン（`WasmParams::bleed_preset`）が解決した
+    /// 内部 `aqua_bleed` 量。`None`（既定 = にじみオフ）のとき `to_animate_options`
+    /// は `aqua: None` を保ち、従来の Web 出力と byte-identical（非リグレッション
+    /// ゲート）。`Some(bleed)` のとき非 aquarelle shape に限り continuous モードの
+    /// additive ブラーレイヤを engage する（CLI の `--bleed` と同じ写像）。
+    aqua_bleed: Option<f32>,
 }
 
 /// 1 タイルの spec / preset / kmeans / orb 数を解決する（WGSL canvas-present 経路、#231）。
@@ -812,6 +870,10 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
     let count_override = parse_count_preset(&p.count_preset)?;
     let speed_override = parse_speed_preset(&p.speed_preset)?;
     let softness = parse_softness_preset(&p.softness_preset)?;
+    // #239 Phase 1: にじみの 3 段ボタン。`""` は None（くっきり）で従来挙動と byte
+    // 一致。weak/mid/strong は 0.15/0.3/0.5。aquarelle shape での無視は
+    // to_animate_options が shape を見て行う（CLI の poc_aqua と同じ責務分割）。
+    let aqua_bleed = parse_bleed_preset(&p.bleed_preset)?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
@@ -900,6 +962,9 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         height: p.height,
         orb_size: spec.orb_size.max(0.0),
         blur: spec.blur,
+        // #239 Phase 1: にじみ量（None = くっきり）。aquarelle shape での無視は
+        // to_animate_options 側で行う。
+        aqua_bleed,
     })
 }
 
@@ -1158,6 +1223,20 @@ mod tests {
         assert!(parse_softness_preset("xxx").is_err());
     }
 
+    /// #239 Phase 1: にじみ preset 文字列 → 内部 `aqua_bleed` 量の写像。`""` は
+    /// `None`（にじみオフ＝くっきり）で、CLI の `--bleed` 未指定（`poc_aqua == None`）
+    /// と同じく従来の Web 出力を byte-identical に保つ。weak/mid/strong は CLI の
+    /// `CliBleedPreset::to_bleed` と同じ 0.15/0.3/0.5。製品 UI は数字を出さないので
+    /// この対応表が唯一の正本。
+    #[test]
+    fn parse_bleed_preset_table() {
+        assert_eq!(parse_bleed_preset("").unwrap(), None);
+        assert_eq!(parse_bleed_preset("weak").unwrap(), Some(0.15));
+        assert_eq!(parse_bleed_preset("mid").unwrap(), Some(0.3));
+        assert_eq!(parse_bleed_preset("strong").unwrap(), Some(0.5));
+        assert!(parse_bleed_preset("xxx").is_err());
+    }
+
     #[test]
     fn parse_shape_orb_glyph_aquarelle() {
         let aq = AquarelleParams::default();
@@ -1296,6 +1375,8 @@ mod tests {
             count_preset: String::new(),
             speed_preset: String::new(),
             softness_preset: String::new(),
+            // #239 Phase 1: 既定はにじみオフ（くっきり）。aqua = None で従来挙動互換。
+            bleed_preset: String::new(),
             glyph_rotate: true,
             // #231: image / aquarelle 入力。既定では未使用（shape="orb"）。
             image_mask_rgba: Vec::new(),
@@ -1833,6 +1914,146 @@ mod tests {
             }
             other => panic!("expected Aquarelle, got {other:?}"),
         }
+    }
+
+    /// #239 Phase 1: 製品の 3 段にじみボタン（`bleed_preset`）が Web GPU 経路の
+    /// `AnimateOptions.aqua` に伝播する。weak/mid/strong → `aqua_bleed` 0.15/0.3/0.5、
+    /// 常に Continuous、bloom/offset/halo は CLI `--bleed` 既定と同じ 0.5。orb /
+    /// glyph / image いずれの shape でも engage することを固定する。
+    #[test]
+    fn bleed_preset_propagates_to_animate_options() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for shape in ["orb", "glyph", "image"] {
+            for (preset, want) in [("weak", 0.15_f32), ("mid", 0.3), ("strong", 0.5)] {
+                let mut p = small_source_params();
+                p.shape = shape.into();
+                p.bleed_preset = preset.into();
+                // glyph / image は shape 解決に追加入力が要る。orb は不要。
+                if shape == "glyph" {
+                    p.glyph_char = "☆".into();
+                } else if shape == "image" {
+                    let (w, h) = (16u32, 16u32);
+                    p.image_mask_width = w;
+                    p.image_mask_height = h;
+                    let mut rgba = vec![0u8; (w * h * 4) as usize];
+                    for y in 0..h {
+                        for x in 0..w {
+                            let i = ((y * w + x) * 4) as usize;
+                            let a = if y < h / 2 { 255 } else { 0 };
+                            rgba[i] = 255;
+                            rgba[i + 1] = 255;
+                            rgba[i + 2] = 255;
+                            rgba[i + 3] = a;
+                        }
+                    }
+                    p.image_mask_rgba = rgba;
+                }
+                let gpu = build_gpu_render_inputs(p, 12, 0)
+                    .unwrap_or_else(|e| panic!("gpu inputs for {shape}/{preset}: {e}"));
+                let aqua = gpu.opts.aqua.unwrap_or_else(|| {
+                    panic!("bleed_preset {preset} on shape {shape} must engage aqua")
+                });
+                assert_eq!(
+                    aqua.bleed, want,
+                    "{shape}/{preset}: aqua_bleed must map to {want}"
+                );
+                assert_eq!(
+                    aqua.mode,
+                    BleedMode::Continuous,
+                    "{shape}/{preset}: bleed must engage continuous mode (the only product geometry)"
+                );
+                assert_eq!(
+                    aqua.bloom, 0.5,
+                    "{shape}/{preset}: bloom stays at CLI default"
+                );
+                assert_eq!(
+                    aqua.offset, 0.5,
+                    "{shape}/{preset}: offset stays at CLI default"
+                );
+                assert_eq!(
+                    aqua.halo, 0.5,
+                    "{shape}/{preset}: halo stays at CLI default"
+                );
+            }
+        }
+    }
+
+    /// #239 Phase 1 ★非リグレッションゲート: `bleed_preset` を送らない（既定 `""`）と
+    /// `AnimateOptions.aqua` は `None` のまま。orb / glyph / image どの shape でも
+    /// 従来の Web 出力と byte-identical（aqua = None = にじみオフ）。
+    #[test]
+    fn bleed_preset_absent_keeps_aqua_none() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // orb（追加入力不要）。
+        let gpu = build_gpu_render_inputs(small_source_params(), 12, 0).expect("orb inputs");
+        assert!(
+            gpu.opts.aqua.is_none(),
+            "without bleed_preset, orb must keep aqua None (byte-identical)"
+        );
+        // glyph。
+        let mut g = small_source_params();
+        g.shape = "glyph".into();
+        g.glyph_char = "☆".into();
+        let gpu = build_gpu_render_inputs(g, 12, 0).expect("glyph inputs");
+        assert!(
+            gpu.opts.aqua.is_none(),
+            "without bleed_preset, glyph must keep aqua None (byte-identical)"
+        );
+    }
+
+    /// #239 Phase 1: `shape == "aquarelle"` は専用 byte-pinned レンダラを持つので、
+    /// `bleed_preset` を渡しても additive レイヤを engage しない（`aqua` は `None`）。
+    /// CLI の `bleed_preset_ignored_for_aquarelle_shape` と同じ契約を wasm 経路で固定する。
+    #[test]
+    fn bleed_preset_ignored_for_aquarelle_shape() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.shape = "aquarelle".into();
+        p.bleed_preset = "strong".into();
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle inputs");
+        assert!(
+            gpu.opts.aqua.is_none(),
+            "shape aquarelle has its own renderer; bleed_preset must not engage the additive layer"
+        );
+        assert!(
+            matches!(gpu.opts.shape, OrbShape::Aquarelle(_)),
+            "shape must still resolve to Aquarelle"
+        );
+    }
+
+    /// #239 Phase 1: 無効な `bleed_preset` は `build_gpu_render_inputs` がエラーにする
+    /// （parse_bleed_preset の Err が resolve_frame 経由で伝播）。
+    #[test]
+    fn bleed_preset_invalid_value_errors() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.bleed_preset = "ultra".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "invalid bleed_preset must be rejected"
+        );
+    }
+
+    /// #239 Phase 1 ★最重要 byte ゲート: `bleed_preset` を送らない既定の orb pack /
+    /// 入力は、にじみ機能追加の前後で何も変わらない。`bleed_preset` フィールドは
+    /// `aqua` だけを制御し、orb pack（header + per-orb スカラ）には一切触れない。
+    /// `weak` を送っても orb pack は byte-identical（にじみは pack ではなく
+    /// `AnimateOptions.aqua` 経由でシェーダに乗るため）。
+    #[test]
+    fn bleed_preset_does_not_touch_orb_pack() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let pack_off = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("inputs (bleed off)")
+            .pack;
+        let mut on = small_source_params();
+        on.bleed_preset = "weak".into();
+        let pack_on = build_gpu_render_inputs(on, 12, 3)
+            .expect("inputs (bleed weak)")
+            .pack;
+        assert_eq!(
+            pack_off, pack_on,
+            "orb pack must be byte-identical regardless of bleed_preset (bleed rides aqua, not the pack)"
+        );
     }
 
     /// #247: orb pack が `glyph_sdf` を読まない回帰ガード（旧 WebGL `build_render_pack`

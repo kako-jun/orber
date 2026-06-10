@@ -146,6 +146,29 @@ describe('buildWasmParams', () => {
     expect(deps.generateSdf).not.toHaveBeenCalled();
   });
 
+  it('#239: bleed_preset は素通しで wasm params に乗る（orb / glyph / image どの shape でも）', () => {
+    // buildWasmParams は BaseParams を `...p` で展開するので、bleed_preset を
+    // 渡せば wasm 側 WasmParams.bleed_preset へそのまま流れる。wasm 側で
+    // 'weak'|'mid'|'strong' → aqua_bleed 0.15/0.3/0.5 に写像される（Rust 側で固定）。
+    for (const preset of ['weak', 'mid', 'strong'] as const) {
+      const params = buildWasmParams(baseParams({ bleed_preset: preset }), makeDeps());
+      expect(params.bleed_preset).toBe(preset);
+    }
+  });
+
+  it("#239: bleed_preset 省略時はキー自体が無い（serde default '' = にじみオフ）", () => {
+    // 既定はにじみオフ（くっきり）。BaseParams に bleed_preset を渡さなければ
+    // wasm params にもキーが乗らず、wasm 側 serde default '' → aqua = None で
+    // 従来 Web 出力と byte 一致（非リグレッション）。
+    const params = buildWasmParams(baseParams(), makeDeps());
+    expect('bleed_preset' in params).toBe(false);
+  });
+
+  it("#239: bleed_preset='' を明示しても off として素通しする（aqua = None 相当）", () => {
+    const params = buildWasmParams(baseParams({ bleed_preset: '' }), makeDeps());
+    expect(params.bleed_preset).toBe('');
+  });
+
   it('transparentBackground=true で transparent_background: true が付与される', () => {
     const params = buildWasmParams(baseParams(), makeDeps(), { transparentBackground: true });
     expect(params.transparent_background).toBe(true);
