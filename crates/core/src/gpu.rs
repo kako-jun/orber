@@ -3327,15 +3327,23 @@ mod tests {
             wgsl.contains("let rgb_scale = cov.y;"),
             "rgb_scale must come from the coverage result cov.y (plain single-tap or blurred avg)"
         );
-        // #239 character axes: the source rgb is `o.color.rgb` run through
-        // `aqua_character` (bloom/halo). With both coefs 0 it is the IDENTITY (each
-        // branch is gated on `> 0`), so for the plain orb path `src_rgb == o.color.rgb`
-        // and the composite is byte-identical to the pre-#239 GLSL 1:1 + #241 equation.
+        // #239 character axes: the source rgb starts as the raw `o.color.rgb` and is run
+        // through `aqua_character` (bloom/halo) **only when にじみが engage している
+        // (`aqua_bleed > 0`)** — character rides the bleed, so bleed=0 (water off) keeps the
+        // raw color crisp regardless of bloom/halo (question 7 のゲート)。For the plain orb
+        // path (aqua_bleed == 0) `src_rgb == o.color.rgb` exactly, so the composite is
+        // byte-identical to the pre-#239 GLSL 1:1 + #241 equation.
         assert!(
-            wgsl.contains(
-                "let src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);"
-            ),
-            "src rgb must be o.color.rgb fed through aqua_character (identity when bloom=halo=0)"
+            wgsl.contains("var src_rgb = o.color.rgb;"),
+            "src rgb must default to the raw o.color.rgb (crisp identity when bleed=0)"
+        );
+        assert!(
+            wgsl.contains("if (params.aqua_bleed > 0.0) {")
+                && wgsl.contains(
+                    "src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);"
+                ),
+            "aqua_character must be gated on aqua_bleed > 0 (character rides the bleed; \
+             bleed=0 stays crisp even with bloom/halo > 0)"
         );
         assert!(
             wgsl.contains("acc_rgb = src_rgb * rgb_scale * alpha + acc_rgb * one_minus_a;"),
@@ -3532,6 +3540,67 @@ mod tests {
         }
     }
 
+    /// #239 question 7: character (bloom / halo / offset) rides the bleed. With
+    /// **`bleed = 0` but the three character coefs non-zero**, the output must still be
+    /// **byte-identical** to the plain orb — `aqua_character` is gated on `aqua_bleed > 0`,
+    /// so water-off stays crisp regardless of bloom/halo, and `offset` only biases the
+    /// blur disk origin (unreachable when the blur path itself is gated off). This pins
+    /// the gate that makes the internal expert `--aquarelle-bleed-mode` flag (which
+    /// defaults bloom/halo to 0.5) byte-match plain when `--aquarelle-bleed 0` is set.
+    #[test]
+    fn aqua_bleed_zero_with_character_byte_match_plain_orb() {
+        let Some(renderer) =
+            require_or_skip_renderer("aqua_bleed_zero_with_character_byte_match_plain_orb")
+        else {
+            return;
+        };
+        let (w, h) = (64u32, 48u32);
+        for &seed in &[0u64, 42, 99] {
+            for &n in &[1usize, 8, 64] {
+                let clusters: Vec<Cluster> = (0..n)
+                    .map(|i| {
+                        let f = i as f32 / n.max(1) as f32;
+                        cluster(
+                            [
+                                (40 + (i * 37) % 200) as u8,
+                                (60 + (i * 53) % 180) as u8,
+                                (80 + (i * 71) % 160) as u8,
+                            ],
+                            0.15 + 0.7 * f,
+                            0.2 + 0.6 * ((i * 13 % 100) as f32 / 100.0),
+                            0.2 + 0.3 * ((i % 5) as f32 / 5.0),
+                        )
+                    })
+                    .collect();
+                let mut base = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+                base.seed = seed;
+                base.count = Some(n);
+
+                let plain = renderer.render_frame(&clusters, &base, 0.37);
+
+                for mode in [BleedMode::Continuous, BleedMode::Blob] {
+                    let mut characterful = base.clone();
+                    // bleed = 0 but bloom / offset / halo all non-zero (the internal flag's
+                    // default 0.5). With the gate, character must not engage ⇒ plain.
+                    characterful.aqua = Some(crate::animate::AquaBleedConfig {
+                        bleed: 0.0,
+                        bloom: 0.5,
+                        offset: 0.5,
+                        halo: 0.5,
+                        mode,
+                    });
+                    let via_aqua = renderer.render_frame(&clusters, &characterful, 0.37);
+                    assert_eq!(
+                        via_aqua.as_raw(),
+                        plain.as_raw(),
+                        "bleed=0 with character>0 ({mode:?}) must stay byte-identical to plain orb \
+                         (character rides the bleed; seed={seed}, n={n})"
+                    );
+                }
+            }
+        }
+    }
+
     /// #239 PoC: with a **non-zero** slider the additive layer must actually change
     /// the output (so the byte-match gate above is not passing by a dead code path).
     /// A positive `halo` adds an outer glow, so the lit-pixel count must rise versus
@@ -3633,13 +3702,15 @@ mod tests {
     }
 
     /// #239 bloom: a positive `bloom` brightens the orb's center (pushes it toward
-    /// white) — the central mean luma must rise — and `bloom=0` (other axes off) is
-    /// **byte-identical** to the bleed-only render (the term vanishes at coef 0).
+    /// white) — the peak luma of lit pixels must rise versus the bleed-only (bloom=0)
+    /// render. The "coef=0 ⇒ identity" half is **not** asserted here: `base` and a
+    /// re-run with the same `0.0` args are byte-identical by construction (same inputs),
+    /// so that assert was a tautology (`X == X`). The real byte担保 is the dedicated
+    /// all-zero gate `aqua_zero_params_byte_match_plain_orb` (bloom=0 ⇒ no white-mix,
+    /// gated on `bloom > 0` in WGSL).
     #[test]
-    fn aqua_bloom_brightens_center_and_vanishes_at_zero() {
-        let Some(renderer) =
-            require_or_skip_renderer("aqua_bloom_brightens_center_and_vanishes_at_zero")
-        else {
+    fn aqua_bloom_brightens_center() {
+        let Some(renderer) = require_or_skip_renderer("aqua_bloom_brightens_center") else {
             return;
         };
         let (w, h) = (96u32, 96u32);
@@ -3652,18 +3723,14 @@ mod tests {
             lit_peak_luma(&bloomed, bg, 8),
             lit_peak_luma(&base, bg, 8)
         );
-        // coef=0 ⇒ identical to bleed-only (bloom term is gated on bloom>0).
-        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
-        assert_eq!(
-            zero.as_raw(),
-            base.as_raw(),
-            "bloom=0 must be byte-identical to the bleed-only render"
-        );
     }
 
     /// #239 halo: a positive `halo` boosts peripheral **saturation** (chroma) without
     /// adding an alpha ring — the lit-pixel count must NOT grow meaningfully (no frame),
-    /// while the mean chroma of lit pixels rises. `halo=0` is byte-identical to bleed-only.
+    /// while the mean chroma of lit pixels rises. The "halo=0 ⇒ identity" half is not
+    /// asserted here (it would be `X == X` against a same-args re-run); the all-zero
+    /// gate `aqua_zero_params_byte_match_plain_orb` is the real byte担保 (halo gated on
+    /// `halo > 0` in WGSL).
     #[test]
     fn aqua_halo_boosts_saturation_without_ring() {
         let Some(renderer) = require_or_skip_renderer("aqua_halo_boosts_saturation_without_ring")
@@ -3688,23 +3755,17 @@ mod tests {
             halo_lit <= base_lit * 1.05 + 4.0,
             "halo must not add an alpha ring (lit count {halo_lit} vs base {base_lit})"
         );
-        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
-        assert_eq!(
-            zero.as_raw(),
-            base.as_raw(),
-            "halo=0 must be byte-identical to the bleed-only render"
-        );
     }
 
     /// #239 offset: a positive `offset` biases the blur disk origin in a per-orb seed
     /// direction, making the smear asymmetric — the output must differ from the
-    /// symmetric (offset=0) render — and `offset=0` is byte-identical to bleed-only.
-    /// The lit-pixel count stays of the same order (the shape is not morphed/rounded).
+    /// symmetric (offset=0) render. The lit-pixel count stays of the same order (the
+    /// shape is not morphed/rounded). The "offset=0 ⇒ identity" half is not asserted
+    /// here (it would be `X == X` against a same-args re-run); the all-zero gate
+    /// `aqua_zero_params_byte_match_plain_orb` is the real byte担保 (offset=0 ⇒ bias_px=0).
     #[test]
-    fn aqua_offset_makes_smear_asymmetric_and_vanishes_at_zero() {
-        let Some(renderer) =
-            require_or_skip_renderer("aqua_offset_makes_smear_asymmetric_and_vanishes_at_zero")
-        else {
+    fn aqua_offset_makes_smear_asymmetric() {
+        let Some(renderer) = require_or_skip_renderer("aqua_offset_makes_smear_asymmetric") else {
             return;
         };
         let (w, h) = (96u32, 96u32);
@@ -3722,12 +3783,6 @@ mod tests {
         assert!(
             off_lit > base_lit * 0.5 && off_lit < base_lit * 1.6,
             "offset must shift, not explode/round the silhouette (lit {off_lit} vs base {base_lit})"
-        );
-        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
-        assert_eq!(
-            zero.as_raw(),
-            base.as_raw(),
-            "offset=0 must be byte-identical to the bleed-only render"
         );
     }
 

@@ -272,6 +272,21 @@ const HALO_SAT_GAIN: f32 = 0.6;
 // ずらす）。形は壊さず滲みを非対称にする程度に控えめ。
 const AQUA_OFFSET_BIAS: f32 = 0.6;
 
+// #239 ブラー経路の空間早期カル用の「シルエット最大到達」（radius 倍）。被覆が確実に 0 に
+// なる距離の上限を **安全側に大きく** 取るための定数。出力は一切変えない（カルするのは
+// もともと alpha=0 になる画素だけ）。両 variant の最大到達を包む保守値:
+//   - orb variant   : r=distance/radius、coverage_at は r>=1 で 0 → 到達 = radius（係数 1.0）。
+//   - SDF variant   : サンプル箱は半幅 radius/CONTENT_SPAN（CONTENT_SPAN=1/√2）の正方形。
+//                     中心からの最遠点は角で radius/CONTENT_SPAN * √2 = radius*2 → 係数 2.0。
+// 共有 composite_straight は両 variant に展開されるので、大きい方（2.0）を採る。
+const AQUA_REACH_RADIUS_FACTOR: f32 = 2.0;
+// タップが sample_px から離れうる最大比（blur_px 倍）。disk 半径 blur_px + offset bias
+// （最大 AQUA_OFFSET_BIAS*blur_px=0.6*blur_px）→ 1.0 + 0.6 = 1.6。
+const AQUA_REACH_BLUR_FACTOR: f32 = 1.6;
+// カル境界に足す安全マージン（px）。丸め・補間の縁を確実に内側へ寄せ、寄与しうる画素を
+// 絶対にカルしないための保険。出力は不変なのでいくら大きくても正しさは保たれる。
+const AQUA_CULL_SAFETY_PX: f32 = 4.0;
+
 // per-orb seed（phase 由来）から決定論的な単位方向ベクトルを作る。offset 軸が
 // ブラーの disk 原点をこの向きへずらして滲みを左右非対称・有機的にするのに使う。
 // hash で角度を散らすだけなので「形」は一切作らない（円へモーフしない）。
@@ -335,10 +350,11 @@ fn blurred_coverage(
 // #239 bloom/halo 軸（ブラー後の色味補正。各 coef=0 で恒等）。被覆 alpha `cov_a`
 // （ブラー後）を中心度の代理にして、`color` を控えめに加工する:
 //   - bloom: 内部（cov_a 高）で色を白へ寄せて柔らかい明るいコアにする。
-//            t = bloom * smoothstep(0.45, 1.0, cov_a) を白との mix 比に使う（最大でも
-//            BLOOM_MAX=0.45 までしか白へ寄せない＝強い白飛びを禁止）。
+//            t = bloom * smoothstep(0.18, 0.5, cov_a) を白との mix 比に使う（閾値は
+//            ブラー後 alpha の実効レンジ基準。最大でも BLOOM_MAX=0.45 までしか白へ
+//            寄せない＝強い白飛びを禁止）。
 //   - halo : 外周の柔らかい縁（cov_a 低～中）で**彩度だけ**を上げる。枠（alpha）は作らない。
-//            彩度ブースト量 = halo * edgeness。edgeness = smoothstep(0.6,0.05,cov_a) で
+//            彩度ブースト量 = halo * edgeness。edgeness = smoothstep(0.45,0.05,cov_a) で
 //            内部ほど 0、縁ほど 1。彩度は luma 軸からの距離を係数 (1+halo*k) 倍にする。
 // 返り値は加工後の straight rgb。cov_a=0 の画素はそもそも合成側 `alpha>0` で弾かれる。
 fn aqua_character(color: vec3<f32>, cov_a: f32, bloom: f32, halo: f32) -> vec3<f32> {
@@ -463,9 +479,27 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             let blur_px = mix(min_px, max_px, params.aqua_bleed) * aqua_blur_scale;
             // offset 軸: disk 原点を per-orb seed 方向へ blur_px 比でずらす（offset=0 で bias=0）。
             let bias_px = aqua_seed_dir(phase) * (params.aqua_offset * AQUA_OFFSET_BIAS * blur_px);
-            cov = blurred_coverage(
-                style_bit, sample_px, cx, cy, radius, blur, opacity, angle, blur_px, phase, bias_px
-            );
+            // 空間早期カル（出力不変・48 タップ節約）: このブラー画素が踏みうる全タップは
+            // sample_px から高々 AQUA_REACH_BLUR_FACTOR*blur_px（disk 半径 + offset bias）の範囲。
+            // そのどのタップも orb 中心 (cx,cy) のシルエット最大到達 AQUA_REACH_RADIUS_FACTOR*radius
+            // より遠ければ coverage_at は全タップ 0 を返す → blurred_coverage は alpha=0 → 合成側
+            // `if (alpha > 0.0)` が寄与をスキップ。よって sample_px が
+            //   到達上限 = AQUA_REACH_RADIUS_FACTOR*radius + AQUA_REACH_BLUR_FACTOR*blur_px + 安全マージン
+            // より遠い画素は multi-tap を回さず被覆 0 扱いにできる（= もともと alpha=0 の画素だけ
+            // をスキップするので **byte 完全不変**）。境界は安全側に大きく取る。
+            let reach = AQUA_REACH_RADIUS_FACTOR * radius
+                + AQUA_REACH_BLUR_FACTOR * blur_px
+                + AQUA_CULL_SAFETY_PX;
+            let dx = sample_px.x - cx;
+            let dy = sample_px.y - cy;
+            if (dx * dx + dy * dy > reach * reach) {
+                // 確実に寄与 0。48 タップを省いて被覆 0（合成スキップ）にする。
+                cov = vec2<f32>(0.0, 0.0);
+            } else {
+                cov = blurred_coverage(
+                    style_bit, sample_px, cx, cy, radius, blur, opacity, angle, blur_px, phase, bias_px
+                );
+            }
         } else {
             // plain 経路（byte 一致ゲート）: sample_px の単一タップ。
             cov = coverage_at(style_bit, sample_px, cx, cy, radius, blur, opacity, angle);
@@ -477,7 +511,15 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             // #239 bloom/halo 軸（ブラー後の色味補正。各 coef=0 で恒等＝plain と byte 一致）。
             // 被覆 alpha を中心度の代理に、色を控えめに加工（中心は白へ寄せ、縁は彩度ブースト）。
             // bloom=halo=0 で aqua_character は color をそのまま返すので非回帰ゲートを満たす。
-            let src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);
+            //
+            // **にじみ(bleed)が前提**: character はにじみの上に乗る装飾なので、`aqua_bleed > 0`
+            // でゲートする。bleed=0（水彩オフ）のときは bloom/halo が何であろうと素の色のまま＝
+            // plain と crisp に byte 一致。これで内部上級者 flag が bleed=0 のまま bloom/halo を
+            // 0.5 に流しても（製品 UI も「にじみなし」のとき 3 軸 disabled）crisp が保たれる。
+            var src_rgb = o.color.rgb;
+            if (params.aqua_bleed > 0.0) {
+                src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);
+            }
             // Source-Over（straight alpha）。GLSL と同式 + #241 影スケール:
             //   out.rgb = (src.rgb * shadow_scale) * src.a + out.rgb * (1 - src.a)
             //   out.a   = src.a + out.a * (1 - src.a)
