@@ -426,6 +426,10 @@ pub fn pack_render_data(
         buf[off + 12] = p.rot_speed_signed;
         // #255: off+13 = cross 軸 重心ドリフト delta（B 案）。`None`（tracks 無し）の
         // とき 0.0 ＝ 従来と byte 完全一致。`p.cluster_idx` で per-cluster delta を引く。
+        // `cluster_idx` は `pick_weighted` が常に `[0, clusters.len())` を返し、production の
+        // `cross_drift` は長さ `clusters.len()`（[`keyframe_cross_drift`] が `n_clusters` で生成）
+        // なので添字は常に範囲内。色の `.min(len-1)` clamp と同じ不変条件に乗っており、
+        // `.get(..).unwrap_or(0.0)` は防御（範囲外なら「ドリフト無し」が正しい既定値）。
         buf[off + 13] = cross_drift.map_or(0.0, |d| d.get(p.cluster_idx).copied().unwrap_or(0.0));
     }
     buf
