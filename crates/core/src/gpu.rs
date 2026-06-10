@@ -1105,6 +1105,10 @@ impl GpuRenderer {
         };
         let cycle = opts.speed.cycle_count() as f32;
         let n_orbs = Self::resolved_orb_count(clusters, opts);
+        // #255: per-cluster cross 軸ドリフト delta（B 案）。tracks 無しなら None ⇒
+        // pack の off+13 が 0.0 ＝ 従来と byte 完全一致。
+        let cross_drift =
+            crate::animate::keyframe_cross_drift(opts, t, direction_id, clusters.len());
         // shape_id / glyph_rotate / edge_softness are SDF (glyph / image) inputs; the
         // plain orb shader ignores them. Pass orb defaults. shadow_strength (#241)
         // is read by every shape on the unified template, the orb included.
@@ -1122,6 +1126,7 @@ impl GpuRenderer {
             true, // glyph_rotate (unused by Orb)
             opts.softness.edge_softness(),
             opts.shadow_strength,
+            cross_drift.as_deref(),
         );
 
         // `pack_render_data` is shared with the Web wasm path and must NOT
@@ -1488,6 +1493,10 @@ impl GpuRenderer {
             MotionDirection::BottomToTop => 3.0,
         };
         let cycle = opts.speed.cycle_count() as f32;
+        // #255: per-cluster cross 軸ドリフト delta（B 案、全 shape 対象）。tracks
+        // 無しなら None ⇒ pack の off+13 が 0.0 ＝ 従来と byte 完全一致。
+        let cross_drift =
+            crate::animate::keyframe_cross_drift(opts, t, direction_id, clusters.len());
         let mut pack = pack_render_data(
             clusters,
             opts.background,
@@ -1502,6 +1511,7 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
             opts.shadow_strength,
+            cross_drift.as_deref(),
         );
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
         pack
@@ -1764,7 +1774,15 @@ impl GpuRenderer {
             *slot = GpuOrb {
                 color: [pack[off], pack[off + 1], pack[off + 2], pack[off + 3]],
                 phase: [pack[off + 4], pack[off + 5], pack[off + 6], pack[off + 7]],
-                misc: [pack[off + 8], pack[off + 9], pack[off + 10], 0.0],
+                // #255: misc.w = cross-axis centroid drift delta（0 = 位置トラック無し＝従来と一致）。
+                // `.get().unwrap_or(0.0)` で short-row guard（off+13 > len）に当たる
+                // 短い pack でも 0.0 にフォールバックし、guard とその検証テストを変えずに通す。
+                misc: [
+                    pack[off + 8],
+                    pack[off + 9],
+                    pack[off + 10],
+                    pack.get(off + 13).copied().unwrap_or(0.0),
+                ],
                 // off + 11 = base_angle, off + 12 = rot_speed_signed (#136).
                 // The SDF variant reads these; the orb variant ignores the rot texel.
                 rot: [pack[off + 11], pack[off + 12], 0.0, 0.0],
@@ -2429,6 +2447,7 @@ mod tests {
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // Lie in the header: claim more orbs than the buffer actually carries.
         // The buffer still only has `real_orbs` per-orb rows, so rows
@@ -2454,6 +2473,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         let honest_img = renderer.render_packed(&honest, w, h, 0.3);
 
@@ -2497,6 +2517,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         pack[8] = 2000.0;
 
@@ -3862,6 +3883,7 @@ mod tests {
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // The single orb lives at off = HEADER_WORDS. The shader reads up to
         // pack[off + 12] (rot_speed_signed), so off + 13 words is the minimal length
@@ -4010,6 +4032,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // (header[9] is already 0.0 from the arg above; re-pin defensively in case
         // the packer ever changes which header slot carries alpha_mul.)
@@ -4969,6 +4992,7 @@ mod tests {
             false, // glyph_rotate OFF → angle = base_angle = 0
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         pack[11] = 0.0; // header glyph_rotate OFF (defensive)
         let off = HEADER_WORDS;
@@ -5335,6 +5359,7 @@ mod tests {
             false, // glyph_rotate (Orb は無視)
             0.5,   // edge_softness (Orb は無視)
             shadow_strength,
+            None, // #255: no keyframe drift
         );
         for (i, o) in orbs.iter().enumerate() {
             let off = HEADER_WORDS + PER_ORB_WORDS * i;
