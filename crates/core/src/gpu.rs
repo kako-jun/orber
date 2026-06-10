@@ -3418,6 +3418,74 @@ mod tests {
         );
     }
 
+    /// #251 (review nit): isolate **color** from **motion**. The over-`t` tests
+    /// above vary `t`, but orbs also *move* with `t` (the conveyor), so a frame
+    /// would differ even if the color fold were a no-op — they cannot tell color
+    /// apart from motion. This test holds `t` **fixed** (t=0.5) and varies only the
+    /// presence of a color track: identical clusters / opts / seed / count / `t`,
+    /// so motion and breathing are byte-for-byte the same in both renders and the
+    /// *only* possible cause of any per-pixel difference is the color fold.
+    ///
+    /// The track [255,0,0]→[0,0,255] resolves to ≈[127,0,127] (purple) at t=0.5
+    /// for every cluster, far from `sample_clusters`'s reds/blues/greens/yellows,
+    /// so the recolor is large where orbs are painted. We require the *mean*
+    /// per-channel absolute difference over the whole frame to clear a threshold
+    /// (not mere byte inequality), so a tiny incidental drift could not pass: with
+    /// the recolor active the mean lands well above 1.0/channel here; the no-op /
+    /// inert-fold failure mode would leave it at 0. The 0.5 gate sits safely
+    /// between those regimes.
+    #[test]
+    fn video_color_track_isolates_color_from_motion() {
+        let Some(renderer) =
+            require_or_skip_renderer("video_color_track_isolates_color_from_motion")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        // Same width/height/direction/speed/seed/count for both renders, so the
+        // orb layout and motion at a given t are identical; only `color_tracks`
+        // differs between the two `opts`.
+        let opts_base = orb_opts(96, 64, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        let mut opts_colored = opts_base.clone();
+        // A red→blue track for every cluster ⇒ ≈[127,0,127] at t=0.5.
+        opts_colored.color_tracks = Some(vec![vec![[255, 0, 0], [0, 0, 255]]; clusters.len()]);
+
+        // Hold t fixed so motion / breathing are identical in both frames; the
+        // sole difference is the color fold (present vs absent).
+        let t = 0.5;
+        let without_track = renderer.render_frame(&clusters, &opts_base, t);
+        let with_track = renderer.render_frame(&clusters, &opts_colored, t);
+
+        assert_eq!(
+            without_track.dimensions(),
+            with_track.dimensions(),
+            "both renders must share the same frame size"
+        );
+        assert!(
+            lit_vs_bg(&with_track, opts_colored.background, 8) > 0,
+            "color-track frame must have lit (painted) pixels to recolor"
+        );
+
+        // Mean per-channel absolute difference over the whole frame. Because the
+        // frames are identical except for the recolor, this isolates color from
+        // motion: it is exactly the magnitude of the color fold's effect.
+        let a = without_track.as_raw();
+        let b = with_track.as_raw();
+        assert_eq!(a.len(), b.len(), "frame byte lengths must match");
+        let sum_abs_diff: u64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| u64::from(x.abs_diff(y)))
+            .sum();
+        let mean_abs_diff = sum_abs_diff as f64 / a.len() as f64;
+        assert!(
+            mean_abs_diff > 0.5,
+            "color track must visibly recolor the orbs at fixed t (motion held \
+             constant); mean per-channel abs diff = {mean_abs_diff:.3}, want > 0.5"
+        );
+        eprintln!("color-isolation mean per-channel abs diff = {mean_abs_diff:.3}");
+    }
+
     /// #251: a keyframe track (#33) must also animate the orb **color** with `t`.
     /// Position is intentionally not reflected (that is #255), so the assertion is
     /// on color keys: a red→blue keyframe pair on every cluster, t=0.0 vs t=0.5.
