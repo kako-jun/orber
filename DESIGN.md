@@ -137,7 +137,7 @@ The same tokens drive the **transparent-DL checkbox** introduced for #56 ("透�
 
 ### SegmentedControl
 
-Connected pill — used by every mutually-exclusive control row in Studio (#133). Aspect / Shape are 2-segment, Count / Speed / Softness are 3-segment. All five rows share the same outer container, the same per-cell sizing rule, and the same active-state token, so a 2-pick row and a 3-pick row read as the same primitive at different cardinalities.
+Connected pill — used by every mutually-exclusive control row in Studio (#133). Aspect is 2-segment; Shape / Count / Speed / Softness / Bleed are 3-segment (Bleed dropped its former "なし" off-segment in #253 when the watercolor axis became always-on). All six rows share the same outer container, the same per-cell sizing rule, and the same active-state token, so a 2-pick row and a 3-pick row read as the same primitive at different cardinalities.
 
 - Outer wrapper: `inline-flex w-full max-w-md mx-auto rounded-md overflow-hidden border border-glassBorder` — `overflow-hidden` clips the children's square corners against the wrapper radius so the whole row reads as one pill
 - Cells: `flex-1 h-9 px-2 text-sm` (equal-width, fixed 36px height)
