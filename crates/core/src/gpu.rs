@@ -48,10 +48,15 @@
 //!   `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS` — do not re-sync a 64 cap onto
 //!   this path.)
 //!
-//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not folded into the
-//! GPU pack: until #239 their only consumer was the (now-removed) radial aquarelle
-//! path, so animated video color/position is currently not rendered. The CLI keeps
-//! building the tracks and warns at runtime; re-wiring them into this pack is #251.
+//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) **color** is re-wired
+//! into this GPU pack as of #251: the pack builders evaluate the tracks at frame
+//! time `t` (via [`crate::animate::apply_color_tracks_at_t`]) and overwrite each
+//! orb's `color` before [`pack_render_data`]. With no tracks (the production /
+//! still-image default) the builder borrows the input clusters unchanged, so the
+//! output is byte-identical to pre-#251. Only **color** moves here: the #33 position
+//! keyframe follow-through (centroid drift) and weight modulation stay on the
+//! still-image scatter and are tracked in #255 — folding them back blindly would
+//! double-apply the position wrap / breathing the unified `orb.wgsl` already does.
 //!
 //! ## Compositing contract
 //!
@@ -87,7 +92,9 @@ use std::collections::HashMap;
 use image::RgbaImage;
 use wgpu::util::DeviceExt;
 
-use crate::animate::{pack_render_data, AnimateOptions, MotionDirection, MAX_ORB_COUNT};
+use crate::animate::{
+    apply_color_tracks_at_t, pack_render_data, AnimateOptions, MotionDirection, MAX_ORB_COUNT,
+};
 use crate::cluster::Cluster;
 use crate::orb::adjust_saturation_pub;
 
@@ -1025,7 +1032,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        let pack = Self::pack_orb_frame(clusters, opts, width, height);
+        let pack = Self::pack_orb_frame(clusters, opts, width, height, t);
         // #239 PoC: `opts.aqua` rides the orb (no SDF) variant of the unified shader.
         // `None` (the production default) is the plain orb path, byte-identical to
         // pre-#239.
@@ -1062,7 +1069,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        let pack = Self::pack_orb_frame(clusters, opts, width, height);
+        let pack = Self::pack_orb_frame(clusters, opts, width, height, t);
         // #239 PoC: `opts.aqua` rides the orb variant; `None` is the plain orb path.
         self.render_packed_inner_to_view(&pack, width, height, t, None, opts.aqua, view, format);
     }
@@ -1078,7 +1085,15 @@ impl GpuRenderer {
         opts: &AnimateOptions,
         width: u32,
         height: u32,
+        t: f32,
     ) -> Vec<f32> {
+        // #251: fold the video color tracks (#7 / #33) into the per-orb colors at
+        // time `t`. With no tracks (the production / still-image default) this is a
+        // zero-copy borrow of the input clusters, so the pack stays byte-identical
+        // to pre-#251 (the non-regression gate). Only color is touched; position /
+        // weight stay on the original clusters (centroid drift is #255).
+        let effective = Self::color_tracked_clusters(clusters, opts, t);
+        let clusters = effective.as_ref();
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
         let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
@@ -1159,7 +1174,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        match self.prepare_glyph_frame(clusters, opts, width, height) {
+        match self.prepare_glyph_frame(clusters, opts, width, height, t) {
             // Not a glyph shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame(clusters, opts, t),
             // Background-only routes through `render_packed` (the plain orb path),
@@ -1204,7 +1219,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        match self.prepare_glyph_frame(clusters, opts, width, height) {
+        match self.prepare_glyph_frame(clusters, opts, width, height, t) {
             // Not a glyph shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame_to_view(clusters, opts, t, view, format),
             SdfFramePack::BackgroundOnly(pack) => {
@@ -1254,6 +1269,7 @@ impl GpuRenderer {
         opts: &AnimateOptions,
         width: u32,
         height: u32,
+        t: f32,
     ) -> SdfFramePack {
         let (ch, font) = match opts.shape {
             crate::orb::OrbShape::Glyph { ch, font } => (ch, font),
@@ -1271,12 +1287,12 @@ impl GpuRenderer {
             crate::glyph::cached_glyph_sdf_for_radius(font, ch, frame_radius)
         else {
             return SdfFramePack::BackgroundOnly(Self::pack_sdf_frame(
-                clusters, opts, width, height, 0,
+                clusters, opts, width, height, 0, t,
             ));
         };
 
         let n_orbs = Self::resolved_orb_count(clusters, opts);
-        let pack = Self::pack_sdf_frame(clusters, opts, width, height, n_orbs);
+        let pack = Self::pack_sdf_frame(clusters, opts, width, height, n_orbs, t);
         let sdf_view = self.upload_glyph_sdf(ch, sdf_size, &sdf);
         SdfFramePack::Sdf {
             pack,
@@ -1311,7 +1327,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        match self.prepare_image_frame(clusters, opts, width, height) {
+        match self.prepare_image_frame(clusters, opts, width, height, t) {
             // Not an image shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame(clusters, opts, t),
             SdfFramePack::BackgroundOnly(pack) => self.render_packed(&pack, width, height, t),
@@ -1351,7 +1367,7 @@ impl GpuRenderer {
         let width = opts.width.max(1);
         let height = opts.height.max(1);
         let t = t.clamp(0.0, 1.0);
-        match self.prepare_image_frame(clusters, opts, width, height) {
+        match self.prepare_image_frame(clusters, opts, width, height, t) {
             // Not an image shape: fall back to the plain orb path so the call is total.
             SdfFramePack::NotSdfShape => self.render_frame_to_view(clusters, opts, t, view, format),
             SdfFramePack::BackgroundOnly(pack) => {
@@ -1388,6 +1404,7 @@ impl GpuRenderer {
         opts: &AnimateOptions,
         width: u32,
         height: u32,
+        t: f32,
     ) -> SdfFramePack {
         let (sdf, sdf_size) = match &opts.shape {
             crate::orb::OrbShape::Image { sdf, size } => (sdf.clone(), *size),
@@ -1399,17 +1416,39 @@ impl GpuRenderer {
             || sdf.iter().all(|&b| b == 0)
         {
             return SdfFramePack::BackgroundOnly(Self::pack_sdf_frame(
-                clusters, opts, width, height, 0,
+                clusters, opts, width, height, 0, t,
             ));
         }
 
         let n_orbs = Self::resolved_orb_count(clusters, opts);
-        let pack = Self::pack_sdf_frame(clusters, opts, width, height, n_orbs);
+        let pack = Self::pack_sdf_frame(clusters, opts, width, height, n_orbs, t);
         let sdf_view = self.upload_image_sdf(sdf_size, &sdf);
         SdfFramePack::Sdf {
             pack,
             sdf_view,
             size: sdf_size,
+        }
+    }
+
+    /// Effective clusters for frame time `t` with the video color tracks (#7 / #33)
+    /// folded into per-orb colors (#251). Shared by every pack builder.
+    ///
+    /// With neither `color_tracks` nor `keyframe_tracks` set (the production /
+    /// still-image default) this is a **zero-copy `Borrowed`** of the input — the
+    /// pack then sees the exact same `&[Cluster]` as pre-#251, so the byte output is
+    /// unchanged (the non-regression gate). Only when a track is present does it
+    /// allocate an `Owned` Vec via [`apply_color_tracks_at_t`], which overwrites
+    /// `color` only (centroid / weight stay on the original clusters; position
+    /// follow-through is #255).
+    fn color_tracked_clusters<'a>(
+        clusters: &'a [Cluster],
+        opts: &AnimateOptions,
+        t: f32,
+    ) -> std::borrow::Cow<'a, [Cluster]> {
+        if opts.color_tracks.is_none() && opts.keyframe_tracks.is_none() {
+            std::borrow::Cow::Borrowed(clusters)
+        } else {
+            std::borrow::Cow::Owned(apply_color_tracks_at_t(clusters, opts, t))
         }
     }
 
@@ -1433,7 +1472,12 @@ impl GpuRenderer {
         width: u32,
         height: u32,
         n_orbs: usize,
+        t: f32,
     ) -> Vec<f32> {
+        // #251: same color-track fold as the plain orb path (glyph / image colors
+        // also animate over a video). No tracks ⇒ zero-copy borrow ⇒ byte-identical.
+        let effective = Self::color_tracked_clusters(clusters, opts, t);
+        let clusters = effective.as_ref();
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
         let base_blur = (opts.blur + opts.softness.blur_offset()).clamp(0.0, 1.0);
         let alpha_mul = opts.softness.alpha_mul().clamp(0.0, 1.0);
@@ -3343,6 +3387,137 @@ mod tests {
         );
     }
 
+    /// #251: a per-cluster color track must make the rendered orb colors change
+    /// with `t`. Two keys ([255,0,0] → [0,0,255]) on every cluster, rendered at
+    /// `t=0.0` and `t=0.5` through the plain-orb entry, must produce different bytes
+    /// (the orbs also move with `t`, but here the colors alone are enough to differ;
+    /// the non-regression test pins that no-track frames don't drift on color). The
+    /// count / seed are fixed so the run is deterministic.
+    #[test]
+    fn video_color_track_animates_orb_colors_over_t() {
+        let Some(renderer) =
+            require_or_skip_renderer("video_color_track_animates_orb_colors_over_t")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = orb_opts(96, 64, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        // A red→blue track for every cluster so the per-orb color sweeps with t.
+        opts.color_tracks = Some(vec![vec![[255, 0, 0], [0, 0, 255]]; clusters.len()]);
+
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0);
+        let at_half = renderer.render_frame(&clusters, &opts, 0.5);
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "color-track frame must have lit pixels"
+        );
+        assert_ne!(
+            at0.as_raw(),
+            at_half.as_raw(),
+            "color track must change orb colors between t=0.0 and t=0.5"
+        );
+    }
+
+    /// #251: a keyframe track (#33) must also animate the orb **color** with `t`.
+    /// Position is intentionally not reflected (that is #255), so the assertion is
+    /// on color keys: a red→blue keyframe pair on every cluster, t=0.0 vs t=0.5.
+    #[test]
+    fn video_keyframe_track_animates_orb_colors_over_t() {
+        let Some(renderer) =
+            require_or_skip_renderer("video_keyframe_track_animates_orb_colors_over_t")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = orb_opts(96, 64, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        // Same centroid/weight on both keys (position fixed); only the color sweeps.
+        let key = |color: [u8; 3], time: f32| crate::keyframe_track::KeyframeClusterPoint {
+            color,
+            centroid: Centroid { x: 0.5, y: 0.5 },
+            weight: 0.5,
+            time,
+        };
+        opts.keyframe_tracks = Some(vec![
+            vec![key([255, 0, 0], 0.0), key([0, 0, 255], 1.0)];
+            clusters.len()
+        ]);
+
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0);
+        let at_half = renderer.render_frame(&clusters, &opts, 0.5);
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "keyframe-track frame must have lit pixels"
+        );
+        assert_ne!(
+            at0.as_raw(),
+            at_half.as_raw(),
+            "keyframe color must change orb colors between t=0.0 and t=0.5"
+        );
+    }
+
+    /// #251: a color track also animates the **glyph / image** path (`pack_sdf_frame`,
+    /// shape_id=1) — color is folded for every shape, not just the plain orb. Render
+    /// a glyph with a red→blue track at t=0.0 vs t=0.5 and require the bytes differ.
+    #[test]
+    fn video_color_track_animates_glyph_colors_over_t() {
+        let Some(renderer) =
+            require_or_skip_renderer("video_color_track_animates_glyph_colors_over_t")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = glyph_opts(
+            96,
+            64,
+            MotionDirection::LeftToRight,
+            MotionSpeed::Slow,
+            true,
+        );
+        opts.color_tracks = Some(vec![vec![[255, 0, 0], [0, 0, 255]]; clusters.len()]);
+
+        let at0 = renderer.render_frame_glyph(&clusters, &opts, 0.0);
+        let at_half = renderer.render_frame_glyph(&clusters, &opts, 0.5);
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "glyph color-track frame must have lit pixels"
+        );
+        assert_ne!(
+            at0.as_raw(),
+            at_half.as_raw(),
+            "color track must change glyph colors between t=0.0 and t=0.5"
+        );
+    }
+
+    /// #251 non-regression: with no tracks (the production / still-image default)
+    /// the color fold is inert. `color_tracked_clusters` must hand back the exact
+    /// input colors (a zero-copy borrow), and the orb pack must be **byte-identical**
+    /// regardless of `t` (no track ⇒ orb colors do not drift over time). This is the
+    /// byte-equality gate that proves threading `t` into the pack builders did not
+    /// disturb the no-track path.
+    #[test]
+    fn video_no_tracks_color_fold_is_inert() {
+        let clusters = sample_clusters();
+        let opts = orb_opts(96, 64, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        assert!(opts.color_tracks.is_none() && opts.keyframe_tracks.is_none());
+
+        // Helper returns the input colors unchanged (borrowed, not modulated).
+        let resolved = GpuRenderer::color_tracked_clusters(&clusters, &opts, 0.5);
+        assert_eq!(
+            resolved.iter().map(|c| c.color).collect::<Vec<_>>(),
+            clusters.iter().map(|c| c.color).collect::<Vec<_>>(),
+            "no tracks ⇒ color_tracked_clusters must return the input colors unchanged"
+        );
+
+        // And the packed buffer must not change with t when there are no tracks:
+        // the only t-dependence in the pack would be a color track, which is absent.
+        let pack_at0 = GpuRenderer::pack_orb_frame(&clusters, &opts, 96, 64, 0.0);
+        let pack_at_half = GpuRenderer::pack_orb_frame(&clusters, &opts, 96, 64, 0.5);
+        assert_eq!(
+            pack_at0, pack_at_half,
+            "no tracks ⇒ the orb pack must be byte-identical across t (color does not drift)"
+        );
+    }
+
     /// #217: an empty (all-zero) image SDF yields a background-only frame
     /// ("draw nothing" contract, no panic).
     #[test]
@@ -4136,7 +4311,7 @@ mod tests {
 
         // Orb, via the pack-level seam shared with the browser path.
         let opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h);
+        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h, 0.3);
         let reference = renderer.render_packed(&pack, w, h, 0.3);
         let via_view = readback_via_view(renderer, w, h, format, |view| {
             renderer.render_packed_to_view(&pack, w, h, 0.3, view, format);
@@ -4298,7 +4473,7 @@ mod tests {
         let (w, h) = (32u32, 24u32);
         let clusters = sample_clusters();
         let opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
-        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h);
+        let pack = GpuRenderer::pack_orb_frame(&clusters, &opts, w, h, 0.3);
         let draw = |format: wgpu::TextureFormat| {
             let _ = readback_via_view(&renderer, w, h, format, |view| {
                 renderer.render_packed_to_view(&pack, w, h, 0.3, view, format);
