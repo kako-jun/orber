@@ -411,9 +411,11 @@ struct Cli {
     /// `color-track` = #7 (position fixed, color tracks over time, default).
     /// `keyframe` = #33 (color + position + weight all interpolated between keyframes).
     /// Passing `keyframe` with a still image input yields an explicit error.
-    /// NOTE (since #239 Phase 1): the per-frame color/keyframe animation is not yet
-    /// rendered by the unified WGSL renderer — video output uses static per-orb colors
-    /// and warns at runtime. Re-wiring is tracked in #251.
+    /// NOTE (#251): the per-frame **color** animation (both #7 color tracks and #33
+    /// keyframe colors) is now rendered by the unified WGSL renderer — video output
+    /// animates per-orb colors. Only the #33 **position** keyframe follow-through is
+    /// still unrendered (orbs keep the still-image scatter); it warns at runtime and
+    /// is tracked in #255.
     #[arg(long = "input-mode", value_enum, default_value_t = CliInputMode::ColorTrack)]
     input_mode: CliInputMode,
 
@@ -671,14 +673,15 @@ fn warn_if_aqua_ignored_for_video(cli: &Cli) {
     }
 }
 
-/// #239 Phase 1 で旧 aquarelle 経路を撤去した結果、動画の色トラック(#7) / キーフレーム(#33)
-/// の時間アニメは現在の統一 WGSL レンダラでは描画されない（`color_tracks` / `keyframe_tracks`
-/// は pack に畳み込まれていない）。フレームは静止色で出力される。再配線は #251。各動画出力経路で
-/// 1 度だけ警告し、嘘をつかない。`detail` は対象（"color (#7)" / "color/position keyframe (#33)"）。
+/// #251 で動画の色トラック(#7) / キーフレーム(#33)の **色** は統一 WGSL レンダラへ
+/// 再配線され、フレームごとに色がアニメする。ただし **位置** キーフレーム(#33)の追従
+/// （centroid ドリフト）はまだ描画されない（pack に畳み込まれていない）— orb は静止画と
+/// 同じ散布のまま色だけが時間で動く。位置の反映は #255。キーフレーム動画の各出力経路で
+/// 1 度だけ警告し、嘘をつかない（色は動く / 位置は動かない）。`detail` は対象を表す。
 fn warn_video_track_anim_unsupported(detail: &str) {
     eprintln!(
-        "orber: warning: video {detail} animation is not rendered by the current renderer; \
-         frames use static per-orb colors (re-wiring tracked in #251)"
+        "orber: warning: video {detail} position is not yet rendered by the current renderer; \
+         per-orb colors animate but orb positions stay put (position follow-through tracked in #255)"
     );
 }
 
@@ -984,7 +987,8 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         warn_if_aqua_ignored_for_video(cli);
-        warn_video_track_anim_unsupported("color (#7)");
+        // #251: color tracks (#7) now animate per frame via the unified renderer —
+        // no "unsupported" warning. (Color-only video has no position keyframes.)
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
@@ -1132,7 +1136,9 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         warn_if_aqua_ignored_for_video(cli);
-        warn_video_track_anim_unsupported("color/position keyframe (#33)");
+        // #251: keyframe color (#33) now animates; only position keyframes are still
+        // unrendered (orbs keep the still-image scatter). Position reflection is #255.
+        warn_video_track_anim_unsupported("keyframe (#33)");
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
