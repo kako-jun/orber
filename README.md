@@ -61,9 +61,11 @@ one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace wit
 ```bash
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
-# Video input: keyframe interpolation (#33). NOTE: since #239 the per-frame color/position
-# animation is not yet rendered by the unified renderer (it warns and uses static colors);
-# motion + breathing still animate. Re-wiring the tracks is tracked in #251.
+# Video input: keyframe interpolation (#33). Per-frame colors now animate — since #251
+# the color tracks are rendered by the unified WGSL renderer (orb/glyph/image alike), so
+# the output's orb colors change over time. The #33 position keyframe is not yet rendered:
+# orbs stay at their still-image scatter positions (motion + breathing still animate as
+# usual). Position re-wiring is tracked in #255.
 orber --input video.mp4 --output orb.mp4 --input-mode keyframe --keyframes 8 --duration-ms 10000
 ```
 
