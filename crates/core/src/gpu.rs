@@ -3699,6 +3699,16 @@ mod tests {
         let clusters = sample_clusters();
         let bg = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow).background;
 
+        // The midpoint detrended deviation is 0.8 − 0.3 = 0.5 for both runs below, so the
+        // per-orb cross shift at t=0.5 is `KEYFRAME_DRIFT_GAIN · detrended_mid`. The lit-mass
+        // centroid follows it but is attenuated by the orb scatter, so require at least
+        // `lit_floor_frac` of it. Tying the floor to the gain (a product value, blink-tuned)
+        // keeps this axis test robust when the const is re-tuned — an absolute floor
+        // calibrated to one gain breaks on the next.
+        let detrended_mid = 0.5; // 0.8 − 0.3, the midpoint deviation of both wobble tracks
+        let lit_floor_frac = 0.6; // lit-centroid attenuation slack vs the per-orb shift
+        let min_shift = crate::animate::KEYFRAME_DRIFT_GAIN * detrended_mid * lit_floor_frac;
+
         // LR: cross axis = y. A y-wobble should push the lit centroid downward (y up)
         // at the midpoint relative to the endpoint frame.
         let mut lr = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
@@ -3712,8 +3722,8 @@ mod tests {
         let lr_dy = lr_mid.1 - lr0.1;
         let lr_dx = (lr_mid.0 - lr0.0).abs();
         assert!(
-            lr_dy > 0.05 && lr_dy > lr_dx,
-            "LR drift must move lit mass mainly in y (dy={lr_dy:.3}, dx={lr_dx:.3})"
+            lr_dy > min_shift && lr_dy > lr_dx,
+            "LR drift must move lit mass mainly in y (dy={lr_dy:.3}, dx={lr_dx:.3}, min={min_shift:.3})"
         );
 
         // TB: cross axis = x. An x-wobble should push the lit centroid rightward (x up).
@@ -3728,8 +3738,8 @@ mod tests {
         let tb_dx = tb_mid.0 - tb0.0;
         let tb_dy = (tb_mid.1 - tb0.1).abs();
         assert!(
-            tb_dx > 0.05 && tb_dx > tb_dy,
-            "TB drift must move lit mass mainly in x (dx={tb_dx:.3}, dy={tb_dy:.3})"
+            tb_dx > min_shift && tb_dx > tb_dy,
+            "TB drift must move lit mass mainly in x (dx={tb_dx:.3}, dy={tb_dy:.3}, min={min_shift:.3})"
         );
     }
 

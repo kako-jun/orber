@@ -108,9 +108,14 @@ pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
 /// #255: 位置追従（[`keyframe_cross_drift`]）のドリフト量を抑える係数（0..1）。
 ///
 /// デトレンドした重心の揺らぎ（端点を結ぶ直線からの偏差）にこの係数を掛けて、
-/// **ごく微妙な揺らぎ**に抑える。blink（A-B ライブ比較）で微調する想定の値。
-/// `1.0` ならデトレンド生値そのまま、`0.0` ならドリフト無効（pack の `off+13` が常に 0）。
-pub const KEYFRAME_DRIFT_GAIN: f32 = 0.25;
+/// **ごく微妙な揺らぎ**に抑える。`1.0` ならデトレンド生値そのまま、`0.0` ならドリフト
+/// 無効（pack の `off+13` が常に 0）。
+///
+/// 値は kako-jun のライブ blink で選定（#255 サインオフ）。gain 0.25 や 0.60 では
+/// 「動きすぎ」で、止まってはいない"気配だけ"の揺らぎとして **0.10** に確定した。製品（CLI / core）は
+/// この定数のみを使い、調整ノブは外に出さない（値の置き場はこの 1 箇所に集約する。
+/// `SHADOW_STRENGTH_DEFAULT` と同じ方針）。
+pub const KEYFRAME_DRIFT_GAIN: f32 = 0.10;
 
 /// アニメーション 1 フレーム描画のオプション。
 ///
@@ -1115,7 +1120,9 @@ mod tests {
 
     /// #255 A4b: LR (direction_id=0.0) ⇒ cross axis = **y**. A 3-key wobble
     /// (y: 0.2→0.8→0.2) leaves the line at the midpoint: detrended(0.5)=0.8−0.2=0.6,
-    /// ×gain 0.25 ⇒ **0.15**; endpoints 0. Moving x must NOT change it (LR ignores x).
+    /// ×gain ⇒ `KEYFRAME_DRIFT_GAIN·0.6`; endpoints 0. Moving x must NOT change it
+    /// (LR ignores x). Expectation is symbolic in the gain so re-tuning the const
+    /// (a product value) does not break this axis/detrend test.
     #[test]
     fn keyframe_cross_drift_lr_wobble_uses_centroid_y() {
         // x fixed: only y wobbles.
@@ -1126,8 +1133,8 @@ mod tests {
         ]]));
         approx(
             keyframe_cross_drift(&fixed_x, 0.5, 0.0, 1).expect("Some")[0],
-            0.15,
-            "LR t=0.5 y-wobble (0.6 detrended × 0.25)",
+            KEYFRAME_DRIFT_GAIN * 0.6,
+            "LR t=0.5 y-wobble (0.6 detrended × gain)",
         );
         approx(
             keyframe_cross_drift(&fixed_x, 0.0, 0.0, 1).expect("Some")[0],
@@ -1148,14 +1155,14 @@ mod tests {
         ]]));
         approx(
             keyframe_cross_drift(&moving_x, 0.5, 0.0, 1).expect("Some")[0],
-            0.15,
+            KEYFRAME_DRIFT_GAIN * 0.6,
             "LR wobble drift must be x-invariant",
         );
     }
 
     /// #255 A5: TB (direction_id=2.0) ⇒ cross axis = **x**. A 3-key wobble
-    /// (x: 0.2→0.8→0.2) gives 0.15 at t=0.5, 0 at the endpoints; moving y must not
-    /// change it (TB ignores y).
+    /// (x: 0.2→0.8→0.2) gives `KEYFRAME_DRIFT_GAIN·0.6` at t=0.5, 0 at the endpoints;
+    /// moving y must not change it (TB ignores y).
     #[test]
     fn keyframe_cross_drift_tb_uses_centroid_x() {
         let fixed_y = drift_opts(Some(vec![vec![
@@ -1165,7 +1172,7 @@ mod tests {
         ]]));
         approx(
             keyframe_cross_drift(&fixed_y, 0.5, 2.0, 1).expect("Some")[0],
-            0.15,
+            KEYFRAME_DRIFT_GAIN * 0.6,
             "TB t=0.5 x-wobble",
         );
         approx(
@@ -1185,7 +1192,7 @@ mod tests {
         ]]));
         approx(
             keyframe_cross_drift(&moving_y, 0.5, 2.0, 1).expect("Some")[0],
-            0.15,
+            KEYFRAME_DRIFT_GAIN * 0.6,
             "TB wobble drift must be y-invariant",
         );
     }
@@ -1193,8 +1200,8 @@ mod tests {
     /// #255 A6: the axis switch happens at direction_id 1.5. One wobble track whose x
     /// and y both deviate from their endpoint line at the midpoint
     /// (x:0.2→0.7→0.2 ⇒ Δx=0.5, y:0.1→0.9→0.1 ⇒ Δy=0.8): RL(1.0, below 1.5) must pick
-    /// the y-wobble (0.8×0.25=0.2), TB(2.0, above 1.5) the x-wobble (0.5×0.25=0.125).
-    /// Contrasted at t=0.5 in one test so a flipped boundary is caught.
+    /// the y-wobble (`gain·0.8`), TB(2.0, above 1.5) the x-wobble (`gain·0.5`).
+    /// Contrasted at t=0.5 in one test so a flipped boundary is caught (0.8 ≠ 0.5).
     #[test]
     fn keyframe_cross_drift_axis_switch_boundary_rl_vs_tb() {
         let opts = drift_opts(Some(vec![vec![
@@ -1204,8 +1211,16 @@ mod tests {
         ]]));
         let rl = keyframe_cross_drift(&opts, 0.5, 1.0, 1).expect("Some")[0]; // RL → y
         let tb = keyframe_cross_drift(&opts, 0.5, 2.0, 1).expect("Some")[0]; // TB → x
-        approx(rl, 0.2, "RL (<1.5) ⇒ y-wobble × gain (0.8×0.25)");
-        approx(tb, 0.125, "TB (>=1.5) ⇒ x-wobble × gain (0.5×0.25)");
+        approx(
+            rl,
+            KEYFRAME_DRIFT_GAIN * 0.8,
+            "RL (<1.5) ⇒ y-wobble × gain (Δy=0.8)",
+        );
+        approx(
+            tb,
+            KEYFRAME_DRIFT_GAIN * 0.5,
+            "TB (>=1.5) ⇒ x-wobble × gain (Δx=0.5)",
+        );
     }
 
     /// #255: loop-close guarantee — for **any** wobble track, `drift(0)` and `drift(1)`
@@ -1230,8 +1245,8 @@ mod tests {
     }
 
     /// #255: the gain constant is applied exactly once. A wobble whose raw detrended
-    /// value at t=0.5 is 0.6 must come back as 0.6 × [`KEYFRAME_DRIFT_GAIN`] (=0.15),
-    /// pinning that the const is not mis-multiplied (e.g. squared, or omitted).
+    /// value at t=0.5 is 0.6 must come back as 0.6 × [`KEYFRAME_DRIFT_GAIN`], pinning
+    /// that the const is not mis-multiplied (e.g. squared, or omitted).
     #[test]
     fn keyframe_cross_drift_applies_subtle_gain() {
         let opts = drift_opts(Some(vec![vec![
@@ -1258,7 +1273,11 @@ mod tests {
         ]));
         let drift = keyframe_cross_drift(&opts, 0.5, 0.0, 2).expect("Some");
         approx(drift[0], 0.0, "empty track ⇒ drift 0");
-        approx(drift[1], 0.15, "real wobble ⇒ y-drift 0.15 at t=0.5");
+        approx(
+            drift[1],
+            KEYFRAME_DRIFT_GAIN * 0.6,
+            "real wobble ⇒ y-drift gain·0.6 at t=0.5",
+        );
     }
 
     /// #255 A8: the output length is always `n_clusters`, independent of the number
@@ -1274,7 +1293,7 @@ mod tests {
         ]]));
         let d = keyframe_cross_drift(&few, 0.5, 0.0, 3).expect("Some");
         assert_eq!(d.len(), 3, "len must equal n_clusters");
-        approx(d[0], 0.15, "cluster 0 wobbles");
+        approx(d[0], KEYFRAME_DRIFT_GAIN * 0.6, "cluster 0 wobbles");
         approx(d[1], 0.0, "no track ⇒ 0");
         approx(d[2], 0.0, "no track ⇒ 0");
 
