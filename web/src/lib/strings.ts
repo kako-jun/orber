@@ -88,34 +88,13 @@ export const STRINGS = {
   softnessOptionLow: { ja: '弱め', en: 'Low' },
   softnessOptionMid: { ja: '標準', en: 'Standard' },
   softnessOptionHigh: { ja: '強め', en: 'High' },
-  // #239 Phase 1: にじみ (watercolor bleed) の 3 段ボタン。「なし」はくっきり
-  // （水彩オフ）で wasm 側 aqua = None。弱/中/強 は内部 aqua_bleed 0.15/0.3/0.5。
-  // 数字は出さない（kako-jun 確定）。en も weak/mid/strong で数字を露出しない。
+  // #253: 単一「にじみ」ノブ（弱/中/強）。にじみは常時オン（#239 の「なし」は廃止）。
+  // レベルは内部 aqua_bleed 0.15/0.3/0.5 で、芯の光/縁の彩度/かたよりも同じレベルから
+  // 導出して一括駆動する。数字は出さない（kako-jun 確定）。en も weak/mid/strong。
   bleedLabel: { ja: 'にじみ', en: 'Bleed' },
-  bleedOptionOff: { ja: 'なし', en: 'Off' },
   bleedOptionWeak: { ja: '弱', en: 'Weak' },
   bleedOptionMid: { ja: '中', en: 'Mid' },
   bleedOptionStrong: { ja: '強', en: 'Strong' },
-  // #239 Phase 1: bloom / halo / offset の character 3 段ボタン。にじみと同形の
-  // なし / 弱 / 中 / 強。「なし」は wasm 側でその軸 0（オフ）。弱/中/強 は内部
-  // aqua_bloom/halo/offset 0.3/0.6/0.9。数字は出さない。にじみが「なし」のときは
-  // 3 軸とも無効化（disabled）= 水彩オフでは意味が無いため。日本語ラベルは効果が
-  // 伝わる平易な言い回し（ブルーム＝芯の光 / ハロー＝縁の彩度 / オフセット＝かたより）。
-  bloomLabel: { ja: '芯の光', en: 'Bloom' },
-  bloomOptionOff: { ja: 'なし', en: 'Off' },
-  bloomOptionWeak: { ja: '弱', en: 'Weak' },
-  bloomOptionMid: { ja: '中', en: 'Mid' },
-  bloomOptionStrong: { ja: '強', en: 'Strong' },
-  haloLabel: { ja: '縁の彩度', en: 'Halo' },
-  haloOptionOff: { ja: 'なし', en: 'Off' },
-  haloOptionWeak: { ja: '弱', en: 'Weak' },
-  haloOptionMid: { ja: '中', en: 'Mid' },
-  haloOptionStrong: { ja: '強', en: 'Strong' },
-  offsetLabel: { ja: 'かたより', en: 'Offset' },
-  offsetOptionOff: { ja: 'なし', en: 'Off' },
-  offsetOptionWeak: { ja: '弱', en: 'Weak' },
-  offsetOptionMid: { ja: '中', en: 'Mid' },
-  offsetOptionStrong: { ja: '強', en: 'Strong' },
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',

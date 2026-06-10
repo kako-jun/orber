@@ -5,6 +5,9 @@
 //   image マスク必須 / glyph SDF フォールバックとキャッシュ / orb 素通し /
 //   transparent_background キーの有無）。wasm / OffscreenCanvas は
 //   ロードせず、glyphSupported / generateSdf を vi.fn で DI する
+// - bleedDerivedParams (#253): 単一「にじみ」ノブのレベル語が
+//   bleed/bloom/halo/offset の 4 preset を「すべて同じ語で」駆動する
+//   （ロックステップ）ことを固定する。
 // - computeMaskSize: 長辺 1024 縮小の境界とアスペクト比保持
 // - formatRunBatchError: sentinel → i18n キーのマップ（t() は fake を DI）。
 //   worker が `String(err)` で post する 'Error: ' 前置きでも includes
@@ -12,12 +15,14 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import {
+  bleedDerivedParams,
   buildWasmParams,
   computeMaskSize,
   formatRunBatchError,
   GLYPH_SDF_SIZE,
   IMAGE_MASK_TARGET_LONG_EDGE,
   type BaseParams,
+  type BleedLevel,
   type BuildWasmParamsDeps,
 } from './workerLogic';
 
@@ -146,20 +151,18 @@ describe('buildWasmParams', () => {
     }
   });
 
-  it("#239: bleed_preset 省略時はキー自体が無い（serde default '' = にじみオフ）", () => {
-    // 既定はにじみオフ（くっきり）。BaseParams に bleed_preset を渡さなければ
-    // wasm params にもキーが乗らず、wasm 側 serde default '' → aqua = None で
-    // 従来 Web 出力と byte 一致（非リグレッション）。
+  it('buildWasmParams は preset を合成しない（BaseParams に無いキーは素通しで生やさない）', () => {
+    // buildWasmParams 自体は与えられた preset を素通しするだけで、欠けたキーを
+    // 補完しない（#253 で にじみは Studio 側で常時 'weak'/'mid'/'strong' を必ず
+    // 渡すようになったが、buildWasmParams は依然として汎用の素通しヘルパ）。
     const params = buildWasmParams(baseParams(), makeDeps());
     expect('bleed_preset' in params).toBe(false);
+    expect('bloom_preset' in params).toBe(false);
+    expect('halo_preset' in params).toBe(false);
+    expect('offset_preset' in params).toBe(false);
   });
 
-  it("#239: bleed_preset='' を明示しても off として素通しする（aqua = None 相当）", () => {
-    const params = buildWasmParams(baseParams({ bleed_preset: '' }), makeDeps());
-    expect(params.bleed_preset).toBe('');
-  });
-
-  it('#239: bloom / halo / offset の character preset も素通しで wasm params に乗る', () => {
+  it('#239: bloom / halo / offset の preset も素通しで wasm params に乗る', () => {
     // にじみと同じく `...p` 展開で wasm 側 WasmParams.{bloom,halo,offset}_preset へ
     // そのまま流れる。wasm 側で 'weak'|'mid'|'strong' → 0.3/0.6/0.9 に写像される。
     for (const preset of ['weak', 'mid', 'strong'] as const) {
@@ -178,15 +181,6 @@ describe('buildWasmParams', () => {
     }
   });
 
-  it('#239: character preset 省略時はキー自体が無い（serde default = その軸オフ）', () => {
-    // BaseParams に bloom/halo/offset_preset を渡さなければ wasm params にもキーが
-    // 乗らず、wasm 側 serde default '' → その軸 0 で従来挙動。
-    const params = buildWasmParams(baseParams(), makeDeps());
-    expect('bloom_preset' in params).toBe(false);
-    expect('halo_preset' in params).toBe(false);
-    expect('offset_preset' in params).toBe(false);
-  });
-
   it('transparentBackground=true で transparent_background: true が付与される', () => {
     const params = buildWasmParams(baseParams(), makeDeps(), { transparentBackground: true });
     expect(params.transparent_background).toBe(true);
@@ -201,6 +195,40 @@ describe('buildWasmParams', () => {
       transparentBackground: false,
     });
     expect('transparent_background' in explicitFalse).toBe(false);
+  });
+});
+
+describe('bleedDerivedParams (#253: にじみノブのロックステップ)', () => {
+  // #253: session605(#239 Phase 1) で出した にじみ/芯の光/縁の彩度/かたより の
+  // 4 軸を単一「にじみ」ノブに畳んだ。レベル（弱/中/強）が bleed/bloom/halo/offset
+  // の 4 preset フィールドを「すべて同じ語で」駆動する＝ロックステップなのが新仕様。
+  it('レベル語が bleed/bloom/halo/offset の 4 フィールドを同じ語で駆動する', () => {
+    for (const level of ['weak', 'mid', 'strong'] as const) {
+      const d = bleedDerivedParams(level);
+      // 4 フィールドすべてが同じレベル語であること（ロックステップ）。
+      expect(d.bleed_preset).toBe(level);
+      expect(d.bloom_preset).toBe(level);
+      expect(d.halo_preset).toBe(level);
+      expect(d.offset_preset).toBe(level);
+      // 重複も含め、4 フィールドの値が全て一致する（横並びの不一致を弾く）。
+      const values = [d.bleed_preset, d.bloom_preset, d.halo_preset, d.offset_preset];
+      expect(new Set(values).size).toBe(1);
+      // 余計なキーを生やさない（param 組み立てに混入させないため）。
+      expect(Object.keys(d).sort()).toEqual(
+        ['bleed_preset', 'bloom_preset', 'halo_preset', 'offset_preset'].sort(),
+      );
+    }
+  });
+
+  it('導出した 4 preset を BaseParams に展開すると buildWasmParams 経由でも同じ語のまま乗る', () => {
+    // Studio の param 組み立て（`...bleedDerivedParams(bleedPreset())`）を再現し、
+    // buildWasmParams の素通しを通っても 4 フィールドがロックステップを保つことを固定。
+    const level: BleedLevel = 'mid';
+    const params = buildWasmParams(baseParams({ ...bleedDerivedParams(level) }), makeDeps());
+    expect(params.bleed_preset).toBe(level);
+    expect(params.bloom_preset).toBe(level);
+    expect(params.halo_preset).toBe(level);
+    expect(params.offset_preset).toBe(level);
   });
 });
 
