@@ -3544,6 +3544,180 @@ mod tests {
         );
     }
 
+    // ---- #255: cross-axis centroid drift (B案) e2e ----
+
+    /// Mean (x, y) of the lit pixels, in normalized [0,1] coords. Used by the
+    /// cross-axis drift tests to see which way the orb mass shifted.
+    fn lit_centroid(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> (f32, f32) {
+        let (w, h) = img.dimensions();
+        let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u64);
+        for (x, y, p) in img.enumerate_pixels() {
+            let lit =
+                (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh) || p.0[3].abs_diff(bg[3]) > thresh;
+            if lit {
+                sx += x as f64;
+                sy += y as f64;
+                n += 1;
+            }
+        }
+        assert!(n > 0, "expected some lit pixels to take a centroid of");
+        (
+            (sx / n as f64) as f32 / w as f32,
+            (sy / n as f64) as f32 / h as f32,
+        )
+    }
+
+    /// A keyframe track whose centroid sweeps along an axis (color/weight fixed so
+    /// only position drives the drift), applied to every cluster.
+    fn drift_tracks(
+        clusters: &[Cluster],
+        from: Centroid,
+        to: Centroid,
+    ) -> Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>> {
+        let key = |c: Centroid, time: f32| crate::keyframe_track::KeyframeClusterPoint {
+            color: [220, 220, 220],
+            centroid: c,
+            weight: 0.5,
+            time,
+        };
+        vec![vec![key(from, 0.0), key(to, 1.0)]; clusters.len()]
+    }
+
+    /// #255 C14: a drift of all-zeros is a no-op vs no drift at all. Render a hand-built
+    /// pack with `cross_drift = None` and another with `Some(vec![0.0; clusters.len()])`;
+    /// the two images must be **bit-exact** (max diff 0). The byte-level e2e proof that
+    /// `misc.w = 0` does not perturb the plain-orb output.
+    #[test]
+    fn gpu_zero_cross_drift_is_noop_byte_match() {
+        let Some(renderer) = require_or_skip_renderer("gpu_zero_cross_drift_is_noop_byte_match")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let (w, h) = (64u32, 48u32);
+        let bg = [12u8, 18, 28, 255];
+        let mk = |drift: Option<&[f32]>| {
+            pack_render_data(
+                &clusters,
+                bg,
+                (w.min(h) as f32) * 0.25,
+                0.5,
+                0.0, // LR
+                MotionSpeed::Mid.cycle_count() as f32,
+                12345,
+                12, // n_orbs
+                1.0,
+                0.0,  // shape_id = Orb
+                true, // glyph_rotate (ignored)
+                0.5,
+                SHADOW_STRENGTH_DEFAULT,
+                drift,
+            )
+        };
+        let none_pack = mk(None);
+        let zeros = vec![0.0f32; clusters.len()];
+        let zero_pack = mk(Some(&zeros));
+        // The packs themselves should already be byte-identical (off+13 = 0 either way),
+        // but the e2e gate renders both and asserts the rendered frames match exactly.
+        let img_none = renderer.render_packed(&none_pack, w, h, 0.6);
+        let img_zero = renderer.render_packed(&zero_pack, w, h, 0.6);
+        let max_diff = assert_within_tolerance(
+            &img_zero,
+            &img_none,
+            "all-zero cross_drift vs None cross_drift",
+        );
+        assert_eq!(
+            max_diff, 0,
+            "all-zero drift must be byte-identical to no drift (misc.w=0 is a no-op)"
+        );
+    }
+
+    /// #255 C15: a non-zero drift actually moves the orbs. An LR track whose centroid
+    /// sweeps in y (0.2→0.8) renders a drifted frame at t=1 that differs significantly
+    /// from the un-drifted frame at t=0 (where the delta is 0). Asserts the bytes
+    /// differ well beyond tolerance — misc.w reaches the shader and shifts position.
+    #[test]
+    fn gpu_cross_drift_shifts_orbs_along_cross_axis() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_cross_drift_shifts_orbs_along_cross_axis")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        // Large y sweep so the cross-axis (y, for LR) shift is unmistakable.
+        opts.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.2 },
+            Centroid { x: 0.5, y: 0.8 },
+        ));
+
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0); // delta 0
+        let at1 = renderer.render_frame(&clusters, &opts, 1.0); // delta = +0.6 in y
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "drift frame must have lit pixels"
+        );
+        // Count how many pixels differ beyond tolerance: a real position shift moves
+        // far more than the color sweep alone could (color/weight are fixed here).
+        let (mut differing, total) = (0usize, (at0.width() * at0.height()) as usize);
+        for (a, b) in at0.pixels().zip(at1.pixels()) {
+            if (0..4).any(|c| a.0[c].abs_diff(b.0[c]) > 2) {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing * 20 > total,
+            "drift must move a substantial fraction of pixels (got {differing}/{total})"
+        );
+    }
+
+    /// #255 C16: the cross axis is **y for LR** and **x for TB**. Give the same-size
+    /// drift to an LR run (y sweep) and a TB run (x sweep) and confirm the lit mass
+    /// shifts down (y grows) for LR but barely in x, and right (x grows) for TB but
+    /// barely in y. RL/BT share the wgsl branch shape so they are not retested.
+    #[test]
+    fn gpu_cross_axis_is_y_for_lr_and_x_for_tb() {
+        let Some(renderer) = require_or_skip_renderer("gpu_cross_axis_is_y_for_lr_and_x_for_tb")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let bg = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow).background;
+
+        // LR: cross axis = y. A y-sweep should push the lit centroid downward (y up).
+        let mut lr = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        lr.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.3 },
+            Centroid { x: 0.5, y: 0.8 },
+        ));
+        let lr0 = lit_centroid(&renderer.render_frame(&clusters, &lr, 0.0), bg, 8);
+        let lr1 = lit_centroid(&renderer.render_frame(&clusters, &lr, 1.0), bg, 8);
+        let lr_dy = lr1.1 - lr0.1;
+        let lr_dx = (lr1.0 - lr0.0).abs();
+        assert!(
+            lr_dy > 0.05 && lr_dy > lr_dx,
+            "LR drift must move lit mass mainly in y (dy={lr_dy:.3}, dx={lr_dx:.3})"
+        );
+
+        // TB: cross axis = x. An x-sweep should push the lit centroid rightward (x up).
+        let mut tb = orb_opts(64, 48, MotionDirection::TopToBottom, MotionSpeed::Slow);
+        tb.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.3, y: 0.5 },
+            Centroid { x: 0.8, y: 0.5 },
+        ));
+        let tb0 = lit_centroid(&renderer.render_frame(&clusters, &tb, 0.0), bg, 8);
+        let tb1 = lit_centroid(&renderer.render_frame(&clusters, &tb, 1.0), bg, 8);
+        let tb_dx = tb1.0 - tb0.0;
+        let tb_dy = (tb1.1 - tb0.1).abs();
+        assert!(
+            tb_dx > 0.05 && tb_dx > tb_dy,
+            "TB drift must move lit mass mainly in x (dx={tb_dx:.3}, dy={tb_dy:.3})"
+        );
+    }
+
     /// #251: a color track also animates the **glyph / image** path (`pack_sdf_frame`,
     /// shape_id=1) — color is folded for every shape, not just the plain orb. Render
     /// a glyph with a red→blue track at t=0.0 vs t=0.5 and require the bytes differ.

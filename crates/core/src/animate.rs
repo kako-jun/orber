@@ -990,4 +990,259 @@ mod tests {
             "non-empty track ⇒ track color"
         );
     }
+
+    // ---- #255: keyframe_cross_drift (cross-axis centroid drift delta, B案) ----
+
+    /// Build a [`KeyframeClusterPoint`] with the given centroid / time
+    /// (color / weight are inert for drift — only centroid matters here).
+    fn kfp(cx: f32, cy: f32, time: f32) -> KeyframeClusterPoint {
+        KeyframeClusterPoint {
+            color: [0, 0, 0],
+            centroid: Centroid { x: cx, y: cy },
+            weight: 0.0,
+            time,
+        }
+    }
+
+    fn drift_opts(tracks: Option<Vec<Vec<KeyframeClusterPoint>>>) -> AnimateOptions {
+        AnimateOptions {
+            keyframe_tracks: tracks,
+            ..AnimateOptions::default()
+        }
+    }
+
+    fn approx(a: f32, b: f32, label: &str) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "{label}: expected ~{b}, got {a} (eps=1e-6)"
+        );
+    }
+
+    /// #255 A1: no keyframe tracks ⇒ `None` (caller passes `None` to the packer,
+    /// so `misc.w` stays 0.0 = byte-identical to pre-#255).
+    #[test]
+    fn keyframe_cross_drift_none_tracks_returns_none() {
+        let opts = drift_opts(None);
+        assert!(
+            keyframe_cross_drift(&opts, 0.5, 0.0, 3).is_none(),
+            "no tracks ⇒ None"
+        );
+    }
+
+    /// #255 A2: an empty tracks Vec is treated like `None` (no per-cluster track to
+    /// follow), so the drift is `None` — not a `Some(vec![0.0; n])` that would still
+    /// be byte-identical but allocate needlessly.
+    #[test]
+    fn keyframe_cross_drift_empty_tracks_returns_none() {
+        let opts = drift_opts(Some(vec![]));
+        assert!(
+            keyframe_cross_drift(&opts, 0.5, 0.0, 3).is_none(),
+            "empty tracks Vec ⇒ None"
+        );
+    }
+
+    /// #255 A3: drift is a **delta** from `t=0`, so at `t=0` every cluster's delta is
+    /// ~0 (the orb sits exactly where the still image would — byte-identical motion
+    /// onset). track[0].time = 0.0 so c_t and c_0 coincide.
+    #[test]
+    fn keyframe_cross_drift_t0_is_all_zero_delta() {
+        let opts = drift_opts(Some(vec![
+            vec![kfp(0.2, 0.2, 0.0), kfp(0.9, 0.8, 1.0)],
+            vec![kfp(0.5, 0.1, 0.0), kfp(0.5, 0.7, 1.0)],
+        ]));
+        let drift = keyframe_cross_drift(&opts, 0.0, 0.0, 2).expect("Some at t=0");
+        for (i, d) in drift.iter().enumerate() {
+            approx(*d, 0.0, &format!("t=0 delta for cluster {i}"));
+        }
+    }
+
+    /// #255 A4: LR (direction_id=0.0) ⇒ cross axis = **y**. With centroid.y sweeping
+    /// 0.2→0.8 the delta is 0.6 at t=1 and 0.3 at t=0.5. Moving x must NOT change the
+    /// result (LR ignores x).
+    #[test]
+    fn keyframe_cross_drift_lr_uses_centroid_y() {
+        // x fixed at 0.5: y is the only thing that moves.
+        let fixed_x = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
+        let d1 = keyframe_cross_drift(&fixed_x, 1.0, 0.0, 1).expect("Some")[0];
+        let dh = keyframe_cross_drift(&fixed_x, 0.5, 0.0, 1).expect("Some")[0];
+        approx(d1, 0.6, "LR t=1 y-delta");
+        approx(dh, 0.3, "LR t=0.5 y-delta");
+
+        // Same y sweep but x now also moves: LR must give the identical y-delta.
+        let moving_x = drift_opts(Some(vec![vec![kfp(0.1, 0.2, 0.0), kfp(0.95, 0.8, 1.0)]]));
+        let d1_mx = keyframe_cross_drift(&moving_x, 1.0, 0.0, 1).expect("Some")[0];
+        approx(d1_mx, 0.6, "LR delta must be x-invariant");
+    }
+
+    /// #255 A5: TB (direction_id=2.0) ⇒ cross axis = **x**. centroid.x 0.2→0.8 gives
+    /// delta 0.6 at t=1; moving y must not change it.
+    #[test]
+    fn keyframe_cross_drift_tb_uses_centroid_x() {
+        let fixed_y = drift_opts(Some(vec![vec![kfp(0.2, 0.5, 0.0), kfp(0.8, 0.5, 1.0)]]));
+        approx(
+            keyframe_cross_drift(&fixed_y, 1.0, 2.0, 1).expect("Some")[0],
+            0.6,
+            "TB t=1 x-delta",
+        );
+        let moving_y = drift_opts(Some(vec![vec![kfp(0.2, 0.1, 0.0), kfp(0.8, 0.95, 1.0)]]));
+        approx(
+            keyframe_cross_drift(&moving_y, 1.0, 2.0, 1).expect("Some")[0],
+            0.6,
+            "TB delta must be y-invariant",
+        );
+    }
+
+    /// #255 A6: the axis switch happens at direction_id 1.5. One track whose x and y
+    /// both move (x:0.2→0.7 ⇒ Δx=0.5, y:0.1→0.9 ⇒ Δy=0.8): RL(1.0, below 1.5) must
+    /// pick the y-delta, TB(2.0, above 1.5) the x-delta. Contrasted in one test so a
+    /// flipped boundary is caught.
+    #[test]
+    fn keyframe_cross_drift_axis_switch_boundary_rl_vs_tb() {
+        let opts = drift_opts(Some(vec![vec![kfp(0.2, 0.1, 0.0), kfp(0.7, 0.9, 1.0)]]));
+        let rl = keyframe_cross_drift(&opts, 1.0, 1.0, 1).expect("Some")[0]; // RL → y
+        let tb = keyframe_cross_drift(&opts, 1.0, 2.0, 1).expect("Some")[0]; // TB → x
+        approx(rl, 0.8, "RL (<1.5) ⇒ y-delta");
+        approx(tb, 0.5, "TB (>=1.5) ⇒ x-delta");
+    }
+
+    /// #255 A7: an empty per-cluster track yields delta 0 for that index, while a
+    /// real track at another index drifts. Index 0 empty, index 1 real.
+    #[test]
+    fn keyframe_cross_drift_empty_track_index_is_zero() {
+        let opts = drift_opts(Some(vec![
+            vec![],                                       // cluster 0: no track → delta 0
+            vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)], // cluster 1: y 0.2→0.8
+        ]));
+        let drift = keyframe_cross_drift(&opts, 1.0, 0.0, 2).expect("Some");
+        approx(drift[0], 0.0, "empty track ⇒ delta 0");
+        approx(drift[1], 0.6, "real track ⇒ y-delta");
+    }
+
+    /// #255 A8: the output length is always `n_clusters`, independent of the number
+    /// of tracks supplied. Fewer tracks than clusters ⇒ trailing clusters get 0;
+    /// more tracks than clusters ⇒ the surplus tracks are ignored.
+    #[test]
+    fn keyframe_cross_drift_output_len_is_n_clusters_not_tracks_len() {
+        // 1 track, 3 clusters → len 3, only index 0 drifts.
+        let few = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
+        let d = keyframe_cross_drift(&few, 1.0, 0.0, 3).expect("Some");
+        assert_eq!(d.len(), 3, "len must equal n_clusters");
+        approx(d[0], 0.6, "cluster 0 drifts");
+        approx(d[1], 0.0, "no track ⇒ 0");
+        approx(d[2], 0.0, "no track ⇒ 0");
+
+        // 3 tracks, 2 clusters → len 2 (surplus track ignored, no panic).
+        let many = drift_opts(Some(vec![
+            vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)],
+            vec![kfp(0.5, 0.1, 0.0), kfp(0.5, 0.5, 1.0)],
+            vec![kfp(0.5, 0.0, 0.0), kfp(0.5, 1.0, 1.0)],
+        ]));
+        let d = keyframe_cross_drift(&many, 1.0, 0.0, 2).expect("Some");
+        assert_eq!(d.len(), 2, "len must be n_clusters, surplus tracks ignored");
+    }
+
+    /// #255 A9: a NaN `t` must not panic. `interpolate_keyframe_track` returns the
+    /// head value for NaN, and head==t=0 head ⇒ delta ~0.
+    #[test]
+    fn keyframe_cross_drift_nan_t_does_not_panic_and_is_zero() {
+        let opts = drift_opts(Some(vec![vec![kfp(0.5, 0.2, 0.0), kfp(0.5, 0.8, 1.0)]]));
+        let d = keyframe_cross_drift(&opts, f32::NAN, 0.0, 1).expect("Some");
+        approx(d[0], 0.0, "NaN t ⇒ head value both ends ⇒ delta 0");
+    }
+
+    // ---- #255: pack_render_data off+13 carries the per-cluster drift ----
+
+    /// Call the packer with a fixed orb-1 layout. `off = 16 + 16*i`; off+13 is drift.
+    #[allow(clippy::too_many_arguments)]
+    fn pack_with_drift(clusters: &[Cluster], n_orbs: usize, drift: Option<&[f32]>) -> Vec<f32> {
+        pack_render_data(
+            clusters,
+            [0, 0, 0, 255],
+            32.0,
+            0.5,
+            0.0, // direction_id (LR)
+            2.0,
+            7, // seed
+            n_orbs,
+            1.0,
+            0.0,
+            true,
+            0.5,
+            0.5,
+            drift,
+        )
+    }
+
+    /// #255 B10: with `cross_drift = None` every orb's off+13 word is exactly 0.0 —
+    /// the minimal byte-level proof that the no-track path is unchanged.
+    #[test]
+    fn pack_off13_zero_when_cross_drift_none() {
+        let clusters = vec![
+            track_cluster([200, 100, 50], 0.3, 0.4, 0.5),
+            track_cluster([50, 100, 200], 0.7, 0.6, 0.5),
+        ];
+        let n_orbs = 6;
+        let pack = pack_with_drift(&clusters, n_orbs, None);
+        for i in 0..n_orbs {
+            let off = 16 + 16 * i;
+            assert_eq!(pack[off + 13], 0.0, "orb {i} off+13 must be 0.0 with None");
+        }
+    }
+
+    /// #255 B11: with a `Some` per-cluster drift, each orb's off+13 word carries the
+    /// drift value of **its** cluster (looked up by `cluster_idx`). Verified by
+    /// reading off+0..2 (the orb's color) back to which cluster it borrowed.
+    #[test]
+    fn pack_off13_carries_per_cluster_drift_by_cluster_idx() {
+        // Two clearly distinct colors so we can recover cluster_idx from the packed color.
+        let clusters = vec![
+            track_cluster([200, 0, 0], 0.3, 0.4, 0.5),
+            track_cluster([0, 0, 200], 0.7, 0.6, 0.5),
+        ];
+        let drift = [0.11f32, 0.22f32];
+        let n_orbs = 8;
+        let pack = pack_with_drift(&clusters, n_orbs, Some(&drift));
+        for i in 0..n_orbs {
+            let off = 16 + 16 * i;
+            // Recover which cluster this orb borrowed from its packed red channel.
+            let red = pack[off];
+            let cluster_idx = if (red - 200.0 / 255.0).abs() < 1e-3 {
+                0
+            } else {
+                1
+            };
+            assert!(
+                (pack[off + 13] - drift[cluster_idx]).abs() < 1e-6,
+                "orb {i} (cluster {cluster_idx}) off+13 must be drift[{cluster_idx}]={}",
+                drift[cluster_idx]
+            );
+        }
+    }
+
+    /// #255 B12: B案 = per-cluster delta, **not** a per-orb stripe. With one cluster
+    /// and many orbs, every orb shares the single cluster's delta in off+13, while
+    /// off+8 (cross_axis, the uniform scatter) still spreads across orbs. This pins
+    /// "same cluster ⇒ same delta, scatter preserved ⇒ no stripe" purely in unit land.
+    #[test]
+    fn pack_drift_is_per_cluster_not_striped() {
+        let clusters = vec![track_cluster([120, 120, 120], 0.5, 0.5, 1.0)];
+        let drift = [0.5f32];
+        let n_orbs = 8;
+        let pack = pack_with_drift(&clusters, n_orbs, Some(&drift));
+        let mut cross_axes = Vec::new();
+        for i in 0..n_orbs {
+            let off = 16 + 16 * i;
+            assert!(
+                (pack[off + 13] - 0.5).abs() < 1e-6,
+                "orb {i} shares the single cluster's delta (0.5)"
+            );
+            cross_axes.push(pack[off + 8]);
+        }
+        // The cross_axis scatter must NOT collapse to one value (that would be a stripe).
+        let first = cross_axes[0];
+        assert!(
+            cross_axes.iter().any(|&c| (c - first).abs() > 1e-3),
+            "cross_axis must still scatter across orbs (delta shared, scatter kept): {cross_axes:?}"
+        );
+    }
 }
