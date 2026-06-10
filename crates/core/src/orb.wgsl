@@ -406,6 +406,10 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         let cross_axis = o.misc.x;
         let style_bit = o.misc.y; // 0=rim, 1=soft
         let speed_mult = o.misc.z;
+        // #255: cross 軸 重心ドリフト delta（B案）。一様散布(cross_axis)は保持したまま、
+        // この cluster の重心が t=0 から動いた分だけを cross 側に加算する。0 = 位置
+        // トラック無し＝従来と完全一致（byte 一致ゲート）。clamp/wrap はしない（PoC）。
+        let cross_drift = o.misc.w;
 
         let r_pixels_max = params.base_radius * sqrt(max(weight, 0.0)) * BREATH_RADIUS_MAX_FACTOR;
         var r_normalized = 0.0;
@@ -424,15 +428,15 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         var ny: f32;
         if (params.direction < 0.5) {        // LR
             nx = pos;
-            ny = cross_axis;
+            ny = cross_axis + cross_drift;
         } else if (params.direction < 1.5) { // RL
             nx = 1.0 - pos;
-            ny = cross_axis;
+            ny = cross_axis + cross_drift;
         } else if (params.direction < 2.5) { // TB
-            nx = cross_axis;
+            nx = cross_axis + cross_drift;
             ny = pos;
         } else {                             // BT
-            nx = cross_axis;
+            nx = cross_axis + cross_drift;
             ny = 1.0 - pos;
         }
 
