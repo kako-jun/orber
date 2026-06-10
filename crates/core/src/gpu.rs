@@ -150,6 +150,12 @@ const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 /// geometry (`//!ORB_AQUA_BLEED_GEOM`) is the single continuous space-blur; when
 /// no aqua params are set the layer is structurally inert (byte-identical to plain
 /// orb).
+///
+/// The watercolor-bleed constants + functions (`AQUA_*`, `aqua_seed_dir`,
+/// `blurred_coverage`, `aqua_character`) are no longer inline: they come from the
+/// shared `aquarelle::AQUA_BLEED_WGSL` fragment, substituted at the
+/// `//!ORB_AQUA_BLEED_SHARED` marker (orber#250 Phase 2). The fragment is byte-equivalent
+/// to the previous inline copy, so the rendered output is unchanged.
 fn orb_wgsl() -> &'static str {
     use std::sync::OnceLock;
     static ORB: OnceLock<String> = OnceLock::new();
@@ -160,6 +166,7 @@ fn orb_wgsl() -> &'static str {
             .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
             .replace("//!ORB_COVERAGE", ORB_COVERAGE_CIRCLE)
             .replace("//!ORB_ANGLE", ORB_ANGLE_NONE)
+            .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
             .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
     })
 }
@@ -171,6 +178,10 @@ fn orb_wgsl() -> &'static str {
 /// remap preserved). The DISTANCE SOURCE is the only difference from the orb
 /// variant; the falloff / breath / compositing are the **same** orb math, so
 /// glyph / image now blur exactly like orb (no bleed/halo). Built once (`OnceLock`).
+///
+/// Like [`orb_wgsl`], the watercolor-bleed fragment comes from the shared
+/// `aquarelle::AQUA_BLEED_WGSL` const, substituted at `//!ORB_AQUA_BLEED_SHARED`
+/// (orber#250 Phase 2; byte-equivalent to the former inline copy).
 fn orb_sdf_wgsl() -> &'static str {
     use std::sync::OnceLock;
     static SDF: OnceLock<String> = OnceLock::new();
@@ -181,6 +192,7 @@ fn orb_sdf_wgsl() -> &'static str {
             .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
             .replace("//!ORB_COVERAGE", ORB_COVERAGE_SDF)
             .replace("//!ORB_ANGLE", ORB_ANGLE_SDF)
+            .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
             .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
     })
 }
@@ -2993,7 +3005,11 @@ mod tests {
     /// (`bias_px`), it does not touch the coverage distance, so the star stays a star.
     #[test]
     fn aqua_character_axes_gated_and_shape_safe() {
-        let wgsl = ORB_WGSL_TEMPLATE;
+        // The bleed fragment (`aqua_character` / `blurred_coverage` definitions) now lives in
+        // the shared `aquarelle::AQUA_BLEED_WGSL`, substituted into the `//!ORB_AQUA_BLEED_SHARED`
+        // marker (orber#250 Phase 2). Assert on the assembled orb shader so this structural pin
+        // still covers the actually-compiled bleed code.
+        let wgsl = orb_wgsl();
         // bloom / halo each gated on > 0 inside aqua_character (coef=0 ⇒ identity).
         assert!(
             wgsl.contains("if (bloom > 0.0) {") && wgsl.contains("if (halo > 0.0) {"),
