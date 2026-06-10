@@ -3327,10 +3327,20 @@ mod tests {
             wgsl.contains("let rgb_scale = cov.y;"),
             "rgb_scale must come from the coverage result cov.y (plain single-tap or blurred avg)"
         );
+        // #239 character axes: the source rgb is `o.color.rgb` run through
+        // `aqua_character` (bloom/halo). With both coefs 0 it is the IDENTITY (each
+        // branch is gated on `> 0`), so for the plain orb path `src_rgb == o.color.rgb`
+        // and the composite is byte-identical to the pre-#239 GLSL 1:1 + #241 equation.
         assert!(
-            wgsl.contains("acc_rgb = o.color.rgb * rgb_scale * alpha + acc_rgb * one_minus_a;"),
+            wgsl.contains(
+                "let src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);"
+            ),
+            "src rgb must be o.color.rgb fed through aqua_character (identity when bloom=halo=0)"
+        );
+        assert!(
+            wgsl.contains("acc_rgb = src_rgb * rgb_scale * alpha + acc_rgb * one_minus_a;"),
             "template must composite rgb as (src.rgb * shadow_scale) * a + dst.rgb * (1 - a) \
-             (GLSL 1:1 + #241 thin shadow)"
+             (GLSL 1:1 + #241 thin shadow; src.rgb = aqua_character output)"
         );
         assert!(
             wgsl.contains("acc_a = alpha + acc_a * one_minus_a;"),
@@ -3427,6 +3437,43 @@ mod tests {
         );
     }
 
+    /// #239 character axes (bloom / halo / offset) structure pins. Each axis must be
+    /// gated on its coef `> 0` so coef=0 is the strict identity (the all-zero byte-match
+    /// half), and none may morph the silhouette or build an alpha ring (kako-jun's
+    /// rejected "丸化" / "目立つ枠"). The offset only biases the blur disk ORIGIN
+    /// (`bias_px`), it does not touch the coverage distance, so the star stays a star.
+    #[test]
+    fn aqua_character_axes_gated_and_shape_safe() {
+        let wgsl = ORB_WGSL_TEMPLATE;
+        // bloom / halo each gated on > 0 inside aqua_character (coef=0 ⇒ identity).
+        assert!(
+            wgsl.contains("if (bloom > 0.0) {") && wgsl.contains("if (halo > 0.0) {"),
+            "bloom and halo must each be gated on coef > 0 (so coef=0 is the identity)"
+        );
+        // halo must NOT add alpha — it only rescales chroma around the (constant) luma.
+        // The whole function operates on rgb (vec3) and is fed into the existing `alpha`
+        // path; assert it returns rgb only (no alpha term named here) and boosts saturation.
+        assert!(
+            wgsl.contains("fn aqua_character(color: vec3<f32>, cov_a: f32, bloom: f32, halo: f32) -> vec3<f32>"),
+            "aqua_character must transform rgb only (no alpha ring): vec3 in, vec3 out"
+        );
+        assert!(
+            wgsl.contains("let sat_gain ="),
+            "halo must boost saturation (chroma), not paint an outline"
+        );
+        // offset biases the blur disk origin only; it must NOT enter coverage_at's
+        // distance (no circle morph). The bias is applied to the disk center.
+        assert!(
+            wgsl.contains("params.aqua_offset * AQUA_OFFSET_BIAS")
+                && wgsl.contains("let center = sample_px + bias_px;"),
+            "offset must bias the blur disk origin (center), never the coverage distance"
+        );
+        assert!(
+            !wgsl.contains("r_circle") && !wgsl.contains("roundness"),
+            "no character axis may morph the silhouette toward a circle"
+        );
+    }
+
     /// #239 PoC ★最重要ゲート: with **all four aqua params = 0**, the additive-layer
     /// shader output is **byte-identical** to the plain orb (`aqua: None`) output —
     /// for both bleed modes (Continuous / Blob), across several seeds and cluster
@@ -3519,6 +3566,169 @@ mod tests {
                 "the additive glow ({mode:?}) must light more pixels than plain orb"
             );
         }
+    }
+
+    /// #239 character axes: a single centered orb on a dark bg, blur engaged
+    /// (`bleed=0.3`), so each axis can be isolated. Returns the rendered frame.
+    #[cfg(test)]
+    fn aqua_axis_frame(
+        renderer: &GpuRenderer,
+        w: u32,
+        h: u32,
+        bloom: f32,
+        offset: f32,
+        halo: f32,
+    ) -> RgbaImage {
+        // one bright saturated orb dead-center, big enough to cover the frame middle.
+        let clusters = vec![cluster([230, 40, 40], 0.5, 0.5, 0.9)];
+        let mut opts = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        opts.count = Some(1);
+        opts.background = [10, 10, 14, 255];
+        opts.aqua = Some(crate::animate::AquaBleedConfig {
+            bleed: 0.3,
+            bloom,
+            offset,
+            halo,
+            mode: BleedMode::Continuous,
+        });
+        // t chosen so the single orb sits near frame center (LR motion, phase 0).
+        renderer.render_frame(&clusters, &opts, 0.0)
+    }
+
+    /// Peak luma among lit pixels (the interior/center brightening proxy for bloom:
+    /// bloom pushes the high-coverage interior toward white, so the brightest pixel
+    /// climbs). Restricted to lit pixels so the dark background is excluded.
+    #[cfg(test)]
+    fn lit_peak_luma(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> f32 {
+        let mut peak = 0.0f32;
+        for p in img.pixels() {
+            let lit = (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh);
+            if !lit {
+                continue;
+            }
+            let luma = 0.299 * p.0[0] as f32 + 0.587 * p.0[1] as f32 + 0.114 * p.0[2] as f32;
+            peak = peak.max(luma);
+        }
+        peak
+    }
+
+    /// Mean chroma (max-min over RGB) of lit pixels — a saturation proxy for halo.
+    /// Restricted to pixels that differ from the background so the flat bg (chroma~0)
+    /// does not dilute the measure.
+    #[cfg(test)]
+    fn lit_mean_chroma(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> f32 {
+        let mut sum = 0.0f32;
+        let mut n = 0u32;
+        for p in img.pixels() {
+            let lit = (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh);
+            if !lit {
+                continue;
+            }
+            let mx = p.0[0].max(p.0[1]).max(p.0[2]) as f32;
+            let mn = p.0[0].min(p.0[1]).min(p.0[2]) as f32;
+            sum += mx - mn;
+            n += 1;
+        }
+        sum / n.max(1) as f32
+    }
+
+    /// #239 bloom: a positive `bloom` brightens the orb's center (pushes it toward
+    /// white) — the central mean luma must rise — and `bloom=0` (other axes off) is
+    /// **byte-identical** to the bleed-only render (the term vanishes at coef 0).
+    #[test]
+    fn aqua_bloom_brightens_center_and_vanishes_at_zero() {
+        let Some(renderer) =
+            require_or_skip_renderer("aqua_bloom_brightens_center_and_vanishes_at_zero")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 96u32);
+        let bg = [10u8, 10, 14, 255];
+        let base = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        let bloomed = aqua_axis_frame(renderer, w, h, 0.8, 0.0, 0.0);
+        assert!(
+            lit_peak_luma(&bloomed, bg, 8) > lit_peak_luma(&base, bg, 8) + 3.0,
+            "bloom>0 must brighten the interior toward white: peak {} vs base {}",
+            lit_peak_luma(&bloomed, bg, 8),
+            lit_peak_luma(&base, bg, 8)
+        );
+        // coef=0 ⇒ identical to bleed-only (bloom term is gated on bloom>0).
+        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        assert_eq!(
+            zero.as_raw(),
+            base.as_raw(),
+            "bloom=0 must be byte-identical to the bleed-only render"
+        );
+    }
+
+    /// #239 halo: a positive `halo` boosts peripheral **saturation** (chroma) without
+    /// adding an alpha ring — the lit-pixel count must NOT grow meaningfully (no frame),
+    /// while the mean chroma of lit pixels rises. `halo=0` is byte-identical to bleed-only.
+    #[test]
+    fn aqua_halo_boosts_saturation_without_ring() {
+        let Some(renderer) = require_or_skip_renderer("aqua_halo_boosts_saturation_without_ring")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 96u32);
+        let bg = [10u8, 10, 14, 255];
+        let base = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        let haloed = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.9);
+        // chroma of lit pixels must rise (more saturated edge).
+        assert!(
+            lit_mean_chroma(&haloed, bg, 8) > lit_mean_chroma(&base, bg, 8) + 1.0,
+            "halo>0 must raise lit-pixel chroma: {} vs base {}",
+            lit_mean_chroma(&haloed, bg, 8),
+            lit_mean_chroma(&base, bg, 8)
+        );
+        // no alpha ring: lit-pixel count must not jump (saturation tweak, not a frame).
+        let base_lit = lit_vs_bg(&base, bg, 8) as f32;
+        let halo_lit = lit_vs_bg(&haloed, bg, 8) as f32;
+        assert!(
+            halo_lit <= base_lit * 1.05 + 4.0,
+            "halo must not add an alpha ring (lit count {halo_lit} vs base {base_lit})"
+        );
+        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        assert_eq!(
+            zero.as_raw(),
+            base.as_raw(),
+            "halo=0 must be byte-identical to the bleed-only render"
+        );
+    }
+
+    /// #239 offset: a positive `offset` biases the blur disk origin in a per-orb seed
+    /// direction, making the smear asymmetric — the output must differ from the
+    /// symmetric (offset=0) render — and `offset=0` is byte-identical to bleed-only.
+    /// The lit-pixel count stays of the same order (the shape is not morphed/rounded).
+    #[test]
+    fn aqua_offset_makes_smear_asymmetric_and_vanishes_at_zero() {
+        let Some(renderer) =
+            require_or_skip_renderer("aqua_offset_makes_smear_asymmetric_and_vanishes_at_zero")
+        else {
+            return;
+        };
+        let (w, h) = (96u32, 96u32);
+        let bg = [10u8, 10, 14, 255];
+        let base = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        let shifted = aqua_axis_frame(renderer, w, h, 0.0, 0.9, 0.0);
+        assert_ne!(
+            shifted.as_raw(),
+            base.as_raw(),
+            "offset>0 must change the smear (asymmetric blur)"
+        );
+        // shape is not blown up: lit count stays within a small band of the symmetric blur.
+        let base_lit = lit_vs_bg(&base, bg, 8) as f32;
+        let off_lit = lit_vs_bg(&shifted, bg, 8) as f32;
+        assert!(
+            off_lit > base_lit * 0.5 && off_lit < base_lit * 1.6,
+            "offset must shift, not explode/round the silhouette (lit {off_lit} vs base {base_lit})"
+        );
+        let zero = aqua_axis_frame(renderer, w, h, 0.0, 0.0, 0.0);
+        assert_eq!(
+            zero.as_raw(),
+            base.as_raw(),
+            "offset=0 must be byte-identical to the bleed-only render"
+        );
     }
 
     /// #242 裁定の境界の死守: aquarelle（`orb_aquarelle.wgsl`）の参照アルゴリズムは

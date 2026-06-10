@@ -99,11 +99,19 @@ struct Params {
     // （= 画像編集のブラー）。**星はブラーで星のままぼけ、距離場を円へモーフしない**。
     // **bleed=0 のときブラー経路に入らない**ので非回帰ゲートを満たす。aquarelle
     // 以外の shape（orb / glyph / image）の既存描画では gpu.rs が 0 を流すので不変。
-    // bloom / offset / halo は受け口だけ維持の no-op（今回はブラー一本に集中）。
+    //
+    // bloom / offset / halo はにじみ(bleed)の上に薄く乗せる「少しだけ複雑な見た目」の
+    // character 軸（各 0..1。各 coef=0 で厳密に消え、全0 で plain と byte 一致）:
+    //   - bloom : ブラー後の被覆の中心側（avg_a が高い内部）で色を白へ寄せて柔らかい明るい
+    //             コアを作る。控えめ（強い白飛びはしない）。term = bloom * centerness。
+    //   - halo  : ブラーの外側の柔らかい縁（avg_a が低い帯）で色の**彩度を上げる**だけ。
+    //             alpha の枠リングは作らない（kako-jun 却下）。色味だけ鮮やかにする。
+    //   - offset: ブラーの disk 原点を per-orb seed 方向へ少しずらし、滲みを左右非対称・
+    //             有機的にする。**形は壊さない**（円へモーフしない・星は星のまま）。
     aqua_bleed: f32,       // ブラー量（0=素の形 → 1=強ブラーで formless な雲）
-    aqua_bloom: f32,       // 予約（現状 no-op）
-    aqua_offset: f32,      // 予約（現状 no-op）
-    aqua_halo: f32,        // 予約（現状 no-op）
+    aqua_bloom: f32,       // 中心の柔らかい明るいコア（0=無し）
+    aqua_offset: f32,      // ブラー原点の seed 方向バイアス＝非対称な滲み（0=対称）
+    aqua_halo: f32,        // 外周の彩度ブースト（0=無し。枠リングは作らない）
 };
 
 // per-orb のパック（data-texture, #210 / #212 Phase 1b で 4 texel 化）。
@@ -255,12 +263,33 @@ fn falloff_curve(style_bit: f32, r_in: f32, blur: f32, opacity: f32) -> vec2<f32
 const AQUA_BLUR_TAPS: u32 = 48u;
 // 黄金角（ラジアン）。disk 内に等密度でタップを撒くスパイラルに使う（規則格子を避ける）。
 const AQUA_GOLDEN_ANGLE: f32 = 2.39996323;
+// bloom の白へ寄せる上限（offset=1 でもこの比までしか白くしない）。控えめにして
+// 強い白飛びを禁止する（kako-jun「控えめに」）。
+const BLOOM_MAX: f32 = 0.45;
+// halo の彩度ゲイン係数（halo=1・縁で luma 軸からの距離をこの倍まで伸ばす上限）。
+const HALO_SAT_GAIN: f32 = 0.6;
+// offset の disk 原点バイアス量（blur_px に対する比。offset=1 でこの比だけ seed 方向へ
+// ずらす）。形は壊さず滲みを非対称にする程度に控えめ。
+const AQUA_OFFSET_BIAS: f32 = 0.6;
+
+// per-orb seed（phase 由来）から決定論的な単位方向ベクトルを作る。offset 軸が
+// ブラーの disk 原点をこの向きへずらして滲みを左右非対称・有機的にするのに使う。
+// hash で角度を散らすだけなので「形」は一切作らない（円へモーフしない）。
+fn aqua_seed_dir(seed: f32) -> vec2<f32> {
+    let a = hash21(vec2<f32>(seed * 12.9898, seed * 78.233 + 4.1)) * TAU;
+    return vec2<f32>(cos(a), sin(a));
+}
 
 // 被覆 alpha を blur 半径 `blur_px` の disk 内で multi-tap 空間平均する（= ガウス近似ブラー）。
 // `coverage_at` は variant ごとに差し替わる（orb=円距離 / SDF=サンプル距離）。返り値は
 // plain と同じ (straight alpha, rgb_scale) の vec2。形は変えず被覆を空間平均するだけなので
 // 星は星のままぼけ、強ブラーで自然に formless 化する（丸へモーフしない）。
 // `seed` は per-orb（phase 由来）。スパイラルの初期角をずらして規則パターンを避ける。
+//
+// #239 offset 軸: `bias_px` は disk 原点（タップを撒く中心）に加える per-orb seed 方向の
+// ずれ。**サンプル位置（cx,cy への距離評価）はそのまま**で、ブラーの“筆の置きどころ”だけ
+// を seed 方向へ寄せるので、滲みが左右非対称になる。形（coverage_at の距離場）は不変＝
+// 星は星のまま・円へモーフしない。bias_px=0（offset=0）で従来の対称ブラーと厳密に一致。
 fn blurred_coverage(
     style_bit: f32,
     sample_px: vec2<f32>,
@@ -272,6 +301,7 @@ fn blurred_coverage(
     angle: f32,
     blur_px: f32,
     seed: f32,
+    bias_px: vec2<f32>,
 ) -> vec2<f32> {
     // タップ 0 は中心。残りは黄金角スパイラルで disk(半径 blur_px) に等密度散布。
     var sum_a = 0.0;
@@ -281,13 +311,15 @@ fn blurred_coverage(
     // 初期角は per-orb seed に加え **per-pixel ハッシュ**でずらす。これで隣接画素が
     // 別のタップ位置を踏み、コヒーレントなスパイラルのトゲがディザされて滑らかになる。
     let ang0 = seed * AQUA_GOLDEN_ANGLE * 7.0 + hash21(sample_px) * TAU;
+    // disk の中心を offset 軸の bias 分だけ seed 方向へずらす（offset=0 で bias_px=0）。
+    let center = sample_px + bias_px;
     for (var k: u32 = 0u; k < n; k = k + 1u) {
         // r ∝ sqrt(k/n) で disk 内一様面積分布、角は黄金角で回す。
         let kf = f32(k);
         let rr = blur_px * sqrt((kf + 0.5) / nf);
         let th = ang0 + kf * AQUA_GOLDEN_ANGLE;
         let off = vec2<f32>(cos(th) * rr, sin(th) * rr);
-        let sp = sample_px + off;
+        let sp = center + off;
         let cov = coverage_at(style_bit, sp, cx, cy, radius, blur, opacity, angle);
         sum_a = sum_a + cov.x;
         sum_scaled = sum_scaled + cov.x * cov.y;
@@ -298,6 +330,35 @@ fn blurred_coverage(
         avg_scale = sum_scaled / sum_a; // alpha 重み付き平均の rgb_scale
     }
     return vec2<f32>(avg_a, avg_scale);
+}
+
+// #239 bloom/halo 軸（ブラー後の色味補正。各 coef=0 で恒等）。被覆 alpha `cov_a`
+// （ブラー後）を中心度の代理にして、`color` を控えめに加工する:
+//   - bloom: 内部（cov_a 高）で色を白へ寄せて柔らかい明るいコアにする。
+//            t = bloom * smoothstep(0.45, 1.0, cov_a) を白との mix 比に使う（最大でも
+//            BLOOM_MAX=0.45 までしか白へ寄せない＝強い白飛びを禁止）。
+//   - halo : 外周の柔らかい縁（cov_a 低～中）で**彩度だけ**を上げる。枠（alpha）は作らない。
+//            彩度ブースト量 = halo * edgeness。edgeness = smoothstep(0.6,0.05,cov_a) で
+//            内部ほど 0、縁ほど 1。彩度は luma 軸からの距離を係数 (1+halo*k) 倍にする。
+// 返り値は加工後の straight rgb。cov_a=0 の画素はそもそも合成側 `alpha>0` で弾かれる。
+fn aqua_character(color: vec3<f32>, cov_a: f32, bloom: f32, halo: f32) -> vec3<f32> {
+    var rgb = color;
+    // ブラー後の被覆 alpha は orb の opacity（≈0.5 程度）で頭打ちになるため、中心度/縁度は
+    // その実効レンジに合わせて閾値を取る（絶対 1.0 基準だと内部でもほぼ発火しない）。
+    // --- halo: 外周の彩度ブースト（色味だけ。alpha リングは作らない）---
+    if (halo > 0.0) {
+        let edgeness = smoothstep(0.45, 0.05, cov_a); // 内部=0 → 縁=1
+        let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+        let sat_gain = 1.0 + halo * HALO_SAT_GAIN * edgeness; // 1.0 で恒等
+        rgb = clamp(vec3<f32>(luma) + (rgb - vec3<f32>(luma)) * sat_gain, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    // --- bloom: 中心の柔らかい明るいコア（控えめに白へ）---
+    if (bloom > 0.0) {
+        let centerness = smoothstep(0.18, 0.5, cov_a); // 縁=0 → 中心=1（実効レンジ基準）
+        let t = bloom * BLOOM_MAX * centerness; // 最大 BLOOM_MAX までしか白へ寄せない
+        rgb = mix(rgb, vec3<f32>(1.0), t);
+    }
+    return rgb;
 }
 
 // サブピクセル位置 `sample_px` での 1 サンプルを **straight alpha の float
@@ -400,8 +461,10 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
             let min_px = radius * 0.18;
             let max_px = radius * 0.66;
             let blur_px = mix(min_px, max_px, params.aqua_bleed) * aqua_blur_scale;
+            // offset 軸: disk 原点を per-orb seed 方向へ blur_px 比でずらす（offset=0 で bias=0）。
+            let bias_px = aqua_seed_dir(phase) * (params.aqua_offset * AQUA_OFFSET_BIAS * blur_px);
             cov = blurred_coverage(
-                style_bit, sample_px, cx, cy, radius, blur, opacity, angle, blur_px, phase
+                style_bit, sample_px, cx, cy, radius, blur, opacity, angle, blur_px, phase, bias_px
             );
         } else {
             // plain 経路（byte 一致ゲート）: sample_px の単一タップ。
@@ -411,12 +474,16 @@ fn composite_straight(sample_px: vec2<f32>) -> vec4<f32> {
         let rgb_scale = cov.y;
 
         if (alpha > 0.0) {
+            // #239 bloom/halo 軸（ブラー後の色味補正。各 coef=0 で恒等＝plain と byte 一致）。
+            // 被覆 alpha を中心度の代理に、色を控えめに加工（中心は白へ寄せ、縁は彩度ブースト）。
+            // bloom=halo=0 で aqua_character は color をそのまま返すので非回帰ゲートを満たす。
+            let src_rgb = aqua_character(o.color.rgb, alpha, params.aqua_bloom, params.aqua_halo);
             // Source-Over（straight alpha）。GLSL と同式 + #241 影スケール:
             //   out.rgb = (src.rgb * shadow_scale) * src.a + out.rgb * (1 - src.a)
             //   out.a   = src.a + out.a * (1 - src.a)
             // ブラー経路では rgb_scale は disk 内の alpha 重み付き平均（影は被覆と一緒に平均される）。
             let one_minus_a = 1.0 - alpha;
-            acc_rgb = o.color.rgb * rgb_scale * alpha + acc_rgb * one_minus_a;
+            acc_rgb = src_rgb * rgb_scale * alpha + acc_rgb * one_minus_a;
             acc_a = alpha + acc_a * one_minus_a;
         }
     }
