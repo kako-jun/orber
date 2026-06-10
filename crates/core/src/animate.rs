@@ -351,6 +351,12 @@ fn unit_from_hash(x: u64) -> f32 {
 /// `shadow_strength` (#241): orb 機構（orb / glyph / image）の最外周フェードの
 /// rgb 暗化強度（0..1、`header[13]`）。0..1 にクランプして詰める。WGSL（gpu.rs）が
 /// Params uniform に読む（#241 で追加された word）。
+///
+/// `cross_drift` (#255): per-cluster の cross 軸 重心ドリフト delta（B 案、動画 #33
+/// キーフレームの位置追従）。index は cluster index、各 orb は `cluster_idx` で引く。
+/// per-orb word `off+13`（従来 0.0 埋めの空き）に書く。`None`（tracks 無し）のとき
+/// 0.0 ＝ **従来と byte 完全一致**（非回帰ゲート）。delta なので `t=0` でも 0 になる
+/// （[`keyframe_cross_drift`] が算出。centroid 絶対値は使わない＝縞を出さない）。
 #[allow(clippy::too_many_arguments)]
 pub fn pack_render_data(
     clusters: &[Cluster],
@@ -366,6 +372,7 @@ pub fn pack_render_data(
     glyph_rotate: bool,
     edge_softness: f32,
     shadow_strength: f32,
+    cross_drift: Option<&[f32]>,
 ) -> Vec<f32> {
     let header_words = 16usize;
     let per_orb_words = 16usize;
@@ -413,6 +420,9 @@ pub fn pack_render_data(
         buf[off + 10] = p.speed_mult as f32;
         buf[off + 11] = p.base_angle;
         buf[off + 12] = p.rot_speed_signed;
+        // #255: off+13 = cross 軸 重心ドリフト delta（B 案）。`None`（tracks 無し）の
+        // とき 0.0 ＝ 従来と byte 完全一致。`p.cluster_idx` で per-cluster delta を引く。
+        buf[off + 13] = cross_drift.map_or(0.0, |d| d.get(p.cluster_idx).copied().unwrap_or(0.0));
     }
     buf
 }
@@ -470,6 +480,53 @@ pub fn apply_color_tracks_at_t(
             *cluster
         })
         .collect()
+}
+
+/// 動画入力（#33 キーフレーム）の **cross 軸 重心ドリフト delta** を per-cluster で返す。
+///
+/// B 案（#255）: 一様散布（`OrbParams::cross_axis`）は保持したまま、その cluster の
+/// 重心が `t=0` から動いた分（cross 軸の差分）だけを上に**加算**するためのスカラー列。
+/// 各 orb は `cluster_idx` でこの列を引き、同色の群れが塊ごとにドリフトする
+/// （縞＝同色 orb が 1 帯に吸着、は出さない）。
+///
+/// - `keyframe_tracks` が `None` または空なら `None` を返す。呼び出し側はこれを
+///   `pack_render_data` に `None` として渡し、`misc.w = 0` ＝ **従来と byte 一致**にする。
+/// - `Some` のとき、長さ `n_clusters` の `Vec<f32>` を返す。各 index について
+///   [`interpolate_keyframe_track`] の centroid を `t` と `0.0` で取り、
+///   **cross 軸座標の delta = cross(t) − cross(0)** を入れる。delta なので `t=0` で
+///   必ず 0（＝従来と一致）。centroid の**絶対値は使わない**（A 案＝縞を避ける）。
+/// - cross 軸は direction 依存: LR/RL（`direction_id < 1.5`）→ centroid.y、
+///   TB/BT（`>= 1.5`）→ centroid.x。
+/// - track が無い / 空の cluster index は delta = 0.0。
+///
+/// `weight` 変調は戻さない（#251 の挙動を維持。位置だけ）。色も別ヘルパ
+/// [`apply_color_tracks_at_t`] の管轄でここでは触らない。
+pub fn keyframe_cross_drift(
+    opts: &AnimateOptions,
+    t: f32,
+    direction_id: f32,
+    n_clusters: usize,
+) -> Option<Vec<f32>> {
+    let tracks = opts.keyframe_tracks.as_ref()?;
+    if tracks.is_empty() {
+        return None;
+    }
+    // cross 軸の選択: LR/RL → y、TB/BT → x。
+    let cross_is_y = direction_id < 1.5;
+    let mut drift = vec![0.0f32; n_clusters];
+    for (idx, slot) in drift.iter_mut().enumerate() {
+        let Some(track) = tracks.get(idx).filter(|track| !track.is_empty()) else {
+            continue; // track 無し / 空 → delta = 0.0。
+        };
+        let (_color, c_t, _weight) = interpolate_keyframe_track(track, t);
+        let (_color0, c_0, _weight0) = interpolate_keyframe_track(track, 0.0);
+        *slot = if cross_is_y {
+            c_t.y - c_0.y
+        } else {
+            c_t.x - c_0.x
+        };
+    }
+    Some(drift)
 }
 
 /// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU の SDF variant
@@ -778,6 +835,7 @@ mod tests {
                 true,
                 0.5,
                 s,
+                None,
             )
         };
         assert_eq!(pack_with(0.7)[13], 0.7, "in-range value must pass through");
