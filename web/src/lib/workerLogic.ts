@@ -44,19 +44,44 @@ export interface BaseParams {
   count_preset?: string;
   speed_preset?: string;
   softness_preset?: string;
-  // #239 Phase 1: にじみ (watercolor bleed) の 3 段ボタン。空文字 / 省略は
-  // "にじみオフ（くっきり）" で wasm 側 aqua = None → 従来 Web 出力と byte 一致。
-  // 'weak' | 'mid' | 'strong' が内部 aqua_bleed 0.15/0.3/0.5 に写像される。
+  // #253: 単一「にじみ」ノブ（弱/中/強）。にじみは常時オン（#239 の「なし」は廃止）。
+  // 'weak' | 'mid' | 'strong' が wasm 側で aqua_bleed 0.15/0.3/0.5 に写像される。
   bleed_preset?: string;
-  // #239 Phase 1: bloom（芯の光）/ halo（縁の彩度）/ offset（にじみのかたより）の
-  // character 3 段ボタン。空文字 / 省略は "その軸オフ（0）"。'weak' | 'mid' | 'strong'
-  // が内部 aqua_bloom/halo/offset 0.3/0.6/0.9 に写像される。にじみ（bleed_preset）が
-  // engage しているときだけ効く（wasm 側 aqua = None なら 3 軸とも無視）。
+  // #253: bloom / halo / offset は独立軸をやめ、にじみレベルから導出する
+  // （`bleedDerivedParams` でロックステップに同じ語を入れる）。wasm 側で同じ
+  // 'weak' | 'mid' | 'strong' が aqua_bloom/halo/offset 0.3/0.6/0.9 に写像される。
   bloom_preset?: string;
   halo_preset?: string;
   offset_preset?: string;
   // #136: Glyph 回転 ON/OFF。`true` 既定で従来挙動、`false` で静止描画。
   glyph_rotate?: boolean;
+}
+
+/** にじみノブの 3 段（#253 で「なし」を廃止、常時オン）。 */
+export type BleedLevel = 'weak' | 'mid' | 'strong';
+
+/**
+ * #253: 単一「にじみ」ノブ（弱/中/強）から wasm へ渡す 4 つの preset
+ * フィールドを導出する。session605(#239 Phase 1) で出した にじみ / 芯の光 /
+ * 縁の彩度 / かたより の 4 軸は「最小操作で最良を出す」原則から外れた出しすぎ
+ * だったので、ここで 1 つのレベル語に畳む（ロックステップ）。
+ *
+ * 嬉しい事実: wasm 側で bleed の weak/mid/strong は aqua_bleed 0.15/0.3/0.5、
+ * bloom/halo/offset の同じ語は 0.3/0.6/0.9 に写像される。つまりレベル語を
+ * そのまま 4 フィールドへ渡すだけで狙いの curve になる（wasm/Rust 無改修）。
+ */
+export function bleedDerivedParams(level: BleedLevel): {
+  bleed_preset: BleedLevel;
+  bloom_preset: BleedLevel;
+  halo_preset: BleedLevel;
+  offset_preset: BleedLevel;
+} {
+  return {
+    bleed_preset: level,
+    bloom_preset: level,
+    halo_preset: level,
+    offset_preset: level,
+  };
 }
 
 /** `setSource` で worker にキャッシュされる入力画像 RGB。 */

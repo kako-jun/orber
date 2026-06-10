@@ -184,6 +184,55 @@ describe('lang signal + t()', () => {
     expect(STRINGS.shapeOptionOrb.en).toBe('Orb');
   });
 
+  test('にじみ統合で bloom/halo/offset 系キーは STRINGS から消え、bleed/softness は残存 (#253)', async () => {
+    // #253 で Studio GUI の「にじみ/芯の光/縁の彩度/かたより」4 軸を単一「にじみ」ノブ
+    // （弱/中/強、「なし」廃止）に統合した。bloomLabel/haloLabel/offsetLabel と各 option、
+    // および旧 bleedOptionOff は strings.ts から削除済み。これらのキーが復活すると
+    // Studio.tsx 側で旧 4 軸 UI を生やせてしまい二重管理・退行になるため、STRINGS に
+    // 無いことを直接押さえる。逆に統合後も使う bleed/softness 系は ja/en とも残ることを担保。
+    const { STRINGS } = await import('./strings');
+
+    // 削除済み: bloom / halo / offset 系 と 旧 bleedOptionOff
+    const removed = [
+      'bloomLabel',
+      'bloomOptionOff',
+      'bloomOptionWeak',
+      'bloomOptionMid',
+      'bloomOptionStrong',
+      'haloLabel',
+      'haloOptionOff',
+      'haloOptionWeak',
+      'haloOptionMid',
+      'haloOptionStrong',
+      'offsetLabel',
+      'offsetOptionOff',
+      'offsetOptionWeak',
+      'offsetOptionMid',
+      'offsetOptionStrong',
+      'bleedOptionOff',
+    ];
+    const stillPresent = removed.filter((key) => key in STRINGS);
+    expect(stillPresent).toEqual([]);
+
+    // 残存: 統合後の bleed ノブ（弱/中/強）と softness（ぼかし）。ja/en 両方を持つこと。
+    const retained = [
+      'bleedLabel',
+      'bleedOptionWeak',
+      'bleedOptionMid',
+      'bleedOptionStrong',
+      'softnessLabel',
+      'softnessOptionLow',
+      'softnessOptionMid',
+      'softnessOptionHigh',
+    ] as const;
+    for (const key of retained) {
+      const entry = (STRINGS as Record<string, { ja?: unknown; en?: unknown }>)[key];
+      expect(entry, `${key} が STRINGS に存在しない`).toBeDefined();
+      expect(typeof entry.ja, `${key}.ja`).toBe('string');
+      expect(typeof entry.en, `${key}.en`).toBe('string');
+    }
+  });
+
   test('全 STRINGS キーが ja / en 両方の string 値を持つ (#239 翻訳漏れ検出)', async () => {
     // 個別キーを 1 つずつ押さえると新規キー追加時にテストが伴走せず翻訳漏れを
     // 取りこぼす（#239 で bleed/bloom/halo/offset の 20 キーを足したが parity の
