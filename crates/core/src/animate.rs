@@ -162,8 +162,12 @@ pub struct AnimateOptions {
     /// **色だけ**反映し、補間結果の `centroid` / `weight` は捨てる）。`color_tracks`
     /// (#7) と排他で、両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の
     /// 上位互換）。`None` のときは `color_tracks` に従う。
-    /// 位置キーフレーム（centroid ドリフト）と weight 変調の反映は #255 に退避済み
-    /// （統一 `orb.wgsl` が位置 wrap / breathing を自前でやるため、戻すと二重適用になる）。
+    /// 位置追従（centroid の cross 軸ドリフト）は #255 で実装済み。ただし
+    /// [`apply_color_tracks_at_t`] は色だけを扱い、ドリフトは別関数
+    /// [`keyframe_cross_drift`] が per-cluster の delta を算出して pack の `off+13` に載せる
+    /// （`orb.wgsl` が `misc.w` として cross 軸に加算）。`weight` 変調は色割当の安定のため
+    /// 意図的に適用しない（#255 で確定）。位置 wrap / breathing は `orb.wgsl` 自身がやるので、
+    /// 補間 centroid をそのまま戻すと二重適用になる（だから散布保持 + delta 加算の B 案）。
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
@@ -430,8 +434,10 @@ pub fn pack_render_data(
 /// 動画入力（#7 / #33）の色トラックを時刻 `t` で評価し、各 cluster の `color` だけを
 /// 上書きした新しい `Cluster` 列を返す（#251 で統一 WGSL レンダラへ再配線する一本）。
 ///
-/// **色だけ**を扱う。`centroid` と `weight` は元のまま素通しする（位置追従＝#33 の
-/// centroid ドリフト・weight 変調は #255 に退避済み）。旧 `modulate_aquarelle_clusters`
+/// **色だけ**を扱う。`centroid` と `weight` は元のまま素通しする。位置追従（#33 の
+/// centroid ドリフト）は #255 で実装済みだが、本関数ではなく [`keyframe_cross_drift`] が
+/// per-cluster の cross 軸 delta を別途算出して担う（pack の `off+13` 経由）。`weight` 変調は
+/// 色割当の安定のため意図的に適用しない（#255 で確定）。旧 `modulate_aquarelle_clusters`
 /// は色に加えて位置 wrap・breathing も焼き込んでいたが、それらは今 `orb.wgsl` 自身が
 /// `advance_steps` / `radius_factor` でやるので、ここで戻すと二重適用になる。
 ///
@@ -900,9 +906,10 @@ mod tests {
         );
     }
 
-    /// #251: a keyframe track (#33) reflects **color only** — the interpolated
-    /// centroid / weight from the keyframe are discarded; the original cluster's
-    /// centroid / weight are kept (position follow-through is #255).
+    /// #251: a keyframe track (#33) reflects **color only** in `apply_color_tracks_at_t`
+    /// — the interpolated centroid / weight from the keyframe are discarded; the original
+    /// cluster's centroid / weight are kept. The position follow-through is handled
+    /// separately by `keyframe_cross_drift` (#255), not by this function.
     #[test]
     fn apply_color_tracks_keyframe_track_reflects_color_only() {
         let clusters = vec![track_cluster([0, 0, 0], 0.5, 0.5, 0.5)];
@@ -929,7 +936,7 @@ mod tests {
         assert_eq!(
             out[0].centroid,
             Centroid { x: 0.5, y: 0.5 },
-            "keyframe centroid must be discarded (position is #255)"
+            "keyframe centroid must be discarded here (position drift is handled by keyframe_cross_drift, #255)"
         );
         assert_eq!(out[0].weight, 0.5, "keyframe weight must be discarded");
     }

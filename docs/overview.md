@@ -222,7 +222,8 @@ path; no regression for existing callers.
 
 `--input-mode keyframe` switches the video pipeline to a **keyframe** path that
 interpolates **color + position + weight** between sampled keyframes, rather than
-just colors with positions frozen. Pass `--keyframes N` to control how many
+just colors with positions frozen (what is actually rendered is detailed below —
+color and position drift are, weight is not). Pass `--keyframes N` to control how many
 keyframes are sampled (default 8, clamped to a minimum of 2 since one keyframe
 cannot be interpolated).
 
@@ -239,21 +240,26 @@ How it differs from the color-track path (#7):
    from `interpolate_keyframe_track(tracks[cluster_idx], t)` — a pure linear lerp
    between the two adjacent keyframes by the keyframe's stored normalized time
    (endpoints clamped, NaN-safe, divide-by-zero defended). Note: all three channels
-   are interpolated, but only the **color** currently reaches the renderer — since
-   #251 the unified WGSL pack carries the per-frame color, while `centroid` (position)
-   and `weight` are interpolated but not yet packed (tracked in #255).
+   are interpolated; **color** and **position** (centroid drift) reach the renderer,
+   while `weight` is intentionally not applied (see below).
 
-What is rendered today (color), and what is not (position / weight):
+What is rendered today (color + position drift), and what is not (weight):
 
 - The keyframe **color** track *is* rendered by the unified WGSL renderer — since
   #251 the per-frame color is packed and the output video's orb colors change over
   time across **orb / glyph / image** alike. (#239 Phase 1 had temporarily left this
   dead because the only consumer was the removed aquarelle path; #251 re-wired it.)
-- The `centroid` (position) drift and `weight` are **not yet rendered**: the unified
-  WGSL pack has no per-orb centroid slot, so orb positions stay at the per-orb seeded
-  `cross_axis` scatter — the same layout as still-image / `--input-mode color-track`
-  (#7) input. Wiring keyframe positions (the centroid drift, to make the input video's
-  compositional motion visible) into the renderer is tracked in **#255**.
+- The `centroid` (position) **drift** *is* rendered too, since **#255** (B-plan): the
+  uniform `cross_axis` scatter is kept, and each cluster's centroid shift from `t=0`
+  is added as a per-cluster delta on the **cross axis**. `animate::keyframe_cross_drift`
+  computes the per-cluster delta, `pack_render_data` carries it on per-orb word `off+13`
+  (`cross_drift`), and `orb.wgsl` adds it as `misc.w` to the cross axis. This applies to
+  **orb / glyph / image** alike. With no tracks it is `None` ⇒ byte-identical to before;
+  the Web (wasm) path always passes `None`, so position drift is **CLI/core only**.
+- `weight` is **intentionally not modulated** (decided in #255): restoring it would make
+  the weight-proportional per-cluster color assignment (`cluster_idx`) wander over time
+  and the orb colors would flicker. This is a deliberate design choice, not a missing
+  feature.
 
 Output length is still set entirely by `--duration-ms`. A 3-minute clip
 rendered as a 10-second orb compresses the input's mood; a 10-second clip

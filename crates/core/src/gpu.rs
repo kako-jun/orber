@@ -53,10 +53,14 @@
 //! time `t` (via [`crate::animate::apply_color_tracks_at_t`]) and overwrite each
 //! orb's `color` before [`pack_render_data`]. With no tracks (the production /
 //! still-image default) the builder borrows the input clusters unchanged, so the
-//! output is byte-identical to pre-#251. Only **color** moves here: the #33 position
-//! keyframe follow-through (centroid drift) and weight modulation stay on the
-//! still-image scatter and are tracked in #255 — folding them back blindly would
-//! double-apply the position wrap / breathing the unified `orb.wgsl` already does.
+//! output is byte-identical to pre-#251. Only **color** is folded in via
+//! [`crate::animate::apply_color_tracks_at_t`]; the #33 position follow-through
+//! (centroid cross-axis drift) is rendered too, but through a separate channel
+//! ([`crate::animate::keyframe_cross_drift`] → pack `off+13` → `orb.wgsl` `misc.w`),
+//! since #255 (CLI/core; wasm passes `None`). `weight` is intentionally not modulated
+//! (kept stable so the per-cluster color assignment does not flicker). Folding the
+//! interpolated centroid back blindly would double-apply the position wrap / breathing
+//! the unified `orb.wgsl` already does — hence the B-plan delta-on-scatter approach.
 //!
 //! ## Compositing contract
 //!
@@ -1090,8 +1094,9 @@ impl GpuRenderer {
         // #251: fold the video color tracks (#7 / #33) into the per-orb colors at
         // time `t`. With no tracks (the production / still-image default) this is a
         // zero-copy borrow of the input clusters, so the pack stays byte-identical
-        // to pre-#251 (the non-regression gate). Only color is touched; position /
-        // weight stay on the original clusters (centroid drift is #255).
+        // to pre-#251 (the non-regression gate). Only color is touched here; the
+        // centroid cross-axis drift (#255) is carried separately via `cross_drift`
+        // below, and weight is intentionally not modulated.
         let effective = Self::color_tracked_clusters(clusters, opts, t);
         let clusters = effective.as_ref();
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
@@ -1443,8 +1448,9 @@ impl GpuRenderer {
     /// pack then sees the exact same `&[Cluster]` as pre-#251, so the byte output is
     /// unchanged (the non-regression gate). Only when a track is present does it
     /// allocate an `Owned` Vec via [`apply_color_tracks_at_t`], which overwrites
-    /// `color` only (centroid / weight stay on the original clusters; position
-    /// follow-through is #255).
+    /// `color` only (centroid / weight stay on the original clusters). The position
+    /// follow-through (centroid cross-axis drift, #255) is carried out of band via
+    /// [`crate::animate::keyframe_cross_drift`], not through this color fold.
     fn color_tracked_clusters<'a>(
         clusters: &'a [Cluster],
         opts: &AnimateOptions,
@@ -3508,8 +3514,10 @@ mod tests {
     }
 
     /// #251: a keyframe track (#33) must also animate the orb **color** with `t`.
-    /// Position is intentionally not reflected (that is #255), so the assertion is
-    /// on color keys: a red→blue keyframe pair on every cluster, t=0.0 vs t=0.5.
+    /// This test isolates color: both keys share the same centroid/weight so position
+    /// drift is zero by construction (the drift itself is covered by the C14-C16 e2e
+    /// tests, #255), and the assertion is on color keys: a red→blue keyframe pair on
+    /// every cluster, t=0.0 vs t=0.5.
     #[test]
     fn video_keyframe_track_animates_orb_colors_over_t() {
         let Some(renderer) =
