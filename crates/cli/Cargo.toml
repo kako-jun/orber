@@ -22,7 +22,6 @@ path = "src/main.rs"
 # CLI は GPU(WGSL) を唯一のレンダラとする (#225)。orber-core の gpu feature を
 # ハード依存にして、`cargo build -p orber`（--features 無し）で常に GPU ビルドになる。
 orber-core = { path = "../core", version = "0.3.0", features = ["gpu"] }
-aquarelle = { workspace = true }
 clap = { workspace = true }
 image = { workspace = true, default-features = true }
 tempfile = { workspace = true }

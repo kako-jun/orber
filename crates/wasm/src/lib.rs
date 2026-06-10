@@ -15,7 +15,7 @@
 //!
 //! [`gpu`] モジュール（wasm32 専用）が `gpu_init` / `gpu_set_render_data` /
 //! `gpu_render` / `gpu_resize` を公開する。spec / preset / kmeans の解決は
-//! [`resolve_frame`] に集約し、#231 で orb / glyph / image / aquarelle の 4 shape を
+//! [`resolve_frame`] に集約し、orb / glyph / image の 3 shape を
 //! `OrbShape` まで解決して [`build_gpu_render_inputs`] が clusters +
 //! `AnimateOptions`（+ orb 用 pack）を構築する。描画は orber-core の
 //! `GpuRenderer`（WGSL）が `opts.shape` 別の `render_packed_to_view` /
@@ -36,7 +36,7 @@ use orber_core::animate::AnimateOptions;
 // #239 Phase 1: 製品の 3 段にじみボタンを GPU(WGSL) 経路の AnimateOptions.aqua に
 // 流すための型。GPU 経路専用（wasm32 / test のみ）。
 #[cfg(any(target_arch = "wasm32", test))]
-use orber_core::animate::{AquaBleedConfig, BleedMode};
+use orber_core::animate::AquaBleedConfig;
 use orber_core::cluster::Cluster;
 // kmeans 系（derive_background_rgba / drop_dominant / extract_clusters）は供給系
 // get_or_build_clusters（wasm32 / test 限定）からのみ使う（#247）。
@@ -45,10 +45,10 @@ use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_cluster
 #[cfg(any(target_arch = "wasm32", test))]
 use orber_core::glyph::image_rgba_to_sdf;
 use orber_core::glyph::{has_glyph, render_glyph_sdf, GlyphFontId};
-// OrbShape / AquarelleParams は形状解決（parse_shape / resolve_orb_shape、wasm32 / test
-// 限定）からのみ使う（#247）。
+// OrbShape は形状解決（parse_shape / resolve_orb_shape、wasm32 / test 限定）から
+// のみ使う（#247）。
 #[cfg(any(target_arch = "wasm32", test))]
-use orber_core::orb::{AquarelleParams, OrbShape};
+use orber_core::orb::OrbShape;
 use orber_core::style::SoftnessPreset;
 // spec 再構築・video 領域の固定割当（供給系 resolve_frame / spec_idx ヘルパ、
 // wasm32 / test 限定）からのみ使う（#247）。
@@ -138,8 +138,7 @@ pub struct WasmParams {
     /// 内部 `aqua_bleed` 0.15 / 0.3 / 0.5 に写像し、orb / glyph / image どの shape
     /// にも空間ブラーを乗せる。`""`（既定）は「にじみオフ＝くっきり」で、
     /// `AnimateOptions.aqua` を `None` に保つ＝従来の Web 出力と byte-identical
-    /// （非リグレッションゲート）。`shape == "aquarelle"` の専用レンダラには
-    /// 効かない（CLI の `--bleed` と同じく additive レイヤを engage しない）。
+    /// （非リグレッションゲート）。
     /// bloom / offset / halo は各軸の専用 3 段ボタン（下記）で決まる。`bleed_preset`
     /// が `""`（にじみオフ）なら 3 軸とも無視され 0 になる。
     #[serde(default)]
@@ -147,9 +146,8 @@ pub struct WasmParams {
     /// #239 Phase 1: ブルーム（芯の光）の製品 3 段ボタン preset。CLI の
     /// `--bloom weak|mid|strong` と同義で、`"weak" | "mid" | "strong"` を内部
     /// `aqua_bloom` 0.3 / 0.6 / 0.9 に写像する。`""`（既定）はその軸オフ＝0。にじみ
-    /// （`bleed_preset != ""`）かつ非 aquarelle shape のときだけ効く（にじみ無しでは
-    /// `aqua = None` なので 3 軸とも無視される）。数字は出さない製品 UI ではこの
-    /// 対応表だけが強さの正本。
+    /// （`bleed_preset != ""`）のときだけ効く（にじみ無しでは `aqua = None` なので
+    /// 3 軸とも無視される）。数字は出さない製品 UI ではこの対応表だけが強さの正本。
     #[serde(default)]
     pub bloom_preset: String,
     /// #239 Phase 1: ハロー（縁の彩度）の製品 3 段ボタン preset。CLI の
@@ -185,20 +183,6 @@ pub struct WasmParams {
     /// 画像マスクの高さ（px、#231）。`shape == "image"` のときのみ意味を持つ。
     #[serde(default)]
     pub image_mask_height: u32,
-    /// Aquarelle にじみ量（#231）。`shape == "aquarelle"` のときのみ意味を持つ。
-    /// CLI の `--bleed` と同義。0..1（core 側 `AquarelleParams::clamped()` でクランプ）。
-    /// serde default は CLI と同じ 0.5。
-    #[serde(default = "default_aquarelle_param")]
-    pub aquarelle_bleed: f32,
-    /// Aquarelle 中心ブルーム（#231）。CLI の `--bloom` と同義。0..1、既定 0.5。
-    #[serde(default = "default_aquarelle_param")]
-    pub aquarelle_bloom: f32,
-    /// Aquarelle 中心オフセット（#231）。CLI の `--offset` と同義。0..1、既定 0.5。
-    #[serde(default = "default_aquarelle_param")]
-    pub aquarelle_offset: f32,
-    /// Aquarelle 外周ハロー（#231）。CLI の `--halo` と同義。0..1、既定 0.5。
-    #[serde(default = "default_aquarelle_param")]
-    pub aquarelle_halo: f32,
     /// JS 側で生成した glyph SDF（`shape == "glyph"` のフォールバック、#231）。
     /// 同梱フォント（Noto Sans Symbols 2 サブセット＝記号のみ）に収録されていない
     /// 文字（ひらがな・漢字・絵文字）は wasm の `get_glyph_sdf` で描けないため、Web は
@@ -221,7 +205,7 @@ pub struct WasmParams {
     /// `validate_params` が reject する（0.0 と 1.0 は inclusive で受理）。
     /// gpu-lab（`web/src/pages/gpu-lab.astro`）のスライダー専用 — 本番 Studio は
     /// このフィールドを送らない（製品は定数で固定、kako-jun の実機選定の足場）。
-    /// orb 機構の全 shape（orb / glyph / image）に効き、aquarelle は対象外。
+    /// orb 機構の全 shape（orb / glyph / image）に効く。
     #[serde(default = "default_shadow_strength")]
     pub shadow_strength: f32,
     /// 透過 export（#56 / #245）: `true` なら解決済み背景色の alpha を 0 に
@@ -229,7 +213,7 @@ pub struct WasmParams {
     /// 旧 WebGL 経路で worker が pack header word 3（bg.a）を JS 側で 0 に
     /// 書き換えていた `withTransparentBackground` の wasm 入口版（WGSL 経路は
     /// pack が wasm 内部で完結するため、JS からは触れない）。orb は pack
-    /// header[3]、glyph / image / aquarelle は `AnimateOptions.background[3]`
+    /// header[3]、glyph / image は `AnimateOptions.background[3]`
     /// 経由で効く。serde default は `false`（既存呼び出しはバイト列不変）。
     #[serde(default)]
     pub transparent_background: bool,
@@ -238,12 +222,6 @@ pub struct WasmParams {
 /// `glyph_rotate` の serde default。既存呼び出しが省略しても従来挙動を保つために `true`。
 fn default_glyph_rotate() -> bool {
     true
-}
-
-/// Aquarelle 4 パラメータの serde default。CLI（`--bleed/--bloom/--offset/--halo`）
-/// および `AquarelleParams::default()` と同じ 0.5（mid-strength preset）。
-fn default_aquarelle_param() -> f32 {
-    0.5
 }
 
 /// `shadow_strength` の serde default（#241）。省略時は製品定数 = 製品と同じ見た目。
@@ -364,18 +342,14 @@ fn first_char_of(s: &str) -> Result<char, String> {
         .ok_or_else(|| "glyph_char is empty (expected exactly 1 character)".to_string())
 }
 
-/// shape 文字列を [`OrbShape`] に解決する（#231 で aquarelle / image を追加）。
-///
-/// `aquarelle` は [`AquarelleParams`]（CLI の `--bleed/--bloom/--offset/--halo`
-/// に対応する 4 値）を内包する。クランプは core 側 `render_aquarelle_orb` /
-/// `AquarelleParams::clamped()` に揃え、ここでは raw のまま渡す（CLI と同じ契約）。
+/// shape 文字列を [`OrbShape`] に解決する（#231）。
 ///
 /// `image` は画像マスク RGBA + 幅 / 高さを必要とするため、[`WasmParams`] 全体を受ける
 /// [`resolve_orb_shape`] で解決する（`parse_shape` の引数は文字列だけなので image を
 /// 直接扱えない）。`parse_shape` 内で `"image"` を受けると Err にして、必ず
 /// `resolve_orb_shape` 経由を強制する。
 #[cfg(any(target_arch = "wasm32", test))]
-fn parse_shape(s: &str, glyph_char: &str, aquarelle: AquarelleParams) -> Result<OrbShape, String> {
+fn parse_shape(s: &str, glyph_char: &str) -> Result<OrbShape, String> {
     match s {
         "orb" => Ok(OrbShape::Orb),
         "glyph" => {
@@ -385,20 +359,19 @@ fn parse_shape(s: &str, glyph_char: &str, aquarelle: AquarelleParams) -> Result<
                 font: GlyphFontId::NotoSymbols2,
             })
         }
-        "aquarelle" => Ok(OrbShape::Aquarelle(aquarelle)),
         "image" => Err(
             "shape 'image' must be resolved via resolve_orb_shape (needs image_mask_rgba)"
                 .to_string(),
         ),
         other => Err(format!(
-            "invalid shape: {other} (expected 'orb' / 'glyph' / 'image' / 'aquarelle')"
+            "invalid shape: {other} (expected 'orb' / 'glyph' / 'image')"
         )),
     }
 }
 
 /// [`WasmParams`] から GPU(WGSL) 経路用の [`OrbShape`] を解決する（#231）。
 ///
-/// `orb` / `aquarelle` は [`parse_shape`] に委譲する。`image` は
+/// `orb` は [`parse_shape`] に委譲する。`image` は
 /// `image_mask_rgba` (+ width / height) を core の [`image_rgba_to_sdf`]（#219、Web の
 /// `generateImageSdf` と同フォーマット）でシルエット SDF に変換して
 /// [`OrbShape::Image`] を作る。SDF サイズは [`DEFAULT_GLYPH_SDF_SIZE`] = 256（CLI の
@@ -421,7 +394,7 @@ fn resolve_orb_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
     if p.shape == "glyph" && !p.glyph_sdf.is_empty() {
         return resolve_glyph_sdf_shape(p);
     }
-    parse_shape(&p.shape, &p.glyph_char, aquarelle_params(p))
+    parse_shape(&p.shape, &p.glyph_char)
 }
 
 /// `shape == "glyph"` で JS 生成 SDF が供給されたときの解決（#231）。
@@ -504,20 +477,6 @@ fn resolve_image_shape(p: &mut WasmParams) -> Result<OrbShape, String> {
         sdf: Arc::from(sdf),
         size,
     })
-}
-
-/// [`WasmParams`] の 4 フィールドから [`AquarelleParams`] を組む（#231）。CLI の
-/// `Cli::aquarelle_params` と同じ並び。クランプは core 側に任せる（raw のまま）。
-///
-/// GPU(WGSL) 経路専用（wasm32 / test のみコンパイル）。aquarelle は WebGL に無い。
-#[cfg(any(target_arch = "wasm32", test))]
-fn aquarelle_params(p: &WasmParams) -> AquarelleParams {
-    AquarelleParams {
-        bleed: p.aquarelle_bleed,
-        bloom: p.aquarelle_bloom,
-        offset: p.aquarelle_offset,
-        halo: p.aquarelle_halo,
-    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -745,7 +704,7 @@ fn speed_for_spec_idx(spec_idx: usize, still_count: usize, spec: &VariationSpec)
 /// pack 経由の `render_packed_to_view` を温存する（pack は core の
 /// `pack_render_data` 出力で、saturation を焼かない＝web に saturation ノブが
 /// 無いのと整合する。core の `render_frame_to_view` は saturation を再適用するため、
-/// 万一の HSL 往復誤差で #230 と差が出るのを避ける狙い）。glyph / image / aquarelle は
+/// 万一の HSL 往復誤差で #230 と差が出るのを避ける狙い）。glyph / image は
 /// `opts` 経由で core の専用経路に乗せる。
 // GPU(WGSL) canvas-present 経路は wasm32 専用（gpu.rs が `#[cfg(target_arch =
 // "wasm32")]`）。native の `cargo test` でも検証できるよう `cfg(any(wasm32, test))`
@@ -763,7 +722,7 @@ pub(crate) struct GpuRenderInputs {
 #[cfg(any(target_arch = "wasm32", test))]
 impl ResolvedFrame {
     /// 解決済みスカラを [`AnimateOptions`] に組み替える（#231）。core の
-    /// `pack_sdf_frame` / `prepare_aquarelle_frame` が同じ base_radius_unit /
+    /// `pack_sdf_frame` が同じ base_radius_unit /
     /// base_blur / direction / speed / seed / n_orbs を再計算できるよう、
     /// 元のスカラと逆算可能な形（orb_size / blur / softness / count）で詰める。
     ///
@@ -774,25 +733,17 @@ impl ResolvedFrame {
             width: self.width,
             height: self.height,
             // #239 Phase 1: 製品の 3 段にじみボタンを Web GPU 経路へ流す。`aqua_bleed`
-            // が `Some` かつ shape が Aquarelle でないときだけ additive ブラーレイヤを
-            // engage する（Aquarelle は専用 byte-pinned レンダラを持つので無視＝CLI の
-            // poc_aqua と同じ責務）。`None`（にじみオフ）のとき従来の Web 出力と
-            // byte-identical（非リグレッションゲート）。bloom/offset/halo は各軸の専用
-            // 3 段ボタン（`aqua_bloom`/`aqua_offset`/`aqua_halo`、未指定 = 0）で決まり、
-            // mode は唯一の製品ジオメトリ Continuous。3 軸とも未指定なら `bleed weak`
-            // の出力が CLI の `--bleed weak`（character 軸オフ）と一致する。
-            aqua: self.aqua_bleed.and_then(|bleed| {
-                if matches!(shape, OrbShape::Aquarelle(_)) {
-                    None
-                } else {
-                    Some(AquaBleedConfig {
-                        bleed,
-                        bloom: self.aqua_bloom,
-                        offset: self.aqua_offset,
-                        halo: self.aqua_halo,
-                        mode: BleedMode::Continuous,
-                    })
-                }
+            // が `Some` のときだけ additive ブラーレイヤを engage する（CLI の poc_aqua と
+            // 同じ責務）。`None`（にじみオフ）のとき従来の Web 出力と byte-identical
+            // （非リグレッションゲート）。bloom/offset/halo は各軸の専用 3 段ボタン
+            // （`aqua_bloom`/`aqua_offset`/`aqua_halo`、未指定 = 0）で決まり、幾何は唯一の
+            // 製品ジオメトリ continuous。3 軸とも未指定なら `bleed weak` の出力が CLI の
+            // `--bleed weak`（character 軸オフ）と一致する。
+            aqua: self.aqua_bleed.map(|bleed| AquaBleedConfig {
+                bleed,
+                bloom: self.aqua_bloom,
+                offset: self.aqua_offset,
+                halo: self.aqua_halo,
             }),
             orb_size: self.orb_size,
             blur: self.blur,
@@ -814,10 +765,10 @@ impl ResolvedFrame {
 
 /// WGSL canvas-present 経路の入力を構築する（#231）。[`resolve_frame`] で
 /// spec / preset / kmeans を解決し、形状は `resolve_orb_shape` で
-/// 全 shape（orb / glyph / image / aquarelle）に解決する。
+/// 全 shape（orb / glyph / image）に解決する。
 ///
 /// orb の pack は shape_id=0.0 で焼く（#230 / #242 のルックを温存する固定バイト列）。
-/// glyph / image / aquarelle は `opts` で core の専用経路に分岐させる（pack は未使用だが、
+/// glyph / image は `opts` で core の専用経路に分岐させる（pack は未使用だが、
 /// orb 用に常に作っておく＝分岐は描画時 1 箇所だけにする）。
 #[cfg(any(target_arch = "wasm32", test))]
 fn build_gpu_render_inputs(
@@ -897,15 +848,14 @@ struct ResolvedFrame {
     /// #239 Phase 1: 製品の 3 段にじみボタン（`WasmParams::bleed_preset`）が解決した
     /// 内部 `aqua_bleed` 量。`None`（既定 = にじみオフ）のとき `to_animate_options`
     /// は `aqua: None` を保ち、従来の Web 出力と byte-identical（非リグレッション
-    /// ゲート）。`Some(bleed)` のとき非 aquarelle shape に限り continuous モードの
-    /// additive ブラーレイヤを engage する（CLI の `--bleed` と同じ写像）。
+    /// ゲート）。`Some(bleed)` のとき continuous の空間ブラー additive レイヤを engage
+    /// する（CLI の `--bleed` と同じ写像）。
     aqua_bleed: Option<f32>,
     /// #239 Phase 1: bloom / offset / halo の character 軸係数（`WasmParams` の
     /// `bloom_preset`/`offset_preset`/`halo_preset` が解決した値）。未指定軸は 0.0
-    /// （その軸オフ）。`aqua_bleed` が `Some` で非 aquarelle shape のときだけ
-    /// `to_animate_options` が `AquaBleedConfig` に流す。にじみオフ（`aqua_bleed ==
-    /// None`）なら 3 軸とも無視される。CLI の `--bloom`/`--halo`/`--offset` と同じ
-    /// 0.3 / 0.6 / 0.9 写像。
+    /// （その軸オフ）。`aqua_bleed` が `Some` のときだけ `to_animate_options` が
+    /// `AquaBleedConfig` に流す。にじみオフ（`aqua_bleed == None`）なら 3 軸とも
+    /// 無視される。CLI の `--bloom`/`--halo`/`--offset` と同じ 0.3 / 0.6 / 0.9 写像。
     aqua_bloom: f32,
     aqua_offset: f32,
     aqua_halo: f32,
@@ -921,8 +871,8 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
     let speed_override = parse_speed_preset(&p.speed_preset)?;
     let softness = parse_softness_preset(&p.softness_preset)?;
     // #239 Phase 1: にじみの 3 段ボタン。`""` は None（くっきり）で従来挙動と byte
-    // 一致。weak/mid/strong は 0.15/0.3/0.5。aquarelle shape での無視は
-    // to_animate_options が shape を見て行う（CLI の poc_aqua と同じ責務分割）。
+    // 一致。weak/mid/strong は 0.15/0.3/0.5。`Some` のとき to_animate_options が
+    // additive レイヤを engage する（CLI の poc_aqua と同じ責務分割）。
     let aqua_bleed = parse_bleed_preset(&p.bleed_preset)?;
     // #239 Phase 1: bloom / halo / offset の character 軸。`""` は 0.0（その軸オフ）、
     // weak/mid/strong は 0.3/0.6/0.9（CLI の --bloom/--halo/--offset と同じ）。にじみ
@@ -1018,8 +968,8 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         height: p.height,
         orb_size: spec.orb_size.max(0.0),
         blur: spec.blur,
-        // #239 Phase 1: にじみ量（None = くっきり）。aquarelle shape での無視は
-        // to_animate_options 側で行う。
+        // #239 Phase 1: にじみ量（None = くっきり）。engage 判定は to_animate_options
+        // 側で行う。
         aqua_bleed,
         // #239 Phase 1: character 軸（未指定 = 0）。にじみオフ時は to_animate_options
         // が 3 軸ごと無視する。
@@ -1299,48 +1249,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_shape_orb_glyph_aquarelle() {
-        let aq = AquarelleParams::default();
-        assert!(matches!(parse_shape("orb", "", aq), Ok(OrbShape::Orb)));
+    fn parse_shape_orb_glyph() {
+        assert!(matches!(parse_shape("orb", ""), Ok(OrbShape::Orb)));
         // glyph では glyph_char が必須。空はエラー。
-        assert!(parse_shape("glyph", "", aq).is_err());
-        let g = parse_shape("glyph", "☆", aq).unwrap();
+        assert!(parse_shape("glyph", "").is_err());
+        let g = parse_shape("glyph", "☆").unwrap();
         assert!(matches!(g, OrbShape::Glyph { ch, .. } if ch == '☆'));
-        // #231: aquarelle は受理し、渡した params を内包する。
-        let custom = AquarelleParams {
-            bleed: 0.1,
-            bloom: 0.2,
-            offset: 0.3,
-            halo: 0.4,
-        };
-        match parse_shape("aquarelle", "", custom) {
-            Ok(OrbShape::Aquarelle(p)) => {
-                assert_eq!(p.bleed, 0.1);
-                assert_eq!(p.bloom, 0.2);
-                assert_eq!(p.offset, 0.3);
-                assert_eq!(p.halo, 0.4);
-            }
-            other => panic!("expected Ok(OrbShape::Aquarelle), got {other:?}"),
-        }
         // #231: image は parse_shape では受けない（resolve_orb_shape 経由を強制）。
-        assert!(parse_shape("image", "", aq).is_err());
-        assert!(parse_shape("", "", aq).is_err());
-    }
-
-    /// #231: aquarelle_params が WasmParams の 4 フィールドをそのまま AquarelleParams に
-    /// 写す（CLI の aquarelle_params と同じ並び）。
-    #[test]
-    fn aquarelle_params_maps_fields() {
-        let mut p = base_params();
-        p.aquarelle_bleed = 0.11;
-        p.aquarelle_bloom = 0.22;
-        p.aquarelle_offset = 0.33;
-        p.aquarelle_halo = 0.44;
-        let aq = aquarelle_params(&p);
-        assert_eq!(aq.bleed, 0.11);
-        assert_eq!(aq.bloom, 0.22);
-        assert_eq!(aq.offset, 0.33);
-        assert_eq!(aq.halo, 0.44);
+        assert!(parse_shape("image", "").is_err());
+        assert!(parse_shape("", "").is_err());
+        // aquarelle は #239 Phase 1 で削除済み。未知 shape として弾く。
+        assert!(parse_shape("aquarelle", "").is_err());
     }
 
     /// #231: resolve_orb_shape の image 経路は mask 入力を検証する。サイズ不一致 /
@@ -1443,14 +1362,10 @@ mod tests {
             halo_preset: String::new(),
             offset_preset: String::new(),
             glyph_rotate: true,
-            // #231: image / aquarelle 入力。既定では未使用（shape="orb"）。
+            // #231: image 入力。既定では未使用（shape="orb"）。
             image_mask_rgba: Vec::new(),
             image_mask_width: 0,
             image_mask_height: 0,
-            aquarelle_bleed: 0.5,
-            aquarelle_bloom: 0.5,
-            aquarelle_offset: 0.5,
-            aquarelle_halo: 0.5,
             // #231: glyph SDF フォールバック入力。既定では未使用（同梱フォント経路）。
             glyph_sdf: Vec::new(),
             glyph_sdf_size: 0,
@@ -1958,33 +1873,10 @@ mod tests {
         );
     }
 
-    /// #231: aquarelle shape の WGSL 入力。opts.shape が Aquarelle に解決され、
-    /// 4 パラメータが AquarelleParams にそのまま伝播すること。
-    #[test]
-    fn build_gpu_render_inputs_aquarelle_carries_params() {
-        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = small_source_params();
-        p.shape = "aquarelle".into();
-        p.aquarelle_bleed = 0.1;
-        p.aquarelle_bloom = 0.2;
-        p.aquarelle_offset = 0.3;
-        p.aquarelle_halo = 0.4;
-        let gpu = build_gpu_render_inputs(p, 12, 0).expect("gpu inputs");
-        match gpu.opts.shape {
-            OrbShape::Aquarelle(params) => {
-                assert_eq!(params.bleed, 0.1);
-                assert_eq!(params.bloom, 0.2);
-                assert_eq!(params.offset, 0.3);
-                assert_eq!(params.halo, 0.4);
-            }
-            other => panic!("expected Aquarelle, got {other:?}"),
-        }
-    }
-
     /// #239 Phase 1: 製品の 3 段にじみボタン（`bleed_preset`）が Web GPU 経路の
     /// `AnimateOptions.aqua` に伝播する。weak/mid/strong → `aqua_bleed` 0.15/0.3/0.5、
-    /// 常に Continuous、bloom/offset/halo は CLI `--bleed` 既定と同じ 0.5。orb /
-    /// glyph / image いずれの shape でも engage することを固定する。
+    /// bloom/offset/halo は未指定なら 0（オフ）。orb / glyph / image いずれの shape でも
+    /// engage することを固定する。
     #[test]
     fn bleed_preset_propagates_to_animate_options() {
         let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2021,11 +1913,6 @@ mod tests {
                 assert_eq!(
                     aqua.bleed, want,
                     "{shape}/{preset}: aqua_bleed must map to {want}"
-                );
-                assert_eq!(
-                    aqua.mode,
-                    BleedMode::Continuous,
-                    "{shape}/{preset}: bleed must engage continuous mode (the only product geometry)"
                 );
                 // #239: character 軸 preset を渡していないので 3 軸とも 0（オフ）。
                 assert_eq!(
@@ -2181,26 +2068,6 @@ mod tests {
         );
     }
 
-    /// #239 Phase 1: `shape == "aquarelle"` は専用 byte-pinned レンダラを持つので、
-    /// `bleed_preset` を渡しても additive レイヤを engage しない（`aqua` は `None`）。
-    /// CLI の `bleed_preset_ignored_for_aquarelle_shape` と同じ契約を wasm 経路で固定する。
-    #[test]
-    fn bleed_preset_ignored_for_aquarelle_shape() {
-        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = small_source_params();
-        p.shape = "aquarelle".into();
-        p.bleed_preset = "strong".into();
-        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle inputs");
-        assert!(
-            gpu.opts.aqua.is_none(),
-            "shape aquarelle has its own renderer; bleed_preset must not engage the additive layer"
-        );
-        assert!(
-            matches!(gpu.opts.shape, OrbShape::Aquarelle(_)),
-            "shape must still resolve to Aquarelle"
-        );
-    }
-
     /// #239 Phase 1: 無効な `bleed_preset` は `build_gpu_render_inputs` がエラーにする
     /// （parse_bleed_preset の Err が resolve_frame 経由で伝播）。
     #[test]
@@ -2300,7 +2167,7 @@ mod tests {
         }
     }
 
-    /// #245 (b): WGSL 経路（glyph / image / aquarelle が読む `AnimateOptions`）
+    /// #245 (b): WGSL 経路（glyph / image が読む `AnimateOptions`）
     /// にも透過が伝播する: `opts.background[3] == 0`。orb pack 側（header[3]）と
     /// 二経路が同時に透過になることを固定する。
     #[test]
@@ -2553,45 +2420,6 @@ mod tests {
         }
     }
 
-    /// #231: aquarelle の 4 パラメータは raw のまま OrbShape::Aquarelle に伝播する
-    /// （クランプは core の AquarelleParams::clamped() の領分という契約固定）。
-    /// 0..1 を外れる値 {-0.5, 0.0, 0.5, 1.0, 1.5} を 4 フィールドに割り当て、
-    /// build_gpu_render_inputs が clamp せずそのまま運ぶことを assert する。
-    #[test]
-    fn build_gpu_render_inputs_aquarelle_passes_raw_out_of_range() {
-        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = small_source_params();
-        p.shape = "aquarelle".into();
-        p.aquarelle_bleed = -0.5;
-        p.aquarelle_bloom = 0.0;
-        p.aquarelle_offset = 1.0;
-        p.aquarelle_halo = 1.5;
-        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle GPU inputs should build");
-        match gpu.opts.shape {
-            OrbShape::Aquarelle(params) => {
-                assert_eq!(params.bleed, -0.5, "bleed must pass through un-clamped");
-                assert_eq!(params.bloom, 0.0, "bloom must pass through un-clamped");
-                assert_eq!(params.offset, 1.0, "offset must pass through un-clamped");
-                assert_eq!(params.halo, 1.5, "halo must pass through un-clamped");
-            }
-            other => panic!("expected OrbShape::Aquarelle, got {other:?}"),
-        }
-    }
-
-    /// #231: aquarelle 4 フィールドの serde default 値は 0.5（CLI の
-    /// `--bleed/--bloom/--offset/--halo` および AquarelleParams::default() と同値）。
-    ///
-    /// 観点 6 は本来「serde で 4 フィールド省略時に 0.5 になる」を検証したいが、
-    /// serde_wasm_bindgen は native test では組めず、serde_json はワークスペース・
-    /// Cargo.lock のどちらにも存在しない（追加には workspace.dependencies +
-    /// crates/wasm の dev-dependencies + lock 更新が必要で、default 値 1 つの確認の
-    /// ためには重い）。`#[serde(default = "default_aquarelle_param")]` はこの関数を
-    /// 指す compile-time の配線なので、戻り値 0.5 の単体確認に格下げした（報告済み）。
-    #[test]
-    fn default_aquarelle_param_is_half() {
-        assert_eq!(default_aquarelle_param(), 0.5);
-    }
-
     /// #55 / i18n: first_char_of は文字列の先頭 Unicode スカラを 1 つ採用する。
     /// "☆★" → '☆'、"🍕"（サロゲートペアになる絵文字）→ '🍕'、結合文字列でも
     /// 先頭スカラ（基底文字）を採る。マルチバイト境界をバイトでなく char で割ること。
@@ -2643,22 +2471,6 @@ mod tests {
         assert_eq!(
             gpu.opts.background[3], 0,
             "image opts.background alpha must be 0 when transparent_background is set"
-        );
-    }
-
-    /// #245 (R2): shape="aquarelle" + transparent_background=true でも
-    /// `opts.background[3] == 0`（aquarelle は lowp 合成を維持するが、透過
-    /// export の背景 alpha は orb 機構と同じ `AnimateOptions` 経由で効く）。
-    #[test]
-    fn transparent_background_aquarelle_propagates_to_animate_options() {
-        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = small_source_params();
-        p.shape = "aquarelle".into();
-        p.transparent_background = true;
-        let gpu = build_gpu_render_inputs(p, 12, 0).expect("aquarelle GPU inputs");
-        assert_eq!(
-            gpu.opts.background[3], 0,
-            "aquarelle opts.background alpha must be 0 when transparent_background is set"
         );
     }
 

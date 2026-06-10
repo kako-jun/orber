@@ -2,8 +2,8 @@
 // 単体テスト。
 //
 // - buildWasmParams: WasmParams 組立てのデシジョンテーブル（source 必須 /
-//   image マスク必須 / glyph SDF フォールバックとキャッシュ / orb・aquarelle
-//   素通し / transparent_background キーの有無）。wasm / OffscreenCanvas は
+//   image マスク必須 / glyph SDF フォールバックとキャッシュ / orb 素通し /
+//   transparent_background キーの有無）。wasm / OffscreenCanvas は
 //   ロードせず、glyphSupported / generateSdf を vi.fn で DI する
 // - computeMaskSize: 長辺 1024 縮小の境界とアスペクト比保持
 // - formatRunBatchError: sentinel → i18n キーのマップ（t() は fake を DI）。
@@ -134,16 +134,6 @@ describe('buildWasmParams', () => {
     expect('image_mask_rgba' in params).toBe(false);
     expect('glyph_sdf' in params).toBe(false);
     expect(deps.glyphSupported).not.toHaveBeenCalled();
-  });
-
-  it("shape='aquarelle' も素通し（mask / SDF キー無し・SDF 生成も呼ばない）", () => {
-    const deps = makeDeps();
-    const params = buildWasmParams(baseParams({ shape: 'aquarelle' }), deps);
-    expect(params.shape).toBe('aquarelle');
-    expect('image_mask_rgba' in params).toBe(false);
-    expect('glyph_sdf' in params).toBe(false);
-    expect(deps.glyphSupported).not.toHaveBeenCalled();
-    expect(deps.generateSdf).not.toHaveBeenCalled();
   });
 
   it('#239: bleed_preset は素通しで wasm params に乗る（orb / glyph / image どの shape でも）', () => {

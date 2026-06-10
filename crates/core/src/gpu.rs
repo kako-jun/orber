@@ -8,10 +8,10 @@
 //! variants — the plain orb (analytic circle distance) and the SDF orb (glyph /
 //! image: the same orb math fed a different silhouette via an SDF sample; no
 //! bleed/halo). Since #242 the shared compositing is the straight-alpha float
-//! Source-Over ported 1:1 from the legacy WebGL shader. Aquarelle keeps its own
-//! WGSL ([`orb_aquarelle.wgsl`](../src/orb_aquarelle.wgsl)). All four shapes (Orb,
-//! Glyph, Image, Aquarelle) render on the GPU; the CLI renders every PNG / video /
-//! variation frame through it.
+//! Source-Over ported 1:1 from the legacy WebGL shader. The optional additive
+//! watercolor bleed layer ([`crate::animate::AquaBleedConfig`]) rides on top of any
+//! shape via the same template. All three shapes (Orb, Glyph, Image) render on the
+//! GPU; the CLI renders every PNG / video / variation frame through it.
 //!
 //! ## Output paths (#229)
 //!
@@ -48,8 +48,10 @@
 //!   `crates/wasm/src/lib.rs::GL_RENDERER_MAX_ORBS` — do not re-sync a 64 cap onto
 //!   this path.)
 //!
-//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not yet folded into
-//! the GPU pack; animated color/position tracks come in via the cluster列 instead.
+//! The per-orb `color_tracks` / `keyframe_tracks` (#7 / #33) are not folded into the
+//! GPU pack: until #239 their only consumer was the (now-removed) radial aquarelle
+//! path, so animated video color/position is currently not rendered. The CLI keeps
+//! building the tracks and warns at runtime; re-wiring them into this pack is #251.
 //!
 //! ## Compositing contract
 //!
@@ -89,10 +91,6 @@ use crate::animate::{pack_render_data, AnimateOptions, MotionDirection, MAX_ORB_
 use crate::cluster::Cluster;
 use crate::orb::adjust_saturation_pub;
 
-use palette::{FromColor, Hsl, IntoColor, Srgb};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
-
 /// Bytes per pixel for `Rgba8Unorm` (read-back path; native only).
 #[cfg(not(target_arch = "wasm32"))]
 const BYTES_PER_PIXEL: u32 = 4;
@@ -120,15 +118,6 @@ const ORB_TEX_BYTES_PER_TEXEL: u32 = 16;
 /// row-alignment requirement, so this tight value is used as-is.
 const ORB_TEX_BYTES_PER_ROW: u32 = ORB_TEX_WIDTH * ORB_TEX_BYTES_PER_TEXEL;
 
-/// Width, in texels, of the per-orb **aquarelle** data-texture (#216). Nine texels
-/// per orb hold the four `render_aquarelle_orb` layers' geometry + u8 colors; see
-/// `orb_aquarelle.wgsl`'s header for the slot map. Independent of the orb / SDF
-/// `ORB_TEX_WIDTH` (4) — aquarelle binds its own texture so the two never alias.
-const AQUARELLE_TEX_WIDTH: u32 = 9;
-/// Bytes per row of the aquarelle data-texture (`9 × 16 = 144`). `write_texture` is
-/// exempt from row-alignment, so this tight value is used directly.
-const AQUARELLE_TEX_BYTES_PER_ROW: u32 = AQUARELLE_TEX_WIDTH * ORB_TEX_BYTES_PER_TEXEL;
-
 /// Header words / per-orb words in the `pack_render_data` layout.
 /// Kept in sync with that function (header 16 words, per-orb 16 words).
 const HEADER_WORDS: usize = 16;
@@ -151,33 +140,26 @@ const PER_ORB_WORDS: usize = 16;
 /// #242 algorithm switch applies to every shape the template serves.
 const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 
-use crate::animate::BleedMode;
-
 /// The orb (analytic circle) variant of [`ORB_WGSL_TEMPLATE`]. No SDF bindings,
 /// no rotation; the DISTANCE SOURCE block inlines the analytic circle distance
 /// (`dist = distance(...); r = dist / radius`) — the same two lines the WebGL
 /// orb arm uses, so the orb output matches the legacy WebGL look (#242).
-/// Built once per [`BleedMode`] (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the
-/// resulting `&'static str` doubles as the stable pipeline-cache key. The bleed
-/// geometry (`//!ORB_AQUA_BLEED_GEOM`) is the only difference between the two
-/// modes; when no aqua params are set both compile to a shader whose additive
-/// layer is structurally inert (byte-identical to plain orb).
-fn orb_wgsl(mode: BleedMode) -> &'static str {
+/// Built once (`OnceLock`, MSRV 1.78 — `LazyLock` is 1.80); the resulting
+/// `&'static str` doubles as the stable pipeline-cache key. The additive bleed
+/// geometry (`//!ORB_AQUA_BLEED_GEOM`) is the single continuous space-blur; when
+/// no aqua params are set the layer is structurally inert (byte-identical to plain
+/// orb).
+fn orb_wgsl() -> &'static str {
     use std::sync::OnceLock;
-    static ORB_CONTINUOUS: OnceLock<String> = OnceLock::new();
-    static ORB_BLOB: OnceLock<String> = OnceLock::new();
-    let cell = match mode {
-        BleedMode::Continuous => &ORB_CONTINUOUS,
-        BleedMode::Blob => &ORB_BLOB,
-    };
-    cell.get_or_init(|| {
+    static ORB: OnceLock<String> = OnceLock::new();
+    ORB.get_or_init(|| {
         ORB_WGSL_TEMPLATE
             .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_NONE)
             .replace("//!ORB_LOAD", ORB_LOAD_ORB)
             .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
             .replace("//!ORB_COVERAGE", ORB_COVERAGE_CIRCLE)
             .replace("//!ORB_ANGLE", ORB_ANGLE_NONE)
-            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom(mode))
+            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
     })
 }
 
@@ -188,46 +170,35 @@ fn orb_wgsl(mode: BleedMode) -> &'static str {
 /// remap preserved). The DISTANCE SOURCE is the only difference from the orb
 /// variant; the falloff / breath / compositing are the **same** orb math, so
 /// glyph / image now blur exactly like orb (no bleed/halo). Built once (`OnceLock`).
-fn orb_sdf_wgsl(mode: BleedMode) -> &'static str {
+fn orb_sdf_wgsl() -> &'static str {
     use std::sync::OnceLock;
-    static SDF_CONTINUOUS: OnceLock<String> = OnceLock::new();
-    static SDF_BLOB: OnceLock<String> = OnceLock::new();
-    let cell = match mode {
-        BleedMode::Continuous => &SDF_CONTINUOUS,
-        BleedMode::Blob => &SDF_BLOB,
-    };
-    cell.get_or_init(|| {
+    static SDF: OnceLock<String> = OnceLock::new();
+    SDF.get_or_init(|| {
         ORB_WGSL_TEMPLATE
             .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_SDF)
             .replace("//!ORB_LOAD", ORB_LOAD_ORB_WITH_ROT)
             .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
             .replace("//!ORB_COVERAGE", ORB_COVERAGE_SDF)
             .replace("//!ORB_ANGLE", ORB_ANGLE_SDF)
-            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom(mode))
+            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
     })
 }
 
 /// #239: the WGSL fragment substituted into `//!ORB_AQUA_BLEED_GEOM`. The bleed is
-/// now a plain Gaussian-blur amount (the silhouette coverage is spatially averaged
-/// over a disk of radius ∝ bleed — the star blurs *as a star*, no circle morph),
-/// so the only A/B difference is the blur-radius scale (`aqua_blur_scale`). Both
-/// define that one `let`; neither morphs the distance field toward a circle, adds a
-/// rim/halo/blob, nor warps with noise. The blur path is only reached when
-/// `aqua_bleed > 0`, so `bleed == 0` is still byte-identical to plain orb.
-fn aqua_bleed_geom(mode: BleedMode) -> &'static str {
-    match mode {
-        BleedMode::Continuous => ORB_AQUA_BLEED_CONTINUOUS,
-        BleedMode::Blob => ORB_AQUA_BLEED_BLOB,
-    }
+/// a plain Gaussian-blur amount (the silhouette coverage is spatially averaged over
+/// a disk of radius ∝ bleed — the star blurs *as a star*, no circle morph). It only
+/// defines the blur-radius scale `let`; it does not morph the distance field toward
+/// a circle, add a rim/halo/blob, nor warp with noise. The blur path is only reached
+/// when `aqua_bleed > 0`, so `bleed == 0` is still byte-identical to plain orb. The
+/// #239 Phase 1 redesign dropped the wider-blur Blob A/B variant, leaving this single
+/// continuous geometry.
+fn aqua_bleed_geom() -> &'static str {
+    ORB_AQUA_BLEED_CONTINUOUS
 }
 
-/// A案 bleed (Continuous): 標準のブラー半径（multi-tap 空間平均の disk 半径スケール 1.0）。
+/// Continuous bleed: 標準のブラー半径（multi-tap 空間平均の disk 半径スケール 1.0）。
 /// `bleed=0` でブラー経路に入らないので消える。距離場を円へモーフしない。
 const ORB_AQUA_BLEED_CONTINUOUS: &str = "let aqua_blur_scale = 1.0;";
-
-/// B案 bleed (Blob): やや強いブラー半径（disk 半径スケール 1.4）で blink 比較用。
-/// `bleed=0` で消える。円へモーフしない（前回 NG を撤去済み）。
-const ORB_AQUA_BLEED_BLOB: &str = "let aqua_blur_scale = 1.4;";
 
 /// No extra bindings (orb variant): the analytic circle needs only the params
 /// uniform (0) and the orb data-texture (1) the template already declares.
@@ -380,22 +351,6 @@ fn coverage_at(\n\
     return falloff_curve(style_bit, r, blur, opacity);\n\
 }";
 
-/// The Aquarelle orb WGSL (#216 Phase 1c). A dedicated pipeline + data-texture
-/// (separate from the orb data-texture) that evaluates the four
-/// `aquarelle::render_aquarelle_orb` layers analytically: offset main 3-stop
-/// radial, 0..3 bleed satellites, and the bloom core, composited SourceOver in
-/// the u8-quantize → premultiply → source_over lowp流儀 of the reference
-/// `aquarelle` crate (Skia lowp). Unlike `orb.wgsl` (whose reference is the
-/// legacy WebGL shader since the #242 ruling), aquarelle's reference algorithm
-/// is the CPU crate, so it keeps the lowp pipeline and does **not** share the
-/// orb template's float straight Source-Over.
-/// The ChaCha8 RNG / HSL color math is **not** ported to WGSL; `pack_aquarelle_orbs`
-/// runs it on the CPU (bit-identical to the crate) and uploads the resulting
-/// centers / radii / u8 colors.
-fn orb_aquarelle_wgsl() -> &'static str {
-    include_str!("orb_aquarelle.wgsl")
-}
-
 /// Header uniform block handed to the orb / SDF shader. Mirrors `struct Params` in
 /// `orb.wgsl`. `#[repr(C)]` + explicit padding to satisfy WGSL std140-ish
 /// uniform layout (vec2 then scalars packed into 16-byte rows). The same struct
@@ -433,14 +388,14 @@ struct Params {
     /// outermost fade segment of the shared `falloff_curve`. `0.0` is bit-identical
     /// to the post-#242 (no-shadow) output; `1.0` matches the darkness of the
     /// removed Skia-lowp rgb→0 fade. Read from pack header[13]; every shape on the
-    /// unified template (orb / glyph / image) gets it, aquarelle does not.
+    /// unified template (orb / glyph / image) gets it.
     shadow_strength: f32,
-    // row 5: aquarelle bleed params (#239 PoC) — the additive layer's 4 sliders.
-    /// #239 PoC: aquarelle にじみ 4 パラメータ（各 0..1）を統一機構の上の加算レイヤーへ
-    /// 流す。bleed=0 のとき WGSL の watercolor 経路に入らず、出力は plain orb と
-    /// byte 一致する（非回帰ゲート）。aquarelle 以外の shape の既存描画では
-    /// `pack_orb_frame` / `pack_sdf_frame` が 0 を入れるので不変。A/B の幾何差は
-    /// シェーダ variant（`//!ORB_AQUA_BLEED_GEOM` 置換）で表すので mode フラグは持たない。
+    // row 5: additive watercolor bleed params (#239) — the layer's 4 sliders.
+    /// #239: にじみ 4 パラメータ（各 0..1）を統一機構の上の加算レイヤーへ流す。
+    /// bleed=0 のとき WGSL の watercolor 経路に入らず、出力は plain orb と byte 一致
+    /// する（非回帰ゲート）。にじみを使わない描画では `pack_orb_frame` /
+    /// `pack_sdf_frame` が 0 を入れるので不変。幾何は唯一の continuous space-blur
+    /// （`//!ORB_AQUA_BLEED_GEOM` 置換）なので mode フラグは持たない。
     aqua_bleed: f32,
     aqua_bloom: f32,
     aqua_offset: f32,
@@ -467,40 +422,6 @@ struct GpuOrb {
     phase: [f32; 4], // phase, phi_radius, phi_blur, phi_opacity
     misc: [f32; 4],  // cross_axis, style_bit, speed_mult, _
     rot: [f32; 4],   // base_angle, rot_speed_signed, _, _
-}
-
-/// Header uniform block for the Aquarelle shader. Mirrors `struct Params` in
-/// `orb_aquarelle.wgsl` (resolution, orb count, background). `#[repr(C)]` + padding
-/// to 16-byte rows. Separate from the orb [`Params`] because the aquarelle pack
-/// needs no motion scalars (positions are baked per orb on the CPU).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct AquarelleHeader {
-    // row 0: resolution.xy, n_orbs, pad
-    resolution: [f32; 2],
-    n_orbs: f32,
-    _pad0: f32,
-    // row 1: bg.rgba (straight)
-    bg: [f32; 4],
-}
-
-/// One aquarelle orb as the shader sees it: nine `vec4`s mirroring `struct AquaOrb`
-/// in `orb_aquarelle.wgsl`. Filled by [`GpuRenderer::pack_aquarelle_orbs`] from the
-/// per-orb ChaCha8 + HSL math (run on the CPU, bit-identical to the crate). One
-/// `GpuAquaOrb` packs to one row of the `Rgba32Float` aquarelle data-texture
-/// (9 texels = 144 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuAquaOrb {
-    main: [f32; 4],       // main_cx, main_cy, main_radius, sat_count
-    inner: [f32; 4],      // inner_rgb (color@255), bloom_flag
-    halo: [f32; 4],       // halo_rgb (mid@128 / edge@0), _
-    bloom_geom: [f32; 4], // bloom_cx, bloom_cy, bloom_core_radius, _
-    bloom_col: [f32; 4],  // bloom_rgb (mix_with_white), _
-    bleed_col: [f32; 4],  // bleed_rgb (satellite color), _
-    sat0: [f32; 4],       // sat0_cx, sat0_cy, sat0_radius, _
-    sat1: [f32; 4],       // sat1_cx, sat1_cy, sat1_radius, _
-    sat2: [f32; 4],       // sat2_cx, sat2_cy, sat2_radius, _
 }
 
 /// A render pipeline plus its bind-group layout, compiled once per distinct
@@ -614,12 +535,6 @@ pub struct GpuRenderer {
     /// The bilinear (linear/linear, clamp-to-edge) sampler the SDF orb shader uses
     /// to read the `R8Unorm` SDF. Built once; reused for every glyph / image frame.
     glyph_sampler: wgpu::Sampler,
-    /// The grow-only per-orb **aquarelle** data-texture (#216), reallocated only
-    /// when a frame needs more rows than the cached capacity. `None` until the first
-    /// aquarelle frame (orb/glyph/image-only runs never allocate it). Separate from
-    /// `orb_texture` so the 9-texel aquarelle layout never aliases the 4-texel
-    /// orb/glyph/image one, keeping the orb output bit-exact.
-    aquarelle_texture: std::sync::Mutex<Option<OrbTexture>>,
     /// Serializes the whole GPU side of [`Self::render_packed`] (orb/params
     /// upload → pass record → `queue.submit` → map/readback) so concurrent
     /// `render_frame` calls on one shared renderer cannot alias the shared cached
@@ -719,7 +634,6 @@ impl GpuRenderer {
             orb_texture: std::sync::Mutex::new(None),
             glyph_sdf_cache: std::sync::Mutex::new(HashMap::new()),
             glyph_sampler,
-            aquarelle_texture: std::sync::Mutex::new(None),
             render_guard: std::sync::Mutex::new(()),
         }
     }
@@ -1097,8 +1011,8 @@ impl GpuRenderer {
     /// # Scope
     ///
     /// This is the **plain orb** path only. The shape in `opts.shape` is ignored
-    /// here; the caller routes `Glyph` to `render_frame_glyph`, `Image` to
-    /// `render_frame_image`, and `Aquarelle` to `render_frame_aquarelle` (all GPU).
+    /// here; the caller routes `Glyph` to `render_frame_glyph` and `Image` to
+    /// `render_frame_image` (all GPU).
     /// GPU is the only renderer (#225) — no CPU fallback exists; when no adapter is
     /// available, [`GpuRenderer::new`] returns `None` and the CLI exits with an
     /// error. See the module docs.
@@ -1226,7 +1140,8 @@ impl GpuRenderer {
     /// It is **one** pass —
     /// the old aquarelle-derived bleed/halo 2nd pass group is removed, so glyph now
     /// blurs exactly like an orb (a `●` glyph looks like an orb; a `▲` blurs while
-    /// keeping its triangular form). "Bleed" is now the領分 of the Aquarelle shape only.
+    /// keeping its triangular form). "Bleed" is now the領分 of the optional additive
+    /// [`crate::animate::AquaBleedConfig`] layer (which rides any shape).
     ///
     /// Returns a background-only frame (no glyph fill) when the glyph is unknown /
     /// empty in the bundled font — the "draw nothing for tofu" contract (never
@@ -1499,8 +1414,8 @@ impl GpuRenderer {
     }
 
     /// Resolved orb count: `count.unwrap_or(clusters.len())` clamped to
-    /// [`MAX_ORB_COUNT`], at least 1 if there are clusters (mirrors
-    /// `precompute_orb_params`). Shared by every pack builder.
+    /// [`MAX_ORB_COUNT`], at least 1 if there are clusters (mirrors the count
+    /// resolution in [`pack_render_data`]). Shared by every pack builder.
     fn resolved_orb_count(clusters: &[Cluster], opts: &AnimateOptions) -> usize {
         opts.count
             .unwrap_or(clusters.len())
@@ -1546,436 +1461,6 @@ impl GpuRenderer {
         );
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
         pack
-    }
-
-    /// Render one **Aquarelle** frame at time `t` from `clusters` + `opts`, built on
-    /// the [`aquarelle::render_aquarelle_orb`] four-layer model (#216 Phase 1c).
-    ///
-    /// `opts.shape` must be [`OrbShape::Aquarelle`]; its [`AquarelleParams`] drive
-    /// the four layers. Per-orb positions / radii / colors come from
-    /// [`crate::animate::aquarelle_modulated_clusters`] (the shared per-orb
-    /// modulation), then [`Self::pack_aquarelle_orbs`] runs the crate's ChaCha8 RNG
-    /// (`seed = orb index`) + `palette` HSL color math host-side to produce the
-    /// offset center, satellite placements, and boosted/mixed u8 colors. The
-    /// `orb_aquarelle.wgsl` shader evaluates the radials and composites SourceOver.
-    ///
-    /// # Fidelity
-    ///
-    /// The RNG / color math reuse the crate's exact arithmetic (host-side), so those
-    /// are byte-identical to the crate; only the radial fill is analytic where Skia
-    /// lowp anti-aliases `fill_path`, so the residual is an AA-only difference at orb
-    /// edges (the same kind the orb has). Non-Aquarelle shapes fall back to the plain
-    /// orb path so the call is total.
-    ///
-    /// Native only (#229): read-back path; the wasm/browser path uses
-    /// [`Self::render_frame_aquarelle_to_view`] instead.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn render_frame_aquarelle(
-        &self,
-        clusters: &[Cluster],
-        opts: &AnimateOptions,
-        t: f32,
-    ) -> RgbaImage {
-        let width = opts.width.max(1);
-        let height = opts.height.max(1);
-        let t = t.clamp(0.0, 1.0);
-        match Self::prepare_aquarelle_frame(clusters, opts, t, width, height) {
-            // Not an aquarelle shape: fall back to the plain orb path so the call is total.
-            None => self.render_frame(clusters, opts, t),
-            Some(orbs) => self.render_aquarelle_packed(&orbs, width, height, opts.background),
-        }
-    }
-
-    /// [`Self::render_frame_aquarelle`], but drawing into an externally supplied
-    /// `view` of `format` instead of the offscreen read-back target (#229). Same
-    /// CPU-side ChaCha8 / HSL pack; only the final color target differs.
-    ///
-    /// Same `view` / `format` contract as [`Self::render_frame_to_view`]:
-    /// `format` non-sRGB (the shader output is already sRGB-encoded; an sRGB
-    /// format would encode twice), `view` exactly `opts.width × opts.height`
-    /// texels.
-    pub fn render_frame_aquarelle_to_view(
-        &self,
-        clusters: &[Cluster],
-        opts: &AnimateOptions,
-        t: f32,
-        view: &wgpu::TextureView,
-        format: wgpu::TextureFormat,
-    ) {
-        let width = opts.width.max(1);
-        let height = opts.height.max(1);
-        let t = t.clamp(0.0, 1.0);
-        match Self::prepare_aquarelle_frame(clusters, opts, t, width, height) {
-            // Not an aquarelle shape: fall back to the plain orb path so the call is total.
-            None => self.render_frame_to_view(clusters, opts, t, view, format),
-            Some(orbs) => self.render_aquarelle_packed_to_view(
-                &orbs,
-                width,
-                height,
-                opts.background,
-                view,
-                format,
-            ),
-        }
-    }
-
-    /// Build one Aquarelle frame's packed orbs, or `None` when `opts.shape` is not
-    /// Aquarelle (the caller falls back to the plain orb path). Shared by the
-    /// read-back and to_view entry points.
-    ///
-    /// Runs the shared per-orb modulation (position wrap, radius breath, #33/#7
-    /// color interpolation) — the cluster index order is the orb draw order and is
-    /// also the `render_aquarelle_orb` seed `i`, so RNG consumption stays in step —
-    /// then [`Self::pack_aquarelle_orbs`] (the crate's ChaCha8 + HSL math, CPU-side).
-    fn prepare_aquarelle_frame(
-        clusters: &[Cluster],
-        opts: &AnimateOptions,
-        t: f32,
-        width: u32,
-        height: u32,
-    ) -> Option<Vec<GpuAquaOrb>> {
-        let params = match opts.shape {
-            crate::orb::OrbShape::Aquarelle(p) => p,
-            _ => return None,
-        };
-
-        let modulated = crate::animate::aquarelle_modulated_clusters(clusters, opts, t);
-
-        // `base_radius_unit` is the standard orb radius unit: min(w,h) * 0.25 * orb_size.
-        let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
-        let saturation = opts.saturation.max(0.0);
-
-        Some(Self::pack_aquarelle_orbs(
-            &modulated,
-            width as f32,
-            height as f32,
-            base_radius_unit,
-            saturation,
-            params,
-        ))
-    }
-
-    /// Run the crate's four-layer `render_aquarelle_orb` math on the CPU and pack
-    /// each orb into a [`GpuAquaOrb`] row. `seed = orb index` (matching `orb.rs:176`
-    /// `i as u64`); the ChaCha8 `gen_range` consumption order is **identical** to
-    /// `aquarelle::render_aquarelle_orb` (offset θ → per-satellite θ/dist/radius →
-    /// bloom with no RNG) so the satellite count / placement and offset direction
-    /// are bit-identical to the crate. Colors run through the same `boost_saturation`
-    /// (HSL via `palette`) / `mix_with_white` as the crate, quantized to u8.
-    ///
-    /// Orbs with radius `<= 0.0` (zero weight) pack a zero-radius row, which the
-    /// shader skips — matching the crate's early `return` for non-positive radius.
-    ///
-    /// Pure data transform (no `self`): an associated function so pack-only tests
-    /// can call it without a live GPU adapter (RNG/layout reproduction is verified
-    /// on every host, not just GPU CI).
-    fn pack_aquarelle_orbs(
-        clusters: &[Cluster],
-        width: f32,
-        height: f32,
-        base_radius_unit: f32,
-        saturation: f32,
-        params: aquarelle::AquarelleParams,
-    ) -> Vec<GpuAquaOrb> {
-        use std::f32::consts::TAU;
-
-        // `clamped()` mirrors the crate: out-of-range slider values are capped.
-        let p = params.clamped();
-        let n = clusters.len().min(MAX_ORB_COUNT);
-
-        let mut orbs = Vec::with_capacity(n.max(1));
-        for (i, cluster) in clusters.iter().take(n).enumerate() {
-            // Standard orb geometry: radius = base_radius_unit * sqrt(weight),
-            // color = adjust_saturation(cluster.color, saturation),
-            // center = clamp(centroid, 0..1) * (width, height).
-            let radius = base_radius_unit * cluster.weight.max(0.0).sqrt();
-            let color = adjust_saturation_pub(cluster.color, saturation);
-            let center_x = cluster.centroid.x.clamp(0.0, 1.0) * width;
-            let center_y = cluster.centroid.y.clamp(0.0, 1.0) * height;
-
-            // Zero / negative radius ⇒ the crate returns early (draws nothing). Pack
-            // a zero-radius row; the shader's `main_radius <= 0.0` guard skips it.
-            if radius <= 0.0 {
-                orbs.push(GpuAquaOrb {
-                    main: [center_x, center_y, 0.0, 0.0],
-                    inner: [0.0; 4],
-                    halo: [0.0; 4],
-                    bloom_geom: [0.0; 4],
-                    bloom_col: [0.0; 4],
-                    bleed_col: [0.0; 4],
-                    sat0: [0.0; 4],
-                    sat1: [0.0; 4],
-                    sat2: [0.0; 4],
-                });
-                continue;
-            }
-
-            // RNG seeded per orb with `seed = i`, consumed in the *exact* order of
-            // `render_aquarelle_orb`. Any deviation here desyncs the satellite stream.
-            let mut rng = ChaCha8Rng::seed_from_u64(i as u64);
-
-            // 1. offset: shift the gradient center by up to 25 % of the radius.
-            let offset_dist = radius * 0.25 * p.offset;
-            let theta: f32 = rng.gen_range(0.0..TAU);
-            let cx = center_x + offset_dist * theta.cos();
-            let cy = center_y + offset_dist * theta.sin();
-
-            // 2. main color: halo color = boost_saturation(color, 1 + 0.6 * halo).
-            let halo_color = boost_saturation(color, 1.0 + 0.6 * p.halo);
-
-            // 3. bleed satellites: 0..3 small same-color gradients. The RNG draws
-            //    per satellite in order (θ, dist, radius-factor), matching the crate.
-            let bleed_count = (3.0 * p.bleed).round() as u32;
-            let bleed_color = boost_saturation(color, 1.0 + 0.4 * p.halo);
-            let mut sats = [[0.0f32; 4]; 3];
-            for sat in sats.iter_mut().take(bleed_count.min(3) as usize) {
-                let bleed_theta: f32 = rng.gen_range(0.0..TAU);
-                let bleed_dist = radius * rng.gen_range(0.4..0.9);
-                let bx = center_x + bleed_dist * bleed_theta.cos();
-                let by = center_y + bleed_dist * bleed_theta.sin();
-                let bleed_radius = radius * rng.gen_range(0.2..0.4) * (0.5 + 0.5 * p.bleed);
-                *sat = [bx, by, bleed_radius, 0.0];
-            }
-
-            // 4. bloom: near-white core inside the inner ~30 % when bloom > 0.
-            let (bloom_flag, bloom_core_radius, bloom_color) = if p.bloom > 0.0 {
-                let core_radius = radius * 0.3 * p.bloom;
-                if core_radius > 0.0 {
-                    let bloom_color = mix_with_white(color, 0.7);
-                    (1.0, core_radius, bloom_color)
-                } else {
-                    (0.0, 0.0, [0u8; 3])
-                }
-            } else {
-                (0.0, 0.0, [0u8; 3])
-            };
-
-            let to_unit = |c: [u8; 3]| {
-                [
-                    c[0] as f32 / 255.0,
-                    c[1] as f32 / 255.0,
-                    c[2] as f32 / 255.0,
-                ]
-            };
-            let inner_u = to_unit(color);
-            let halo_u = to_unit(halo_color);
-            let bleed_u = to_unit(bleed_color);
-            let bloom_u = to_unit(bloom_color);
-
-            orbs.push(GpuAquaOrb {
-                main: [cx, cy, radius, bleed_count.min(3) as f32],
-                inner: [inner_u[0], inner_u[1], inner_u[2], bloom_flag],
-                halo: [halo_u[0], halo_u[1], halo_u[2], 0.0],
-                // bloom center == main offset center (crate draws bloom at cx,cy).
-                bloom_geom: [cx, cy, bloom_core_radius, 0.0],
-                bloom_col: [bloom_u[0], bloom_u[1], bloom_u[2], 0.0],
-                bleed_col: [bleed_u[0], bleed_u[1], bleed_u[2], 0.0],
-                sat0: sats[0],
-                sat1: sats[1],
-                sat2: sats[2],
-            });
-        }
-        orbs
-    }
-
-    /// Upload the packed aquarelle orbs into the grow-only aquarelle data-texture,
-    /// build the header uniform, run the aquarelle pass, and read back. Serialized
-    /// under `render_guard` (like the orb / glyph / image path) so concurrent renders on a
-    /// shared renderer cannot alias the one shared aquarelle texture / per-size
-    /// target / read-back buffer (the #210 concurrency contract).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn render_aquarelle_packed(
-        &self,
-        orbs: &[GpuAquaOrb],
-        width: u32,
-        height: u32,
-        background: [u8; 4],
-    ) -> RgbaImage {
-        let _render_guard = self
-            .render_guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let width = width.max(1);
-        let height = height.max(1);
-
-        let (header_buffer, orb_view) =
-            self.upload_aquarelle_frame(orbs, width, height, background);
-
-        self.pipeline(
-            orb_aquarelle_wgsl(),
-            false,
-            wgpu::TextureFormat::Rgba8Unorm,
-            |cached| {
-                self.sized_resources(width, height, |res| {
-                    let bind_group = self.aquarelle_bind_group(
-                        &cached.bind_group_layout,
-                        &header_buffer,
-                        &orb_view,
-                    );
-                    self.run_pass_and_readback(&cached.pipeline, &bind_group, res)
-                })
-            },
-        )
-    }
-
-    /// [`Self::render_aquarelle_packed`], but drawing into an externally supplied
-    /// `view` of `format` instead of the offscreen read-back target (#229). Same
-    /// upload + single pass; serialized under `render_guard` because the to_view
-    /// path shares the same grow-only aquarelle data-texture (the #210 contract).
-    fn render_aquarelle_packed_to_view(
-        &self,
-        orbs: &[GpuAquaOrb],
-        width: u32,
-        height: u32,
-        background: [u8; 4],
-        view: &wgpu::TextureView,
-        format: wgpu::TextureFormat,
-    ) {
-        debug_assert_view_format_not_srgb(format);
-
-        let _render_guard = self
-            .render_guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let width = width.max(1);
-        let height = height.max(1);
-
-        let (header_buffer, orb_view) =
-            self.upload_aquarelle_frame(orbs, width, height, background);
-
-        self.pipeline(orb_aquarelle_wgsl(), false, format, |cached| {
-            let bind_group =
-                self.aquarelle_bind_group(&cached.bind_group_layout, &header_buffer, &orb_view);
-            self.run_pass_to_view(&cached.pipeline, &bind_group, view);
-        });
-    }
-
-    /// Build the aquarelle header uniform buffer and upload the packed orbs into
-    /// the grow-only aquarelle data-texture. Shared by the read-back and to_view
-    /// paths; the caller must already hold `render_guard` (the orb texture is the
-    /// shared mutable resource).
-    fn upload_aquarelle_frame(
-        &self,
-        orbs: &[GpuAquaOrb],
-        width: u32,
-        height: u32,
-        background: [u8; 4],
-    ) -> (wgpu::Buffer, wgpu::TextureView) {
-        let header = AquarelleHeader {
-            resolution: [width as f32, height as f32],
-            n_orbs: orbs.len() as f32,
-            _pad0: 0.0,
-            bg: [
-                background[0] as f32 / 255.0,
-                background[1] as f32 / 255.0,
-                background[2] as f32 / 255.0,
-                background[3] as f32 / 255.0,
-            ],
-        };
-        let header_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("orber-aquarelle-params"),
-                contents: bytemuck::bytes_of(&header),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let orb_view = self.upload_aquarelle_texture(orbs);
-        (header_buffer, orb_view)
-    }
-
-    /// Build the aquarelle bind group (header uniform 0 + orb data-texture 1).
-    fn aquarelle_bind_group(
-        &self,
-        layout: &wgpu::BindGroupLayout,
-        header_buffer: &wgpu::Buffer,
-        orb_view: &wgpu::TextureView,
-    ) -> wgpu::BindGroup {
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("orber-aquarelle-bg"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: header_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(orb_view),
-                },
-            ],
-        })
-    }
-
-    /// Upload the packed aquarelle orbs into the grow-only `Rgba32Float` aquarelle
-    /// data-texture (9 texels wide × `orbs.len()` tall) and return a view to bind.
-    /// Mirrors [`Self::upload_orb_texture`] but for the separate aquarelle texture so
-    /// the orb / glyph / image data-texture is never resized to the wider aquarelle layout.
-    fn upload_aquarelle_texture(&self, orbs: &[GpuAquaOrb]) -> wgpu::TextureView {
-        let rows = orbs.len().max(1) as u32;
-        let mut guard = self
-            .aquarelle_texture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let needs_realloc = match guard.as_ref() {
-            Some(tex) => tex.capacity < rows,
-            None => true,
-        };
-        if needs_realloc {
-            *guard = Some(self.build_aquarelle_texture(rows));
-        }
-        let tex = guard
-            .as_ref()
-            .expect("aquarelle texture just ensured present");
-
-        // One `GpuAquaOrb` is 9 × vec4<f32> = 144 bytes = one texel row.
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(orbs),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(AQUARELLE_TEX_BYTES_PER_ROW),
-                rows_per_image: Some(rows),
-            },
-            wgpu::Extent3d {
-                width: AQUARELLE_TEX_WIDTH,
-                height: rows,
-                depth_or_array_layers: 1,
-            },
-        );
-        tex.view.clone()
-    }
-
-    /// Allocate the aquarelle data-texture sized for `capacity` orbs (9 texels wide).
-    /// `usage = TEXTURE_BINDING | COPY_DST` (sampled via `textureLoad`, written via
-    /// `write_texture`) — input only, like [`Self::build_orb_texture`].
-    fn build_aquarelle_texture(&self, capacity: u32) -> OrbTexture {
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("orber-aquarelle-tex"),
-            size: wgpu::Extent3d {
-                width: AQUARELLE_TEX_WIDTH,
-                height: capacity,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        OrbTexture {
-            capacity,
-            texture,
-            view,
-        }
     }
 
     /// Render one **plain orb** frame from a raw `pack_render_data` buffer.
@@ -2059,12 +1544,11 @@ impl GpuRenderer {
         // small params uniform / bind group are rebuilt per frame. The SDF variant
         // selects a different shader source + adds the SDF texture / sampler
         // bindings (2/3) but draws the same single pass. The read-back path always
-        // targets `Rgba8Unorm`. #239 PoC: the bleed `mode` (default Continuous) picks
-        // the WGSL variant; the additive layer stays inert when aqua params are 0.
-        let mode = aqua.map(|a| a.mode).unwrap_or_default();
+        // targets `Rgba8Unorm`. #239: the additive bleed layer stays inert when aqua
+        // params are 0 (byte-identical to plain orb).
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(mode), true),
-            None => (orb_wgsl(mode), false),
+            Some(_) => (orb_sdf_wgsl(), true),
+            None => (orb_wgsl(), false),
         };
         self.pipeline(
             shader,
@@ -2119,12 +1603,11 @@ impl GpuRenderer {
 
         // Both orb and SDF draw straight into the caller's view, so the pipeline
         // targets `format` either way (the SDF variant just binds the SDF
-        // texture / sampler and runs a different shader source). #239 PoC: bleed
-        // `mode` (default Continuous) selects the WGSL variant.
-        let mode = aqua.map(|a| a.mode).unwrap_or_default();
+        // texture / sampler and runs a different shader source). #239: the additive
+        // bleed layer stays inert when aqua params are 0.
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(mode), true),
-            None => (orb_wgsl(mode), false),
+            Some(_) => (orb_sdf_wgsl(), true),
+            None => (orb_wgsl(), false),
         };
         self.pipeline(shader, is_glyph, format, |cached| {
             let bind_group =
@@ -2162,7 +1645,6 @@ impl GpuRenderer {
             bloom: 0.0,
             offset: 0.0,
             halo: 0.0,
-            mode: BleedMode::Continuous,
         });
 
         // Header → Params. Layout per `pack_render_data` doc-comment.
@@ -2475,49 +1957,12 @@ fn apply_saturation_to_pack(pack: &mut [f32], saturation: f32, n_orbs: usize) {
     }
 }
 
-/// `boost_saturation` from `aquarelle::render_aquarelle_orb`, reproduced verbatim
-/// so the CPU pack produces the **same u8 color** the crate feeds Skia lowp. The
-/// HSL transform runs through `palette` at the exact version aquarelle pins
-/// (`palette 0.7`, the workspace dep), so the result is bit-identical and never
-/// reimplemented in WGSL. A factor within an ULP of 1.0 short-circuits like the
-/// crate.
-fn boost_saturation(rgb: [u8; 3], factor: f32) -> [u8; 3] {
-    if (factor - 1.0).abs() < f32::EPSILON {
-        return rgb;
-    }
-    let srgb = Srgb::new(
-        rgb[0] as f32 / 255.0,
-        rgb[1] as f32 / 255.0,
-        rgb[2] as f32 / 255.0,
-    );
-    let mut hsl: Hsl = Hsl::from_color(srgb);
-    hsl.saturation = (hsl.saturation * factor).clamp(0.0, 1.0);
-    let out: Srgb = hsl.into_color();
-    [
-        (out.red.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (out.green.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (out.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
-}
-
-/// `mix_with_white` from `aquarelle::render_aquarelle_orb`, reproduced verbatim so
-/// the bloom core color matches the crate's u8 output exactly.
-fn mix_with_white(rgb: [u8; 3], amount: f32) -> [u8; 3] {
-    let a = amount.clamp(0.0, 1.0);
-    [
-        (rgb[0] as f32 * (1.0 - a) + 255.0 * a).round() as u8,
-        (rgb[1] as f32 * (1.0 - a) + 255.0 * a).round() as u8,
-        (rgb[2] as f32 * (1.0 - a) + 255.0 * a).round() as u8,
-    ]
-}
-
 /// Debug-guard for the to_view paths (#229): the shaders emit already-sRGB-encoded
 /// values and write them raw into a Unorm target (see the module's compositing
 /// contract), so an sRGB view format would apply the sRGB encoding a second time.
 /// `debug_assert` so the release/browser hot path pays nothing; called from the
-/// two internal to_view funnels (`render_packed_inner_to_view` /
-/// `render_aquarelle_packed_to_view`) that every `*_to_view` entry point routes
-/// through.
+/// internal to_view funnel (`render_packed_inner_to_view`) that every `*_to_view`
+/// entry point routes through.
 fn debug_assert_view_format_not_srgb(format: wgpu::TextureFormat) {
     debug_assert!(
         !format.is_srgb(),
@@ -3103,7 +2548,7 @@ mod tests {
     /// drifting out of sync (which would shift the glyph UV mapping and break parity).
     #[test]
     fn glyph_wgsl_content_span_matches_rust() {
-        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
+        let wgsl = orb_sdf_wgsl();
         // Find the literal after `GLYPH_SDF_CONTENT_SPAN: f32 = ` in the shader.
         let needle = "GLYPH_SDF_CONTENT_SPAN: f32 = ";
         let start = wgsl
@@ -3132,7 +2577,7 @@ mod tests {
     /// SDF-only machinery in one place.
     #[test]
     fn orb_variant_wgsl_inlines_analytic_circle_distance() {
-        let wgsl = orb_wgsl(BleedMode::Continuous);
+        let wgsl = orb_wgsl();
         // #239: the analytic circle distance now lives in the orb variant's `coverage_at`
         // (so the plain single tap and the blur's multi-tap share one coverage function),
         // but it is still the same `distance(sp, center) / radius` the WebGL orb arm used.
@@ -3163,7 +2608,7 @@ mod tests {
     /// `textureSampleLevel` would mean an SDF leaked into the orb shader).
     #[test]
     fn orb_variant_has_no_sdf_bindings_or_rot() {
-        let wgsl = orb_wgsl(BleedMode::Continuous);
+        let wgsl = orb_wgsl();
         assert!(
             !wgsl.contains("@binding(2)") && !wgsl.contains("@binding(3)"),
             "orb variant must declare only bindings 0 (params) and 1 (orb_tex)"
@@ -3185,7 +2630,7 @@ mod tests {
     /// together they pin that the two variants differ exactly by the SDF source.
     #[test]
     fn sdf_variant_has_sdf_bindings_and_rot() {
-        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
+        let wgsl = orb_sdf_wgsl();
         assert!(
             wgsl.contains("sdf_tex") && wgsl.contains("sdf_samp"),
             "SDF variant must declare the SDF texture + sampler bindings"
@@ -3223,7 +2668,7 @@ mod tests {
     /// inclusive forms are absent.
     #[test]
     fn wgsl_clip_uses_strict_inequality() {
-        let wgsl = orb_sdf_wgsl(BleedMode::Continuous);
+        let wgsl = orb_sdf_wgsl();
         assert!(
             wgsl.contains("(u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0)"),
             "SDF UV clip must use strict < 0.0 / > 1.0 inequalities"
@@ -3286,8 +2731,8 @@ mod tests {
     fn orb_wgsl_template_has_no_lowp_composite_residue() {
         for (name, src) in [
             ("template", ORB_WGSL_TEMPLATE),
-            ("orb variant", orb_wgsl(BleedMode::Continuous)),
-            ("sdf variant", orb_sdf_wgsl(BleedMode::Continuous)),
+            ("orb variant", orb_wgsl()),
+            ("sdf variant", orb_sdf_wgsl()),
         ] {
             let code = wgsl_code_only(src);
             for needle in [
@@ -3367,42 +2812,31 @@ mod tests {
         );
     }
 
-    // ---- #239 PoC: aquarelle additive bleed layer (structure + non-regression) ----
+    // ---- #239: additive watercolor bleed layer (structure + non-regression) ----
 
-    /// #239 structure: both bleed variants substitute the `//!ORB_AQUA_BLEED_GEOM`
-    /// marker away (a leftover marker would not compile) and define the single
+    /// #239 structure: the bleed geometry substitutes the `//!ORB_AQUA_BLEED_GEOM`
+    /// marker away (a leftover marker would not compile) and defines the single
     /// blur-radius scale `aqua_blur_scale` the multi-tap blur reads — checked on both
     /// the orb and SDF variants so the bleed rides every shape the unified template
     /// serves. The bleed is a REAL spatial blur (multi-tap average of the silhouette
-    /// coverage); the only A/B difference is the blur-radius scale (Blob blurs wider).
+    /// coverage). #239 Phase 1 collapsed to the single continuous geometry (the wider
+    /// Blob A/B variant was dropped), so the injected scale is always 1.0.
     #[test]
-    fn aqua_bleed_variants_substitute_geometry_marker() {
-        for mode in [BleedMode::Continuous, BleedMode::Blob] {
-            for (name, src) in [("orb", orb_wgsl(mode)), ("sdf", orb_sdf_wgsl(mode))] {
-                assert!(
-                    !src.contains("//!ORB_AQUA_BLEED_GEOM"),
-                    "{name}/{mode:?}: the aqua bleed geometry marker must be substituted away"
-                );
-                assert!(
-                    src.contains("fn blurred_coverage("),
-                    "{name}/{mode:?}: the multi-tap blur function must be present"
-                );
-                assert!(
-                    src.contains("let aqua_blur_scale ="),
-                    "{name}/{mode:?}: the geometry marker must define the blur-radius scale"
-                );
-            }
+    fn aqua_bleed_substitutes_geometry_marker() {
+        for (name, src) in [("orb", orb_wgsl()), ("sdf", orb_sdf_wgsl())] {
+            assert!(
+                !src.contains("//!ORB_AQUA_BLEED_GEOM"),
+                "{name}: the aqua bleed geometry marker must be substituted away"
+            );
+            assert!(
+                src.contains("fn blurred_coverage("),
+                "{name}: the multi-tap blur function must be present"
+            );
+            assert!(
+                src.contains("let aqua_blur_scale = 1.0;"),
+                "{name}: the geometry marker must define the continuous blur-radius scale 1.0"
+            );
         }
-        // The two modes differ only in the blur-radius scale (no rim/halo/blob ring and
-        // no circle morph): Blob blurs wider.
-        assert!(
-            orb_wgsl(BleedMode::Continuous).contains("let aqua_blur_scale = 1.0;"),
-            "Continuous arm uses the base blur radius (scale 1.0)"
-        );
-        assert!(
-            orb_wgsl(BleedMode::Blob).contains("let aqua_blur_scale = 1.4;"),
-            "Blob arm blurs wider (scale 1.4)"
-        );
     }
 
     /// #239 non-regression + correctness structure: the bleed is a REAL spatial blur
@@ -3482,11 +2916,11 @@ mod tests {
         );
     }
 
-    /// #239 PoC ★最重要ゲート: with **all four aqua params = 0**, the additive-layer
+    /// #239 ★最重要ゲート: with **all four aqua params = 0**, the additive-layer
     /// shader output is **byte-identical** to the plain orb (`aqua: None`) output —
-    /// for both bleed modes (Continuous / Blob), across several seeds and cluster
-    /// counts. This is the structural non-regression guarantee: the new layer can
-    /// never change an existing orb / glyph / image render unless a slider is moved.
+    /// across several seeds and cluster counts. This is the structural non-regression
+    /// guarantee: the new layer can never change an existing orb / glyph / image
+    /// render unless a slider is moved.
     #[test]
     fn aqua_zero_params_byte_match_plain_orb() {
         let Some(renderer) = require_or_skip_renderer("aqua_zero_params_byte_match_plain_orb")
@@ -3519,23 +2953,19 @@ mod tests {
 
                 let plain = renderer.render_frame(&clusters, &base, 0.37);
 
-                for mode in [BleedMode::Continuous, BleedMode::Blob] {
-                    let mut zeroed = base.clone();
-                    zeroed.aqua = Some(crate::animate::AquaBleedConfig {
-                        bleed: 0.0,
-                        bloom: 0.0,
-                        offset: 0.0,
-                        halo: 0.0,
-                        mode,
-                    });
-                    let via_aqua = renderer.render_frame(&clusters, &zeroed, 0.37);
-                    assert_eq!(
-                        via_aqua.as_raw(),
-                        plain.as_raw(),
-                        "aqua zero ({mode:?}) must be byte-identical to plain orb \
-                         (seed={seed}, n={n})"
-                    );
-                }
+                let mut zeroed = base.clone();
+                zeroed.aqua = Some(crate::animate::AquaBleedConfig {
+                    bleed: 0.0,
+                    bloom: 0.0,
+                    offset: 0.0,
+                    halo: 0.0,
+                });
+                let via_aqua = renderer.render_frame(&clusters, &zeroed, 0.37);
+                assert_eq!(
+                    via_aqua.as_raw(),
+                    plain.as_raw(),
+                    "aqua zero must be byte-identical to plain orb (seed={seed}, n={n})"
+                );
             }
         }
     }
@@ -3545,8 +2975,7 @@ mod tests {
     /// **byte-identical** to the plain orb — `aqua_character` is gated on `aqua_bleed > 0`,
     /// so water-off stays crisp regardless of bloom/halo, and `offset` only biases the
     /// blur disk origin (unreachable when the blur path itself is gated off). This pins
-    /// the gate that makes the internal expert `--aquarelle-bleed-mode` flag (which
-    /// defaults bloom/halo to 0.5) byte-match plain when `--aquarelle-bleed 0` is set.
+    /// the gate that keeps bloom/halo/offset inert whenever `bleed` is 0.
     #[test]
     fn aqua_bleed_zero_with_character_byte_match_plain_orb() {
         let Some(renderer) =
@@ -3578,25 +3007,22 @@ mod tests {
 
                 let plain = renderer.render_frame(&clusters, &base, 0.37);
 
-                for mode in [BleedMode::Continuous, BleedMode::Blob] {
-                    let mut characterful = base.clone();
-                    // bleed = 0 but bloom / offset / halo all non-zero (the internal flag's
-                    // default 0.5). With the gate, character must not engage ⇒ plain.
-                    characterful.aqua = Some(crate::animate::AquaBleedConfig {
-                        bleed: 0.0,
-                        bloom: 0.5,
-                        offset: 0.5,
-                        halo: 0.5,
-                        mode,
-                    });
-                    let via_aqua = renderer.render_frame(&clusters, &characterful, 0.37);
-                    assert_eq!(
-                        via_aqua.as_raw(),
-                        plain.as_raw(),
-                        "bleed=0 with character>0 ({mode:?}) must stay byte-identical to plain orb \
-                         (character rides the bleed; seed={seed}, n={n})"
-                    );
-                }
+                let mut characterful = base.clone();
+                // bleed = 0 but bloom / offset / halo all non-zero. With the gate,
+                // character must not engage ⇒ plain.
+                characterful.aqua = Some(crate::animate::AquaBleedConfig {
+                    bleed: 0.0,
+                    bloom: 0.5,
+                    offset: 0.5,
+                    halo: 0.5,
+                });
+                let via_aqua = renderer.render_frame(&clusters, &characterful, 0.37);
+                assert_eq!(
+                    via_aqua.as_raw(),
+                    plain.as_raw(),
+                    "bleed=0 with character>0 must stay byte-identical to plain orb \
+                     (character rides the bleed; seed={seed}, n={n})"
+                );
             }
         }
     }
@@ -3615,26 +3041,23 @@ mod tests {
         let base = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Mid);
         let plain = renderer.render_frame(&clusters, &base, 0.37);
 
-        for mode in [BleedMode::Continuous, BleedMode::Blob] {
-            let mut lit = base.clone();
-            lit.aqua = Some(crate::animate::AquaBleedConfig {
-                bleed: 0.7,
-                bloom: 0.5,
-                offset: 0.3,
-                halo: 0.6,
-                mode,
-            });
-            let via_aqua = renderer.render_frame(&clusters, &lit, 0.37);
-            assert_ne!(
-                via_aqua.as_raw(),
-                plain.as_raw(),
-                "non-zero aqua ({mode:?}) must change the output (else the layer is dead)"
-            );
-            assert!(
-                lit_vs_bg(&via_aqua, base.background, 8) > lit_vs_bg(&plain, base.background, 8),
-                "the additive glow ({mode:?}) must light more pixels than plain orb"
-            );
-        }
+        let mut lit = base.clone();
+        lit.aqua = Some(crate::animate::AquaBleedConfig {
+            bleed: 0.7,
+            bloom: 0.5,
+            offset: 0.3,
+            halo: 0.6,
+        });
+        let via_aqua = renderer.render_frame(&clusters, &lit, 0.37);
+        assert_ne!(
+            via_aqua.as_raw(),
+            plain.as_raw(),
+            "non-zero aqua must change the output (else the layer is dead)"
+        );
+        assert!(
+            lit_vs_bg(&via_aqua, base.background, 8) > lit_vs_bg(&plain, base.background, 8),
+            "the additive glow must light more pixels than plain orb"
+        );
     }
 
     /// #239 character axes: a single centered orb on a dark bg, blur engaged
@@ -3658,7 +3081,6 @@ mod tests {
             bloom,
             offset,
             halo,
-            mode: BleedMode::Continuous,
         });
         // t chosen so the single orb sits near frame center (LR motion, phase 0).
         renderer.render_frame(&clusters, &opts, 0.0)
@@ -3783,23 +3205,6 @@ mod tests {
         assert!(
             off_lit > base_lit * 0.5 && off_lit < base_lit * 1.6,
             "offset must shift, not explode/round the silhouette (lit {off_lit} vs base {base_lit})"
-        );
-    }
-
-    /// #242 裁定の境界の死守: aquarelle（`orb_aquarelle.wgsl`）の参照アルゴリズムは
-    /// `aquarelle` crate（Skia lowp）のままなので、orb 機構の #242 置換に巻き込まれず
-    /// lowp 合成（`div255` / `composite_premul`）を**維持**していること。ここが
-    /// 消えたら aquarelle が CPU 参照 crate と一致しなくなる。
-    #[test]
-    fn aquarelle_wgsl_keeps_lowp_composite() {
-        let wgsl = orb_aquarelle_wgsl();
-        assert!(
-            wgsl.contains("fn div255("),
-            "aquarelle WGSL must keep the Skia lowp div255 helper (#242 keeps aquarelle lowp)"
-        );
-        assert!(
-            wgsl.contains("fn composite_premul("),
-            "aquarelle WGSL must keep the premultiplied lowp compositing (#242 keeps aquarelle lowp)"
         );
     }
 
@@ -4630,601 +4035,6 @@ mod tests {
         eprintln!("glyph determinism: two renders byte-identical");
     }
 
-    // ===== #216: Aquarelle WGSL path — RNG/color parity + structural GPU↔CPU =====
-
-    use aquarelle::AquarelleParams;
-
-    fn aquarelle_opts(w: u32, h: u32, params: AquarelleParams) -> AnimateOptions {
-        AnimateOptions {
-            width: w,
-            height: h,
-            aqua: None,
-            orb_size: 1.0,
-            blur: 0.5,
-            saturation: 1.0,
-            direction: MotionDirection::LeftToRight,
-            speed: MotionSpeed::Mid,
-            seed: 12345,
-            // Aquarelle ignores --count (one orb per cluster), so count is irrelevant.
-            count: None,
-            background: [12, 18, 28, 255],
-            shape: OrbShape::Aquarelle(params),
-            softness: SoftnessPreset::Mid,
-            glyph_rotate: true,
-            shadow_strength: SHADOW_STRENGTH_DEFAULT,
-            color_tracks: None,
-            keyframe_tracks: None,
-        }
-    }
-
-    /// `boost_saturation` / `mix_with_white` are reproduced verbatim from the crate.
-    /// A factor of exactly 1.0 (halo=0 ⇒ 1+0.6*0) must be the identity fast-path,
-    /// and a boost must raise HSL saturation (here: pull a desaturated gray toward
-    /// its hue). `mix_with_white(c, 0.7)` must land 70 % of the way to white.
-    #[test]
-    fn aquarelle_color_helpers_match_crate_semantics() {
-        // Identity fast-path: factor 1.0 returns the input untouched.
-        assert_eq!(boost_saturation([200, 100, 50], 1.0), [200, 100, 50]);
-
-        // A boost on an already-colored pixel must not *lower* its max-min spread
-        // (saturation goes up, clamped at 1.0).
-        let base = [200u8, 120, 60];
-        let boosted = boost_saturation(base, 1.6);
-        let spread = |c: [u8; 3]| c.iter().max().unwrap() - c.iter().min().unwrap();
-        assert!(
-            spread(boosted) >= spread(base),
-            "boost_saturation must not reduce chroma: base={base:?} boosted={boosted:?}"
-        );
-
-        // mix_with_white(c, 0.7): each channel = round(c*0.3 + 255*0.7).
-        let mixed = mix_with_white([100, 0, 200], 0.7);
-        let expect = |c: u8| (c as f32 * 0.3 + 255.0 * 0.7).round() as u8;
-        assert_eq!(mixed, [expect(100), expect(0), expect(200)]);
-
-        // Full white mix => white; zero mix => unchanged.
-        assert_eq!(mix_with_white([10, 20, 30], 1.0), [255, 255, 255]);
-        assert_eq!(mix_with_white([10, 20, 30], 0.0), [10, 20, 30]);
-    }
-
-    /// `bleed_count = round(3 * bleed)` and the satellite stream is consumed in the
-    /// crate's order. Pack one orb and assert the satellite count for representative
-    /// `bleed` values, plus that bloom presence tracks `bloom > 0`.
-    #[test]
-    fn aquarelle_pack_satellite_count_and_bloom_flag() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this RNG/layout test runs on every host, not just GPU CI.
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-        // bleed → expected round(3*bleed): 0→0, 0.5→2 (1.5 rounds to 2), 1.0→3.
-        for (bleed, expected) in [(0.0_f32, 0u32), (0.5, 2), (1.0, 3)] {
-            let params = AquarelleParams {
-                bleed,
-                bloom: 0.5,
-                offset: 0.5,
-                halo: 0.5,
-            };
-            let orbs = GpuRenderer::pack_aquarelle_orbs(
-                &single,
-                200.0,
-                200.0,
-                40.0,
-                1.0,
-                params.clamped(),
-            );
-            assert_eq!(orbs.len(), 1);
-            assert_eq!(
-                orbs[0].main[3] as u32, expected,
-                "bleed={bleed} must pack {expected} satellites"
-            );
-            // bloom=0.5 > 0 ⇒ bloom_flag set, core radius positive.
-            assert!(orbs[0].inner[3] > 0.5, "bloom>0 must set bloom_flag");
-            assert!(
-                orbs[0].bloom_geom[2] > 0.0,
-                "bloom core radius must be positive when bloom>0"
-            );
-        }
-        // bloom=0 ⇒ no bloom layer.
-        let no_bloom = AquarelleParams {
-            bleed: 0.0,
-            bloom: 0.0,
-            offset: 0.0,
-            halo: 0.0,
-        };
-        let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, no_bloom);
-        assert!(orbs[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
-    }
-
-    /// Aquarelle GPU determinism: the same `(clusters, opts, t)` must render
-    /// byte-identical twice (the pack RNG is seeded per orb index, no thread_rng).
-    #[test]
-    fn aquarelle_gpu_determinism_byte_identical() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_gpu_determinism_byte_identical")
-        else {
-            return;
-        };
-        let clusters = vec![
-            cluster([200, 100, 50], 0.4, 0.4, 0.7),
-            cluster([50, 180, 120], 0.6, 0.6, 0.5),
-        ];
-        let opts = aquarelle_opts(80, 80, AquarelleParams::default());
-        let a = renderer.render_frame_aquarelle(&clusters, &opts, 0.0);
-        let b = renderer.render_frame_aquarelle(&clusters, &opts, 0.0);
-        assert_eq!(
-            a.as_raw(),
-            b.as_raw(),
-            "aquarelle GPU render must be byte-identical on repeated calls"
-        );
-    }
-
-    /// #216: concurrent aquarelle renders on the shared renderer must each match
-    /// their solo oracle — no panic / poison, no cross-thread aliasing of the shared
-    /// aquarelle data-texture / per-size target / read-back buffer (the #210
-    /// serialization contract). Several threads render different aquarelle frames
-    /// (mixed params + t) on the *same* renderer; each thread's output must equal
-    /// that same input rendered alone (a fresh renderer). Mirrors the orb
-    /// (`shared_gpu_concurrent_high_count_render`) and Glyph
-    /// (`shared_gpu_concurrent_glyph_render`) concurrent tests for the aquarelle
-    /// path. Aquarelle is deterministic (per-orb-index ChaCha8 seed, no thread_rng),
-    /// so the match is byte-identical, not just within tolerance.
-    #[test]
-    fn aquarelle_shared_gpu_concurrent_render() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_shared_gpu_concurrent_render")
-        else {
-            return;
-        };
-        // (params, t) cases — mixed layer params + time so threads exercise different
-        // packs (satellite counts, bloom, offset) and per-orb modulation at once.
-        let cases: [(AquarelleParams, f32); 4] = [
-            (
-                AquarelleParams {
-                    bleed: 1.0,
-                    bloom: 0.8,
-                    offset: 0.6,
-                    halo: 0.4,
-                },
-                0.0,
-            ),
-            (
-                AquarelleParams {
-                    bleed: 0.5,
-                    bloom: 0.0,
-                    offset: 0.3,
-                    halo: 0.7,
-                },
-                0.25,
-            ),
-            (
-                AquarelleParams {
-                    bleed: 0.0,
-                    bloom: 0.5,
-                    offset: 0.9,
-                    halo: 0.2,
-                },
-                0.5,
-            ),
-            (AquarelleParams::default(), 0.75),
-        ];
-
-        let clusters = vec![
-            cluster([220, 60, 60], 0.3, 0.35, 0.8),
-            cluster([60, 120, 220], 0.7, 0.55, 0.5),
-            cluster([200, 200, 80], 0.5, 0.8, 0.4),
-        ];
-
-        // Per-case oracle: render each alone on a fresh renderer first.
-        let mut oracles = Vec::new();
-        for &(params, t) in &cases {
-            let opts = aquarelle_opts(96, 72, params);
-            let Some(fresh) = require_or_skip_fresh_renderer(
-                "aquarelle_shared_gpu_concurrent_render (oracle leg)",
-            ) else {
-                return;
-            };
-            oracles.push(fresh.render_frame_aquarelle(&clusters, &opts, t));
-        }
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (idx, &(params, t)) in cases.iter().enumerate() {
-                let oracle = &oracles[idx];
-                let clusters = &clusters;
-                handles.push(scope.spawn(move || {
-                    let opts = aquarelle_opts(96, 72, params);
-                    // A few iterations per thread to maximize overlap on the shared
-                    // aquarelle texture / per-size resources.
-                    for _ in 0..3 {
-                        let img = renderer.render_frame_aquarelle(clusters, &opts, t);
-                        assert_eq!(
-                            oracle.as_raw(),
-                            img.as_raw(),
-                            "concurrent aquarelle (case {idx}, t={t}) must be byte-identical to its solo render"
-                        );
-                    }
-                }));
-            }
-            for h in handles {
-                h.join()
-                    .expect("concurrent aquarelle render thread panicked");
-            }
-        });
-        eprintln!("concurrent aquarelle render: all threads matched their solo oracle");
-    }
-
-    /// A non-Aquarelle shape passed to `render_frame_aquarelle` must fall back to the
-    /// plain orb path (the call is total), matching the Glyph-entry fallback contract.
-    #[test]
-    fn aquarelle_entry_orb_shape_falls_back() {
-        let Some(renderer) = require_or_skip_renderer("aquarelle_entry_orb_shape_falls_back")
-        else {
-            return;
-        };
-        let clusters = vec![cluster([200, 100, 50], 0.5, 0.5, 1.0)];
-        let mut opts = aquarelle_opts(64, 64, AquarelleParams::default());
-        opts.shape = OrbShape::Orb;
-        // Should not panic and should produce the same image as the plain orb path.
-        let via_aqua = renderer.render_frame_aquarelle(&clusters, &opts, 0.0);
-        let via_orb = renderer.render_frame(&clusters, &opts, 0.0);
-        assert_eq!(
-            via_aqua.as_raw(),
-            via_orb.as_raw(),
-            "non-aquarelle shape must fall back to the plain orb path byte-for-byte"
-        );
-    }
-
-    // --- #216 new coverage: RNG reproduction / offset / round boundaries / clamp /
-    //     desaturation / count-ignore / GPU corner & branch parity ---
-
-    /// Oracle satellite placement for one orb, mirroring `render_aquarelle_orb`'s
-    /// **exact** ChaCha8 consumption order (offset θ → per satellite θ/dist/radius)
-    /// so the test owns an independent reference the pack must match bit-for-bit.
-    /// `seed` == orb index (the pack seeds `ChaCha8Rng::seed_from_u64(i)`).
-    fn oracle_aquarelle_sats(
-        seed: u64,
-        center: (f32, f32),
-        radius: f32,
-        bleed: f32,
-    ) -> (f32, Vec<(f32, f32, f32)>) {
-        use std::f32::consts::TAU;
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        // 1) offset angle is the first draw (consumed even when offset==0).
-        let theta: f32 = rng.gen_range(0.0..TAU);
-        // 2) satellites, in θ → dist → radius-factor order, `round(3*bleed)` of them.
-        let bleed_count = (3.0 * bleed).round() as u32;
-        let mut sats = Vec::new();
-        for _ in 0..bleed_count.min(3) {
-            let bleed_theta: f32 = rng.gen_range(0.0..TAU);
-            let bleed_dist = radius * rng.gen_range(0.4..0.9);
-            let bx = center.0 + bleed_dist * bleed_theta.cos();
-            let by = center.1 + bleed_dist * bleed_theta.sin();
-            let bleed_radius = radius * rng.gen_range(0.2..0.4) * (0.5 + 0.5 * bleed);
-            sats.push((bx, by, bleed_radius));
-        }
-        (theta, sats)
-    }
-
-    /// (#1, most important) The packed satellite centers/radii must be **bit-identical**
-    /// to an independent ChaCha8 oracle consuming the RNG in `render_aquarelle_orb`'s
-    /// exact order. Guards the RNG-reproduction contract the whole WGSL path rests on.
-    #[test]
-    fn aquarelle_pack_satellite_positions_match_crate() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this RNG-reproduction test runs on every host, not just GPU CI.
-        let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
-        // weight 1.0 ⇒ radius == base_radius_unit; center at (0.5,0.5) ⇒ (100,100).
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-        let radius = base_radius_unit * 1.0_f32.sqrt();
-        let center = (0.5_f32.clamp(0.0, 1.0) * w, 0.5_f32.clamp(0.0, 1.0) * h);
-
-        // bleed=1.0 ⇒ 3 satellites; saturation 1.0 keeps colors untouched.
-        let params = AquarelleParams {
-            bleed: 1.0,
-            bloom: 0.5,
-            offset: 0.5,
-            halo: 0.5,
-        };
-        let orbs = GpuRenderer::pack_aquarelle_orbs(
-            &single,
-            w,
-            h,
-            base_radius_unit,
-            1.0,
-            params.clamped(),
-        );
-        assert_eq!(orbs.len(), 1);
-        assert_eq!(
-            orbs[0].main[3] as u32, 3,
-            "bleed=1.0 must pack 3 satellites"
-        );
-
-        let (_, sats) = oracle_aquarelle_sats(0, center, radius, 1.0);
-        assert_eq!(sats.len(), 3);
-        let packed = [orbs[0].sat0, orbs[0].sat1, orbs[0].sat2];
-        for (i, ((ox, oy, or), p)) in sats.iter().zip(packed.iter()).enumerate() {
-            assert_eq!(
-                p[0], *ox,
-                "sat{i} cx must bit-match oracle (packed={}, oracle={ox})",
-                p[0]
-            );
-            assert_eq!(
-                p[1], *oy,
-                "sat{i} cy must bit-match oracle (packed={}, oracle={oy})",
-                p[1]
-            );
-            assert_eq!(
-                p[2], *or,
-                "sat{i} radius must bit-match oracle (packed={}, oracle={or})",
-                p[2]
-            );
-        }
-    }
-
-    /// (#2) offset direction. With `offset=1.0` the packed main center must equal
-    /// `center + radius*0.25*(cosθ,sinθ)` for the seed's first `gen_range(0..TAU)`;
-    /// with `offset=0.0` the offset distance is 0 so the main center is the geometric
-    /// center *exactly* (the θ draw is still consumed but multiplied by 0).
-    #[test]
-    fn aquarelle_pack_offset_direction_matches_seed_angle() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this RNG-reproduction test runs on every host, not just GPU CI.
-        let (w, h, base_radius_unit) = (200.0_f32, 200.0_f32, 40.0_f32);
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-        let radius = base_radius_unit;
-        let center = (100.0_f32, 100.0_f32);
-        let (theta, _) = oracle_aquarelle_sats(0, center, radius, 0.0);
-
-        // offset == 1.0 ⇒ center shifted radius*0.25 along θ.
-        let p1 = AquarelleParams {
-            bleed: 0.0,
-            bloom: 0.0,
-            offset: 1.0,
-            halo: 0.0,
-        };
-        let orbs1 =
-            GpuRenderer::pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p1.clamped());
-        let exp_cx = center.0 + radius * 0.25 * theta.cos();
-        let exp_cy = center.1 + radius * 0.25 * theta.sin();
-        assert_eq!(
-            orbs1[0].main[0], exp_cx,
-            "offset=1.0 main cx must follow seed θ"
-        );
-        assert_eq!(
-            orbs1[0].main[1], exp_cy,
-            "offset=1.0 main cy must follow seed θ"
-        );
-
-        // offset == 0.0 ⇒ exact geometric center (no shift).
-        let p0 = AquarelleParams {
-            bleed: 0.0,
-            bloom: 0.0,
-            offset: 0.0,
-            halo: 0.0,
-        };
-        let orbs0 =
-            GpuRenderer::pack_aquarelle_orbs(&single, w, h, base_radius_unit, 1.0, p0.clamped());
-        assert_eq!(
-            orbs0[0].main[0], center.0,
-            "offset=0.0 main cx must be exact center"
-        );
-        assert_eq!(
-            orbs0[0].main[1], center.1,
-            "offset=0.0 main cy must be exact center"
-        );
-    }
-
-    /// (#3) `round(3*bleed)` boundaries (round-half-away-from-zero). The existing test
-    /// only covers 0.0/0.5/1.0; this nails the three rounding edges so a `.round()` →
-    /// `.floor()`/`.trunc()` regression in the satellite count is caught.
-    #[test]
-    fn aquarelle_pack_bleed_count_round_boundaries() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this rounding-edge test runs on every host, not just GPU CI.
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-        // (bleed, expected sat_count): just below/above each .5 boundary.
-        for (bleed, expected) in [
-            (0.16_f32, 0u32), // 0.48 → 0
-            (0.17, 1),        // 0.51 → 1
-            (0.49, 1),        // 1.47 → 1
-            (0.50, 2),        // 1.50 → 2 (half away from zero)
-            (0.83, 2),        // 2.49 → 2
-            (0.84, 3),        // 2.52 → 3
-        ] {
-            let params = AquarelleParams {
-                bleed,
-                bloom: 0.0,
-                offset: 0.0,
-                halo: 0.0,
-            };
-            let orbs = GpuRenderer::pack_aquarelle_orbs(
-                &single,
-                200.0,
-                200.0,
-                40.0,
-                1.0,
-                params.clamped(),
-            );
-            assert_eq!(
-                orbs[0].main[3] as u32, expected,
-                "bleed={bleed} ⇒ round(3*bleed) must be {expected}"
-            );
-        }
-    }
-
-    /// (#4) bloom guard. A tiny positive bloom (`1e-4`) must still set the bloom flag
-    /// and produce a positive core radius (the inner `core_radius > 0.0` guard must not
-    /// reject it); bloom `0.0` must clear the flag and pack a zero core radius.
-    #[test]
-    fn aquarelle_pack_bloom_tiny_positive_keeps_core_positive() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this bloom-guard test runs on every host, not just GPU CI.
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-
-        let tiny = AquarelleParams {
-            bleed: 0.0,
-            bloom: 1e-4,
-            offset: 0.0,
-            halo: 0.0,
-        };
-        let orbs =
-            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, tiny.clamped());
-        assert!(
-            orbs[0].inner[3] > 0.5,
-            "bloom=1e-4 (>0) must set bloom_flag"
-        );
-        assert!(
-            orbs[0].bloom_geom[2] > 0.0,
-            "bloom=1e-4 must keep core radius positive (got {})",
-            orbs[0].bloom_geom[2]
-        );
-
-        let zero = AquarelleParams {
-            bleed: 0.0,
-            bloom: 0.0,
-            offset: 0.0,
-            halo: 0.0,
-        };
-        let orbs0 =
-            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, zero.clamped());
-        assert!(orbs0[0].inner[3] < 0.5, "bloom=0 must clear bloom_flag");
-        assert_eq!(
-            orbs0[0].bloom_geom[2], 0.0,
-            "bloom=0 must pack zero core radius"
-        );
-    }
-
-    /// (#5) A zero-weight orb packs a fully zeroed row (radius 0, every layer slot 0),
-    /// and a positive-weight orb mixed in the same call is unaffected — only the dead
-    /// row collapses. Guards the early `radius <= 0.0` skip path and row independence.
-    #[test]
-    fn aquarelle_pack_zero_weight_orb_packs_skip_row() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this skip-row test runs on every host, not just GPU CI.
-        // Orb 0: zero weight (dead). Orb 1: positive weight (real).
-        let clusters = vec![
-            cluster([200, 120, 60], 0.3, 0.3, 0.0),
-            cluster([60, 120, 220], 0.7, 0.7, 1.0),
-        ];
-        let params = AquarelleParams::default();
-        let orbs =
-            GpuRenderer::pack_aquarelle_orbs(&clusters, 200.0, 200.0, 40.0, 1.0, params.clamped());
-        assert_eq!(orbs.len(), 2);
-
-        // Dead row: radius 0, sat_count 0, all layer slots zero.
-        assert_eq!(orbs[0].main[2], 0.0, "zero-weight orb must pack radius 0");
-        assert_eq!(
-            orbs[0].main[3], 0.0,
-            "zero-weight orb must pack 0 satellites"
-        );
-        for slot in [
-            orbs[0].inner,
-            orbs[0].halo,
-            orbs[0].bloom_geom,
-            orbs[0].bloom_col,
-            orbs[0].bleed_col,
-            orbs[0].sat0,
-            orbs[0].sat1,
-            orbs[0].sat2,
-        ] {
-            assert_eq!(slot, [0.0; 4], "zero-weight orb layer slots must be zeroed");
-        }
-
-        // Live row: positive radius (the dead neighbor did not poison it).
-        assert!(
-            orbs[1].main[2] > 0.0,
-            "positive-weight orb must have radius > 0"
-        );
-    }
-
-    /// (#6) Out-of-range slider values are clamped (the pack calls `params.clamped()`):
-    /// `bleed=5.0` must still cap at 3 satellites, and a negative `bloom=-1.0` must
-    /// clear the bloom flag (clamped to 0) rather than wrapping to a huge core.
-    #[test]
-    fn aquarelle_pack_clamps_out_of_range_params() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this clamp test runs on every host, not just GPU CI.
-        let single = vec![cluster([200, 120, 60], 0.5, 0.5, 1.0)];
-        let wild = AquarelleParams {
-            bleed: 5.0,
-            bloom: -1.0,
-            offset: 9.0,
-            halo: -3.0,
-        };
-        // The renderer clamps internally; pass the raw params (matching production:
-        // `pack_aquarelle_orbs` calls `params.clamped()`).
-        let orbs = GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 1.0, wild);
-        assert!(
-            (orbs[0].main[3] as u32) <= 3,
-            "bleed=5.0 must clamp to ≤3 satellites (got {})",
-            orbs[0].main[3]
-        );
-        assert!(
-            orbs[0].inner[3] < 0.5,
-            "negative bloom must clamp to 0 and clear the bloom flag"
-        );
-        assert_eq!(
-            orbs[0].bloom_geom[2], 0.0,
-            "negative bloom must pack a zero core radius (clamped)"
-        );
-    }
-
-    /// (#7) `saturation=0.0` desaturates every packed layer color: each must equal the
-    /// grayscale `adjust_saturation_pub(base, 0.0)` (boosting a gray stays gray, mixing
-    /// a gray toward white stays gray), so the desaturation is applied in the pack and
-    /// the shader only ever sees already-grayscale colors.
-    #[test]
-    fn aquarelle_pack_saturation_zero_desaturates_layer_colors() {
-        // Pack-only: `pack_aquarelle_orbs` is an associated fn (no GPU adapter
-        // needed), so this saturation test runs on every host, not just GPU CI.
-        let base = [200u8, 120, 60];
-        let single = vec![cluster(base, 0.5, 0.5, 1.0)];
-        // bleed=1.0 ⇒ satellites exist; bloom=0.5 ⇒ bloom color packed; halo=0.5.
-        let params = AquarelleParams {
-            bleed: 1.0,
-            bloom: 0.5,
-            offset: 0.5,
-            halo: 0.5,
-        };
-        let orbs =
-            GpuRenderer::pack_aquarelle_orbs(&single, 200.0, 200.0, 40.0, 0.0, params.clamped());
-
-        // The pack desaturates the source first (saturation 0.0 ⇒ grayscale), then
-        // boost_saturation/mix_with_white operate on that gray. A boost of an
-        // already-gray color stays gray; a white-mix of gray stays gray. So every
-        // packed layer's three channels must be equal (chroma == 0).
-        let gray = adjust_saturation_pub(base, 0.0);
-        assert_eq!(gray[0], gray[1], "desaturated base must be gray");
-        assert_eq!(gray[1], gray[2], "desaturated base must be gray");
-
-        let is_gray = |rgb: [f32; 4]| -> bool {
-            let to8 = |c: f32| (c * 255.0).round() as i32;
-            (to8(rgb[0]) - to8(rgb[1])).abs() <= 1 && (to8(rgb[1]) - to8(rgb[2])).abs() <= 1
-        };
-        assert!(
-            is_gray(orbs[0].inner),
-            "inner color must be gray at saturation 0"
-        );
-        assert!(
-            is_gray(orbs[0].halo),
-            "halo color must be gray at saturation 0"
-        );
-        assert!(
-            is_gray(orbs[0].bleed_col),
-            "bleed color must be gray at saturation 0"
-        );
-        assert!(
-            is_gray(orbs[0].bloom_col),
-            "bloom color must be gray at saturation 0"
-        );
-        // And the inner color is exactly the desaturated base (round-trip via u8).
-        let inner8 = [
-            (orbs[0].inner[0] * 255.0).round() as u8,
-            (orbs[0].inner[1] * 255.0).round() as u8,
-            (orbs[0].inner[2] * 255.0).round() as u8,
-        ];
-        assert_eq!(
-            inner8, gray,
-            "inner layer must be the desaturated base color"
-        );
-    }
-
     /// #229 helper: create a fresh offscreen texture of `format`, run `draw` with
     /// its view (the to_view seam), then read the texture back into an
     /// `RgbaImage` (raw bytes, no channel reordering). Mirrors the production
@@ -5359,24 +4169,21 @@ mod tests {
     }
 
     /// #229: the to_view path must draw the same bytes the read-back path draws
-    /// for the two remaining SDF/aquarelle shapes — Image (the Glyph-shared SDF
-    /// pipeline + bleed via `render_frame_image_to_view`) and Aquarelle
-    /// (`render_frame_aquarelle_to_view`). Completes the per-shape to_view ↔
+    /// for the Image SDF shape (the Glyph-shared SDF pipeline via
+    /// `render_frame_image_to_view`). Completes the per-shape to_view ↔
     /// read-back identity started by `to_view_matches_readback_orb_and_glyph`.
     /// Lit pixels are asserted first so the identity is not trivially satisfied
     /// by an empty frame.
     #[test]
-    fn to_view_matches_readback_image_and_aquarelle() {
-        let Some(renderer) =
-            require_or_skip_renderer("to_view_matches_readback_image_and_aquarelle")
-        else {
+    fn to_view_matches_readback_image() {
+        let Some(renderer) = require_or_skip_renderer("to_view_matches_readback_image") else {
             return;
         };
         let (w, h) = (96u32, 64u32);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let clusters = sample_clusters();
 
-        // Image, via the frame-level seam (shares the Glyph SDF pipeline + bleed).
+        // Image, via the frame-level seam (shares the Glyph SDF pipeline).
         let image = image_opts(w, h);
         let reference = renderer.render_frame_image(&clusters, &image, 0.3);
         let via_view = readback_via_view(renderer, w, h, format, |view| {
@@ -5390,22 +4197,6 @@ mod tests {
             reference.as_raw(),
             via_view.as_raw(),
             "image to_view bytes must match the read-back path"
-        );
-
-        // Aquarelle, via the frame-level seam (single-pass aquarelle WGSL).
-        let aqua = aquarelle_opts(w, h, AquarelleParams::default());
-        let reference = renderer.render_frame_aquarelle(&clusters, &aqua, 0.3);
-        let via_view = readback_via_view(renderer, w, h, format, |view| {
-            renderer.render_frame_aquarelle_to_view(&clusters, &aqua, 0.3, view, format);
-        });
-        assert!(
-            lit_vs_bg(&reference, aqua.background, 8) > 0,
-            "aquarelle reference must have lit pixels"
-        );
-        assert_eq!(
-            reference.as_raw(),
-            via_view.as_raw(),
-            "aquarelle to_view bytes must match the read-back path"
         );
     }
 
@@ -5446,7 +4237,6 @@ mod tests {
         let orb = orb_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow);
         let glyph = glyph_opts(w, h, MotionDirection::LeftToRight, MotionSpeed::Slow, true);
         let image = image_opts(w, h);
-        let aqua = aquarelle_opts(w, h, AquarelleParams::default());
         type ToView<'a> = Box<dyn Fn(&wgpu::TextureView) + 'a>;
         let cases: Vec<(&str, [u8; 4], RgbaImage, ToView<'_>)> = vec![
             (
@@ -5471,14 +4261,6 @@ mod tests {
                 renderer.render_frame_image(&clusters, &image, 0.3),
                 Box::new(|view: &wgpu::TextureView| {
                     renderer.render_frame_image_to_view(&clusters, &image, 0.3, view, format);
-                }),
-            ),
-            (
-                "aquarelle",
-                aqua.background,
-                renderer.render_frame_aquarelle(&clusters, &aqua, 0.3),
-                Box::new(|view: &wgpu::TextureView| {
-                    renderer.render_frame_aquarelle_to_view(&clusters, &aqua, 0.3, view, format);
                 }),
             ),
         ];
@@ -5660,32 +4442,6 @@ mod tests {
         assert_eq!(
             lit, 0,
             "empty image SDF via to_view must paint no foreground pixels"
-        );
-    }
-
-    /// #229 (B5): `render_frame_aquarelle_to_view` on a non-Aquarelle shape must
-    /// fall back to the orb to_view path (the call is total) — byte-identical
-    /// to `render_frame` at `Rgba8Unorm`, mirroring the read-back variant.
-    #[test]
-    fn aquarelle_to_view_non_aquarelle_shape_falls_back_to_orb() {
-        let Some(renderer) =
-            require_or_skip_renderer("aquarelle_to_view_non_aquarelle_shape_falls_back_to_orb")
-        else {
-            return;
-        };
-        let (w, h) = (40u32, 28u32);
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let clusters = sample_clusters();
-        let mut opts = aquarelle_opts(w, h, AquarelleParams::default());
-        opts.shape = OrbShape::Orb;
-        let via_orb = renderer.render_frame(&clusters, &opts, 0.5);
-        let via_aqua_entry = readback_via_view(renderer, w, h, format, |view| {
-            renderer.render_frame_aquarelle_to_view(&clusters, &opts, 0.5, view, format);
-        });
-        assert_eq!(
-            via_aqua_entry.as_raw(),
-            via_orb.as_raw(),
-            "aquarelle to_view on an Orb shape must fall back to the plain orb path byte-for-byte"
         );
     }
 
