@@ -3700,11 +3700,14 @@ mod tests {
         let bg = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow).background;
 
         // The midpoint detrended deviation is 0.8 − 0.3 = 0.5 for both runs below, so the
-        // per-orb cross shift at t=0.5 is `KEYFRAME_DRIFT_GAIN · 0.5`. The lit-mass centroid
-        // follows it but is attenuated by the orb scatter, so require ≥60% of it. Tying the
-        // floor to the gain (a product value, blink-tuned) keeps this axis test robust when
-        // the const is re-tuned — an absolute floor calibrated to one gain breaks on the next.
-        let min_shift = crate::animate::KEYFRAME_DRIFT_GAIN * 0.5 * 0.6;
+        // per-orb cross shift at t=0.5 is `KEYFRAME_DRIFT_GAIN · detrended_mid`. The lit-mass
+        // centroid follows it but is attenuated by the orb scatter, so require at least
+        // `lit_floor_frac` of it. Tying the floor to the gain (a product value, blink-tuned)
+        // keeps this axis test robust when the const is re-tuned — an absolute floor
+        // calibrated to one gain breaks on the next.
+        let detrended_mid = 0.5; // 0.8 − 0.3, the midpoint deviation of both wobble tracks
+        let lit_floor_frac = 0.6; // lit-centroid attenuation slack vs the per-orb shift
+        let min_shift = crate::animate::KEYFRAME_DRIFT_GAIN * detrended_mid * lit_floor_frac;
 
         // LR: cross axis = y. A y-wobble should push the lit centroid downward (y up)
         // at the midpoint relative to the endpoint frame.
