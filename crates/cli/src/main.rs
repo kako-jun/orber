@@ -205,6 +205,40 @@ impl CliBleedPreset {
     }
 }
 
+/// #239 Phase 1: にじみ (bleed) と同じ 3 段ボタンを bloom / halo / offset の各軸に
+/// 展開するための共通プリセット。`--bloom` / `--halo` / `--offset` が同形の
+/// value_enum でこれを採る。`--bleed` と違って `off` を持たない理由も同じ: flag を
+/// 省くと「その軸 0（オフ）」、指定すると弱 / 中 / 強の 3 段だけを選ぶ。にじみ
+/// （水彩レイヤ）が無いと効かない設計なので、これらは `--bleed` 指定時のみ有効
+/// （`--bleed` 無しで bloom/halo/offset だけ渡すと明示エラー、`requires` で強制）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliCharacterPreset {
+    /// 弱い効き。
+    Weak,
+    /// 中くらいの効き。
+    Mid,
+    /// 強い効き（製品の上限）。
+    Strong,
+}
+
+impl CliCharacterPreset {
+    /// 3 段ボタンを内部 `aqua_bloom` / `aqua_halo` / `aqua_offset` 量へ写像する。
+    /// にじみと同じく数字を出さない製品 UI ではこの対応表だけが強さの正本。
+    /// weak=0.3 / mid=0.6 / strong=0.9（自己検証で弁別を確認した確定値）。
+    fn to_coef(self) -> f32 {
+        match self {
+            CliCharacterPreset::Weak => 0.3,
+            CliCharacterPreset::Mid => 0.6,
+            CliCharacterPreset::Strong => 0.9,
+        }
+    }
+
+    /// `Option<Self>` を係数に解決する。未指定 (`None`) はその軸オフ = 0.0。
+    fn coef_or_zero(opt: Option<Self>) -> f32 {
+        opt.map(Self::to_coef).unwrap_or(0.0)
+    }
+}
+
 /// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
 fn parse_single_char(s: &str) -> Result<char, String> {
     let mut chars = s.chars();
@@ -389,6 +423,24 @@ struct Cli {
     #[arg(long, value_enum, conflicts_with = "aquarelle_bleed_mode")]
     bleed: Option<CliBleedPreset>,
 
+    /// ブルーム（芯の光）: weak / mid / strong の 3 段ボタン (#239)。にじみの上に
+    /// 「明るい芯」を段階的に乗せる。省略するとブルーム無し（その軸オフ）。にじみが
+    /// 前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    bloom: Option<CliCharacterPreset>,
+
+    /// ハロー（縁の彩度）: weak / mid / strong の 3 段ボタン (#239)。にじみの外周の
+    /// 彩度を段階的に上げる（枠リングは作らない）。省略するとハロー無し（その軸オフ）。
+    /// にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    halo: Option<CliCharacterPreset>,
+
+    /// オフセット（にじみのかたより）: weak / mid / strong の 3 段ボタン (#239)。にじみ
+    /// を左右非対称・有機的にする（形は壊さない）。省略するとオフセット無し（その軸
+    /// オフ）。にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    offset: Option<CliCharacterPreset>,
+
     /// #239 PoC (hidden): bleed geometry for the additive aquarelle layer when
     /// riding a NON-aquarelle shape (orb / glyph / image). When set, the
     /// --aquarelle-bleed/bloom/offset/halo sliders feed an additive layer over the
@@ -432,23 +484,26 @@ impl Cli {
     /// = 非リグレッションゲート)。
     ///
     /// 優先順位: 製品の `--bleed` (weak/mid/strong) が最優先。指定されると **continuous**
-    /// モードで engage し、`bleed` を 3 段テーブル値にし、bloom/offset/halo は既定値
-    /// (0.5) のまま。これにより `--bleed weak` の出力は内部 flag
-    /// `--aquarelle-bleed-mode continuous --aquarelle-bleed 0.15` (他はすべて既定) と
-    /// byte 一致する。`--bleed` と `--aquarelle-bleed-mode` は clap の `conflicts_with`
-    /// で排他なので、両者が同時に `Some` になることはない。
+    /// モードで engage し、`bleed` を 3 段テーブル値にする。bloom / offset / halo は
+    /// 各軸の `--bloom` / `--offset` / `--halo` プリセット（同じ 3 段ボタン）で決まり、
+    /// flag を省いた軸は 0（オフ）。3 軸とも省略すると `--bleed weak` の出力は内部 flag
+    /// `--aquarelle-bleed-mode continuous --aquarelle-bleed 0.15 --aquarelle-bloom 0
+    /// --aquarelle-offset 0 --aquarelle-halo 0` 相当になる。`--bleed` と
+    /// `--aquarelle-bleed-mode` は clap の `conflicts_with` で排他なので、両者が同時に
+    /// `Some` になることはない。`--bloom` / `--halo` / `--offset` は `--bleed` を
+    /// `requires` するので、にじみ無しで character 軸だけ渡すと clap が明示エラーにする。
     fn poc_aqua(&self) -> Option<orber_core::animate::AquaBleedConfig> {
         if matches!(self.shape, Shape::Aquarelle) {
             return None;
         }
-        // 製品の 3 段ボタンが最優先。continuous で engage し bleed のみテーブル値に差し替え、
-        // 残り 3 パラメータは既定スライダ値を使う (内部 flag の既定と一致 → byte 一致)。
+        // 製品の 3 段ボタンが最優先。continuous で engage し bleed をテーブル値に差し替え、
+        // bloom/halo/offset は各軸の 3 段ボタン（未指定 = 0）で決める。
         if let Some(preset) = self.bleed {
             return Some(orber_core::animate::AquaBleedConfig {
                 bleed: preset.to_bleed(),
-                bloom: self.aquarelle_bloom,
-                offset: self.aquarelle_offset,
-                halo: self.aquarelle_halo,
+                bloom: CliCharacterPreset::coef_or_zero(self.bloom),
+                offset: CliCharacterPreset::coef_or_zero(self.offset),
+                halo: CliCharacterPreset::coef_or_zero(self.halo),
                 mode: orber_core::animate::BleedMode::Continuous,
             });
         }
@@ -1789,11 +1844,85 @@ mod tests {
                 orber_core::animate::BleedMode::Continuous,
                 "--bleed {arg} must engage continuous mode (the only product geometry)"
             );
-            // bloom/offset/halo は既定スライダ値 (0.5) のまま。内部 flag の既定と一致する。
-            assert_eq!(aqua.bloom, 0.5);
-            assert_eq!(aqua.offset, 0.5);
-            assert_eq!(aqua.halo, 0.5);
+            // #239: bloom/offset/halo は専用 3 段ボタン。--bloom/--halo/--offset を
+            // 渡していないので各軸 0（オフ）。
+            assert_eq!(aqua.bloom, 0.0, "--bloom 未指定なら芯ブルーム 0（オフ）");
+            assert_eq!(aqua.offset, 0.0, "--offset 未指定なら 0（オフ）");
+            assert_eq!(aqua.halo, 0.0, "--halo 未指定なら 0（オフ）");
         }
+    }
+
+    /// #239: bloom / halo / offset の 3 段ボタンが内部係数へ写像される。にじみと同形の
+    /// weak / mid / strong = 0.3 / 0.6 / 0.9。`--bleed` 指定時のみ有効（requires）で、
+    /// 各軸は独立に AquaBleedConfig の対応フィールドへ流れ、未指定軸は 0（オフ）。
+    #[test]
+    fn character_presets_map_to_table() {
+        assert_eq!(CliCharacterPreset::Weak.to_coef(), 0.3);
+        assert_eq!(CliCharacterPreset::Mid.to_coef(), 0.6);
+        assert_eq!(CliCharacterPreset::Strong.to_coef(), 0.9);
+
+        for (arg, want) in [("weak", 0.3_f32), ("mid", 0.6), ("strong", 0.9)] {
+            // bloom 軸: 指定軸だけ係数が乗り、halo / offset は 0 のまま。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--bloom", arg])
+                .unwrap_or_else(|e| panic!("--bloom {arg} must parse: {e}"))
+                .poc_aqua()
+                .unwrap_or_else(|| panic!("--bloom {arg} must engage watercolor"));
+            assert_eq!(aqua.bloom, want, "--bloom {arg} must map to {want}");
+            assert_eq!(aqua.halo, 0.0, "--bloom {arg}: halo stays off");
+            assert_eq!(aqua.offset, 0.0, "--bloom {arg}: offset stays off");
+
+            // halo 軸。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--halo", arg])
+                .unwrap()
+                .poc_aqua()
+                .unwrap();
+            assert_eq!(aqua.halo, want, "--halo {arg} must map to {want}");
+            assert_eq!(aqua.bloom, 0.0, "--halo {arg}: bloom stays off");
+            assert_eq!(aqua.offset, 0.0, "--halo {arg}: offset stays off");
+
+            // offset 軸。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--offset", arg])
+                .unwrap()
+                .poc_aqua()
+                .unwrap();
+            assert_eq!(aqua.offset, want, "--offset {arg} must map to {want}");
+            assert_eq!(aqua.bloom, 0.0, "--offset {arg}: bloom stays off");
+            assert_eq!(aqua.halo, 0.0, "--offset {arg}: halo stays off");
+        }
+    }
+
+    /// #239: 3 軸とも同時指定できる。各軸が独立に対応フィールドへ流れる。
+    #[test]
+    fn character_presets_all_three_axes_independent() {
+        let aqua = try_parse(&[
+            "--shape", "glyph", "--bleed", "strong", "--bloom", "weak", "--halo", "mid",
+            "--offset", "strong",
+        ])
+        .unwrap()
+        .poc_aqua()
+        .expect("all three axes must engage with --bleed");
+        assert_eq!(aqua.bleed, 0.5, "bleed strong");
+        assert_eq!(aqua.bloom, 0.3, "bloom weak");
+        assert_eq!(aqua.halo, 0.6, "halo mid");
+        assert_eq!(aqua.offset, 0.9, "offset strong");
+    }
+
+    /// #239 ★依存ゲート: にじみ無し（`--bleed` 省略）で bloom / halo / offset だけ渡すと
+    /// clap が `requires` で明示エラーにする。水彩レイヤが無いと効かない設計の強制。
+    #[test]
+    fn character_presets_require_bleed() {
+        assert!(
+            try_parse(&["--bloom", "mid"]).is_err(),
+            "--bloom without --bleed must error (requires)"
+        );
+        assert!(
+            try_parse(&["--halo", "mid"]).is_err(),
+            "--halo without --bleed must error (requires)"
+        );
+        assert!(
+            try_parse(&["--offset", "mid"]).is_err(),
+            "--offset without --bleed must error (requires)"
+        );
     }
 
     /// #239 Phase 1: `--bleed` 未指定なら watercolor は off (poc_aqua == None)。orb /
@@ -1819,6 +1948,8 @@ mod tests {
             .unwrap()
             .poc_aqua()
             .expect("product --bleed weak must engage");
+        // #239: 製品の `--bleed weak`（character 軸未指定）は bloom/offset/halo を 0 に
+        // するので、内部 flag 側も明示的に 0 を渡して同値にする。
         let internal = try_parse(&[
             "--shape",
             "glyph",
@@ -1826,13 +1957,19 @@ mod tests {
             "continuous",
             "--aquarelle-bleed",
             "0.15",
+            "--aquarelle-bloom",
+            "0.0",
+            "--aquarelle-offset",
+            "0.0",
+            "--aquarelle-halo",
+            "0.0",
         ])
         .unwrap()
         .poc_aqua()
         .expect("internal continuous 0.15 must engage");
         assert_eq!(
             product, internal,
-            "--bleed weak must resolve to the same AquaBleedConfig as the internal continuous 0.15"
+            "--bleed weak must resolve to the same AquaBleedConfig as the internal continuous 0.15 (character axes off)"
         );
     }
 

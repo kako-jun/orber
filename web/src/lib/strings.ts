@@ -96,6 +96,26 @@ export const STRINGS = {
   bleedOptionWeak: { ja: '弱', en: 'Weak' },
   bleedOptionMid: { ja: '中', en: 'Mid' },
   bleedOptionStrong: { ja: '強', en: 'Strong' },
+  // #239 Phase 1: bloom / halo / offset の character 3 段ボタン。にじみと同形の
+  // なし / 弱 / 中 / 強。「なし」は wasm 側でその軸 0（オフ）。弱/中/強 は内部
+  // aqua_bloom/halo/offset 0.3/0.6/0.9。数字は出さない。にじみが「なし」のときは
+  // 3 軸とも無効化（disabled）= 水彩オフでは意味が無いため。日本語ラベルは効果が
+  // 伝わる平易な言い回し（ブルーム＝芯の光 / ハロー＝縁の彩度 / オフセット＝かたより）。
+  bloomLabel: { ja: '芯の光', en: 'Bloom' },
+  bloomOptionOff: { ja: 'なし', en: 'Off' },
+  bloomOptionWeak: { ja: '弱', en: 'Weak' },
+  bloomOptionMid: { ja: '中', en: 'Mid' },
+  bloomOptionStrong: { ja: '強', en: 'Strong' },
+  haloLabel: { ja: '縁の彩度', en: 'Halo' },
+  haloOptionOff: { ja: 'なし', en: 'Off' },
+  haloOptionWeak: { ja: '弱', en: 'Weak' },
+  haloOptionMid: { ja: '中', en: 'Mid' },
+  haloOptionStrong: { ja: '強', en: 'Strong' },
+  offsetLabel: { ja: 'かたより', en: 'Offset' },
+  offsetOptionOff: { ja: 'なし', en: 'Off' },
+  offsetOptionWeak: { ja: '弱', en: 'Weak' },
+  offsetOptionMid: { ja: '中', en: 'Mid' },
+  offsetOptionStrong: { ja: '強', en: 'Strong' },
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',

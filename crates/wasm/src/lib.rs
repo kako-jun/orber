@@ -140,9 +140,30 @@ pub struct WasmParams {
     /// `AnimateOptions.aqua` を `None` に保つ＝従来の Web 出力と byte-identical
     /// （非リグレッションゲート）。`shape == "aquarelle"` の専用レンダラには
     /// 効かない（CLI の `--bleed` と同じく additive レイヤを engage しない）。
-    /// bloom / offset / halo は本フェーズでは既定 0.5 固定（後フェーズ）。
+    /// bloom / offset / halo は各軸の専用 3 段ボタン（下記）で決まる。`bleed_preset`
+    /// が `""`（にじみオフ）なら 3 軸とも無視され 0 になる。
     #[serde(default)]
     pub bleed_preset: String,
+    /// #239 Phase 1: ブルーム（芯の光）の製品 3 段ボタン preset。CLI の
+    /// `--bloom weak|mid|strong` と同義で、`"weak" | "mid" | "strong"` を内部
+    /// `aqua_bloom` 0.3 / 0.6 / 0.9 に写像する。`""`（既定）はその軸オフ＝0。にじみ
+    /// （`bleed_preset != ""`）かつ非 aquarelle shape のときだけ効く（にじみ無しでは
+    /// `aqua = None` なので 3 軸とも無視される）。数字は出さない製品 UI ではこの
+    /// 対応表だけが強さの正本。
+    #[serde(default)]
+    pub bloom_preset: String,
+    /// #239 Phase 1: ハロー（縁の彩度）の製品 3 段ボタン preset。CLI の
+    /// `--halo weak|mid|strong` と同義。`"weak" | "mid" | "strong"` → `aqua_halo`
+    /// 0.3 / 0.6 / 0.9。`""`（既定）はオフ＝0。`bloom_preset` と同じ依存条件
+    /// （にじみ engage 時のみ有効）。
+    #[serde(default)]
+    pub halo_preset: String,
+    /// #239 Phase 1: オフセット（にじみのかたより）の製品 3 段ボタン preset。CLI の
+    /// `--offset weak|mid|strong` と同義。`"weak" | "mid" | "strong"` → `aqua_offset`
+    /// 0.3 / 0.6 / 0.9。`""`（既定）はオフ＝0。`bloom_preset` と同じ依存条件
+    /// （にじみ engage 時のみ有効）。
+    #[serde(default)]
+    pub offset_preset: String,
     /// Glyph 形状時に per-orb 回転をアニメーションさせるか（#136）。
     /// `true` で従来挙動、`false` で全 t において base_angle を保つ静止描画。
     /// Orb 形状では使われない。`#[serde(default = "default_glyph_rotate")]`
@@ -311,6 +332,25 @@ fn parse_bleed_preset(s: &str) -> Result<Option<f32>, String> {
         "strong" => Ok(Some(0.5)),
         other => Err(format!(
             "invalid bleed_preset: {other} (expected one of '' / weak / mid / strong)"
+        )),
+    }
+}
+
+/// #239 Phase 1: bloom / halo / offset の character 3 段ボタン preset 文字列を内部
+/// 係数へ写像する。にじみと同形の `weak | mid | strong` を CLI の
+/// `CliCharacterPreset::to_coef` と同じ 0.3 / 0.6 / 0.9 に写す。`""`（既定）はその軸
+/// オフ＝0.0（`Ok(0.0)`）で、にじみが engage していても当該軸は無効。`label` は
+/// エラー文言用（"bloom" / "halo" / "offset"）。GPU(WGSL) 経路専用（wasm32 / test
+/// のみコンパイル）。
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_character_preset(s: &str, label: &str) -> Result<f32, String> {
+    match s {
+        "" => Ok(0.0),
+        "weak" => Ok(0.3),
+        "mid" => Ok(0.6),
+        "strong" => Ok(0.9),
+        other => Err(format!(
+            "invalid {label}_preset: {other} (expected one of '' / weak / mid / strong)"
         )),
     }
 }
@@ -737,18 +777,19 @@ impl ResolvedFrame {
             // が `Some` かつ shape が Aquarelle でないときだけ additive ブラーレイヤを
             // engage する（Aquarelle は専用 byte-pinned レンダラを持つので無視＝CLI の
             // poc_aqua と同じ責務）。`None`（にじみオフ）のとき従来の Web 出力と
-            // byte-identical（非リグレッションゲート）。bloom/offset/halo は CLI の
-            // `--bleed` 既定と同じ 0.5、mode は唯一の製品ジオメトリ Continuous で、
-            // `bleed weak` の出力が CLI の `--bleed weak` と一致する。
+            // byte-identical（非リグレッションゲート）。bloom/offset/halo は各軸の専用
+            // 3 段ボタン（`aqua_bloom`/`aqua_offset`/`aqua_halo`、未指定 = 0）で決まり、
+            // mode は唯一の製品ジオメトリ Continuous。3 軸とも未指定なら `bleed weak`
+            // の出力が CLI の `--bleed weak`（character 軸オフ）と一致する。
             aqua: self.aqua_bleed.and_then(|bleed| {
                 if matches!(shape, OrbShape::Aquarelle(_)) {
                     None
                 } else {
                     Some(AquaBleedConfig {
                         bleed,
-                        bloom: 0.5,
-                        offset: 0.5,
-                        halo: 0.5,
+                        bloom: self.aqua_bloom,
+                        offset: self.aqua_offset,
+                        halo: self.aqua_halo,
                         mode: BleedMode::Continuous,
                     })
                 }
@@ -859,6 +900,15 @@ struct ResolvedFrame {
     /// ゲート）。`Some(bleed)` のとき非 aquarelle shape に限り continuous モードの
     /// additive ブラーレイヤを engage する（CLI の `--bleed` と同じ写像）。
     aqua_bleed: Option<f32>,
+    /// #239 Phase 1: bloom / offset / halo の character 軸係数（`WasmParams` の
+    /// `bloom_preset`/`offset_preset`/`halo_preset` が解決した値）。未指定軸は 0.0
+    /// （その軸オフ）。`aqua_bleed` が `Some` で非 aquarelle shape のときだけ
+    /// `to_animate_options` が `AquaBleedConfig` に流す。にじみオフ（`aqua_bleed ==
+    /// None`）なら 3 軸とも無視される。CLI の `--bloom`/`--halo`/`--offset` と同じ
+    /// 0.3 / 0.6 / 0.9 写像。
+    aqua_bloom: f32,
+    aqua_offset: f32,
+    aqua_halo: f32,
 }
 
 /// 1 タイルの spec / preset / kmeans / orb 数を解決する（WGSL canvas-present 経路、#231）。
@@ -874,6 +924,12 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
     // 一致。weak/mid/strong は 0.15/0.3/0.5。aquarelle shape での無視は
     // to_animate_options が shape を見て行う（CLI の poc_aqua と同じ責務分割）。
     let aqua_bleed = parse_bleed_preset(&p.bleed_preset)?;
+    // #239 Phase 1: bloom / halo / offset の character 軸。`""` は 0.0（その軸オフ）、
+    // weak/mid/strong は 0.3/0.6/0.9（CLI の --bloom/--halo/--offset と同じ）。にじみ
+    // オフ（aqua_bleed == None）なら to_animate_options が 3 軸ごと無視する。
+    let aqua_bloom = parse_character_preset(&p.bloom_preset, "bloom")?;
+    let aqua_halo = parse_character_preset(&p.halo_preset, "halo")?;
+    let aqua_offset = parse_character_preset(&p.offset_preset, "offset")?;
 
     let total = (n as usize).clamp(1, 50);
     let spec_idx = spec_idx as usize;
@@ -965,6 +1021,11 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
         // #239 Phase 1: にじみ量（None = くっきり）。aquarelle shape での無視は
         // to_animate_options 側で行う。
         aqua_bleed,
+        // #239 Phase 1: character 軸（未指定 = 0）。にじみオフ時は to_animate_options
+        // が 3 軸ごと無視する。
+        aqua_bloom,
+        aqua_offset,
+        aqua_halo,
     })
 }
 
@@ -1377,6 +1438,10 @@ mod tests {
             softness_preset: String::new(),
             // #239 Phase 1: 既定はにじみオフ（くっきり）。aqua = None で従来挙動互換。
             bleed_preset: String::new(),
+            // #239 Phase 1: character 軸も既定は空（各軸オフ = 0）。
+            bloom_preset: String::new(),
+            halo_preset: String::new(),
+            offset_preset: String::new(),
             glyph_rotate: true,
             // #231: image / aquarelle 入力。既定では未使用（shape="orb"）。
             image_mask_rgba: Vec::new(),
@@ -1962,20 +2027,135 @@ mod tests {
                     BleedMode::Continuous,
                     "{shape}/{preset}: bleed must engage continuous mode (the only product geometry)"
                 );
+                // #239: character 軸 preset を渡していないので 3 軸とも 0（オフ）。
                 assert_eq!(
-                    aqua.bloom, 0.5,
-                    "{shape}/{preset}: bloom stays at CLI default"
+                    aqua.bloom, 0.0,
+                    "{shape}/{preset}: bloom off without bloom_preset"
                 );
                 assert_eq!(
-                    aqua.offset, 0.5,
-                    "{shape}/{preset}: offset stays at CLI default"
+                    aqua.offset, 0.0,
+                    "{shape}/{preset}: offset off without offset_preset"
                 );
                 assert_eq!(
-                    aqua.halo, 0.5,
-                    "{shape}/{preset}: halo stays at CLI default"
+                    aqua.halo, 0.0,
+                    "{shape}/{preset}: halo off without halo_preset"
                 );
             }
         }
+    }
+
+    /// #239 Phase 1: bloom / halo / offset の character 3 段ボタンが Web GPU 経路の
+    /// `AnimateOptions.aqua` の各フィールドへ独立に伝播する。weak/mid/strong →
+    /// 0.3/0.6/0.9（CLI の --bloom/--halo/--offset と同じ）。にじみ（bleed_preset）が
+    /// engage していることが前提。
+    #[test]
+    fn character_presets_propagate_to_animate_options() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for (axis, want) in [("weak", 0.3_f32), ("mid", 0.6), ("strong", 0.9)] {
+            // bloom 軸だけ指定（にじみは mid で engage）。
+            let mut p = small_source_params();
+            p.bleed_preset = "mid".into();
+            p.bloom_preset = axis.into();
+            let aqua = build_gpu_render_inputs(p, 12, 0)
+                .expect("inputs")
+                .opts
+                .aqua
+                .expect("bleed engaged");
+            assert_eq!(aqua.bloom, want, "bloom {axis} -> {want}");
+            assert_eq!(aqua.halo, 0.0, "halo stays off");
+            assert_eq!(aqua.offset, 0.0, "offset stays off");
+
+            // halo 軸だけ指定。
+            let mut p = small_source_params();
+            p.bleed_preset = "mid".into();
+            p.halo_preset = axis.into();
+            let aqua = build_gpu_render_inputs(p, 12, 0)
+                .expect("inputs")
+                .opts
+                .aqua
+                .expect("bleed engaged");
+            assert_eq!(aqua.halo, want, "halo {axis} -> {want}");
+            assert_eq!(aqua.bloom, 0.0, "bloom stays off");
+            assert_eq!(aqua.offset, 0.0, "offset stays off");
+
+            // offset 軸だけ指定。
+            let mut p = small_source_params();
+            p.bleed_preset = "mid".into();
+            p.offset_preset = axis.into();
+            let aqua = build_gpu_render_inputs(p, 12, 0)
+                .expect("inputs")
+                .opts
+                .aqua
+                .expect("bleed engaged");
+            assert_eq!(aqua.offset, want, "offset {axis} -> {want}");
+            assert_eq!(aqua.bloom, 0.0, "bloom stays off");
+            assert_eq!(aqua.halo, 0.0, "halo stays off");
+        }
+    }
+
+    /// #239 Phase 1: character 軸 preset の写像表（`""` = 0 / weak/mid/strong =
+    /// 0.3/0.6/0.9 / 不正値はエラー）を固定する。
+    #[test]
+    fn parse_character_preset_table() {
+        assert_eq!(parse_character_preset("", "bloom").unwrap(), 0.0);
+        assert_eq!(parse_character_preset("weak", "bloom").unwrap(), 0.3);
+        assert_eq!(parse_character_preset("mid", "halo").unwrap(), 0.6);
+        assert_eq!(parse_character_preset("strong", "offset").unwrap(), 0.9);
+        assert!(parse_character_preset("ultra", "bloom").is_err());
+    }
+
+    /// #239 Phase 1: にじみオフ（`bleed_preset == ""`）なら character 軸を指定しても
+    /// `aqua` は `None`（にじみが無いと 3 軸とも効かない設計）。従来 Web 出力と
+    /// byte-identical を保つ。
+    #[test]
+    fn character_presets_ignored_without_bleed() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.bloom_preset = "strong".into();
+        p.halo_preset = "strong".into();
+        p.offset_preset = "strong".into();
+        let gpu = build_gpu_render_inputs(p, 12, 0).expect("inputs");
+        assert!(
+            gpu.opts.aqua.is_none(),
+            "without bleed, character axes must keep aqua None (byte-identical)"
+        );
+    }
+
+    /// #239 Phase 1: 無効な character 軸 preset は `build_gpu_render_inputs` がエラーに
+    /// する（parse_character_preset の Err が resolve_frame 経由で伝播）。
+    #[test]
+    fn character_preset_invalid_value_errors() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = small_source_params();
+        p.bleed_preset = "mid".into();
+        p.bloom_preset = "ultra".into();
+        assert!(
+            build_gpu_render_inputs(p, 12, 0).is_err(),
+            "invalid bloom_preset must be rejected"
+        );
+    }
+
+    /// #239 Phase 1 ★byte ゲート: character 軸 preset も orb pack には一切触れない
+    /// （character はすべて aqua 経由）。`bleed`/`bloom`/`halo`/`offset` を全部盛っても
+    /// orb pack は byte-identical。
+    #[test]
+    fn character_presets_do_not_touch_orb_pack() {
+        let _guard = CACHE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let pack_off = build_gpu_render_inputs(small_source_params(), 12, 3)
+            .expect("inputs (off)")
+            .pack;
+        let mut on = small_source_params();
+        on.bleed_preset = "strong".into();
+        on.bloom_preset = "strong".into();
+        on.halo_preset = "strong".into();
+        on.offset_preset = "strong".into();
+        let pack_on = build_gpu_render_inputs(on, 12, 3)
+            .expect("inputs (all on)")
+            .pack;
+        assert_eq!(
+            pack_off, pack_on,
+            "orb pack must be byte-identical regardless of character presets (they ride aqua, not the pack)"
+        );
     }
 
     /// #239 Phase 1 ★非リグレッションゲート: `bleed_preset` を送らない（既定 `""`）と
