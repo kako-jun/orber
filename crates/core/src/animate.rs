@@ -33,6 +33,8 @@
 //!   100% 同一の per-orb 列が返る（GPU(WGSL) 描画の決定論性の根拠）。
 
 use crate::cluster::Cluster;
+use crate::color_track::interpolate_color_track;
+use crate::keyframe_track::interpolate_keyframe_track;
 use crate::orb::{OrbShape, OrbStyle};
 use crate::style::SoftnessPreset;
 use rand::{Rng, SeedableRng};
@@ -146,19 +148,22 @@ pub struct AnimateOptions {
     /// 動画入力（#7）の per-cluster 色トラック。
     ///
     /// `Some(tracks)` のとき、各 orb の `cluster.color` は
-    /// `interpolate_color_track(tracks[cluster_idx], t)` で動的に上書きされる。
+    /// `interpolate_color_track(tracks[cluster_idx], t)` で動的に上書きされる
+    /// （#251 で [`apply_color_tracks_at_t`] が pack 直前に評価する）。
     /// `tracks.len()` が clusters の数より少ない場合（理論上ないが防衛）や、
     /// 個別 track が空の場合は `cluster.color` にフォールバックする。
     /// `None` は静止画入力の従来挙動（色固定）。
     pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
     /// 動画入力（#33）の per-cluster キーフレーム補間トラック。
     ///
-    /// `Some(tracks)` のとき、各 orb の `cluster.color` / `cluster.centroid` /
-    /// `cluster.weight` は [`crate::keyframe_track::interpolate_keyframe_track`]
-    /// で時刻 `t` の補間値に動的に上書きされる。`color_tracks` (#7) と排他で、
-    /// 両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の上位互換）。
-    /// `None` のときは `color_tracks` に従う。
-    /// pack 経路 ([`pack_render_data`]) は keyframe_tracks を見ない。
+    /// `Some(tracks)` のとき、各 orb の `cluster.color` が
+    /// [`crate::keyframe_track::interpolate_keyframe_track`] の補間色で時刻 `t` に
+    /// 動的に上書きされる（#251 で [`apply_color_tracks_at_t`] が pack 直前に評価。
+    /// **色だけ**反映し、補間結果の `centroid` / `weight` は捨てる）。`color_tracks`
+    /// (#7) と排他で、両方 Some の場合は `keyframe_tracks` を優先する（#33 が #7 の
+    /// 上位互換）。`None` のときは `color_tracks` に従う。
+    /// 位置キーフレーム（centroid ドリフト）と weight 変調の反映は #255 に退避済み
+    /// （統一 `orb.wgsl` が位置 wrap / breathing を自前でやるため、戻すと二重適用になる）。
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
@@ -410,6 +415,61 @@ pub fn pack_render_data(
         buf[off + 12] = p.rot_speed_signed;
     }
     buf
+}
+
+/// 動画入力（#7 / #33）の色トラックを時刻 `t` で評価し、各 cluster の `color` だけを
+/// 上書きした新しい `Cluster` 列を返す（#251 で統一 WGSL レンダラへ再配線する一本）。
+///
+/// **色だけ**を扱う。`centroid` と `weight` は元のまま素通しする（位置追従＝#33 の
+/// centroid ドリフト・weight 変調は #255 に退避済み）。旧 `modulate_aquarelle_clusters`
+/// は色に加えて位置 wrap・breathing も焼き込んでいたが、それらは今 `orb.wgsl` 自身が
+/// `advance_steps` / `radius_factor` でやるので、ここで戻すと二重適用になる。
+///
+/// 優先順位は `keyframe_tracks` (#33) > `color_tracks` (#7)（旧挙動と同じ。#33 が
+/// #7 の上位互換）。track の index は cluster の index と一致する
+/// （`pack_render_data` が引く `cluster_idx` と同じ）。
+///
+/// 両 tracks が `None` のときは入力 `clusters` をそのまま複製して返す（変調なし）。
+/// 呼び出し側は両 `None` のとき本関数を呼ばずに元 `clusters` を直接使い、無駄な
+/// 複製と byte 差混入の両方を避けるべき（#251 の非回帰ゲート）。
+///
+/// `pub`（兄弟の `interpolate_color_track` / `interpolate_keyframe_track` と同様）。
+/// 実消費は gpu feature の pack 経路だが、feature を切った素の core lib でも
+/// 「未使用」扱いにならないよう公開 API として置く。
+pub fn apply_color_tracks_at_t(
+    clusters: &[Cluster],
+    opts: &AnimateOptions,
+    t: f32,
+) -> Vec<Cluster> {
+    clusters
+        .iter()
+        .enumerate()
+        .map(|(cluster_idx, cluster)| {
+            // #33 (keyframe) を #7 (color) より優先。色だけ取り出し centroid/weight は捨てる。
+            if let Some(track) = opts
+                .keyframe_tracks
+                .as_ref()
+                .and_then(|tracks| tracks.get(cluster_idx))
+                .filter(|track| !track.is_empty())
+            {
+                let (color, _centroid, _weight) = interpolate_keyframe_track(track, t);
+                return Cluster { color, ..*cluster };
+            }
+            if let Some(track) = opts
+                .color_tracks
+                .as_ref()
+                .and_then(|tracks| tracks.get(cluster_idx))
+                .filter(|track| !track.is_empty())
+            {
+                return Cluster {
+                    color: interpolate_color_track(track, t),
+                    ..*cluster
+                };
+            }
+            // どちらも該当なし → color 据え置き（centroid / weight は常に元のまま）。
+            *cluster
+        })
+        .collect()
 }
 
 /// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU の SDF variant
@@ -725,5 +785,151 @@ mod tests {
         assert_eq!(pack_with(1.0)[13], 1.0, "1.0 is inclusive");
         assert_eq!(pack_with(-0.5)[13], 0.0, "below range clamps to 0");
         assert_eq!(pack_with(1.5)[13], 1.0, "above range clamps to 1");
+    }
+
+    // ---- #251: apply_color_tracks_at_t (color-only fold) ----
+
+    use crate::cluster::Centroid;
+    use crate::keyframe_track::KeyframeClusterPoint;
+
+    fn track_cluster(color: [u8; 3], cx: f32, cy: f32, weight: f32) -> Cluster {
+        Cluster {
+            color,
+            centroid: Centroid { x: cx, y: cy },
+            weight,
+        }
+    }
+
+    /// #251: with neither track set, the fold returns the clusters unchanged
+    /// (color / centroid / weight all preserved) — the inert / non-regression path.
+    #[test]
+    fn apply_color_tracks_none_returns_input_unchanged() {
+        let clusters = vec![
+            track_cluster([10, 20, 30], 0.1, 0.2, 0.3),
+            track_cluster([200, 100, 50], 0.7, 0.8, 0.6),
+        ];
+        let opts = AnimateOptions::default(); // color_tracks / keyframe_tracks both None
+        let out = apply_color_tracks_at_t(&clusters, &opts, 0.5);
+        assert_eq!(
+            out, clusters,
+            "no tracks ⇒ clusters must pass through unchanged"
+        );
+    }
+
+    /// #251: a color track (#7) overwrites only `color` at time `t`; centroid and
+    /// weight stay exactly on the original cluster.
+    #[test]
+    fn apply_color_tracks_color_track_overwrites_color_only() {
+        let clusters = vec![track_cluster([10, 20, 30], 0.1, 0.2, 0.3)];
+        let opts = AnimateOptions {
+            color_tracks: Some(vec![vec![[0, 0, 0], [100, 200, 40]]]),
+            ..AnimateOptions::default()
+        };
+        // t=1.0 ⇒ end key color.
+        let out = apply_color_tracks_at_t(&clusters, &opts, 1.0);
+        assert_eq!(
+            out[0].color,
+            [100, 200, 40],
+            "color must come from the track"
+        );
+        assert_eq!(
+            out[0].centroid, clusters[0].centroid,
+            "centroid must be untouched"
+        );
+        assert_eq!(
+            out[0].weight, clusters[0].weight,
+            "weight must be untouched"
+        );
+    }
+
+    /// #251: a keyframe track (#33) reflects **color only** — the interpolated
+    /// centroid / weight from the keyframe are discarded; the original cluster's
+    /// centroid / weight are kept (position follow-through is #255).
+    #[test]
+    fn apply_color_tracks_keyframe_track_reflects_color_only() {
+        let clusters = vec![track_cluster([0, 0, 0], 0.5, 0.5, 0.5)];
+        let kf = |color: [u8; 3], cx: f32, cy: f32, weight: f32, time: f32| KeyframeClusterPoint {
+            color,
+            centroid: Centroid { x: cx, y: cy },
+            weight,
+            time,
+        };
+        let opts = AnimateOptions {
+            keyframe_tracks: Some(vec![vec![
+                kf([0, 0, 0], 0.0, 0.0, 0.0, 0.0),
+                kf([200, 100, 50], 1.0, 1.0, 1.0, 1.0),
+            ]]),
+            ..AnimateOptions::default()
+        };
+        // t=1.0 ⇒ end key: color = [200,100,50], but centroid/weight stay original.
+        let out = apply_color_tracks_at_t(&clusters, &opts, 1.0);
+        assert_eq!(
+            out[0].color,
+            [200, 100, 50],
+            "color must come from the keyframe"
+        );
+        assert_eq!(
+            out[0].centroid,
+            Centroid { x: 0.5, y: 0.5 },
+            "keyframe centroid must be discarded (position is #255)"
+        );
+        assert_eq!(out[0].weight, 0.5, "keyframe weight must be discarded");
+    }
+
+    /// #251: keyframe (#33) takes priority over color track (#7) when both are set
+    /// for the same cluster index (the #33-is-superset-of-#7 ordering).
+    #[test]
+    fn apply_color_tracks_keyframe_wins_over_color_track() {
+        let clusters = vec![track_cluster([0, 0, 0], 0.5, 0.5, 0.5)];
+        let opts = AnimateOptions {
+            color_tracks: Some(vec![vec![[9, 9, 9], [9, 9, 9]]]),
+            keyframe_tracks: Some(vec![vec![
+                KeyframeClusterPoint {
+                    color: [1, 2, 3],
+                    centroid: Centroid { x: 0.0, y: 0.0 },
+                    weight: 0.0,
+                    time: 0.0,
+                },
+                KeyframeClusterPoint {
+                    color: [77, 88, 99],
+                    centroid: Centroid { x: 1.0, y: 1.0 },
+                    weight: 1.0,
+                    time: 1.0,
+                },
+            ]]),
+            ..AnimateOptions::default()
+        };
+        let out = apply_color_tracks_at_t(&clusters, &opts, 1.0);
+        assert_eq!(
+            out[0].color,
+            [77, 88, 99],
+            "keyframe track must win over color track"
+        );
+    }
+
+    /// #251: an empty per-cluster track falls back to the cluster's own color
+    /// (defensive: a Some(tracks) with a zero-length entry must not blacken the orb).
+    #[test]
+    fn apply_color_tracks_empty_track_falls_back_to_cluster_color() {
+        let clusters = vec![
+            track_cluster([10, 20, 30], 0.1, 0.2, 0.3),
+            track_cluster([200, 100, 50], 0.7, 0.8, 0.6),
+        ];
+        // cluster 0 has an empty track; cluster 1 has a real one.
+        let opts = AnimateOptions {
+            color_tracks: Some(vec![vec![], vec![[5, 5, 5], [250, 250, 250]]]),
+            ..AnimateOptions::default()
+        };
+        let out = apply_color_tracks_at_t(&clusters, &opts, 1.0);
+        assert_eq!(
+            out[0].color,
+            [10, 20, 30],
+            "empty track ⇒ keep cluster color"
+        );
+        assert_eq!(
+            out[1].color,
+            [250, 250, 250],
+            "non-empty track ⇒ track color"
+        );
     }
 }

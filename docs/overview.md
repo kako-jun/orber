@@ -238,17 +238,22 @@ How it differs from the color-track path (#7):
 3. At output time `t ∈ [0, 1]`, each orb's `(color, centroid, weight)` is taken
    from `interpolate_keyframe_track(tracks[cluster_idx], t)` — a pure linear lerp
    between the two adjacent keyframes by the keyframe's stored normalized time
-   (endpoints clamped, NaN-safe, divide-by-zero defended).
+   (endpoints clamped, NaN-safe, divide-by-zero defended). Note: all three channels
+   are interpolated, but only the **color** currently reaches the renderer — since
+   #251 the unified WGSL pack carries the per-frame color, while `centroid` (position)
+   and `weight` are interpolated but not yet packed (tracked in #255).
 
-How `centroid` drift is intended to become visible (note: since #239 Phase 1 this
-per-frame track animation is **not yet rendered** by the unified renderer — the only
-consumer was the removed aquarelle path; re-wiring is tracked in #251):
+What is rendered today (color), and what is not (position / weight):
 
-- **Orb / glyph / image** shapes blend `cluster.centroid` drift with the per-orb
-  seeded `cross_axis` at 50:50 to keep the input video's compositional motion visible
-  without losing the per-orb scatter that prevents stripe artifacts. With
-  `--input-mode color-track` (#7) or still-image input, the orb uses `cross_axis`
-  alone (existing behavior preserved).
+- The keyframe **color** track *is* rendered by the unified WGSL renderer — since
+  #251 the per-frame color is packed and the output video's orb colors change over
+  time across **orb / glyph / image** alike. (#239 Phase 1 had temporarily left this
+  dead because the only consumer was the removed aquarelle path; #251 re-wired it.)
+- The `centroid` (position) drift and `weight` are **not yet rendered**: the unified
+  WGSL pack has no per-orb centroid slot, so orb positions stay at the per-orb seeded
+  `cross_axis` scatter — the same layout as still-image / `--input-mode color-track`
+  (#7) input. Wiring keyframe positions (the centroid drift, to make the input video's
+  compositional motion visible) into the renderer is tracked in **#255**.
 
 Output length is still set entirely by `--duration-ms`. A 3-minute clip
 rendered as a 10-second orb compresses the input's mood; a 10-second clip
