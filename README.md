@@ -5,14 +5,14 @@
   <a href="https://nostalgic.llll-ll.com/yokoso"><img src="https://api.nostalgic.llll-ll.com/yokoso?action=get&id=github-20b16cd9&format=image" alt="Welcome" align="middle"></a>
 </p>
 
-Turn photos and videos into abstract **orb mood** output — colorful, blurry light spheres drifting slowly. Useful as video backgrounds, streaming wait screens, social story backgrounds, wallpapers, or just to obfuscate a personal photo into a vibe.
+Turn a photo into abstract **orb mood** output — colorful, blurry light spheres drifting slowly. Useful as video backgrounds, streaming wait screens, social story backgrounds, wallpapers, or just to obfuscate a personal photo into a vibe.
 
 > **Status:** prototype. PNG output and vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9) are implemented end-to-end. Vector / CSS outputs are still placeholders.
 
 ## Concept
 
 ```
-Input image / video
+Input image (still only)
   → Extract color clusters (this area is red, that area is blue, ...)
   → Convert each cluster into a light orb
   → Animate orbs drifting slowly with smooth color transitions
@@ -61,12 +61,6 @@ one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace wit
 ```bash
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
-# Video input: keyframe interpolation (#33). Per-frame colors now animate — since #251
-# the color tracks are rendered by the unified WGSL renderer (orb/glyph/image alike), so
-# the output's orb colors change over time. The #33 position keyframe is not yet rendered:
-# orbs stay at their still-image scatter positions (motion + breathing still animate as
-# usual). Position re-wiring is tracked in #255.
-orber --input video.mp4 --output orb.mp4 --input-mode keyframe --keyframes 8 --duration-ms 10000
 ```
 
 `--speed` is the **global** cycle count (`very-slow` / `slow` / `mid` / `fast`

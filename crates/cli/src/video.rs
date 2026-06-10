@@ -89,15 +89,6 @@ pub struct VideoOptions {
     pub shape: OrbShape,
     /// ぼかし (Softness) preset (#55, #131 で改名)。Mid なら既存挙動と完全同値。
     pub softness: SoftnessPreset,
-    /// 動画入力（#7）の per-cluster 色トラック。
-    /// `Some` のとき各フレームで `cluster.color` を時刻 t の補間色に置換する。
-    /// 静止画入力では `None` で従来挙動。
-    pub color_tracks: Option<Vec<Vec<[u8; 3]>>>,
-    /// 動画入力（#33）の per-cluster キーフレーム補間トラック。
-    /// `Some` のとき各フレームで `cluster.color` / `centroid` / `weight` を
-    /// 時刻 t の補間値に置換する。`color_tracks` (#7) と排他で、
-    /// 両方 Some なら `keyframe_tracks` を優先する。
-    pub keyframe_tracks: Option<Vec<Vec<orber_core::keyframe_track::KeyframeClusterPoint>>>,
 }
 
 impl Default for VideoOptions {
@@ -114,8 +105,6 @@ impl Default for VideoOptions {
             background: a.background,
             shape: a.shape,
             softness: a.softness,
-            color_tracks: None,
-            keyframe_tracks: None,
         }
     }
 }
@@ -229,8 +218,6 @@ pub fn render_video(
         glyph_rotate: true,
         // #241: 薄い影は製品定数（CLI フラグは増やさない）。
         shadow_strength: SHADOW_STRENGTH_DEFAULT,
-        color_tracks: opts.color_tracks.clone(),
-        keyframe_tracks: opts.keyframe_tracks.clone(),
     };
 
     let temp_dir = tempfile::TempDir::new()?;
@@ -350,8 +337,6 @@ mod tests {
             softness: opts.softness,
             glyph_rotate: true,
             shadow_strength: SHADOW_STRENGTH_DEFAULT,
-            color_tracks: opts.color_tracks.clone(),
-            keyframe_tracks: opts.keyframe_tracks.clone(),
         }
     }
 

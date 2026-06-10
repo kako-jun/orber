@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod video;
-mod video_input;
 use video::{render_video, VideoCodec, VideoOptions};
-use video_input::{build_color_tracks, build_keyframe_tracks, is_video_path, sample_video_frames};
 
 /// Conveyor-belt direction (`--direction`). All orbs flow the same way for the entire clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -105,30 +103,6 @@ impl CliCountPreset {
             CliCountPreset::High => 30,
         }
     }
-}
-
-/// `--input-mode` の選択肢。動画入力時の処理パスを切り替える。
-///
-/// - `ColorTrack` (#7): 位置固定 + 色だけ時間軸補間。`--keyframes` は無視され、
-///   `VIDEO_INPUT_N_SAMPLES` 個のサンプル列から色トラックを作る。
-/// - `Keyframe` (#33): 色 + 位置 + 重みを `--keyframes` 個のキーから時間軸補間。
-///
-/// 時間アニメの描画状況: 色トラック(#7) / キーフレームの色(#33)は **#251 で統一 WGSL
-/// レンダラへ再配線済み**——動画出力はフレーム毎に orb の色が時間変化する。さらに #33 の
-/// **位置追従**（centroid の cross 軸ドリフト）も **#255 で実装済み**（B 案: 一様散布は
-/// 保持したまま重心の delta を cross 軸に加算）。`weight` 変調は色割当の安定のため意図的に
-/// 適用しない（#255 で確定した設計判断）。Web(wasm) は位置追従を出さず CLI/core 限定。
-///
-/// 静止画入力ではどちらも従来挙動（時間軸補間なし）。`Keyframe` を静止画に渡すと
-/// 明示エラーで弾く（後段の `run_video_input_keyframe` に到達しないため UI 上の
-/// 矛盾を起こさない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
-enum CliInputMode {
-    /// 色トラックのみ。位置固定、色だけ時間変化（#7、画像入力でも default）。
-    #[default]
-    ColorTrack,
-    /// キーフレーム補間。色 + 位置 + 重みを時間軸キーから補間（#33、video のみ）。
-    Keyframe,
 }
 
 /// `--variations-mode` の選択肢。
@@ -291,9 +265,9 @@ fn parse_saturation(s: &str) -> Result<f32, String> {
 #[derive(Debug, Parser)]
 #[command(name = "orber")]
 #[command(version)]
-#[command(about = "Turn photos and videos into abstract orb mood output")]
+#[command(about = "Turn a still image into abstract orb mood output (image / video / SVG / CSS)")]
 struct Cli {
-    /// Input image or video file.
+    /// Input image file (still only). Raster formats (PNG / JPEG / WebP / …).
     #[arg(short, long)]
     input: PathBuf,
 
@@ -408,24 +382,6 @@ struct Cli {
     /// オフ）。にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
     #[arg(long, value_enum, requires = "bleed")]
     offset: Option<CliCharacterPreset>,
-
-    /// Input processing mode (#7 / #33). Only meaningful for video input.
-    /// `color-track` = #7 (position fixed, color tracks over time, default).
-    /// `keyframe` = #33 (color + position + weight all interpolated between keyframes).
-    /// Passing `keyframe` with a still image input yields an explicit error.
-    /// NOTE: the per-frame **color** animation (both #7 color tracks and #33 keyframe
-    /// colors) is rendered by the unified WGSL renderer (#251), and the #33 **position**
-    /// follow-through (centroid cross-axis drift) is rendered too (#255, CLI/core only).
-    /// `weight` is intentionally not modulated (kept stable so the per-cluster color
-    /// assignment does not flicker over time).
-    #[arg(long = "input-mode", value_enum, default_value_t = CliInputMode::ColorTrack)]
-    input_mode: CliInputMode,
-
-    /// Number of keyframes to sample from the video (#33). Default 8. Used only when
-    /// `--input-mode keyframe`. Minimum 2 (a single keyframe cannot be interpolated;
-    /// values <2 are clamped to 2).
-    #[arg(long, default_value_t = 8)]
-    keyframes: u32,
 }
 
 impl Cli {
@@ -516,26 +472,7 @@ fn main() -> ExitCode {
 
     warn_if_glyph_char_unsupported(&cli);
 
-    // #33 review S3: --input-mode keyframe は動画入力専用。静止画 + variations の
-    // 組合せでは silent skip にせず、--variations 分岐より先に明示エラーで弾く。
-    if cli.input_mode == CliInputMode::Keyframe && !is_video_path(&cli.input) {
-        eprintln!(
-            "orber: --input-mode keyframe requires video input (got still image: {})",
-            cli.input.display()
-        );
-        return ExitCode::from(2);
-    }
-
     if let Some(n) = cli.variations {
-        // #7 review M1: video + --variations は未対応経路。`render_variations` は
-        // `image::open` を直に叩くので動画を渡すと「decoder error」で落ち、
-        // ユーザーには「動画が壊れている」かのように見えてしまう。明示エラーで弾く。
-        if is_video_path(&cli.input) {
-            eprintln!(
-                "orber: --variations is not supported with video input; use --output FILE.mp4 / .webm / .png instead"
-            );
-            return ExitCode::from(2);
-        }
         return render_variations(&cli, n);
     }
 
@@ -555,12 +492,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // #7: 入力ファイルが動画なら動画入力経路へ分岐。
-    // 静止画入力は従来どおり既存パスを通る。
-    if is_video_path(&cli.input) {
-        return run_video_input(&cli, &output, mode);
-    }
-
+    // 入力は静止画のみ。出力が動画ならアニメ orb をエンコードする。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         return render_video_path(&cli, &output, codec);
     }
@@ -700,7 +632,10 @@ fn render_style_path(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -748,7 +683,10 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -787,8 +725,6 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
         background,
         shape: orb_shape,
         softness: cli.resolved_softness(),
-        color_tracks: None,
-        keyframe_tracks: None,
     };
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
@@ -817,7 +753,10 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -866,8 +805,6 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         glyph_rotate: true,
         // #241: 薄い影は製品定数（CLI フラグは増やさない）。
         shadow_strength: SHADOW_STRENGTH_DEFAULT,
-        color_tracks: None,
-        keyframe_tracks: None,
     };
     // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Orb/Glyph/Image）に
     // 対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
@@ -884,320 +821,6 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     }
     eprintln!("orber: wrote {}", output.display());
     ExitCode::SUCCESS
-}
-
-/// 動画入力（#7）に使うサンプル数。
-///
-/// 色変化を「ある程度滑らかに乗せる」目的で 20 枚に固定。
-/// per-sample に ffmpeg を 1 回ずつ起動するので、増やすと前処理時間が線形に伸びる。
-const VIDEO_INPUT_N_SAMPLES: usize = 20;
-
-/// 動画入力（#33）の最低キーフレーム数。
-///
-/// 1 枚では補間できないので、`--keyframes` の値が 2 未満の場合は 2 にクランプする。
-const MIN_KEYFRAMES: u32 = 2;
-
-/// 動画入力（#33）の k-means cluster 数。color_track 経路と揃える（k=6）。
-const VIDEO_INPUT_KEYFRAME_K: usize = 6;
-
-/// 動画入力経路の dispatch。`--input-mode` で #7 / #33 を切り替える。
-fn run_video_input(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
-    match cli.input_mode {
-        CliInputMode::ColorTrack => run_video_input_color_track(cli, output, mode),
-        CliInputMode::Keyframe => run_video_input_keyframe(cli, output, mode),
-    }
-}
-
-/// 動画入力（#7）経路。
-///
-/// - `ffprobe` / `ffmpeg` でフレーム N 枚をサンプリング
-/// - 先頭フレーム k=6 で位置・重み・テンプレート色を決め、各サンプルとの LAB マッチングで color tracks を作る
-/// - orb の位置 / 個数は時間で動かない（先頭フレームの k-means 結果で固定）
-/// - 出力時刻 t ∈ [0, 1] は出力動画の t（duration_ms で決まる）にマップされ、
-///   `interpolate_color_track` が「入力動画時刻」ごとの色を引いてくる
-///
-/// 出力長は `--duration-ms` で独立に決まる（入力動画の長さは色サンプル列の
-/// サイズだけに影響する）。
-fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
-    eprintln!(
-        "orber: sampling {} frames from {}...",
-        VIDEO_INPUT_N_SAMPLES,
-        cli.input.display()
-    );
-    let samples = match sample_video_frames(&cli.input, VIDEO_INPUT_N_SAMPLES) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("orber: video input failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    eprintln!("orber: extracted {} sample frame(s)", samples.len());
-
-    // k=6 で先頭フレームを基準にしてテンプレートクラスタとトラックを構築。
-    let color_tracks_data = match build_color_tracks(&samples, 6) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("orber: color track build failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    // 既存の静止画経路と挙動を揃えるため、derive_background + drop_dominant を適用。
-    // 同じ index フィルタを tracks にも適用しないと、cluster_idx と tracks の対応が
-    // 崩れるので、`drop_dominant` 相当を template_clusters と tracks に同時に効かせる。
-    let template_clusters = color_tracks_data.template_clusters.clone();
-    let dominant_idx = template_clusters
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
-        .map(|(i, _)| i);
-    let background = orber_core::cluster::derive_background_rgba(&template_clusters);
-
-    let (orb_clusters, orb_tracks): (Vec<_>, Vec<_>) = template_clusters
-        .iter()
-        .zip(color_tracks_data.tracks.iter())
-        .enumerate()
-        .filter(|(i, _)| Some(*i) != dominant_idx)
-        .map(|(_, (c, t))| (*c, t.clone()))
-        .unzip();
-    warn_if_orb_pool_empty(&orb_clusters);
-
-    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
-    let orb_shape = match resolve_orb_shape(cli) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    // #225: PNG / 動画どちらの経路も GPU で描く。renderer は 1 本だけ作る。
-    let renderer = match init_renderer() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-
-    // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
-    if let Some(codec) = VideoCodec::from_output_mode(mode) {
-        warn_if_aqua_ignored_for_video(cli);
-        // #251: color tracks (#7) now animate per frame via the unified renderer —
-        // no "unsupported" warning. (Color-only video has no position keyframes.)
-        let (direction, speed) = resolve_motion(cli);
-        let opts = VideoOptions {
-            orb_size: cli.orb_size,
-            blur: cli.blur,
-            saturation: cli.saturation,
-            direction,
-            speed,
-            seed: cli.seed,
-            count: Some(cli.resolved_count()),
-            background,
-            shape: orb_shape,
-            softness: cli.resolved_softness(),
-            color_tracks: Some(orb_tracks),
-            keyframe_tracks: None,
-        };
-        if let Err(e) = render_video(
-            &renderer,
-            &orb_clusters,
-            &opts,
-            output,
-            cli.duration_ms,
-            codec,
-        ) {
-            eprintln!("orber: video render failed: {e}");
-            return ExitCode::from(2);
-        }
-        eprintln!("orber: wrote {}", output.display());
-        return ExitCode::SUCCESS;
-    }
-
-    match mode {
-        OutputMode::Png => {
-            // PNG は t=0 の 1 枚（=入力動画の先頭フレームの色）。
-            let (direction, speed) = resolve_motion(cli);
-            let frame_opts = orber_core::animate::AnimateOptions {
-                width: RenderOptions::default().width,
-                height: RenderOptions::default().height,
-                // #239: additive watercolor bleed layer (only when --bleed set).
-                aqua: cli.poc_aqua(),
-                orb_size: cli.orb_size,
-                blur: cli.blur,
-                saturation: cli.saturation,
-                direction,
-                speed,
-                seed: cli.seed,
-                count: Some(cli.resolved_count()),
-                background,
-                shape: orb_shape,
-                softness: cli.resolved_softness(),
-                glyph_rotate: true,
-                shadow_strength: SHADOW_STRENGTH_DEFAULT,
-                color_tracks: Some(orb_tracks),
-                keyframe_tracks: None,
-            };
-            let img = renderer.render(&orb_clusters, &frame_opts, 0.0);
-            if let Err(e) = img.save(output) {
-                eprintln!("orber: failed to write output {}: {e}", output.display());
-                return ExitCode::from(2);
-            }
-            eprintln!("orber: wrote {}", output.display());
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!(
-                "orber: video input + output mode {mode:?} is not supported (use mp4 / webm / png)"
-            );
-            ExitCode::from(1)
-        }
-    }
-}
-
-/// 動画入力（#33）経路。色 + 位置 + 重みをキーフレーム間で時間軸補間する。
-///
-/// - `ffprobe` / `ffmpeg` で N キーフレームを均等区間でサンプリング
-/// - 各キーで k-means → LAB ΔE76 greedy マッチングで cluster を時間軸追跡
-/// - 先頭キーを「テンプレート」として orb プールを構築（dominant 色は drop）
-/// - render 時に `keyframe_tracks` 経由で各 cluster の color / centroid / weight を t で補間
-///
-/// 出力長は `--duration-ms` で独立に決まる（入力動画の長さは N 枚抽出の時刻計算に
-/// だけ影響する）。
-fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitCode {
-    // #33 review N3: --keyframes 1 は補間に最低 2 枚必要なので無言で 2 にクランプ
-    // すると挙動と CLI 値が乖離する。ユーザーに気付けるよう warning を出してから clamp。
-    if cli.keyframes < MIN_KEYFRAMES {
-        eprintln!(
-            "orber: warning: --keyframes {} is too few, clamping to {} (need at least 2 to interpolate)",
-            cli.keyframes, MIN_KEYFRAMES
-        );
-    }
-    let n_keys = cli.keyframes.max(MIN_KEYFRAMES) as usize;
-    eprintln!(
-        "orber: sampling {} keyframe(s) from {}...",
-        n_keys,
-        cli.input.display()
-    );
-    let samples = match sample_video_frames(&cli.input, n_keys) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("orber: video input failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    eprintln!("orber: extracted {} keyframe(s)", samples.len());
-
-    // k=6 で先頭キーフレームを基準にしてテンプレートクラスタとキー列を構築。
-    let kf_data = match build_keyframe_tracks(&samples, VIDEO_INPUT_KEYFRAME_K) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("orber: keyframe track build failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    // color_track 経路と同じく derive_background + drop_dominant を template に適用。
-    // tracks も同じ index で間引かないと cluster_idx と tracks の対応が崩れる。
-    let template_clusters = kf_data.template_clusters.clone();
-    let dominant_idx = template_clusters
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
-        .map(|(i, _)| i);
-    let background = orber_core::cluster::derive_background_rgba(&template_clusters);
-
-    let (orb_clusters, orb_kf_tracks): (Vec<_>, Vec<_>) = template_clusters
-        .iter()
-        .zip(kf_data.tracks.iter())
-        .enumerate()
-        .filter(|(i, _)| Some(*i) != dominant_idx)
-        .map(|(_, (c, t))| (*c, t.clone()))
-        .unzip();
-    warn_if_orb_pool_empty(&orb_clusters);
-
-    // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
-    let orb_shape = match resolve_orb_shape(cli) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    // #225: PNG / 動画どちらの経路も GPU で描く。renderer は 1 本だけ作る。
-    let renderer = match init_renderer() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-
-    // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
-    if let Some(codec) = VideoCodec::from_output_mode(mode) {
-        warn_if_aqua_ignored_for_video(cli);
-        // #251: keyframe color (#33) animates per frame. #255: the position follow-through
-        // (centroid cross-axis drift) is rendered too; weight is intentionally not modulated.
-        let (direction, speed) = resolve_motion(cli);
-        let opts = VideoOptions {
-            orb_size: cli.orb_size,
-            blur: cli.blur,
-            saturation: cli.saturation,
-            direction,
-            speed,
-            seed: cli.seed,
-            count: Some(cli.resolved_count()),
-            background,
-            shape: orb_shape,
-            softness: cli.resolved_softness(),
-            color_tracks: None,
-            keyframe_tracks: Some(orb_kf_tracks),
-        };
-        if let Err(e) = render_video(
-            &renderer,
-            &orb_clusters,
-            &opts,
-            output,
-            cli.duration_ms,
-            codec,
-        ) {
-            eprintln!("orber: video render failed: {e}");
-            return ExitCode::from(2);
-        }
-        eprintln!("orber: wrote {}", output.display());
-        return ExitCode::SUCCESS;
-    }
-
-    match mode {
-        OutputMode::Png => {
-            // PNG は t=0 の 1 枚。`interpolate_keyframe_track` の端点 clamp 仕様で
-            // 入力動画の先頭キーフレームの色 + 位置 + 重みになる。
-            let (direction, speed) = resolve_motion(cli);
-            let frame_opts = orber_core::animate::AnimateOptions {
-                width: RenderOptions::default().width,
-                height: RenderOptions::default().height,
-                // #239: additive watercolor bleed layer (only when --bleed set).
-                aqua: cli.poc_aqua(),
-                orb_size: cli.orb_size,
-                blur: cli.blur,
-                saturation: cli.saturation,
-                direction,
-                speed,
-                seed: cli.seed,
-                count: Some(cli.resolved_count()),
-                background,
-                shape: orb_shape,
-                softness: cli.resolved_softness(),
-                glyph_rotate: true,
-                shadow_strength: SHADOW_STRENGTH_DEFAULT,
-                color_tracks: None,
-                keyframe_tracks: Some(orb_kf_tracks),
-            };
-            let img = renderer.render(&orb_clusters, &frame_opts, 0.0);
-            if let Err(e) = img.save(output) {
-                eprintln!("orber: failed to write output {}: {e}", output.display());
-                return ExitCode::from(2);
-            }
-            eprintln!("orber: wrote {}", output.display());
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!(
-                "orber: video input + output mode {mode:?} is not supported (use mp4 / webm / png)"
-            );
-            ExitCode::from(1)
-        }
-    }
 }
 
 /// `--variations` 経路。`output_dir` を作って各 spec で逐次書き出す。
@@ -1218,7 +841,10 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     let img = match image::open(&cli.input) {
         Ok(img) => img.to_rgb8(),
         Err(e) => {
-            eprintln!("orber: failed to read input {}: {e}", cli.input.display());
+            eprintln!(
+                "orber: failed to read input {}: {e} (orber takes a still image; video input is not supported)",
+                cli.input.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -1331,8 +957,6 @@ fn render_one_variation(
                 softness,
                 glyph_rotate: true,
                 shadow_strength: SHADOW_STRENGTH_DEFAULT,
-                color_tracks: None,
-                keyframe_tracks: None,
             };
             let img = renderer.render(clusters, &frame_opts, 0.0);
             img.save(out_path).map_err(|e| e.to_string())
@@ -1349,8 +973,6 @@ fn render_one_variation(
                 background: bg_rgba,
                 shape: orb_shape.clone(),
                 softness,
-                color_tracks: None,
-                keyframe_tracks: None,
             };
             render_video(
                 renderer,
@@ -1962,8 +1584,6 @@ mod tests {
             softness: SoftnessPreset::Mid,
             glyph_rotate: true,
             shadow_strength: SHADOW_STRENGTH_DEFAULT,
-            color_tracks: None,
-            keyframe_tracks: None,
         };
 
         let glyph_opts = AnimateOptions {
