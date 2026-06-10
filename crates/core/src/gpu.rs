@@ -53,10 +53,14 @@
 //! time `t` (via [`crate::animate::apply_color_tracks_at_t`]) and overwrite each
 //! orb's `color` before [`pack_render_data`]. With no tracks (the production /
 //! still-image default) the builder borrows the input clusters unchanged, so the
-//! output is byte-identical to pre-#251. Only **color** moves here: the #33 position
-//! keyframe follow-through (centroid drift) and weight modulation stay on the
-//! still-image scatter and are tracked in #255 — folding them back blindly would
-//! double-apply the position wrap / breathing the unified `orb.wgsl` already does.
+//! output is byte-identical to pre-#251. Only **color** is folded in via
+//! [`crate::animate::apply_color_tracks_at_t`]; the #33 position follow-through
+//! (centroid cross-axis drift) is rendered too, but through a separate channel
+//! ([`crate::animate::keyframe_cross_drift`] → pack `off+13` → `orb.wgsl` `misc.w`),
+//! since #255 (CLI/core; wasm passes `None`). `weight` is intentionally not modulated
+//! (kept stable so the per-cluster color assignment does not flicker). Folding the
+//! interpolated centroid back blindly would double-apply the position wrap / breathing
+//! the unified `orb.wgsl` already does — hence the B-plan delta-on-scatter approach.
 //!
 //! ## Compositing contract
 //!
@@ -1090,8 +1094,9 @@ impl GpuRenderer {
         // #251: fold the video color tracks (#7 / #33) into the per-orb colors at
         // time `t`. With no tracks (the production / still-image default) this is a
         // zero-copy borrow of the input clusters, so the pack stays byte-identical
-        // to pre-#251 (the non-regression gate). Only color is touched; position /
-        // weight stay on the original clusters (centroid drift is #255).
+        // to pre-#251 (the non-regression gate). Only color is touched here; the
+        // centroid cross-axis drift (#255) is carried separately via `cross_drift`
+        // below, and weight is intentionally not modulated.
         let effective = Self::color_tracked_clusters(clusters, opts, t);
         let clusters = effective.as_ref();
         let base_radius_unit = (width.min(height) as f32) * 0.25 * opts.orb_size.max(0.0);
@@ -1105,6 +1110,10 @@ impl GpuRenderer {
         };
         let cycle = opts.speed.cycle_count() as f32;
         let n_orbs = Self::resolved_orb_count(clusters, opts);
+        // #255: per-cluster cross 軸ドリフト delta（B 案）。tracks 無しなら None ⇒
+        // pack の off+13 が 0.0 ＝ 従来と byte 完全一致。
+        let cross_drift =
+            crate::animate::keyframe_cross_drift(opts, t, direction_id, clusters.len());
         // shape_id / glyph_rotate / edge_softness are SDF (glyph / image) inputs; the
         // plain orb shader ignores them. Pass orb defaults. shadow_strength (#241)
         // is read by every shape on the unified template, the orb included.
@@ -1122,6 +1131,7 @@ impl GpuRenderer {
             true, // glyph_rotate (unused by Orb)
             opts.softness.edge_softness(),
             opts.shadow_strength,
+            cross_drift.as_deref(),
         );
 
         // `pack_render_data` is shared with the Web wasm path and must NOT
@@ -1438,8 +1448,9 @@ impl GpuRenderer {
     /// pack then sees the exact same `&[Cluster]` as pre-#251, so the byte output is
     /// unchanged (the non-regression gate). Only when a track is present does it
     /// allocate an `Owned` Vec via [`apply_color_tracks_at_t`], which overwrites
-    /// `color` only (centroid / weight stay on the original clusters; position
-    /// follow-through is #255).
+    /// `color` only (centroid / weight stay on the original clusters). The position
+    /// follow-through (centroid cross-axis drift, #255) is carried out of band via
+    /// [`crate::animate::keyframe_cross_drift`], not through this color fold.
     fn color_tracked_clusters<'a>(
         clusters: &'a [Cluster],
         opts: &AnimateOptions,
@@ -1488,6 +1499,10 @@ impl GpuRenderer {
             MotionDirection::BottomToTop => 3.0,
         };
         let cycle = opts.speed.cycle_count() as f32;
+        // #255: per-cluster cross 軸ドリフト delta（B 案、全 shape 対象）。tracks
+        // 無しなら None ⇒ pack の off+13 が 0.0 ＝ 従来と byte 完全一致。
+        let cross_drift =
+            crate::animate::keyframe_cross_drift(opts, t, direction_id, clusters.len());
         let mut pack = pack_render_data(
             clusters,
             opts.background,
@@ -1502,6 +1517,7 @@ impl GpuRenderer {
             opts.glyph_rotate,
             opts.softness.edge_softness(),
             opts.shadow_strength,
+            cross_drift.as_deref(),
         );
         apply_saturation_to_pack(&mut pack, opts.saturation.max(0.0), n_orbs);
         pack
@@ -1764,7 +1780,15 @@ impl GpuRenderer {
             *slot = GpuOrb {
                 color: [pack[off], pack[off + 1], pack[off + 2], pack[off + 3]],
                 phase: [pack[off + 4], pack[off + 5], pack[off + 6], pack[off + 7]],
-                misc: [pack[off + 8], pack[off + 9], pack[off + 10], 0.0],
+                // #255: misc.w = cross-axis centroid drift delta（0 = 位置トラック無し＝従来と一致）。
+                // `.get().unwrap_or(0.0)` で short-row guard（off+13 > len）に当たる
+                // 短い pack でも 0.0 にフォールバックし、guard とその検証テストを変えずに通す。
+                misc: [
+                    pack[off + 8],
+                    pack[off + 9],
+                    pack[off + 10],
+                    pack.get(off + 13).copied().unwrap_or(0.0),
+                ],
                 // off + 11 = base_angle, off + 12 = rot_speed_signed (#136).
                 // The SDF variant reads these; the orb variant ignores the rot texel.
                 rot: [pack[off + 11], pack[off + 12], 0.0, 0.0],
@@ -2429,6 +2453,7 @@ mod tests {
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // Lie in the header: claim more orbs than the buffer actually carries.
         // The buffer still only has `real_orbs` per-orb rows, so rows
@@ -2454,6 +2479,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         let honest_img = renderer.render_packed(&honest, w, h, 0.3);
 
@@ -2497,6 +2523,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         pack[8] = 2000.0;
 
@@ -3487,8 +3514,10 @@ mod tests {
     }
 
     /// #251: a keyframe track (#33) must also animate the orb **color** with `t`.
-    /// Position is intentionally not reflected (that is #255), so the assertion is
-    /// on color keys: a red→blue keyframe pair on every cluster, t=0.0 vs t=0.5.
+    /// This test isolates color: both keys share the same centroid/weight so position
+    /// drift is zero by construction (the drift itself is covered by the C14-C16 e2e
+    /// tests, #255), and the assertion is on color keys: a red→blue keyframe pair on
+    /// every cluster, t=0.0 vs t=0.5.
     #[test]
     fn video_keyframe_track_animates_orb_colors_over_t() {
         let Some(renderer) =
@@ -3521,6 +3550,215 @@ mod tests {
             at_half.as_raw(),
             "keyframe color must change orb colors between t=0.0 and t=0.5"
         );
+    }
+
+    // ---- #255: cross-axis centroid drift (B案) e2e ----
+
+    /// Mean (x, y) of the lit pixels, in normalized [0,1] coords. Used by the
+    /// cross-axis drift tests to see which way the orb mass shifted.
+    fn lit_centroid(img: &RgbaImage, bg: [u8; 4], thresh: u8) -> (f32, f32) {
+        let (w, h) = img.dimensions();
+        let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u64);
+        for (x, y, p) in img.enumerate_pixels() {
+            let lit =
+                (0..3).any(|c| p.0[c].abs_diff(bg[c]) > thresh) || p.0[3].abs_diff(bg[3]) > thresh;
+            if lit {
+                sx += x as f64;
+                sy += y as f64;
+                n += 1;
+            }
+        }
+        assert!(n > 0, "expected some lit pixels to take a centroid of");
+        (
+            (sx / n as f64) as f32 / w as f32,
+            (sy / n as f64) as f32 / h as f32,
+        )
+    }
+
+    /// A 3-key **wobble** track: centroid goes `ends → mid → ends`, so the midpoint
+    /// (t=0.5) deviates from the endpoint line while t=0 / t=1 sit on it. After the
+    /// detrend (#255) only the wobble survives: drift is 0 at the endpoints and peaks
+    /// at the midpoint. A plain 2-key linear track would detrend to 0 everywhere, so
+    /// the GPU drift tests must use this shape. Color/weight fixed so only position
+    /// drives the drift; applied to every cluster.
+    fn drift_tracks(
+        clusters: &[Cluster],
+        ends: Centroid,
+        mid: Centroid,
+    ) -> Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>> {
+        let key = |c: Centroid, time: f32| crate::keyframe_track::KeyframeClusterPoint {
+            color: [220, 220, 220],
+            centroid: c,
+            weight: 0.5,
+            time,
+        };
+        vec![vec![key(ends, 0.0), key(mid, 0.5), key(ends, 1.0)]; clusters.len()]
+    }
+
+    /// #255 C14: a drift of all-zeros is a no-op vs no drift at all. Render a hand-built
+    /// pack with `cross_drift = None` and another with `Some(vec![0.0; clusters.len()])`;
+    /// the two images must be **bit-exact** (max diff 0). The byte-level e2e proof that
+    /// `misc.w = 0` does not perturb the plain-orb output.
+    #[test]
+    fn gpu_zero_cross_drift_is_noop_byte_match() {
+        let Some(renderer) = require_or_skip_renderer("gpu_zero_cross_drift_is_noop_byte_match")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let (w, h) = (64u32, 48u32);
+        let bg = [12u8, 18, 28, 255];
+        let mk = |drift: Option<&[f32]>| {
+            pack_render_data(
+                &clusters,
+                bg,
+                (w.min(h) as f32) * 0.25,
+                0.5,
+                0.0, // LR
+                MotionSpeed::Mid.cycle_count() as f32,
+                12345,
+                12, // n_orbs
+                1.0,
+                0.0,  // shape_id = Orb
+                true, // glyph_rotate (ignored)
+                0.5,
+                SHADOW_STRENGTH_DEFAULT,
+                drift,
+            )
+        };
+        let none_pack = mk(None);
+        let zeros = vec![0.0f32; clusters.len()];
+        let zero_pack = mk(Some(&zeros));
+        // The packs themselves should already be byte-identical (off+13 = 0 either way),
+        // but the e2e gate renders both and asserts the rendered frames match exactly.
+        let img_none = renderer.render_packed(&none_pack, w, h, 0.6);
+        let img_zero = renderer.render_packed(&zero_pack, w, h, 0.6);
+        let max_diff = assert_within_tolerance(
+            &img_zero,
+            &img_none,
+            "all-zero cross_drift vs None cross_drift",
+        );
+        assert_eq!(
+            max_diff, 0,
+            "all-zero drift must be byte-identical to no drift (misc.w=0 is a no-op)"
+        );
+    }
+
+    /// #255 C15: a non-zero (detrended) drift actually moves the orbs. An LR wobble
+    /// track in y (0.2→0.8→0.2) gives drift 0 at the endpoint t=0 but a peak drift at
+    /// the midpoint t=0.5. The midpoint frame must differ significantly from the t=0
+    /// frame — misc.w reaches the shader and shifts position. (A plain linear sweep
+    /// would detrend to 0 at every t, so a wobble is required here.)
+    #[test]
+    fn gpu_cross_drift_shifts_orbs_along_cross_axis() {
+        let Some(renderer) =
+            require_or_skip_renderer("gpu_cross_drift_shifts_orbs_along_cross_axis")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let mut opts = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        // Large y wobble so the cross-axis (y, for LR) midpoint shift is unmistakable.
+        opts.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.2 }, // endpoints (drift 0)
+            Centroid { x: 0.5, y: 0.8 }, // midpoint (peak drift)
+        ));
+
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0); // detrended drift 0
+        let at_half = renderer.render_frame(&clusters, &opts, 0.5); // peak y drift
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "drift frame must have lit pixels"
+        );
+        // Count how many pixels differ beyond tolerance: a real position shift moves
+        // far more than the color sweep alone could (color/weight are fixed here).
+        let (mut differing, total) = (0usize, (at0.width() * at0.height()) as usize);
+        for (a, b) in at0.pixels().zip(at_half.pixels()) {
+            if (0..4).any(|c| a.0[c].abs_diff(b.0[c]) > 2) {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing * 20 > total,
+            "drift must move a substantial fraction of pixels (got {differing}/{total})"
+        );
+    }
+
+    /// #255 C16: the cross axis is **y for LR** and **x for TB**. Give a wobble to an
+    /// LR run (y wobble) and a TB run (x wobble) and confirm that from the endpoint
+    /// frame (t=0, drift 0) to the midpoint frame (t=0.5, peak drift) the lit mass
+    /// shifts down (y grows) for LR but barely in x, and right (x grows) for TB but
+    /// barely in y. RL/BT share the wgsl branch shape so they are not retested.
+    #[test]
+    fn gpu_cross_axis_is_y_for_lr_and_x_for_tb() {
+        let Some(renderer) = require_or_skip_renderer("gpu_cross_axis_is_y_for_lr_and_x_for_tb")
+        else {
+            return;
+        };
+        let clusters = sample_clusters();
+        let bg = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow).background;
+
+        // LR: cross axis = y. A y-wobble should push the lit centroid downward (y up)
+        // at the midpoint relative to the endpoint frame.
+        let mut lr = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Slow);
+        lr.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.3 }, // endpoints
+            Centroid { x: 0.5, y: 0.8 }, // midpoint
+        ));
+        let lr0 = lit_centroid(&renderer.render_frame(&clusters, &lr, 0.0), bg, 8);
+        let lr_mid = lit_centroid(&renderer.render_frame(&clusters, &lr, 0.5), bg, 8);
+        let lr_dy = lr_mid.1 - lr0.1;
+        let lr_dx = (lr_mid.0 - lr0.0).abs();
+        assert!(
+            lr_dy > 0.05 && lr_dy > lr_dx,
+            "LR drift must move lit mass mainly in y (dy={lr_dy:.3}, dx={lr_dx:.3})"
+        );
+
+        // TB: cross axis = x. An x-wobble should push the lit centroid rightward (x up).
+        let mut tb = orb_opts(64, 48, MotionDirection::TopToBottom, MotionSpeed::Slow);
+        tb.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.3, y: 0.5 }, // endpoints
+            Centroid { x: 0.8, y: 0.5 }, // midpoint
+        ));
+        let tb0 = lit_centroid(&renderer.render_frame(&clusters, &tb, 0.0), bg, 8);
+        let tb_mid = lit_centroid(&renderer.render_frame(&clusters, &tb, 0.5), bg, 8);
+        let tb_dx = tb_mid.0 - tb0.0;
+        let tb_dy = (tb_mid.1 - tb0.1).abs();
+        assert!(
+            tb_dx > 0.05 && tb_dx > tb_dy,
+            "TB drift must move lit mass mainly in x (dx={tb_dx:.3}, dy={tb_dy:.3})"
+        );
+    }
+
+    /// #255 C17 (loop close): with a wobble keyframe track, the t=0 and t=1 frames must
+    /// match within tolerance — the drift component returns to 0 at both ends and the
+    /// orb motion / color are loop-periodic, so the seam does not jump. This is the
+    /// e2e counterpart of `keyframe_cross_drift_loop_closes_t0_and_t1_are_zero`.
+    #[test]
+    fn gpu_keyframe_position_loop_closes() {
+        let Some(renderer) = require_or_skip_renderer("gpu_keyframe_position_loop_closes") else {
+            return;
+        };
+        let clusters = sample_clusters();
+        // Use an integer-cycle speed so the orb sweep itself is loop-periodic (t=0≡t=1),
+        // leaving the drift as the only thing that could break the seam. The wobble
+        // colors are identical at t=0 and t=1 (endpoints), so color closes too.
+        let mut opts = orb_opts(64, 48, MotionDirection::LeftToRight, MotionSpeed::Mid);
+        opts.keyframe_tracks = Some(drift_tracks(
+            &clusters,
+            Centroid { x: 0.5, y: 0.2 }, // endpoints (t=0 and t=1)
+            Centroid { x: 0.5, y: 0.8 }, // midpoint
+        ));
+        let at0 = renderer.render_frame(&clusters, &opts, 0.0);
+        let at1 = renderer.render_frame(&clusters, &opts, 1.0);
+        assert!(
+            lit_vs_bg(&at0, opts.background, 8) > 0,
+            "loop-close frame must have lit pixels"
+        );
+        assert_within_tolerance(&at1, &at0, "keyframe wobble loop closure t=0 vs t=1");
     }
 
     /// #251: a color track also animates the **glyph / image** path (`pack_sdf_frame`,
@@ -3862,6 +4100,7 @@ mod tests {
             true, // glyph_rotate (ignored by Orb)
             0.5,  // edge_softness (ignored by Orb)
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // The single orb lives at off = HEADER_WORDS. The shader reads up to
         // pack[off + 12] (rot_speed_signed), so off + 13 words is the minimal length
@@ -4010,6 +4249,7 @@ mod tests {
             true,
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         // (header[9] is already 0.0 from the arg above; re-pin defensively in case
         // the packer ever changes which header slot carries alpha_mul.)
@@ -4969,6 +5209,7 @@ mod tests {
             false, // glyph_rotate OFF → angle = base_angle = 0
             0.5,
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: no keyframe drift
         );
         pack[11] = 0.0; // header glyph_rotate OFF (defensive)
         let off = HEADER_WORDS;
@@ -5335,6 +5576,7 @@ mod tests {
             false, // glyph_rotate (Orb は無視)
             0.5,   // edge_softness (Orb は無視)
             shadow_strength,
+            None, // #255: no keyframe drift
         );
         for (i, o) in orbs.iter().enumerate() {
             let off = HEADER_WORDS + PER_ORB_WORDS * i;

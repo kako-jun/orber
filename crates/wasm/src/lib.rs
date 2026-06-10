@@ -1006,6 +1006,8 @@ fn pack_render_data(
     shadow_strength: f32,
 ) -> Vec<f32> {
     // 完全修飾で呼ぶ（この関数自体が同名 `pack_render_data` のため import すると衝突する）。
+    // #255 は CLI/core 側のみ（位置追従は web では出さない）。cross_drift は常に
+    // `None` を渡して off+13 を 0.0 に保ち、Web の pack を byte 一致のまま維持する。
     orber_core::animate::pack_render_data(
         clusters,
         bg,
@@ -1020,6 +1022,7 @@ fn pack_render_data(
         glyph_rotate,
         edge_softness,
         shadow_strength,
+        None,
     )
 }
 
@@ -1687,6 +1690,7 @@ mod tests {
             true,
             softness.edge_softness(),
             SHADOW_STRENGTH_DEFAULT,
+            None, // #255: wasm wrapper も None を渡すので一致する
         );
         assert_eq!(buf, expected);
     }

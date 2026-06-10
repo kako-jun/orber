@@ -113,9 +113,11 @@ impl CliCountPreset {
 ///   `VIDEO_INPUT_N_SAMPLES` 個のサンプル列から色トラックを作る。
 /// - `Keyframe` (#33): 色 + 位置 + 重みを `--keyframes` 個のキーから時間軸補間。
 ///
-/// 注意（#239 Phase 1〜）: トラック（色 / キーフレーム）の**時間アニメは現在の統一 WGSL
-/// レンダラでは描画されない**（旧 aquarelle 経路の撤去で一時的に dead）。動画出力は静止色
-/// になり、実行時に警告を出す。再配線は #251。トラック生成・plumbing は温存してある。
+/// 時間アニメの描画状況: 色トラック(#7) / キーフレームの色(#33)は **#251 で統一 WGSL
+/// レンダラへ再配線済み**——動画出力はフレーム毎に orb の色が時間変化する。さらに #33 の
+/// **位置追従**（centroid の cross 軸ドリフト）も **#255 で実装済み**（B 案: 一様散布は
+/// 保持したまま重心の delta を cross 軸に加算）。`weight` 変調は色割当の安定のため意図的に
+/// 適用しない（#255 で確定した設計判断）。Web(wasm) は位置追従を出さず CLI/core 限定。
 ///
 /// 静止画入力ではどちらも従来挙動（時間軸補間なし）。`Keyframe` を静止画に渡すと
 /// 明示エラーで弾く（後段の `run_video_input_keyframe` に到達しないため UI 上の
@@ -411,11 +413,11 @@ struct Cli {
     /// `color-track` = #7 (position fixed, color tracks over time, default).
     /// `keyframe` = #33 (color + position + weight all interpolated between keyframes).
     /// Passing `keyframe` with a still image input yields an explicit error.
-    /// NOTE (#251): the per-frame **color** animation (both #7 color tracks and #33
-    /// keyframe colors) is now rendered by the unified WGSL renderer — video output
-    /// animates per-orb colors. Only the #33 **position** keyframe follow-through is
-    /// still unrendered (orbs keep the still-image scatter); it warns at runtime and
-    /// is tracked in #255.
+    /// NOTE: the per-frame **color** animation (both #7 color tracks and #33 keyframe
+    /// colors) is rendered by the unified WGSL renderer (#251), and the #33 **position**
+    /// follow-through (centroid cross-axis drift) is rendered too (#255, CLI/core only).
+    /// `weight` is intentionally not modulated (kept stable so the per-cluster color
+    /// assignment does not flicker over time).
     #[arg(long = "input-mode", value_enum, default_value_t = CliInputMode::ColorTrack)]
     input_mode: CliInputMode,
 
@@ -671,18 +673,6 @@ fn warn_if_aqua_ignored_for_video(cli: &Cli) {
              video output (mp4/webm) ignores them and keeps the plain orb look"
         );
     }
-}
-
-/// #251 で動画の色トラック(#7) / キーフレーム(#33)の **色** は統一 WGSL レンダラへ
-/// 再配線され、フレームごとに色がアニメする。ただし **位置** キーフレーム(#33)の追従
-/// （centroid ドリフト）はまだ描画されない（pack に畳み込まれていない）— orb は静止画と
-/// 同じ散布のまま色だけが時間で動く。位置の反映は #255。キーフレーム動画の各出力経路で
-/// 1 度だけ警告し、嘘をつかない（色は動く / 位置は動かない）。`detail` は対象を表す。
-fn warn_video_track_anim_unsupported(detail: &str) {
-    eprintln!(
-        "orber: warning: video {detail} position is not yet rendered by the current renderer; \
-         per-orb colors animate but orb positions stay put (position follow-through tracked in #255)"
-    );
 }
 
 /// `cli.orb_shape()` を解決し、エラー（`--shape image` の mask 欠如 / 読込失敗 /
@@ -1136,9 +1126,8 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
         warn_if_aqua_ignored_for_video(cli);
-        // #251: keyframe color (#33) now animates; only position keyframes are still
-        // unrendered (orbs keep the still-image scatter). Position reflection is #255.
-        warn_video_track_anim_unsupported("keyframe (#33)");
+        // #251: keyframe color (#33) animates per frame. #255: the position follow-through
+        // (centroid cross-axis drift) is rendered too; weight is intentionally not modulated.
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
