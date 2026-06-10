@@ -4,7 +4,7 @@
 //! `t = 0` と `t = 1` は同一状態に収束する完全ループ。#225 で CPU のピクセル
 //! 描画は撲滅され、実描画は GPU(WGSL, [`crate::gpu`]) がネイティブ CLI と Web wasm の
 //! 両方で担う。本モジュールはそれらが共有する **算術と pack** だけを提供する
-//! （[`pack_render_data`] / [`precompute_orb_params`] / [`aquarelle_modulated_clusters`]）。
+//! （[`pack_render_data`] と per-orb パラメータ計算）。
 //!
 //! # コンセプト
 //!
@@ -32,9 +32,7 @@
 //! - RNG は [`rand_chacha::ChaCha8Rng`] を `seed` で固定。同じ seed・clusters・count で
 //!   100% 同一の per-orb 列が返る（GPU(WGSL) 描画の決定論性の根拠）。
 
-use crate::cluster::{Centroid, Cluster};
-use crate::color_track::interpolate_color_track;
-use crate::keyframe_track::{interpolate_keyframe_track, KeyframeClusterPoint};
+use crate::cluster::Cluster;
 use crate::orb::{OrbShape, OrbStyle};
 use crate::style::SoftnessPreset;
 use rand::{Rng, SeedableRng};
@@ -115,6 +113,11 @@ pub const SHADOW_STRENGTH_DEFAULT: f32 = 0.2;
 pub struct AnimateOptions {
     pub width: u32,
     pub height: u32,
+    /// #239: 水彩のにじみ（bleed/bloom/offset/halo）を統一機構の上の加算レイヤーとして
+    /// 任意の shape（orb/glyph/image）に乗せる設定。`None`（既定）のとき加算層の
+    /// パラメータは全 0 = plain orb と byte 一致（既存挙動を一切変えない）。`Some(cfg)`
+    /// のとき非 0 パラメータを GPU 経路へ流す（幾何は唯一の continuous space-blur）。
+    pub aqua: Option<AquaBleedConfig>,
     pub orb_size: f32,
     pub blur: f32,
     pub saturation: f32,
@@ -132,14 +135,13 @@ pub struct AnimateOptions {
     /// Glyph 形状時に per-orb 回転をアニメーションさせるかどうか（#136）。
     /// `true` で従来挙動（base_angle + cycle * rot_speed_signed * t * TAU）。
     /// `false` で全 t において base_angle を保ち、glyph は静止向きで描かれる。
-    /// Circle / Aquarelle 経路では使われない。既定 `true` で互換維持。
+    /// Circle 経路では使われない。既定 `true` で互換維持。
     pub glyph_rotate: bool,
     /// #241「薄い影」の強度係数（0..1）。orb 機構（orb / glyph / image）の最外周
     /// フェードセグメントで orb 色 rgb を `mix(1.0, 1.0-u, s)` 倍に暗化する。
     /// `0.0` = #242 直後（影なし）と bit 同一、`1.0` = 旧 lowp の rgb→0 フェードと
     /// 同等。製品は [`SHADOW_STRENGTH_DEFAULT`] 固定（CLI フラグ・Studio UI なし）。
     /// gpu-lab（dev）だけが `WasmParams::shadow_strength` 経由で上書きする。
-    /// Aquarelle 経路では使われない（参照アルゴリズムが aquarelle crate のため）。
     pub shadow_strength: f32,
     /// 動画入力（#7）の per-cluster 色トラック。
     ///
@@ -160,11 +162,26 @@ pub struct AnimateOptions {
     pub keyframe_tracks: Option<Vec<Vec<crate::keyframe_track::KeyframeClusterPoint>>>,
 }
 
+/// #239: the additive "bleed" watercolor config carried on [`AnimateOptions`].
+/// The four sliders feed the additive layer over the unified orb mechanism. All four
+/// at `0.0` makes the layer structurally inert (byte-identical to plain orb) — the
+/// non-regression gate. Carried as `Option` on `AnimateOptions` so the default
+/// (`None`) path is exactly the existing behaviour. The geometry is the single
+/// continuous space-blur (the Blob A/B variant was dropped in #239 Phase 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AquaBleedConfig {
+    pub bleed: f32,
+    pub bloom: f32,
+    pub offset: f32,
+    pub halo: f32,
+}
+
 impl Default for AnimateOptions {
     fn default() -> Self {
         Self {
             width: 1080,
             height: 1920,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,
@@ -182,11 +199,6 @@ impl Default for AnimateOptions {
         }
     }
 }
-
-/// 半径呼吸の振幅（±10%）。Aquarelle の per-orb 変調が weight_scale に乗せる。
-/// GPU 経路は `radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin(...)` の最大値
-/// （= 1.10）を WGSL / gpu.rs 側の `BREATH_RADIUS_MAX_FACTOR` と揃える。
-const BREATH_RADIUS_AMPLITUDE: f32 = 0.10;
 
 /// 各 orb の決定的なパラメータ。
 ///
@@ -400,64 +412,6 @@ pub fn pack_render_data(
     buf
 }
 
-/// 動画入力（#7）: `color_tracks` が指定されているときは `tracks[cluster_idx]` を
-/// `t` で線形補間した色を返す。指定が無い・index 範囲外・track が空のときは
-/// `fallback`（cluster.color）にフォールバックする。
-///
-/// 補間そのものは [`crate::color_track::interpolate_color_track`] が担い、
-/// この関数は「track が無い場合の素通し」を担当するだけの薄いラッパー。
-#[inline]
-fn pick_color_at_t(
-    tracks: Option<&[Vec<[u8; 3]>]>,
-    cluster_idx: usize,
-    fallback: [u8; 3],
-    t: f32,
-) -> [u8; 3] {
-    let Some(tracks) = tracks else {
-        return fallback;
-    };
-    let Some(track) = tracks.get(cluster_idx) else {
-        return fallback;
-    };
-    if track.is_empty() {
-        return fallback;
-    }
-    interpolate_color_track(track, t)
-}
-
-/// 動画入力（#33）: `keyframe_tracks` が指定されているときは色 + 位置 + 重みを
-/// 全部時刻 `t` で補間して返す。指定が無い・index 範囲外・track が空のときは
-/// 静止画の `fallback` cluster を素通しする。
-///
-/// `keyframe_tracks` と `color_tracks` (#7) を両方持つ `AnimateOptions` でも、
-/// この関数は keyframe_tracks のみを参照する（呼び出し側で優先順位を決める）。
-#[inline]
-fn pick_cluster_at_t(
-    keyframe_tracks: Option<&[Vec<KeyframeClusterPoint>]>,
-    cluster_idx: usize,
-    fallback: &Cluster,
-    t: f32,
-) -> Option<([u8; 3], Centroid, f32)> {
-    let tracks = keyframe_tracks?;
-    let track = tracks.get(cluster_idx)?;
-    if track.is_empty() {
-        return None;
-    }
-    let _ = fallback; // 現状はフォールバック値を使わず None を返して呼び出し側で素通しさせる。
-    Some(interpolate_keyframe_track(track, t))
-}
-
-/// `(f * t * scale)` を [0, 1) に巻き戻してから 2π を掛け、phi を加えて sin を取る。
-///
-/// `f` と `scale` がともに整数のとき、`t = 1.0` ちょうどで `(f * t * scale)` は
-/// 整数になり `fract()` は 0.0、`t = 0.0` のときの `sin(phi)` と完全に同一の
-/// 演算に収束する。これが t=0 / t=1 フレーム完全一致（=ループ性）の根拠。
-#[inline]
-fn sin_loop(f: u32, t: f32, scale: u32, phi: f32) -> f32 {
-    let raw = (f as f32 * t * scale as f32).fract();
-    (raw * TAU + phi).sin()
-}
-
 /// glyph の per-orb 回転角を出す CPU 参照実装。実描画は GPU の SDF variant
 /// （`orb.wgsl` を `gpu.rs` の `orb_sdf_wgsl()` が合成）が行うため、本関数は WGSL の
 /// `glyph_rotation_angle` と式が一致することを担保する
@@ -487,101 +441,6 @@ fn glyph_rotation_angle(
 /// `GL_RENDERER_MAX_ORBS`(=64、旧固定 uniform-array レンダラ由来) とは別の、
 /// アニメーション側の絶対上限。
 pub const MAX_ORB_COUNT: usize = 1024;
-
-/// `seed` / `count` / `clusters.weight` から決定的に算出した per-orb パラメータ列。
-///
-/// per-orb パラメータ計算の結果を保持するシーム。GPU Aquarelle 経路
-/// （[`aquarelle_modulated_clusters`]）が位置 wrap / 呼吸 / 色補間に使う。
-/// `seed` / `count` / `cluster_weights` のいずれかを変える場合は再計算する必要がある
-/// （`Default` / `Copy` を実装しないのは、その不変条件をうっかり壊すのを防ぐため）。
-#[derive(Debug, Clone)]
-pub struct CachedOrbParams {
-    params: Vec<OrbParams>,
-}
-
-/// `opts.seed` / `opts.count` / `clusters.weight` から決定的な orb パラメータ列を生成する。
-///
-/// per-orb パラメータ計算（位置・呼吸・回転・wrap・cluster 割当）の入口。GPU 経路
-/// （`aquarelle_modulated_clusters` 等）が同じ決定論列を共有するために使う。
-pub fn precompute_orb_params(opts: &AnimateOptions, clusters: &[Cluster]) -> CachedOrbParams {
-    let n_orbs = opts
-        .count
-        .unwrap_or(clusters.len())
-        .min(MAX_ORB_COUNT)
-        .max(if clusters.is_empty() { 0 } else { 1 });
-    let cluster_weights: Vec<f32> = clusters.iter().map(|c| c.weight.max(0.0)).collect();
-    CachedOrbParams {
-        params: generate_orb_params(opts.seed, n_orbs, &cluster_weights),
-    }
-}
-
-/// Aquarelle フレームの per-orb 変調（位置 wrap・半径呼吸・#33/#7 色補間）を 1 箇所に
-/// 集約したヘルパ。GPU 経路（[`aquarelle_modulated_clusters`]）が使う。返す
-/// `Vec<Cluster>` の index は `gpu::GpuRenderer::render_frame_aquarelle` の per-orb 4 層
-/// 描画順（`aquarelle::render_aquarelle_orb` の `seed = i`）に対応する。
-fn modulate_aquarelle_clusters(
-    clusters: &[Cluster],
-    opts: &AnimateOptions,
-    params: &[OrbParams],
-    t: f32,
-) -> Vec<Cluster> {
-    use crate::cluster::Centroid;
-
-    let cycle = opts.speed.cycle_count();
-
-    clusters
-        .iter()
-        .zip(params.iter())
-        .enumerate()
-        .map(|(idx, (c, p))| {
-            // 動画入力（#33）: keyframe_tracks があれば色 + 重心 + 重みを時刻 t の
-            // 補間値で読み替える。#7 (color_tracks) より優先される。
-            let interpolated = pick_cluster_at_t(opts.keyframe_tracks.as_deref(), idx, c, t);
-            let (color_t33, centroid_t33, weight_t33) = match interpolated {
-                Some((col, cen, w)) => (col, cen, w),
-                None => (c.color, c.centroid, c.weight),
-            };
-            let advance = (cycle as f32 * p.speed_mult as f32 * t).fract();
-            let progress = (p.phase + advance).rem_euclid(1.0);
-            let (nx, ny) = match opts.direction {
-                MotionDirection::LeftToRight => (progress, centroid_t33.y),
-                MotionDirection::RightToLeft => (1.0 - progress, centroid_t33.y),
-                MotionDirection::TopToBottom => (centroid_t33.x, progress),
-                MotionDirection::BottomToTop => (centroid_t33.x, 1.0 - progress),
-            };
-            let radius_factor = 1.0 + BREATH_RADIUS_AMPLITUDE * sin_loop(1, t, 1, p.phi_radius);
-            let weight_scale = radius_factor * radius_factor;
-            // #33 が無いときだけ #7 の color_tracks を見る（#33 が指定済みなら色は補間値）。
-            let color_at_t = if opts.keyframe_tracks.is_some() {
-                color_t33
-            } else {
-                pick_color_at_t(opts.color_tracks.as_deref(), idx, c.color, t)
-            };
-            Cluster {
-                color: color_at_t,
-                centroid: Centroid { x: nx, y: ny },
-                weight: (weight_t33 * weight_scale).max(0.0),
-            }
-        })
-        .collect()
-}
-
-/// GPU Aquarelle 経路（#216）が per-orb の変調済み cluster 列を得るための
-/// `#[doc(hidden)]` シーム。[`pack_render_data`] と同様、内部の `OrbParams`
-/// レイアウトや RNG 列は公開しない。
-///
-/// 返り値の index は `gpu::GpuRenderer::render_frame_aquarelle` の per-orb 描画順
-/// （`aquarelle::render_aquarelle_orb` の `seed = i`）に一致する。各 cluster の
-/// 変調済み中心 / 重み / 色を読み、per-orb の 4 層を WGSL で描く。
-#[doc(hidden)]
-pub fn aquarelle_modulated_clusters(
-    clusters: &[Cluster],
-    opts: &AnimateOptions,
-    t: f32,
-) -> Vec<Cluster> {
-    let cache = precompute_orb_params(opts, clusters);
-    modulate_aquarelle_clusters(clusters, opts, &cache.params, t)
-}
 
 #[cfg(test)]
 mod tests {
@@ -866,39 +725,5 @@ mod tests {
         assert_eq!(pack_with(1.0)[13], 1.0, "1.0 is inclusive");
         assert_eq!(pack_with(-0.5)[13], 0.0, "below range clamps to 0");
         assert_eq!(pack_with(1.5)[13], 1.0, "above range clamps to 1");
-    }
-
-    /// #225: per-orb パラメータ計算（pack/GPU 共有）が決定論的であること。
-    /// `aquarelle_modulated_clusters` の入口 `precompute_orb_params` が同じ seed /
-    /// count / clusters で同じ列を返すことを cross_axis / phase 列の一致で固定する。
-    #[test]
-    fn precompute_orb_params_is_deterministic() {
-        use crate::cluster::Centroid;
-        let clusters = vec![
-            Cluster {
-                color: [220, 60, 60],
-                centroid: Centroid { x: 0.3, y: 0.4 },
-                weight: 0.5,
-            },
-            Cluster {
-                color: [60, 120, 220],
-                centroid: Centroid { x: 0.7, y: 0.6 },
-                weight: 0.3,
-            },
-        ];
-        let opts = AnimateOptions {
-            seed: 777,
-            count: Some(16),
-            ..AnimateOptions::default()
-        };
-        let a = precompute_orb_params(&opts, &clusters);
-        let b = precompute_orb_params(&opts, &clusters);
-        assert_eq!(a.params.len(), 16);
-        for (pa, pb) in a.params.iter().zip(b.params.iter()) {
-            assert_eq!(pa.phase, pb.phase);
-            assert_eq!(pa.cross_axis, pb.cross_axis);
-            assert_eq!(pa.cluster_idx, pb.cluster_idx);
-            assert_eq!(pa.speed_mult, pb.speed_mult);
-        }
     }
 }

@@ -37,7 +37,7 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (orb / aquarelle bleed / glyph / image), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (orb / glyph / image), the watercolor bleed axis (`--bleed`/`--bloom`/`--halo`/`--offset`, #239), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
 
 ```bash
 orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --softness low
@@ -61,8 +61,9 @@ one of `lr` (left→right), `rl`, `tb`, or `bt`. Pick the direction and pace wit
 ```bash
 orber --input photo.jpg --output drift.mp4 --direction lr --speed slow
 orber --input photo.jpg --output drift.mp4 --direction tb --speed very-slow --duration-ms 10000
-# Video input: keyframe interpolation (#33) — color + position + weight all lerp between keyframes
-# centroid drift is visible on both Aquarelle (full) and Orb (50% blended with per-orb scatter).
+# Video input: keyframe interpolation (#33). NOTE: since #239 the per-frame color/position
+# animation is not yet rendered by the unified renderer (it warns and uses static colors);
+# motion + breathing still animate. Re-wiring the tracks is tracked in #251.
 orber --input video.mp4 --output orb.mp4 --input-mode keyframe --keyframes 8 --duration-ms 10000
 ```
 
@@ -76,11 +77,8 @@ Combined with a long `--duration-ms`, this gives the characteristic gentle, laye
 drift. Every orb also gets three independent breathing pulses (radius ±10%,
 blur ±15%, opacity ±5%) applied automatically — there is no opt-in flag for that.
 
-> Note: the aquarelle shape uses the legacy `[0, 1]` wrap (its bleed / bloom / halo
-> textures clip cleanly enough that the off-screen buffer would interfere with the
-> rendered halo). The off-screen wrap buffer described above applies to the
-> `orb`, `glyph`, and `image` shapes (`image` shares the `glyph` SDF render
-> path).
+> Note: the off-screen wrap buffer described above applies to all three shapes —
+> `orb`, `glyph`, and `image` (`image` shares the `glyph` SDF render path).
 
 ### Orb count
 
@@ -103,10 +101,6 @@ seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
 `--count-preset low|mid|high` is a shorthand alternative to `--count <N>` (mapped
 to 10 / 20 / 30). The two flags are mutually exclusive — pass one or the other.
 
-> Note: the aquarelle shape ignores `--count` (palette-only rendering). It always
-> renders one orb per cluster from the k-means palette so the bleed / bloom / halo
-> texture set stays coherent.
-
 ### Glyph shape
 
 `--shape glyph` swaps the round orb for a **glyph character** (default `☆`). Pick
@@ -126,9 +120,10 @@ field**, so `--blur` and `--softness` affect glyphs with the same visual
 meaning as plain orbs: soft edge falloff, not a hard text fill. Since #235 the
 glyph is fed to the **same orb mechanism** as the plain `orb` shape — the SDF is
 just a different silhouette, blurred with the orb's falloff / breath / rim-soft
-compositing. There is no separate bleed/halo pass: a `●` glyph looks like a plain
-orb, a `▲` blurs while keeping its triangular form. (Watercolor bleed is the
-`aquarelle` shape's domain only.)
+compositing. There is no separate per-shape bleed/halo pass: a `●` glyph looks like
+a plain orb, a `▲` blurs while keeping its triangular form. (Watercolor bleed is now
+an opt-in additive axis available on **any** shape via `--bleed`/`--bloom`/`--halo`/
+`--offset` (#239), not a separate shape.)
 Glyphs also get a seed-derived base angle so stills are not a wall of
 identically oriented symbols; animated outputs continue rotating per orb from
 that base angle.

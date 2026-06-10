@@ -1,4 +1,3 @@
-use aquarelle::AquarelleParams;
 use clap::{Parser, ValueEnum};
 use orber_core::animate::{MotionDirection, MotionSpeed, SHADOW_STRENGTH_DEFAULT};
 use orber_core::cluster::{derive_background_rgba, drop_dominant, extract_clusters, Cluster};
@@ -114,6 +113,10 @@ impl CliCountPreset {
 ///   `VIDEO_INPUT_N_SAMPLES` 個のサンプル列から色トラックを作る。
 /// - `Keyframe` (#33): 色 + 位置 + 重みを `--keyframes` 個のキーから時間軸補間。
 ///
+/// 注意（#239 Phase 1〜）: トラック（色 / キーフレーム）の**時間アニメは現在の統一 WGSL
+/// レンダラでは描画されない**（旧 aquarelle 経路の撤去で一時的に dead）。動画出力は静止色
+/// になり、実行時に警告を出す。再配線は #251。トラック生成・plumbing は温存してある。
+///
 /// 静止画入力ではどちらも従来挙動（時間軸補間なし）。`Keyframe` を静止画に渡すと
 /// 明示エラーで弾く（後段の `run_video_input_keyframe` に到達しないため UI 上の
 /// 矛盾を起こさない）。
@@ -149,13 +152,73 @@ impl From<CliVariationMode> for VariationMode {
 enum Shape {
     /// Plain orb: a single soft radial gradient (default).
     Orb,
-    /// Cel-painted nightscape texture set: bleed + bloom + offset + halo.
-    Aquarelle,
     /// One bundled-font glyph filled per orb (#55). Pick the glyph with --glyph-char.
     Glyph,
     /// Image silhouette filled per orb (#217). Provide the silhouette with
     /// --image-mask (a raster PNG/JPG/...; SVG is web-only, image crate is raster).
     Image,
+}
+
+/// #239 Phase 1: the product-facing 3-tier にじみ (bleed) button. This is the
+/// supported way to dial the watercolor bleed for ANY shape (orb / glyph / image).
+/// It engages the single continuous space-blur — the only product-shipped geometry —
+/// so silhouettes stay themselves while softening. There is intentionally no `off`
+/// here: omit the flag entirely to keep the crisp default; this enum only chooses
+/// how much it bleeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliBleedPreset {
+    /// 弱いにじみ — シルエットがわずかに溶ける。
+    Weak,
+    /// 中くらいのにじみ — ふんわりぼける。
+    Mid,
+    /// 強いにじみ — ほどよく溶ける（製品の上限）。
+    Strong,
+}
+
+impl CliBleedPreset {
+    /// 3 段ボタンを内部 `aqua_bleed` 量へ写像する。製品 UI では数字を出さないので、
+    /// この対応表だけがにじみの強さの正本。
+    fn to_bleed(self) -> f32 {
+        match self {
+            CliBleedPreset::Weak => 0.15,
+            CliBleedPreset::Mid => 0.3,
+            CliBleedPreset::Strong => 0.5,
+        }
+    }
+}
+
+/// #239 Phase 1: にじみ (bleed) と同じ 3 段ボタンを bloom / halo / offset の各軸に
+/// 展開するための共通プリセット。`--bloom` / `--halo` / `--offset` が同形の
+/// value_enum でこれを採る。`--bleed` と違って `off` を持たない理由も同じ: flag を
+/// 省くと「その軸 0（オフ）」、指定すると弱 / 中 / 強の 3 段だけを選ぶ。にじみ
+/// （水彩レイヤ）が無いと効かない設計なので、これらは `--bleed` 指定時のみ有効
+/// （`--bleed` 無しで bloom/halo/offset だけ渡すと明示エラー、`requires` で強制）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliCharacterPreset {
+    /// 弱い効き。
+    Weak,
+    /// 中くらいの効き。
+    Mid,
+    /// 強い効き（製品の上限）。
+    Strong,
+}
+
+impl CliCharacterPreset {
+    /// 3 段ボタンを内部 `aqua_bloom` / `aqua_halo` / `aqua_offset` 量へ写像する。
+    /// にじみと同じく数字を出さない製品 UI ではこの対応表だけが強さの正本。
+    /// weak=0.3 / mid=0.6 / strong=0.9（自己検証で弁別を確認した確定値）。
+    fn to_coef(self) -> f32 {
+        match self {
+            CliCharacterPreset::Weak => 0.3,
+            CliCharacterPreset::Mid => 0.6,
+            CliCharacterPreset::Strong => 0.9,
+        }
+    }
+
+    /// `Option<Self>` を係数に解決する。未指定 (`None`) はその軸オフ = 0.0。
+    fn coef_or_zero(opt: Option<Self>) -> f32 {
+        opt.map(Self::to_coef).unwrap_or(0.0)
+    }
 }
 
 /// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
@@ -319,26 +382,38 @@ struct Cli {
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1000..=600_000))]
     duration_ms: u64,
 
-    /// Aquarelle: bleed strength (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
-    aquarelle_bleed: f32,
+    /// にじみ (watercolor bleed): weak / mid / strong の 3 段ボタン (#239)。
+    /// 弱いにじみ / 中くらい / 強い、の 3 段でシルエットを溶かす。星は星のまま、丸は丸
+    /// のままぼける。orb / glyph / image どの --shape にも効く。省略すると従来どおりくっ
+    /// きり（にじみオフ）。
+    #[arg(long, value_enum)]
+    bleed: Option<CliBleedPreset>,
 
-    /// Aquarelle: blown-out core strength (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
-    aquarelle_bloom: f32,
+    /// ブルーム（芯の光）: weak / mid / strong の 3 段ボタン (#239)。にじみの上に
+    /// 「明るい芯」を段階的に乗せる。省略するとブルーム無し（その軸オフ）。にじみが
+    /// 前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    bloom: Option<CliCharacterPreset>,
 
-    /// Aquarelle: gradient center offset (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
-    aquarelle_offset: f32,
+    /// ハロー（縁の彩度）: weak / mid / strong の 3 段ボタン (#239)。にじみの外周の
+    /// 彩度を段階的に上げる（枠リングは作らない）。省略するとハロー無し（その軸オフ）。
+    /// にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    halo: Option<CliCharacterPreset>,
 
-    /// Aquarelle: peripheral saturation (halo) (0.0..=1.0). Only used with --shape aquarelle.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
-    aquarelle_halo: f32,
+    /// オフセット（にじみのかたより）: weak / mid / strong の 3 段ボタン (#239)。にじみ
+    /// を左右非対称・有機的にする（形は壊さない）。省略するとオフセット無し（その軸
+    /// オフ）。にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
+    #[arg(long, value_enum, requires = "bleed")]
+    offset: Option<CliCharacterPreset>,
 
     /// Input processing mode (#7 / #33). Only meaningful for video input.
     /// `color-track` = #7 (position fixed, color tracks over time, default).
     /// `keyframe` = #33 (color + position + weight all interpolated between keyframes).
     /// Passing `keyframe` with a still image input yields an explicit error.
+    /// NOTE (since #239 Phase 1): the per-frame color/keyframe animation is not yet
+    /// rendered by the unified WGSL renderer — video output uses static per-orb colors
+    /// and warns at runtime. Re-wiring is tracked in #251.
     #[arg(long = "input-mode", value_enum, default_value_t = CliInputMode::ColorTrack)]
     input_mode: CliInputMode,
 
@@ -350,13 +425,25 @@ struct Cli {
 }
 
 impl Cli {
-    fn aquarelle_params(&self) -> AquarelleParams {
-        AquarelleParams {
-            bleed: self.aquarelle_bleed,
-            bloom: self.aquarelle_bloom,
-            offset: self.aquarelle_offset,
-            halo: self.aquarelle_halo,
-        }
+    /// #239: the additive watercolor bleed config. `Some` only when にじみが要求された
+    /// (product `--bleed`)。`--bleed` を省くと `None` を返すので orb / glyph / image は
+    /// 従来どおり (byte-identical = 非リグレッションゲート)。
+    ///
+    /// `--bleed` (weak/mid/strong) が `bleed` を 3 段テーブル値にして continuous の
+    /// 空間ブラーを engage する。bloom / offset / halo は各軸の `--bloom` / `--offset` /
+    /// `--halo` プリセット（同じ 3 段ボタン）で決まり、flag を省いた軸は 0（オフ）。
+    /// `--bloom` / `--halo` / `--offset` は `--bleed` を `requires` するので、にじみ無しで
+    /// character 軸だけ渡すと clap が明示エラーにする。
+    fn poc_aqua(&self) -> Option<orber_core::animate::AquaBleedConfig> {
+        // 製品の 3 段ボタンで engage し bleed をテーブル値に差し替え、bloom/halo/offset は
+        // 各軸の 3 段ボタン（未指定 = 0）で決める。
+        let preset = self.bleed?;
+        Some(orber_core::animate::AquaBleedConfig {
+            bleed: preset.to_bleed(),
+            bloom: CliCharacterPreset::coef_or_zero(self.bloom),
+            offset: CliCharacterPreset::coef_or_zero(self.offset),
+            halo: CliCharacterPreset::coef_or_zero(self.halo),
+        })
     }
 
     /// Resolve the `OrbShape` for this run. For `--shape image` this performs I/O:
@@ -367,7 +454,6 @@ impl Cli {
     fn orb_shape(&self) -> Result<OrbShape, String> {
         match self.shape {
             Shape::Orb => Ok(OrbShape::Orb),
-            Shape::Aquarelle => Ok(OrbShape::Aquarelle(self.aquarelle_params())),
             Shape::Glyph => Ok(OrbShape::Glyph {
                 ch: self.glyph_char,
                 font: GlyphFontId::NotoSymbols2,
@@ -492,12 +578,11 @@ fn resolve_motion(cli: &Cli) -> (MotionDirection, MotionSpeed) {
 
 /// 単一フレーム描画のバックエンド。GPU(WGSL) を唯一のレンダラとする (#225)。
 ///
-/// 全 shape（Orb / Glyph / Aquarelle / Image）が GPU 上で描かれる。count は 1024 まで
+/// 全 shape（Orb / Glyph / Image）が GPU 上で描かれる。count は 1024 まで
 /// GPU が data-texture 経路で直接描く（#210 Phase 1a で 64 制限を撤去）。Glyph / Image は
-/// #235 で orb 機構に統一（SDF を orb に食わせる単パス、bleed/halo は撲滅）、Aquarelle
-/// は #216 Phase 1c で WGSL 化（4 層を解析 radial で評価、RNG/色は pack で算出）。GPU アダプタ
-/// が取得できない場合は CPU にフォールバックせず、`new` が `None` を返すので呼び出し側が
-/// 明示エラーで終了する（CPU 描画は撲滅済み）。
+/// #235 で orb 機構に統一（SDF を orb に食わせる単パス）。にじみは任意の shape に乗る
+/// 加算レイヤー（#239）の領分。GPU アダプタが取得できない場合は CPU にフォールバックせず、
+/// `new` が `None` を返すので呼び出し側が明示エラーで終了する（CPU 描画は撲滅済み）。
 struct FrameRenderer {
     gpu: Box<orber_core::gpu::GpuRenderer>,
 }
@@ -523,11 +608,9 @@ impl FrameRenderer {
     ) -> image::RgbaImage {
         match &opts.shape {
             // Glyph / Image feed an SDF silhouette to the unified orb mechanism
-            // (#235, single pass, no bleed); Aquarelle uses the dedicated WGSL
-            // four-layer path (#216); Orb is the default analytic-circle path.
+            // (#235, single pass); Orb is the default analytic-circle path.
             OrbShape::Glyph { .. } => self.gpu.render_frame_glyph(clusters, opts, t),
             OrbShape::Image { .. } => self.gpu.render_frame_image(clusters, opts, t),
-            OrbShape::Aquarelle(_) => self.gpu.render_frame_aquarelle(clusters, opts, t),
             _ => self.gpu.render_frame(clusters, opts, t),
         }
     }
@@ -557,11 +640,6 @@ fn warn_if_orb_pool_empty(orb_clusters: &[Cluster]) {
     }
 }
 
-/// `--shape aquarelle` と `--count` の組合せを使ったときに stderr で警告する。
-///
-/// Aquarelle 経路は cluster 数だけ orb を描画する設計（per-orb の独立揺らぎを
-/// 入れると bleed/bloom/halo の質感セットが壊れるため）。CLI からは aquarelle の
-/// ときだけ count が無視される事実が見えないので、ここで明示的に教える。
 /// `--shape glyph` で指定された `--glyph-char` が同梱フォント (Noto Sans Symbols 2)
 /// に収録されていなければ stderr で警告する。出力は走るが Glyph 描画は静かに
 /// スキップされるため、「絵文字を入れたら何も出ない」という挙動の理由が
@@ -579,12 +657,29 @@ fn warn_if_glyph_char_unsupported(cli: &Cli) {
     }
 }
 
-fn warn_if_aquarelle_count_ignored(cli: &Cli) {
-    if matches!(cli.shape, Shape::Aquarelle) {
+/// #239: the additive watercolor にじみ (`--bleed/--bloom/--halo/--offset`) は現状
+/// **PNG 出力のみ**で効く。動画出力 (mp4 / webm) は製品ルックを維持するため additive
+/// bleed レイヤーを通さない (`video::render_video` が `aqua: None` を固定)。にじみが
+/// 要求されているのに動画出力へ落ちると黙って無視されて驚くので、stderr に警告する。
+/// `poc_aqua()` が `Some` = にじみが engage 要求された。
+fn warn_if_aqua_ignored_for_video(cli: &Cli) {
+    if cli.poc_aqua().is_some() {
         eprintln!(
-            "orber: warning: aquarelle shape ignores --count (rendering one orb per k-means cluster from the palette)"
+            "orber: warning: --bleed/--bloom/--halo/--offset are applied to PNG output only; \
+             video output (mp4/webm) ignores them and keeps the plain orb look"
         );
     }
+}
+
+/// #239 Phase 1 で旧 aquarelle 経路を撤去した結果、動画の色トラック(#7) / キーフレーム(#33)
+/// の時間アニメは現在の統一 WGSL レンダラでは描画されない（`color_tracks` / `keyframe_tracks`
+/// は pack に畳み込まれていない）。フレームは静止色で出力される。再配線は #251。各動画出力経路で
+/// 1 度だけ警告し、嘘をつかない。`detail` は対象（"color (#7)" / "color/position keyframe (#33)"）。
+fn warn_video_track_anim_unsupported(detail: &str) {
+    eprintln!(
+        "orber: warning: video {detail} animation is not rendered by the current renderer; \
+         frames use static per-orb colors (re-wiring tracked in #251)"
+    );
 }
 
 /// `cli.orb_shape()` を解決し、エラー（`--shape image` の mask 欠如 / 読込失敗 /
@@ -678,7 +773,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
     let background = derive_background_rgba(&clusters);
     let orb_clusters = drop_dominant(&clusters);
     warn_if_orb_pool_empty(&orb_clusters);
-    warn_if_aquarelle_count_ignored(cli);
+    warn_if_aqua_ignored_for_video(cli);
 
     // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
     let orb_shape = match resolve_orb_shape(cli) {
@@ -747,7 +842,6 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     let background = derive_background_rgba(&clusters);
     let orb_clusters = drop_dominant(&clusters);
     warn_if_orb_pool_empty(&orb_clusters);
-    warn_if_aquarelle_count_ignored(cli);
 
     // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
     let orb_shape = match resolve_orb_shape(cli) {
@@ -763,6 +857,9 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     let frame_opts = orber_core::animate::AnimateOptions {
         width: RenderOptions::default().width,
         height: RenderOptions::default().height,
+        // #239: additive watercolor bleed layer when --bleed is set; None (default)
+        // = byte-identical existing look.
+        aqua: cli.poc_aqua(),
         orb_size: cli.orb_size,
         blur: cli.blur,
         saturation: cli.saturation,
@@ -779,8 +876,8 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
         color_tracks: None,
         keyframe_tracks: None,
     };
-    // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Orb/Glyph/Aquarelle/
-    // Image）に対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
+    // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Orb/Glyph/Image）に
+    // 対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
     let renderer = match init_renderer() {
         Ok(r) => r,
         Err(code) => return code,
@@ -871,7 +968,6 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
         .map(|(_, (c, t))| (*c, t.clone()))
         .unzip();
     warn_if_orb_pool_empty(&orb_clusters);
-    warn_if_aquarelle_count_ignored(cli);
 
     // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
     let orb_shape = match resolve_orb_shape(cli) {
@@ -887,6 +983,8 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
 
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        warn_if_aqua_ignored_for_video(cli);
+        warn_video_track_anim_unsupported("color (#7)");
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
@@ -924,6 +1022,8 @@ fn run_video_input_color_track(cli: &Cli, output: &Path, mode: OutputMode) -> Ex
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239: additive watercolor bleed layer (only when --bleed set).
+                aqua: cli.poc_aqua(),
                 orb_size: cli.orb_size,
                 blur: cli.blur,
                 saturation: cli.saturation,
@@ -1016,7 +1116,6 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
         .map(|(_, (c, t))| (*c, t.clone()))
         .unzip();
     warn_if_orb_pool_empty(&orb_clusters);
-    warn_if_aquarelle_count_ignored(cli);
 
     // shape を 1 度だけ解決（--shape image の mask デコードはここで 1 回）。
     let orb_shape = match resolve_orb_shape(cli) {
@@ -1032,6 +1131,8 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
 
     // 出力モードで分岐。動画 (mp4 / webm)、静止画 (png)、その他はエラー。
     if let Some(codec) = VideoCodec::from_output_mode(mode) {
+        warn_if_aqua_ignored_for_video(cli);
+        warn_video_track_anim_unsupported("color/position keyframe (#33)");
         let (direction, speed) = resolve_motion(cli);
         let opts = VideoOptions {
             orb_size: cli.orb_size,
@@ -1070,6 +1171,8 @@ fn run_video_input_keyframe(cli: &Cli, output: &Path, mode: OutputMode) -> ExitC
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239: additive watercolor bleed layer (only when --bleed set).
+                aqua: cli.poc_aqua(),
                 orb_size: cli.orb_size,
                 blur: cli.blur,
                 saturation: cli.saturation,
@@ -1165,7 +1268,6 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     let background = derive_background_rgba(&base_clusters);
     let orb_clusters = drop_dominant(&base_clusters);
     warn_if_orb_pool_empty(&orb_clusters);
-    warn_if_aquarelle_count_ignored(cli);
 
     // #225: 全 spec を GPU で描く。renderer は 1 本だけ作ってループで使い回す。
     let renderer = match init_renderer() {
@@ -1220,6 +1322,8 @@ fn render_one_variation(
             let frame_opts = orber_core::animate::AnimateOptions {
                 width: RenderOptions::default().width,
                 height: RenderOptions::default().height,
+                // #239 PoC: variations presets keep the production look (no aqua layer).
+                aqua: None,
                 orb_size: spec.orb_size,
                 blur: spec.blur,
                 saturation: 1.0,
@@ -1646,12 +1750,161 @@ mod tests {
         assert_eq!(cli.resolved_softness(), SoftnessPreset::High);
     }
 
+    /// #239 Phase 1: 製品の 3 段ボタン `--bleed` は weak/mid/strong を内部 aqua_bleed
+    /// 0.15 / 0.3 / 0.5 に写像して engage する（唯一の continuous 空間ブラー）。
     #[test]
-    fn aquarelle_params_out_of_range_rejected() {
-        assert!(try_parse(&["--aquarelle-bleed", "1.5"]).is_err());
-        assert!(try_parse(&["--aquarelle-bloom", "-0.1"]).is_err());
-        assert!(try_parse(&["--aquarelle-offset", "0.7"]).is_ok());
-        assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
+    fn bleed_preset_maps_to_table() {
+        assert_eq!(CliBleedPreset::Weak.to_bleed(), 0.15);
+        assert_eq!(CliBleedPreset::Mid.to_bleed(), 0.3);
+        assert_eq!(CliBleedPreset::Strong.to_bleed(), 0.5);
+
+        for (arg, want) in [("weak", 0.15_f32), ("mid", 0.3), ("strong", 0.5)] {
+            let cli = try_parse(&["--shape", "glyph", "--bleed", arg])
+                .unwrap_or_else(|e| panic!("--bleed {arg} must parse: {e}"));
+            let aqua = cli
+                .poc_aqua()
+                .unwrap_or_else(|| panic!("--bleed {arg} must engage watercolor"));
+            assert_eq!(
+                aqua.bleed, want,
+                "--bleed {arg} must map aqua_bleed to {want}"
+            );
+            // #239: bloom/offset/halo は専用 3 段ボタン。--bloom/--halo/--offset を
+            // 渡していないので各軸 0（オフ）。
+            assert_eq!(aqua.bloom, 0.0, "--bloom 未指定なら芯ブルーム 0（オフ）");
+            assert_eq!(aqua.offset, 0.0, "--offset 未指定なら 0（オフ）");
+            assert_eq!(aqua.halo, 0.0, "--halo 未指定なら 0（オフ）");
+        }
+    }
+
+    /// #239: bloom / halo / offset の 3 段ボタンが内部係数へ写像される。にじみと同形の
+    /// weak / mid / strong = 0.3 / 0.6 / 0.9。`--bleed` 指定時のみ有効（requires）で、
+    /// 各軸は独立に AquaBleedConfig の対応フィールドへ流れ、未指定軸は 0（オフ）。
+    #[test]
+    fn character_presets_map_to_table() {
+        assert_eq!(CliCharacterPreset::Weak.to_coef(), 0.3);
+        assert_eq!(CliCharacterPreset::Mid.to_coef(), 0.6);
+        assert_eq!(CliCharacterPreset::Strong.to_coef(), 0.9);
+
+        for (arg, want) in [("weak", 0.3_f32), ("mid", 0.6), ("strong", 0.9)] {
+            // bloom 軸: 指定軸だけ係数が乗り、halo / offset は 0 のまま。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--bloom", arg])
+                .unwrap_or_else(|e| panic!("--bloom {arg} must parse: {e}"))
+                .poc_aqua()
+                .unwrap_or_else(|| panic!("--bloom {arg} must engage watercolor"));
+            assert_eq!(aqua.bloom, want, "--bloom {arg} must map to {want}");
+            assert_eq!(aqua.halo, 0.0, "--bloom {arg}: halo stays off");
+            assert_eq!(aqua.offset, 0.0, "--bloom {arg}: offset stays off");
+
+            // halo 軸。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--halo", arg])
+                .unwrap()
+                .poc_aqua()
+                .unwrap();
+            assert_eq!(aqua.halo, want, "--halo {arg} must map to {want}");
+            assert_eq!(aqua.bloom, 0.0, "--halo {arg}: bloom stays off");
+            assert_eq!(aqua.offset, 0.0, "--halo {arg}: offset stays off");
+
+            // offset 軸。
+            let aqua = try_parse(&["--shape", "glyph", "--bleed", "mid", "--offset", arg])
+                .unwrap()
+                .poc_aqua()
+                .unwrap();
+            assert_eq!(aqua.offset, want, "--offset {arg} must map to {want}");
+            assert_eq!(aqua.bloom, 0.0, "--offset {arg}: bloom stays off");
+            assert_eq!(aqua.halo, 0.0, "--offset {arg}: halo stays off");
+        }
+    }
+
+    /// #239: 3 軸とも同時指定できる。各軸が独立に対応フィールドへ流れる。
+    #[test]
+    fn character_presets_all_three_axes_independent() {
+        let aqua = try_parse(&[
+            "--shape", "glyph", "--bleed", "strong", "--bloom", "weak", "--halo", "mid",
+            "--offset", "strong",
+        ])
+        .unwrap()
+        .poc_aqua()
+        .expect("all three axes must engage with --bleed");
+        assert_eq!(aqua.bleed, 0.5, "bleed strong");
+        assert_eq!(aqua.bloom, 0.3, "bloom weak");
+        assert_eq!(aqua.halo, 0.6, "halo mid");
+        assert_eq!(aqua.offset, 0.9, "offset strong");
+    }
+
+    /// #239 ★依存ゲート: にじみ無し（`--bleed` 省略）で bloom / halo / offset だけ渡すと
+    /// clap が `requires` で明示エラーにする。水彩レイヤが無いと効かない設計の強制。
+    #[test]
+    fn character_presets_require_bleed() {
+        assert!(
+            try_parse(&["--bloom", "mid"]).is_err(),
+            "--bloom without --bleed must error (requires)"
+        );
+        assert!(
+            try_parse(&["--halo", "mid"]).is_err(),
+            "--halo without --bleed must error (requires)"
+        );
+        assert!(
+            try_parse(&["--offset", "mid"]).is_err(),
+            "--offset without --bleed must error (requires)"
+        );
+    }
+
+    /// #239 Phase 1: `--bleed` 未指定なら watercolor は off (poc_aqua == None)。orb /
+    /// glyph / image は従来どおり byte-identical にレンダリングされる非リグレッションゲート。
+    #[test]
+    fn bleed_preset_absent_keeps_watercolor_off() {
+        for shape in ["orb", "glyph", "image"] {
+            let cli = try_parse(&["--shape", shape]).unwrap();
+            assert!(
+                cli.poc_aqua().is_none(),
+                "without --bleed, shape {shape} must keep watercolor off (byte-identical)"
+            );
+        }
+    }
+
+    /// #239 Phase 1: 製品の `--bleed weak`（character 軸未指定）は
+    /// `AquaBleedConfig { bleed: 0.15, bloom: 0, offset: 0, halo: 0 }` に解決する。
+    /// これが「同じ内部値に写像されている」証跡で、レンダリング出力の byte 一致の根拠。
+    #[test]
+    fn bleed_weak_maps_to_continuous_0_15() {
+        let product = try_parse(&["--shape", "glyph", "--bleed", "weak"])
+            .unwrap()
+            .poc_aqua()
+            .expect("product --bleed weak must engage");
+        assert_eq!(
+            product,
+            orber_core::animate::AquaBleedConfig {
+                bleed: 0.15,
+                bloom: 0.0,
+                offset: 0.0,
+                halo: 0.0,
+            },
+            "--bleed weak must resolve to bleed 0.15 with character axes off"
+        );
+    }
+
+    /// #239 should 2: にじみ flag (`--bleed` 等) は現状 PNG 出力のみで効き、動画出力では
+    /// 黙って無視される。`warn_if_aqua_ignored_for_video` は `poc_aqua()` が `Some` の
+    /// ときだけ警告する設計なので、その判定キー（にじみ要求の有無）を直接押さえる:
+    /// にじみ指定 → Some（=警告する）、未指定 → None（=黙る）。
+    #[test]
+    fn aqua_video_warn_predicate_keys_on_poc_aqua() {
+        // にじみが要求されている → 動画出力では警告すべき（predicate = Some）。
+        assert!(
+            try_parse(&["--shape", "glyph", "--bleed", "mid"])
+                .unwrap()
+                .poc_aqua()
+                .is_some(),
+            "--bleed must make the video-ignore warning fire (poc_aqua Some)"
+        );
+        // にじみ未指定 → 動画出力でも何も無視していないので黙る（predicate = None）。
+        assert!(
+            try_parse(&["--shape", "glyph"])
+                .unwrap()
+                .poc_aqua()
+                .is_none(),
+            "without --bleed there is nothing to warn about for video output (poc_aqua None)"
+        );
     }
 
     /// #212 (#11) / #225 / #235: `FrameRenderer::render()` must dispatch by
@@ -1701,6 +1954,7 @@ mod tests {
         let base = AnimateOptions {
             width: 96,
             height: 72,
+            aqua: None,
             orb_size: 1.0,
             blur: 0.5,
             saturation: 1.0,

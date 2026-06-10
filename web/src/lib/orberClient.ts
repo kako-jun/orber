@@ -57,6 +57,17 @@ interface BaseParams {
   count_preset?: string;
   speed_preset?: string;
   softness_preset?: string;
+  // #239 Phase 1: にじみ (watercolor bleed) の 3 段ボタン。空文字 / 省略は
+  // "にじみオフ（くっきり）"。'weak' | 'mid' | 'strong' を wasm 側で aqua_bleed
+  // 0.15/0.3/0.5 に写像する。
+  bleed_preset?: string;
+  // #239 Phase 1: bloom（芯の光）/ halo（縁の彩度）/ offset（かたより）の character
+  // 3 段ボタン。空文字 / 省略は "その軸オフ（0）"。'weak' | 'mid' | 'strong' を wasm
+  // 側で aqua_bloom/halo/offset 0.3/0.6/0.9 に写像する。にじみが engage している
+  // ときだけ効く。
+  bloom_preset?: string;
+  halo_preset?: string;
+  offset_preset?: string;
   // #136: Glyph 回転 ON/OFF。`true` 既定で従来挙動、`false` で静止描画。
   glyph_rotate?: boolean;
 }

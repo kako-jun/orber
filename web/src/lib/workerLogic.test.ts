@@ -2,8 +2,8 @@
 // 単体テスト。
 //
 // - buildWasmParams: WasmParams 組立てのデシジョンテーブル（source 必須 /
-//   image マスク必須 / glyph SDF フォールバックとキャッシュ / orb・aquarelle
-//   素通し / transparent_background キーの有無）。wasm / OffscreenCanvas は
+//   image マスク必須 / glyph SDF フォールバックとキャッシュ / orb 素通し /
+//   transparent_background キーの有無）。wasm / OffscreenCanvas は
 //   ロードせず、glyphSupported / generateSdf を vi.fn で DI する
 // - computeMaskSize: 長辺 1024 縮小の境界とアスペクト比保持
 // - formatRunBatchError: sentinel → i18n キーのマップ（t() は fake を DI）。
@@ -136,14 +136,55 @@ describe('buildWasmParams', () => {
     expect(deps.glyphSupported).not.toHaveBeenCalled();
   });
 
-  it("shape='aquarelle' も素通し（mask / SDF キー無し・SDF 生成も呼ばない）", () => {
-    const deps = makeDeps();
-    const params = buildWasmParams(baseParams({ shape: 'aquarelle' }), deps);
-    expect(params.shape).toBe('aquarelle');
-    expect('image_mask_rgba' in params).toBe(false);
-    expect('glyph_sdf' in params).toBe(false);
-    expect(deps.glyphSupported).not.toHaveBeenCalled();
-    expect(deps.generateSdf).not.toHaveBeenCalled();
+  it('#239: bleed_preset は素通しで wasm params に乗る（orb / glyph / image どの shape でも）', () => {
+    // buildWasmParams は BaseParams を `...p` で展開するので、bleed_preset を
+    // 渡せば wasm 側 WasmParams.bleed_preset へそのまま流れる。wasm 側で
+    // 'weak'|'mid'|'strong' → aqua_bleed 0.15/0.3/0.5 に写像される（Rust 側で固定）。
+    for (const preset of ['weak', 'mid', 'strong'] as const) {
+      const params = buildWasmParams(baseParams({ bleed_preset: preset }), makeDeps());
+      expect(params.bleed_preset).toBe(preset);
+    }
+  });
+
+  it("#239: bleed_preset 省略時はキー自体が無い（serde default '' = にじみオフ）", () => {
+    // 既定はにじみオフ（くっきり）。BaseParams に bleed_preset を渡さなければ
+    // wasm params にもキーが乗らず、wasm 側 serde default '' → aqua = None で
+    // 従来 Web 出力と byte 一致（非リグレッション）。
+    const params = buildWasmParams(baseParams(), makeDeps());
+    expect('bleed_preset' in params).toBe(false);
+  });
+
+  it("#239: bleed_preset='' を明示しても off として素通しする（aqua = None 相当）", () => {
+    const params = buildWasmParams(baseParams({ bleed_preset: '' }), makeDeps());
+    expect(params.bleed_preset).toBe('');
+  });
+
+  it('#239: bloom / halo / offset の character preset も素通しで wasm params に乗る', () => {
+    // にじみと同じく `...p` 展開で wasm 側 WasmParams.{bloom,halo,offset}_preset へ
+    // そのまま流れる。wasm 側で 'weak'|'mid'|'strong' → 0.3/0.6/0.9 に写像される。
+    for (const preset of ['weak', 'mid', 'strong'] as const) {
+      const params = buildWasmParams(
+        baseParams({
+          bleed_preset: 'mid',
+          bloom_preset: preset,
+          halo_preset: preset,
+          offset_preset: preset,
+        }),
+        makeDeps(),
+      );
+      expect(params.bloom_preset).toBe(preset);
+      expect(params.halo_preset).toBe(preset);
+      expect(params.offset_preset).toBe(preset);
+    }
+  });
+
+  it('#239: character preset 省略時はキー自体が無い（serde default = その軸オフ）', () => {
+    // BaseParams に bloom/halo/offset_preset を渡さなければ wasm params にもキーが
+    // 乗らず、wasm 側 serde default '' → その軸 0 で従来挙動。
+    const params = buildWasmParams(baseParams(), makeDeps());
+    expect('bloom_preset' in params).toBe(false);
+    expect('halo_preset' in params).toBe(false);
+    expect('offset_preset' in params).toBe(false);
   });
 
   it('transparentBackground=true で transparent_background: true が付与される', () => {

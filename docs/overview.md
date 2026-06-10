@@ -40,10 +40,26 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
-- `--shape` — `orb`, `aquarelle` (watercolor bleed), `glyph` (text character), or `image` (silhouette from `--image-mask`)
+- `--shape` — `orb`, `glyph` (text character), or `image` (silhouette from `--image-mask`). The legacy
+  4th `aquarelle` shape (radial `orb_aquarelle.wgsl`) was removed in #239 Phase 1; "watercolor にじみ" is
+  now the `--bleed` axis on any shape, not a separate shape
 - `--glyph-char` — single character used when `--shape glyph` (default `☆`)
 - `--image-mask` — silhouette image used when `--shape image` (the *shape* source; `--input` stays the *color* source). Raster only (PNG/JPEG/…); SVG is web-only
 - `--softness` — blur/edge-softness preset: `low` / `mid` / `high` (default `mid`, existing behavior)
+- `--bleed` — watercolor にじみ as a 3-tier button: `weak` / `mid` / `strong` (#239). This is the
+  **product-facing** way to dial the watercolor bleed for **any** shape (orb / glyph / image): a real
+  spatial blur of the silhouette coverage (it does not morph the distance field to a circle). Omitted =
+  no bleed (crisp, byte-identical to plain orb / glyph / image). Numbers are intentionally hidden in the
+  product UI (internally `weak=0.15` / `mid=0.3` / `strong=0.5`). The continuous-only bleed geometry has no
+  user-facing mode knob (the blink-comparison `blob` variant was dropped in #239 Phase 1).
+  Currently the watercolor layer applies to **PNG output only**; video output (mp4 / webm) keeps the plain
+  orb look and ignores `--bleed/--bloom/--halo/--offset` (the CLI warns to stderr when you ask for both).
+- `--bloom` / `--halo` / `--offset` — the bleed's understated *character* axes, each a `weak` / `mid` /
+  `strong` button (=`0.3` / `0.6` / `0.9`) layered on top of the bleed (#239). `--bloom` is a bright
+  central core (capped at `BLOOM_MAX = 0.45`), `--halo` is a peripheral saturation boost (color only — no
+  frame ring), `--offset` biases the blur origin toward the seed direction (an asymmetric bleed that does
+  not break the shape). Each requires `--bleed` (they do nothing without the watercolor layer, enforced by
+  `requires = bleed`).
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
@@ -130,10 +146,8 @@ clip for the slowest orbs). Real-time pacing is set by `--duration-ms`:
 `--speed slow --duration-ms 8000` means the slowest orbs cross the screen twice
 in 8 seconds (4 s/cross), with `2x` orbs proportionally faster.
 
-> Note: the aquarelle shape uses the legacy `[0, 1]` wrap. Its bleed / bloom / halo
-> textures clip cleanly enough that the off-screen wrap buffer would interfere with
-> the halo rendering. The `[-r, 1+r]` off-screen wrap described above applies to
-> the `orb`, `glyph`, and `image` shapes.
+> Note: the `[-r, 1+r]` off-screen wrap described above applies to all three shapes —
+> `orb`, `glyph`, and `image`.
 
 ## Orb count and visual mix (v0.3.0)
 
@@ -151,9 +165,6 @@ Each orb is also assigned one of two visual styles deterministically from the se
 
 The two styles mix roughly 50:50 inside a single frame, so some orbs look like
 ring-haloed lights and others like plain soft glows.
-
-> Note: the aquarelle shape ignores `--count` (palette-only rendering). It renders
-> one orb per k-means cluster so the bleed / bloom / halo texture set stays coherent.
 
 ## Variation preset (v0.3.0)
 
@@ -229,12 +240,12 @@ How it differs from the color-track path (#7):
    between the two adjacent keyframes by the keyframe's stored normalized time
    (endpoints clamped, NaN-safe, divide-by-zero defended).
 
-How `centroid` drift becomes visible depends on the orb shape:
+How `centroid` drift is intended to become visible (note: since #239 Phase 1 this
+per-frame track animation is **not yet rendered** by the unified renderer — the only
+consumer was the removed aquarelle path; re-wiring is tracked in #251):
 
-- **Aquarelle** shape uses `cluster.centroid` directly for orb placement, so the
-  input video's compositional motion is fully reflected in the output.
-- **Orb** shape blends `cluster.centroid` drift with the per-orb seeded
-  `cross_axis` at 50:50 to keep the input video's compositional motion visible
+- **Orb / glyph / image** shapes blend `cluster.centroid` drift with the per-orb
+  seeded `cross_axis` at 50:50 to keep the input video's compositional motion visible
   without losing the per-orb scatter that prevents stripe artifacts. With
   `--input-mode color-track` (#7) or still-image input, the orb uses `cross_axis`
   alone (existing behavior preserved).
@@ -264,15 +275,36 @@ yields an explicit error rather than silently degrading. The default
 
 ## Relationship to aquarelle
 
-The aquarelle (watercolor bleed) shape generator now ships as its own external
-crate at [`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is
-pulled in via `aquarelle = "0.2"` in `Cargo.toml`. Since #235 it backs **only**
-the `OrbShape::Aquarelle` shape:
+The `aquarelle` watercolor **bleed engine** ships as its own external crate at
+[`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is pulled in via
+`aquarelle = "0.2"` in `Cargo.toml`. It is the shared bleed engine that blueprinter
+also consumes (`render_aquarelle_bleed_pass`); orber-core re-exports it (`pub use
+aquarelle;`). The dependency is **retained on purpose**: #239 Phase 1 removed the old
+in-tree radial *shape* (below), and the going-forward plan is to extract orber's new
+`orb.wgsl` bleed into this crate so orber and blueprinter share one engine (#250/#251).
+After #239 there is only one watercolor in the tree:
 
-- **`OrbShape::Aquarelle`** follows the crate's four-layer `render_aquarelle_orb`
-  model. The GPU shader (`orb_aquarelle.wgsl`) evaluates those layers analytically;
-  the ChaCha8 RNG / HSL color math is run host-side in the parameter pack so it stays
-  byte-identical to the crate, and the resulting centers / radii / colors are uploaded.
+- **The #239 watercolor (the only design)** — "にじみ" is no longer a
+  separate shader. The `--bleed` button blurs the silhouette coverage **inside the
+  unified `orb.wgsl`** for any shape (orb / glyph / image): `blurred_coverage`
+  averages the per-pixel coverage alpha over a disk of radius proportional to
+  `bleed` (48-tap golden-angle spiral + per-pixel `hash21` dither), so a star stays
+  a star and dissolves naturally at high blur — **it does not morph the distance
+  field into a circle**. Coverage evaluation is factored into a per-variant
+  `coverage_at` (orb = analytic circle distance / SDF = sample distance), shared by
+  both the plain single-tap path and the blur's multi-tap path. On top of the bleed
+  sit three understated *character* axes (`Params.aqua_bloom` = bright central core,
+  capped at `BLOOM_MAX = 0.45`; `aqua_halo` = peripheral saturation boost, color only
+  with no frame ring; `aqua_offset` = seed-direction bias of the blur origin = an
+  asymmetric bleed that leaves the shape intact). With every parameter `0` (in
+  particular `bleed = 0`) the output is **byte-identical** to plain orb / glyph /
+  image (`aqua_zero_params_byte_match_plain_orb`); the existing rendering of every
+  other shape is unchanged.
+- **The legacy `OrbShape::Aquarelle` shape (`orb_aquarelle.wgsl`)** — the crate's
+  four-layer `render_aquarelle_orb` radial model, ported to a dedicated GPU shader —
+  was **removed in #239 Phase 1**. The going-forward "watercolor" is the `--bleed`
+  axis above, available on any shape (orb / glyph / image), not a 4th shape.
+
 - **`OrbShape::Glyph` and `OrbShape::Image`** no longer run an aquarelle bleed
   pass. As of #235 they are fed to the **same orb mechanism** as `OrbShape::Orb`:
   the SDF sample becomes the normalized distance `r`, which the unified shader
@@ -285,9 +317,9 @@ the `OrbShape::Aquarelle` shape:
   plain #242 compositing, the production strength is the single constant
   `SHADOW_STRENGTH_DEFAULT`). The glyph / image silhouette is simply a
   different shape fed to the orb — a `●` glyph looks like a plain orb, a `▲` blurs
-  while keeping its triangular form. The old `render_aquarelle_bleed_pass`-derived
-  2nd pass (`orb_glyph_bleed.wgsl`) and its bleed/halo are removed; "bleed" is the
-  Aquarelle shape's domain only. Both glyph and image share the GPU SDF render path
+  while keeping its triangular form. The old per-shape 2nd bleed pass
+  (`orb_glyph_bleed.wgsl`) and its bleed/halo are removed; "bleed" is now the #239
+  `--bleed` additive axis (`orb.wgsl`), available on any shape. Both glyph and image share the GPU SDF render path
   (`render_frame_glyph` / `render_frame_image`); the only difference is the SDF
   source (a bundled font glyph vs. an image silhouette from `--image-mask`).
 
@@ -295,7 +327,7 @@ the `OrbShape::Aquarelle` shape:
 
 Since `v0.3.0` (Issue #35) the repository is a Cargo workspace with two crates:
 
-- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; since #245 production rendering on the web runs through the WebGPU(WGSL) path described below). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path is wired for **all shapes** (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` / `render_frame_aquarelle_to_view` (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained the four aquarelle parameters plus an image-mask input, and the legacy WebGL path (since removed in #245 PR-B) was left unchanged at the time (its `get_render_data` byte stream was unaffected — that export was itself later removed in #247 once the WGSL path became the sole data supply). The glyph JS fallback (#159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`). Since #245 (Phase 3 PR-A) the **production Worker uses this WebGPU path** through the new `gpu_init_offscreen(OffscreenCanvas)` entry point (same bring-up as `gpu_init`, worker-context `navigator.gpu`), plus `gpu_render_rgba(t)` — an async straight-alpha RGBA read-back (texture → padded buffer → `map_async`) used for transparent export, because WebGPU canvases only offer `opaque` / `premultiplied` alpha modes — and `WasmParams.transparent_background`, which zeroes the resolved background alpha inside wasm (the WGSL-path equivalent of the old worker-side "patch pack header word 3" trick).
+- **`orber-core`** (`crates/core/`) — pure rendering library: cluster extraction, the GPU (WGSL / `wgpu`) renderer, per-orb parameter packing, glyph / image SDF generation, animation frame parameters, and CSS / SVG output. No filesystem I/O and no subprocess. Builds for `wasm32-unknown-unknown` so the Web frontend can call the parameter / SDF helpers directly (the wasm build supplies data; since #245 production rendering on the web runs through the WebGPU(WGSL) path described below). Since #229 the `gpu` feature also builds on wasm32 (WebGPU backend only — no `webgl` fallback): `GpuRenderer::new_async()` (headless) / `GpuRenderer::from_device_queue()` (surface-compatible bring-up, #230) plus the `*_to_view` methods draw any shape into an externally supplied `wgpu::TextureView` (the browser surface-present seam), while the `RgbaImage` read-back API stays native-only. Since #230 `orber-wasm` ships a minimal WebGPU canvas path on top of that seam (`gpu_init` / `gpu_set_render_data` / `gpu_render` / `gpu_resize`; dev page `web/src/pages/gpu-lab.astro`). Since #231 that path was wired for all shapes (orb / glyph / image / aquarelle): `gpu_render` dispatches per shape to core's `render_packed_to_view` (orb) / `render_frame_glyph_to_view` / `render_frame_image_to_view` (and, until #239, `render_frame_aquarelle_to_view`) (the same branch structure as the CLI), the now-removed `ensure_gpu_supported_shape` no longer gates shapes, `WasmParams` gained an image-mask input (the four radial aquarelle parameters it also gained were removed in #239 Phase 1 along with the aquarelle shape; the watercolor is now the `--bleed`/`--bloom`/`--halo`/`--offset` preset axis), and the legacy WebGL path (since removed in #245 PR-B) was left unchanged at the time (its `get_render_data` byte stream was unaffected — that export was itself later removed in #247 once the WGSL path became the sole data supply). The glyph JS fallback (#159) is now mirrored on the WGSL path too: characters outside the bundled font (Noto Sans Symbols 2 subset — symbols only) — hiragana, kanji, emoji — are rasterized by the browser (`generateJsGlyphSdf`, OffscreenCanvas + OS font stack) into an SDF carried in the new `WasmParams.glyph_sdf` / `glyph_sdf_size`, which `resolve_orb_shape` validates (size `16..=1024`, `len == size*size`) and resolves to `OrbShape::Image` (under the #235 unified mechanism glyph and image share the same SDF-silhouette path); an empty `glyph_sdf` keeps the original bundled-font route (`OrbShape::Glyph`). Since #245 (Phase 3 PR-A) the **production Worker uses this WebGPU path** through the new `gpu_init_offscreen(OffscreenCanvas)` entry point (same bring-up as `gpu_init`, worker-context `navigator.gpu`), plus `gpu_render_rgba(t)` — an async straight-alpha RGBA read-back (texture → padded buffer → `map_async`) used for transparent export, because WebGPU canvases only offer `opaque` / `premultiplied` alpha modes — and `WasmParams.transparent_background`, which zeroes the resolved background alpha inside wasm (the WGSL-path equivalent of the old worker-side "patch pack header word 3" trick).
 - **`orber`** (`crates/cli/`) — the CLI binary. Owns `image::open`, `tempfile`, and the `ffmpeg` subprocess used for video output. Depends on `orber-core` for all rendering.
 
 User-facing CLI behavior is unchanged.
@@ -490,11 +522,11 @@ color. The pipeline:
    `--softness` affect Glyph mode** with the same edge-falloff meaning rather than a
    hard text fill, and the glyph blurs exactly like an orb. Each orb's rotation
    (#136) is applied to the SDF sample coordinates in the shader (before sampling).
-5. That is the **only** pass. Since #235 there is no aquarelle bleed/halo 2nd pass
+5. That is the **only** pass. Since #235 there is no per-shape bleed/halo 2nd pass
    for Glyph / Image — the old `orb_glyph_bleed.wgsl` group is removed. The glyph /
    image silhouette is just a different shape fed to the orb (a `●` glyph looks like
-   a plain orb; a `▲` blurs while keeping its triangular form). "Bleed" is the
-   Aquarelle shape's domain only.
+   a plain orb; a `▲` blurs while keeping its triangular form). "Bleed" is now the
+   #239 `--bleed` additive axis in `orb.wgsl`, available on any shape.
 
 The on-disk font asset is the only payload added by Phase A; the `ttf-parser`
 dependency itself is small and pure-Rust (no shaping, no FreeType).

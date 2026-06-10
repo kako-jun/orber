@@ -12,11 +12,12 @@
 
 use crate::glyph::GlyphFontId;
 use crate::style::SoftnessPreset;
-// `OrbShape::Aquarelle` が内包する [`aquarelle::AquarelleParams`] を core 越しに名前で
-// 参照できるよう `pub use` で re-export する（#231）。orber-wasm は aquarelle crate を
-// 直接依存しない（tiny-skia 推移依存を wasm に張りたくない）ため、`orber_core::orb::
-// AquarelleParams` 経由で型名を得る。
-pub use aquarelle::AquarelleParams;
+// orber-core re-exports the shared aquarelle bleed engine. #239 Phase 1 removed the
+// old radial Aquarelle shape; the new space-blur bleed will be ported from this crate
+// in #250. The whole crate is re-exported (not just `AquarelleParams`) so the
+// workspace `aquarelle = "0.2"` dependency stays linked and meaningful until the
+// port lands — `AquarelleParams` is no longer used internally.
+pub use aquarelle;
 use palette::{FromColor, Hsl, IntoColor, Srgb};
 use std::sync::Arc;
 
@@ -35,15 +36,14 @@ pub enum OrbStyle {
 }
 
 /// orb 描画形式。`Orb` は単一の radial gradient（解析的な円距離 → falloff）、
-/// `Aquarelle` はセル画夜景の質感セット（[`aquarelle`] crate）、`Glyph` は同梱フォント
-/// 1 文字のアウトライン塗りを有効にする。`Image` (#217) は外部から供給された画像
-/// シルエット SDF を描く。
+/// `Glyph` は同梱フォント 1 文字のアウトライン塗りを有効にする。`Image` (#217) は
+/// 外部から供給された画像シルエット SDF を描く。
 ///
 /// #235 で `Glyph` / `Image` は orb と同じ機構に統一された: orb の WGSL に「別の
 /// シルエット（SDF）を食わせる」だけで、ぼやけ方・呼吸・rim/soft・合成は orb と完全に
 /// 共通になり、独自のにじみ（bleed/halo）は撲滅した。形（SDF が表す "形からの距離"）
-/// だけが違い、三角の記号は三角のまま orb のぼやけ方で描かれる。にじみは `Aquarelle`
-/// shape だけの領分。
+/// だけが違い、三角の記号は三角のまま orb のぼやけ方で描かれる。にじみは
+/// [`crate::animate::AquaBleedConfig`] の加算レイヤー（任意の shape に乗る）の領分。
 ///
 /// `Image` が `Arc<[u8]>`（画像シルエットの SDF テクスチャ）を持つため、`OrbShape`
 /// は `Copy` ではなく `Clone`（`Arc` の参照カウント複製は安価）。`Glyph` のフォントは
@@ -54,32 +54,23 @@ pub enum OrbStyle {
 pub enum OrbShape {
     #[default]
     Orb,
-    Aquarelle(AquarelleParams),
     /// 1 文字のグリフを orb として描く。`ch` は描画する文字、`font` は同梱フォント識別子。
-    Glyph {
-        ch: char,
-        font: GlyphFontId,
-    },
+    Glyph { ch: char, font: GlyphFontId },
     /// 画像シルエットを orb として描く（#217）。`sdf` は [`crate::glyph::mask_to_sdf`]
     /// と同フォーマット（`size × size`、128≈edge）の SDF テクスチャ、`size` はその辺長。
     /// SDF の生成（`image_rgba_to_sdf`）は CLI / web 側で 1 度だけ行い、`Arc` で共有する。
-    Image {
-        sdf: Arc<[u8]>,
-        size: u32,
-    },
+    Image { sdf: Arc<[u8]>, size: u32 },
 }
 
 impl PartialEq for OrbShape {
-    // Aquarelle 内部のパラメータ (AquarelleParams) は比較対象から外す。
     // ここでの "等価" は「形が同じか」だけを判定する用途を想定している。
     // Glyph は文字とフォント識別子まで含めて比較する（軽い値なので）。
-    // Image は Aquarelle と同様に内部 SDF（重い Arc<[u8]>）を比較対象から外し、
-    // 「Image == Image なら true」とする。「形が同じか」の用途では SDF バイト列の
-    // 完全一致まで問わない（バリエーション選別等で同一 shape 判定に使うだけ）方針に揃える。
+    // Image は内部 SDF（重い Arc<[u8]>）を比較対象から外し、「Image == Image なら
+    // true」とする。「形が同じか」の用途では SDF バイト列の完全一致まで問わない
+    // （バリエーション選別等で同一 shape 判定に使うだけ）方針に揃える。
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (OrbShape::Orb, OrbShape::Orb) => true,
-            (OrbShape::Aquarelle(_), OrbShape::Aquarelle(_)) => true,
             (OrbShape::Glyph { ch: a, font: fa }, OrbShape::Glyph { ch: b, font: fb }) => {
                 a == b && fa == fb
             }
@@ -106,7 +97,7 @@ pub struct RenderOptions {
     pub saturation: f32,
     /// 背景 RGBA。alpha=0 で透過。デフォルトは黒不透明。
     pub background: [u8; 4],
-    /// orb の描画形式。Orb なら単一 radial gradient、Aquarelle ならセル画夜景の質感セット。
+    /// orb の描画形式。Orb なら単一 radial gradient、Glyph / Image なら SDF シルエット。
     pub shape: OrbShape,
     /// ぼかし (Softness) preset（#55, #131 で改名）。Mid で既存挙動と完全同値。
     pub softness: SoftnessPreset,
@@ -216,16 +207,6 @@ mod tests {
         };
         assert_eq!(a, b, "Image == Image must be true regardless of SDF bytes");
         assert_ne!(a, OrbShape::Orb);
-        assert_eq!(
-            OrbShape::Aquarelle(AquarelleParams::default()),
-            OrbShape::Aquarelle(AquarelleParams {
-                bleed: 0.1,
-                bloom: 0.9,
-                offset: 0.2,
-                halo: 0.8,
-            }),
-            "Aquarelle == Aquarelle ignores params (shape-only eq)"
-        );
         assert_eq!(
             OrbShape::Glyph {
                 ch: '☆',

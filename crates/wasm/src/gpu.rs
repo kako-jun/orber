@@ -30,7 +30,7 @@
 //!
 //! ## 形状について（#231 で全 shape 配線）
 //!
-//! `gpu_set_render_data` は orb / glyph / image / aquarelle の 4 shape を受ける。
+//! `gpu_set_render_data` は orb / glyph / image の 3 shape を受ける。
 //! `build_gpu_render_inputs` が `resolve_frame` で spec / preset / kmeans を解決し、
 //! 形状を `OrbShape` まで解決して
 //! [`AnimateOptions`] + clusters（+ orb 用 pack）を保持する。`gpu_render(t)` は
@@ -39,7 +39,6 @@
 //! - Orb: pack 経由 `render_packed_to_view`（#230 の見た目を一切変えないため温存）
 //! - Glyph: `render_frame_glyph_to_view`（SDF orb 単パス、#235。glyph_rotate 含む #136）
 //! - Image: `render_frame_image_to_view`（`image_rgba_to_sdf` で作った SDF を食わせる）
-//! - Aquarelle: `render_frame_aquarelle_to_view`（4 層モデル、ChaCha8 per-orb pack）
 //!
 //! ## surface format / alpha mode の選択
 //!
@@ -73,7 +72,7 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     /// `gpu_set_render_data` が解決した 1 タイル分の描画入力（#231）。spec ごとに
     /// 静的で、`gpu_render(t)` のたびに `t` だけ変えて再利用する。orb は `pack`、
-    /// glyph / image / aquarelle は `clusters` + `opts` で core 経路へ分岐する。
+    /// glyph / image は `clusters` + `opts` で core 経路へ分岐する。
     frame: Option<FrameInputs>,
 }
 
@@ -231,7 +230,7 @@ async fn init_for_target(
 /// spec 解決経路は [`build_gpu_render_inputs`] → `resolve_frame`（spec 再構築・
 /// preset 上書き・kmeans キャッシュ込み）。同じ params なら決定論的に同一の
 /// spec / per-orb 解決になる。形状は
-/// `resolve_orb_shape` で全 shape（orb / glyph / image / aquarelle）に解決する。
+/// `resolve_orb_shape` で全 shape（orb / glyph / image）に解決する。
 /// モーションは入力に焼かれず、`gpu_render(t)` の `t` がシェーダ内で駆動する。
 #[wasm_bindgen]
 pub fn gpu_set_render_data(params_js: JsValue, n: u32, spec_idx: u32) -> Result<(), JsError> {
@@ -308,8 +307,8 @@ pub fn gpu_render(t: f32) -> Result<(), JsError> {
 
 /// 保持入力 1 フレーム分を任意の view へ描く shape 別ディスパッチ（CLI の
 /// `FrameRenderer::render` と同じ構造）。Orb は #230 の pack 経路を温存して
-/// 見た目を一切変えない。glyph / image / aquarelle は clusters + opts を core の
-/// 専用 to_view 経路へ渡す（SDF / aquarelle pack の面倒は core が見る）。
+/// 見た目を一切変えない。glyph / image は clusters + opts を core の専用 to_view
+/// 経路へ渡す（SDF の面倒は core が見る）。
 /// [`gpu_render`]（surface present）と [`gpu_render_rgba`]（#245 readback）で共有。
 fn dispatch_render_to_view(
     renderer: &GpuRenderer,
@@ -326,9 +325,6 @@ fn dispatch_render_to_view(
         }
         OrbShape::Image { .. } => {
             renderer.render_frame_image_to_view(&f.clusters, &f.opts, t, view, format)
-        }
-        OrbShape::Aquarelle(_) => {
-            renderer.render_frame_aquarelle_to_view(&f.clusters, &f.opts, t, view, format)
         }
         OrbShape::Orb => renderer.render_packed_to_view(&f.pack, width, height, t, view, format),
     }

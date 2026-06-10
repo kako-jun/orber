@@ -1,8 +1,8 @@
 ---
 // orber#230 / #231 — WebGPU (wgpu/WGSL) 検証ページ。開発用で本番導線（ナビ・トップ）
 // からはリンクしない。wasm の gpu_init / gpu_set_render_data / gpu_render を
-// main thread で叩き、canvas に Orb / Glyph / Image / Aquarelle アニメーションを
-// rAF で回す（#231 で 4 shape 切替 + aquarelle パラメータ入力を追加）。
+// main thread で叩き、canvas に Orb / Glyph / Image アニメーションを rAF で回す
+// （#231 で 3 shape 切替）。#239 Phase 1 で旧 radial aquarelle shape は撤去。
 // WebGPU 不在時は明確なエラーを表示する（fallback 無し = #207 方針）。
 // WGSL シェーダの shadow スライダー等のチューニング用 dev ページとして存続する。
 ---
@@ -27,7 +27,6 @@
           <option value="orb">orb</option>
           <option value="glyph">glyph</option>
           <option value="image">image</option>
-          <option value="aquarelle">aquarelle</option>
         </select>
       </label>
 
@@ -63,29 +62,6 @@
         </label>
       </div>
 
-      <!-- aquarelle: bleed / bloom / offset / halo（0..1、既定 0.5） -->
-      <div id="aquarelle-controls" style="display:none; flex-direction:column; gap:8px;">
-        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
-          <span style="width:96px;">bleed</span>
-          <input class="aq-slider" id="aq-bleed" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
-          <span id="aq-bleed-val" style="width:36px; text-align:right;">0.50</span>
-        </label>
-        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
-          <span style="width:96px;">bloom</span>
-          <input class="aq-slider" id="aq-bloom" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
-          <span id="aq-bloom-val" style="width:36px; text-align:right;">0.50</span>
-        </label>
-        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
-          <span style="width:96px;">offset</span>
-          <input class="aq-slider" id="aq-offset" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
-          <span id="aq-offset-val" style="width:36px; text-align:right;">0.50</span>
-        </label>
-        <label style="display:flex; gap:8px; align-items:center; font-size:12px;">
-          <span style="width:96px;">halo</span>
-          <input class="aq-slider" id="aq-halo" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1;" />
-          <span id="aq-halo-val" style="width:36px; text-align:right;">0.50</span>
-        </label>
-      </div>
     </div>
 
     <button id="start" style="background:#222; color:#e8e8e8; border:1px solid #555; padding:8px 24px; cursor:pointer; font:inherit;">start</button>
@@ -114,7 +90,6 @@
       const shapeSel = document.getElementById('shape') as HTMLSelectElement;
       const glyphControls = document.getElementById('glyph-controls') as HTMLDivElement;
       const imageControls = document.getElementById('image-controls') as HTMLDivElement;
-      const aquarelleControls = document.getElementById('aquarelle-controls') as HTMLDivElement;
       const glyphChar = document.getElementById('glyph-char') as HTMLInputElement;
       const glyphRotate = document.getElementById('glyph-rotate') as HTMLInputElement;
       const imageFile = document.getElementById('image-file') as HTMLInputElement;
@@ -144,9 +119,8 @@
         const shape = shapeSel.value;
         glyphControls.style.display = shape === 'glyph' ? 'flex' : 'none';
         imageControls.style.display = shape === 'image' ? 'flex' : 'none';
-        aquarelleControls.style.display = shape === 'aquarelle' ? 'flex' : 'none';
-        // #241: shadow は orb 機構（orb / glyph / image）にだけ効く。aquarelle では隠す。
-        shadowControls.style.display = shape === 'aquarelle' ? 'none' : 'flex';
+        // #241: shadow は orb 機構（orb / glyph / image）の全 shape に効くので常時表示。
+        shadowControls.style.display = 'flex';
       }
 
       // ソース画像は小さなハードコードのグラデーション。kmeans が拾える程度に
@@ -198,8 +172,8 @@
       // 現在の UI 状態から wasm 用 params を組む。WasmParams の必須フィールド
       // （direction / speed / count / orb_size / blur 等）は常に送るが、resolve_frame は
       // それらの一部を spec（random_batch_specs）由来の値で上書きするため、ここで入れた
-      // 値がそのまま使われるとは限らない。shape 依存の追加フィールド（image マスク /
-      // aquarelle 4 値）だけは shape に応じて条件付きで足す（serde default が残りを補完）。
+      // 値がそのまま使われるとは限らない。shape 依存の追加フィールド（image マスク）
+      // だけは shape に応じて条件付きで足す（serde default が残りを補完）。
       function buildParams(): Record<string, unknown> {
         const shape = shapeSel.value;
         const params: Record<string, unknown> = {
@@ -221,7 +195,7 @@
           count_preset: '',
           speed_preset: '',
           softness_preset: '',
-          // #241: 薄い影の強度（0..1）。orb 機構の shape にだけ効く（aquarelle は無視）。
+          // #241: 薄い影の強度（0..1）。orb 機構の shape に効く。
           // 製品はこのフィールドを送らず serde default（= 製品定数）になる。
           shadow_strength: parseFloat(shadowStrength.value),
         };
@@ -251,12 +225,6 @@
           params.image_mask_rgba = imageMask.rgba;
           params.image_mask_width = imageMask.width;
           params.image_mask_height = imageMask.height;
-        }
-        if (shape === 'aquarelle') {
-          params.aquarelle_bleed = parseFloat((document.getElementById('aq-bleed') as HTMLInputElement).value);
-          params.aquarelle_bloom = parseFloat((document.getElementById('aq-bloom') as HTMLInputElement).value);
-          params.aquarelle_offset = parseFloat((document.getElementById('aq-offset') as HTMLInputElement).value);
-          params.aquarelle_halo = parseFloat((document.getElementById('aq-halo') as HTMLInputElement).value);
         }
         return params;
       }
@@ -312,15 +280,7 @@
           imageInfo.textContent = `decode failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       });
-      for (const id of ['aq-bleed', 'aq-bloom', 'aq-offset', 'aq-halo']) {
-        const slider = document.getElementById(id) as HTMLInputElement;
-        const val = document.getElementById(`${id}-val`) as HTMLSpanElement;
-        slider.addEventListener('input', () => {
-          val.textContent = parseFloat(slider.value).toFixed(2);
-          applyRenderData();
-        });
-      }
-      // #241: shadow スライダー（aquarelle 4 本と同じ流儀: input → 表示更新 → 再構築）。
+      // #241: shadow スライダー（input → 表示更新 → 再構築）。
       // touched は「start 前にユーザーが動かした値を init 後の既定値同期で潰さない」ため。
       shadowStrength.addEventListener('input', () => {
         shadowStrength.dataset.touched = '1';

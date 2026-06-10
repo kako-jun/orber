@@ -37,6 +37,18 @@ type ShapeChoice = 'orb' | 'glyph' | 'image';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
+// #239 Phase 1: にじみ (watercolor bleed) の 3 段ボタン。`''` は「にじみオフ
+// （くっきり）」で wasm 側 aqua = None → 従来 Web 出力と byte 一致。3 段
+// 'weak' | 'mid' | 'strong' は内部 aqua_bleed 0.15/0.3/0.5 に写像される。
+// くっきりは「水彩を使わない側」＝この row の off ボタンで表現する（kako-jun 確定:
+// にじみを使うときは常に弱/中/強のどれか、にじみ自体は 3 段のみ）。初期値は
+// `''`（オフ）で既存 output を一切変えない非リグレッション既定。
+type BleedPreset = '' | 'weak' | 'mid' | 'strong';
+// #239 Phase 1: bloom / halo / offset の character 3 段ボタン。にじみと同形で、
+// `''` はその軸オフ（wasm 側 0）、'weak' | 'mid' | 'strong' は内部係数 0.3/0.6/0.9 に
+// 写像される。にじみ（BleedPreset != ''）が engage しているときだけ効く（にじみ
+// 「なし」では水彩レイヤが無いので 3 軸とも無効化＝disabled にする）。初期値 `''`。
+type CharacterPreset = '' | 'weak' | 'mid' | 'strong';
 
 // 9 列 × 2 段の picker 配置を取るため候補リストの順序と数を整える。
 // 旧 `♦` (ダイヤ・スートマーク) はユーザー指示で除外、`◆` (黒ダイヤ) も
@@ -165,6 +177,15 @@ export default function Studio() {
   const [countPreset, setCountPreset] = createSignal<CountPreset>('');
   const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('');
   const [softnessPreset, setSoftnessPreset] = createSignal<SoftnessPreset>('');
+  // #239 Phase 1: にじみ (watercolor bleed)。初期値 `''`（オフ＝くっきり）を厳守
+  // して既存 output の byte-exact identity を保つ（wasm 側 aqua = None）。
+  const [bleedPreset, setBleedPreset] = createSignal<BleedPreset>('');
+  // #239 Phase 1: bloom / halo / offset の character 3 段ボタン。初期値 `''`（各軸
+  // オフ）。にじみ「なし」では効かない（wasm 側 aqua = None）ので、その間は UI 上
+  // でも disabled にする。
+  const [bloomPreset, setBloomPreset] = createSignal<CharacterPreset>('');
+  const [haloPreset, setHaloPreset] = createSignal<CharacterPreset>('');
+  const [offsetPreset, setOffsetPreset] = createSignal<CharacterPreset>('');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
   // ドロップエリアに表示するサムネイル用の object URL。差し替えで revoke する。
@@ -439,6 +460,14 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
+      // #239: にじみ。'' = オフ（くっきり）で wasm 側 aqua = None。weak/mid/strong で
+      // 空間ブラーを乗せる。orb / glyph / image どの shape でも効く。
+      bleed_preset: bleedPreset(),
+      // #239: bloom / halo / offset の character 軸。'' = その軸オフ。にじみが engage
+      // しているときだけ効く（にじみ「なし」のとき UI でも disabled）。
+      bloom_preset: bloomPreset(),
+      halo_preset: haloPreset(),
+      offset_preset: offsetPreset(),
       // #136: glyph_rotate=false で per-orb 回転を抑止。Orb 経路では未使用。
       glyph_rotate: glyphRotate(),
     };
@@ -794,6 +823,29 @@ export default function Studio() {
     runBatchIfReady();
   };
 
+  // #239 Phase 1: にじみボタン。off（くっきり）/ 弱 / 中 / 強 のどれかを選ぶと即
+  // 再ガチャ。off (`''`) のとき wasm 側 aqua = None で従来 Web 出力と byte 一致。
+  const onBleedPresetClick = (next: BleedPreset) => {
+    setBleedPreset(next);
+    runBatchIfReady();
+  };
+
+  // #239 Phase 1: bloom / halo / offset の character ボタン。にじみが engage して
+  // いるときだけ意味を持つ（UI 上では disabled で押せないようにしてあるので、ここに
+  // 来る時点で bleedPreset() != ''）。選ぶと即再ガチャ。
+  const onBloomPresetClick = (next: CharacterPreset) => {
+    setBloomPreset(next);
+    runBatchIfReady();
+  };
+  const onHaloPresetClick = (next: CharacterPreset) => {
+    setHaloPreset(next);
+    runBatchIfReady();
+  };
+  const onOffsetPresetClick = (next: CharacterPreset) => {
+    setOffsetPreset(next);
+    runBatchIfReady();
+  };
+
   const applyGlyphChar = (raw: string) => {
     const first = [...raw][0] ?? '';
     setGlyphChar(first);
@@ -898,6 +950,12 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
+      // #239: hi-res 再描画でも UI のにじみ + character 軸を踏襲（プレビューと DL を
+      // 同形状に保つ）。
+      bleed_preset: bleedPreset(),
+      bloom_preset: bloomPreset(),
+      halo_preset: haloPreset(),
+      offset_preset: offsetPreset(),
       // #136: hi-res 再描画でも UI の glyph_rotate を踏襲。プレビューと DL の
       // 形状不変条件（同じ baseSeed + 同じ params で同じ spec が再現）を保つ。
       glyph_rotate: glyphRotate(),
@@ -964,6 +1022,11 @@ export default function Studio() {
       count_preset: countPreset(),
       speed_preset: speedPreset(),
       softness_preset: softnessPreset(),
+      // #239: 透過 DL もプレビューと同じにじみ + character 軸を踏襲する。
+      bleed_preset: bleedPreset(),
+      bloom_preset: bloomPreset(),
+      halo_preset: haloPreset(),
+      offset_preset: offsetPreset(),
       glyph_rotate: glyphRotate(),
     };
 
@@ -1604,6 +1667,177 @@ export default function Studio() {
             class={SEG_BTN(2, 3, softnessPreset() === 'high')}
           >
             {t('softnessOptionHigh')}
+          </button>
+        </div>
+
+        {/* #239 Phase 1: にじみ (watercolor bleed)。なし(くっきり) / 弱 / 中 / 強 の
+            4 セグメント。「なし」は水彩オフ側（くっきり）= wasm 側 aqua = None で
+            従来 Web 出力と byte 一致。弱/中/強 は内部 aqua_bleed 0.15/0.3/0.5 に写像
+            される（数字は出さない、kako-jun 確定）。他 row と同じ SEG_GROUP /
+            SEG_BTN を使い、見た目・左右端を揃える。 */}
+        <label class="justify-self-end text-sm text-fgMuted">{t('bleedLabel')}:</label>
+        <div class={SEG_GROUP}>
+          <button
+            type="button"
+            aria-pressed={bleedPreset() === ''}
+            onClick={() => onBleedPresetClick('')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(0, 4, bleedPreset() === '')}
+          >
+            {t('bleedOptionOff')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bleedPreset() === 'weak'}
+            onClick={() => onBleedPresetClick('weak')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(1, 4, bleedPreset() === 'weak')}
+          >
+            {t('bleedOptionWeak')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bleedPreset() === 'mid'}
+            onClick={() => onBleedPresetClick('mid')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(2, 4, bleedPreset() === 'mid')}
+          >
+            {t('bleedOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bleedPreset() === 'strong'}
+            onClick={() => onBleedPresetClick('strong')}
+            disabled={!decoded() || downloading()}
+            class={SEG_BTN(3, 4, bleedPreset() === 'strong')}
+          >
+            {t('bleedOptionStrong')}
+          </button>
+        </div>
+
+        {/* #239 Phase 1: にじみの上に乗せる character 3 軸（芯の光 / 縁の彩度 /
+            かたより）。各軸とも なし / 弱 / 中 / 強 の 4 セグメント。「なし」は wasm 側
+            でその軸 0（オフ）。弱/中/強 は内部 0.3/0.6/0.9 に写像（数字は出さない）。
+            にじみが「なし」（bleedPreset() === ''）のときは水彩レイヤが無く効かない
+            ので 3 軸とも disabled でグレーアウトする。にじみ row と同じ SEG_GROUP /
+            SEG_BTN で見た目・左右端を揃える。 */}
+        <label class="justify-self-end text-sm text-fgMuted">{t('bloomLabel')}:</label>
+        <div class={SEG_GROUP}>
+          <button
+            type="button"
+            aria-pressed={bloomPreset() === ''}
+            onClick={() => onBloomPresetClick('')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(0, 4, bloomPreset() === '')}
+          >
+            {t('bloomOptionOff')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bloomPreset() === 'weak'}
+            onClick={() => onBloomPresetClick('weak')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(1, 4, bloomPreset() === 'weak')}
+          >
+            {t('bloomOptionWeak')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bloomPreset() === 'mid'}
+            onClick={() => onBloomPresetClick('mid')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(2, 4, bloomPreset() === 'mid')}
+          >
+            {t('bloomOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={bloomPreset() === 'strong'}
+            onClick={() => onBloomPresetClick('strong')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(3, 4, bloomPreset() === 'strong')}
+          >
+            {t('bloomOptionStrong')}
+          </button>
+        </div>
+
+        <label class="justify-self-end text-sm text-fgMuted">{t('haloLabel')}:</label>
+        <div class={SEG_GROUP}>
+          <button
+            type="button"
+            aria-pressed={haloPreset() === ''}
+            onClick={() => onHaloPresetClick('')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(0, 4, haloPreset() === '')}
+          >
+            {t('haloOptionOff')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={haloPreset() === 'weak'}
+            onClick={() => onHaloPresetClick('weak')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(1, 4, haloPreset() === 'weak')}
+          >
+            {t('haloOptionWeak')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={haloPreset() === 'mid'}
+            onClick={() => onHaloPresetClick('mid')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(2, 4, haloPreset() === 'mid')}
+          >
+            {t('haloOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={haloPreset() === 'strong'}
+            onClick={() => onHaloPresetClick('strong')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(3, 4, haloPreset() === 'strong')}
+          >
+            {t('haloOptionStrong')}
+          </button>
+        </div>
+
+        <label class="justify-self-end text-sm text-fgMuted">{t('offsetLabel')}:</label>
+        <div class={SEG_GROUP}>
+          <button
+            type="button"
+            aria-pressed={offsetPreset() === ''}
+            onClick={() => onOffsetPresetClick('')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(0, 4, offsetPreset() === '')}
+          >
+            {t('offsetOptionOff')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={offsetPreset() === 'weak'}
+            onClick={() => onOffsetPresetClick('weak')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(1, 4, offsetPreset() === 'weak')}
+          >
+            {t('offsetOptionWeak')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={offsetPreset() === 'mid'}
+            onClick={() => onOffsetPresetClick('mid')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(2, 4, offsetPreset() === 'mid')}
+          >
+            {t('offsetOptionMid')}
+          </button>
+          <button
+            type="button"
+            aria-pressed={offsetPreset() === 'strong'}
+            onClick={() => onOffsetPresetClick('strong')}
+            disabled={!decoded() || downloading() || bleedPreset() === ''}
+            class={SEG_BTN(3, 4, offsetPreset() === 'strong')}
+          >
+            {t('offsetOptionStrong')}
           </button>
         </div>
       </div>
