@@ -177,6 +177,34 @@ impl From<CliBleedMode> for orber_core::animate::BleedMode {
     }
 }
 
+/// #239 Phase 1: the product-facing 3-tier にじみ (bleed) button. Unlike the hidden
+/// `--aquarelle-bleed*` internals, this is the supported way to dial the watercolor
+/// bleed for ANY shape (orb / glyph / image). It always engages the continuous
+/// space-blur — the only product-shipped geometry — so silhouettes stay themselves
+/// while softening. There is intentionally no `off` here: omit the flag entirely to
+/// keep the crisp default; this enum only chooses how much it bleeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliBleedPreset {
+    /// 弱いにじみ — シルエットがわずかに溶ける。
+    Weak,
+    /// 中くらいのにじみ — ふんわりぼける。
+    Mid,
+    /// 強いにじみ — ほどよく溶ける（製品の上限）。
+    Strong,
+}
+
+impl CliBleedPreset {
+    /// 3 段ボタンを内部 `aqua_bleed` 量へ写像する。製品 UI では数字を出さないので、
+    /// この対応表だけがにじみの強さの正本。
+    fn to_bleed(self) -> f32 {
+        match self {
+            CliBleedPreset::Weak => 0.15,
+            CliBleedPreset::Mid => 0.3,
+            CliBleedPreset::Strong => 0.5,
+        }
+    }
+}
+
 /// Parse the `--glyph-char` argument: must be exactly one Unicode scalar value.
 fn parse_single_char(s: &str) -> Result<char, String> {
     let mut chars = s.chars();
@@ -354,6 +382,13 @@ struct Cli {
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     aquarelle_halo: f32,
 
+    /// にじみ (watercolor bleed): weak / mid / strong の 3 段ボタン (#239)。
+    /// 弱いにじみ / 中くらい / 強い、の 3 段でシルエットを溶かす。星は星のまま、丸は丸
+    /// のままぼける。orb / glyph / image どの --shape にも効く。省略すると従来どおりくっ
+    /// きり（にじみオフ）。内部の --aquarelle-bleed-mode / --aquarelle-bleed より優先。
+    #[arg(long, value_enum, conflicts_with = "aquarelle_bleed_mode")]
+    bleed: Option<CliBleedPreset>,
+
     /// #239 PoC (hidden): bleed geometry for the additive aquarelle layer when
     /// riding a NON-aquarelle shape (orb / glyph / image). When set, the
     /// --aquarelle-bleed/bloom/offset/halo sliders feed an additive layer over the
@@ -361,6 +396,8 @@ struct Cli {
     /// satellites). This is a blink A/B試作 for picking the look; production
     /// continuous-value / web-slider work is a later phase. Omit it (default) and
     /// orb / glyph / image render exactly as before (byte-identical).
+    ///
+    /// 上級者向け内部フラグ。製品では --bleed (weak/mid/strong) を使う。両方は併用不可。
     #[arg(long, value_enum, hide = true)]
     aquarelle_bleed_mode: Option<CliBleedMode>,
 
@@ -388,17 +425,34 @@ impl Cli {
         }
     }
 
-    /// #239 PoC: the additive aquarelle bleed config ridden by a non-aquarelle shape.
-    /// `Some` only when `--aquarelle-bleed-mode` is set AND the shape is not
-    /// `Aquarelle` (which has its own dedicated, byte-pinned renderer). Reuses the
-    /// `--aquarelle-bleed/bloom/offset/halo` sliders for the four params. When the
-    /// flag is omitted this returns `None`, so orb / glyph / image render exactly as
-    /// before (byte-identical — the non-regression gate).
+    /// #239: the additive aquarelle bleed config ridden by a non-aquarelle shape.
+    /// `Some` only when にじみが要求され (product `--bleed` か内部 `--aquarelle-bleed-mode`)
+    /// かつ shape が `Aquarelle` でない (それは専用 byte-pinned レンダラを持つ)。flag を
+    /// どちらも省くと `None` を返すので orb / glyph / image は従来どおり (byte-identical
+    /// = 非リグレッションゲート)。
+    ///
+    /// 優先順位: 製品の `--bleed` (weak/mid/strong) が最優先。指定されると **continuous**
+    /// モードで engage し、`bleed` を 3 段テーブル値にし、bloom/offset/halo は既定値
+    /// (0.5) のまま。これにより `--bleed weak` の出力は内部 flag
+    /// `--aquarelle-bleed-mode continuous --aquarelle-bleed 0.15` (他はすべて既定) と
+    /// byte 一致する。`--bleed` と `--aquarelle-bleed-mode` は clap の `conflicts_with`
+    /// で排他なので、両者が同時に `Some` になることはない。
     fn poc_aqua(&self) -> Option<orber_core::animate::AquaBleedConfig> {
-        let mode = self.aquarelle_bleed_mode?;
         if matches!(self.shape, Shape::Aquarelle) {
             return None;
         }
+        // 製品の 3 段ボタンが最優先。continuous で engage し bleed のみテーブル値に差し替え、
+        // 残り 3 パラメータは既定スライダ値を使う (内部 flag の既定と一致 → byte 一致)。
+        if let Some(preset) = self.bleed {
+            return Some(orber_core::animate::AquaBleedConfig {
+                bleed: preset.to_bleed(),
+                bloom: self.aquarelle_bloom,
+                offset: self.aquarelle_offset,
+                halo: self.aquarelle_halo,
+                mode: orber_core::animate::BleedMode::Continuous,
+            });
+        }
+        let mode = self.aquarelle_bleed_mode?;
         Some(orber_core::animate::AquaBleedConfig {
             bleed: self.aquarelle_bleed,
             bloom: self.aquarelle_bloom,
@@ -1710,6 +1764,98 @@ mod tests {
         assert!(try_parse(&["--aquarelle-bloom", "-0.1"]).is_err());
         assert!(try_parse(&["--aquarelle-offset", "0.7"]).is_ok());
         assert!(try_parse(&["--aquarelle-halo", "0.0"]).is_ok());
+    }
+
+    /// #239 Phase 1: 製品の 3 段ボタン `--bleed` は weak/mid/strong を内部 aqua_bleed
+    /// 0.15 / 0.3 / 0.5 に写像し、必ず continuous モードで engage する。
+    #[test]
+    fn bleed_preset_maps_to_table() {
+        assert_eq!(CliBleedPreset::Weak.to_bleed(), 0.15);
+        assert_eq!(CliBleedPreset::Mid.to_bleed(), 0.3);
+        assert_eq!(CliBleedPreset::Strong.to_bleed(), 0.5);
+
+        for (arg, want) in [("weak", 0.15_f32), ("mid", 0.3), ("strong", 0.5)] {
+            let cli = try_parse(&["--shape", "glyph", "--bleed", arg])
+                .unwrap_or_else(|e| panic!("--bleed {arg} must parse: {e}"));
+            let aqua = cli
+                .poc_aqua()
+                .unwrap_or_else(|| panic!("--bleed {arg} must engage watercolor"));
+            assert_eq!(
+                aqua.bleed, want,
+                "--bleed {arg} must map aqua_bleed to {want}"
+            );
+            assert_eq!(
+                aqua.mode,
+                orber_core::animate::BleedMode::Continuous,
+                "--bleed {arg} must engage continuous mode (the only product geometry)"
+            );
+            // bloom/offset/halo は既定スライダ値 (0.5) のまま。内部 flag の既定と一致する。
+            assert_eq!(aqua.bloom, 0.5);
+            assert_eq!(aqua.offset, 0.5);
+            assert_eq!(aqua.halo, 0.5);
+        }
+    }
+
+    /// #239 Phase 1: `--bleed` 未指定なら watercolor は off (poc_aqua == None)。orb /
+    /// glyph / image は従来どおり byte-identical にレンダリングされる非リグレッションゲート。
+    #[test]
+    fn bleed_preset_absent_keeps_watercolor_off() {
+        for shape in ["orb", "glyph", "image"] {
+            let cli = try_parse(&["--shape", shape]).unwrap();
+            assert!(
+                cli.poc_aqua().is_none(),
+                "without --bleed, shape {shape} must keep watercolor off (byte-identical)"
+            );
+        }
+    }
+
+    /// #239 Phase 1: 製品の `--bleed` (weak) は内部 flag の組合せ
+    /// `--aquarelle-bleed-mode continuous --aquarelle-bleed 0.15` と同じ
+    /// `AquaBleedConfig` を生み出す。これが「同じ内部値に写像されている」証跡で、
+    /// レンダリング出力の byte 一致の根拠になる。
+    #[test]
+    fn bleed_weak_equals_internal_continuous_0_15() {
+        let product = try_parse(&["--shape", "glyph", "--bleed", "weak"])
+            .unwrap()
+            .poc_aqua()
+            .expect("product --bleed weak must engage");
+        let internal = try_parse(&[
+            "--shape",
+            "glyph",
+            "--aquarelle-bleed-mode",
+            "continuous",
+            "--aquarelle-bleed",
+            "0.15",
+        ])
+        .unwrap()
+        .poc_aqua()
+        .expect("internal continuous 0.15 must engage");
+        assert_eq!(
+            product, internal,
+            "--bleed weak must resolve to the same AquaBleedConfig as the internal continuous 0.15"
+        );
+    }
+
+    /// #239 Phase 1: 製品 `--bleed` と内部 `--aquarelle-bleed-mode` は併用不可
+    /// (clap conflicts_with)。製品 UI と内部上級者 flag を混ぜさせない。
+    #[test]
+    fn bleed_preset_conflicts_with_internal_mode() {
+        let res = try_parse(&["--bleed", "mid", "--aquarelle-bleed-mode", "continuous"]);
+        assert!(
+            res.is_err(),
+            "--bleed and --aquarelle-bleed-mode must be mutually exclusive"
+        );
+    }
+
+    /// #239 Phase 1: `--shape aquarelle` は専用 byte-pinned レンダラを持つので、
+    /// `--bleed` を渡しても additive レイヤを engage しない (None)。
+    #[test]
+    fn bleed_preset_ignored_for_aquarelle_shape() {
+        let cli = try_parse(&["--shape", "aquarelle", "--bleed", "strong"]).unwrap();
+        assert!(
+            cli.poc_aqua().is_none(),
+            "--shape aquarelle has its own renderer; --bleed must not engage the additive layer"
+        );
     }
 
     /// #212 (#11) / #225 / #235: `FrameRenderer::render()` must dispatch by
