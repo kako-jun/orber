@@ -183,4 +183,24 @@ describe('lang signal + t()', () => {
     expect(STRINGS.shapeOptionOrb.ja).toBe('オーブ');
     expect(STRINGS.shapeOptionOrb.en).toBe('Orb');
   });
+
+  test('全 STRINGS キーが ja / en 両方の string 値を持つ (#239 翻訳漏れ検出)', async () => {
+    // 個別キーを 1 つずつ押さえると新規キー追加時にテストが伴走せず翻訳漏れを
+    // 取りこぼす（#239 で bleed/bloom/halo/offset の 20 キーを足したが parity の
+    // 自動テストが無かった）。STRINGS 全体を走査して、各キーが ja と en の
+    // 両方を string 型で持つことを 1 本で担保する。将来どのキーを足しても、片言語の
+    // 定義漏れ（undefined / 型違い）をここで即検出できる。空文字は意図的なものが
+    // ある（viewsLabelPrefix は counter を挟む空 prefix）ため許容し、存在のみ問う。
+    const { STRINGS } = await import('./strings');
+    const missing: string[] = [];
+    for (const [key, value] of Object.entries(STRINGS)) {
+      for (const lang of ['ja', 'en'] as const) {
+        const v = (value as Record<string, unknown>)[lang];
+        if (typeof v !== 'string') {
+          missing.push(`${key}.${lang}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+  });
 });
