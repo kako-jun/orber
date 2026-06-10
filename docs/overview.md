@@ -250,8 +250,13 @@ What is rendered today (color + position drift), and what is not (weight):
   time across **orb / glyph / image** alike. (#239 Phase 1 had temporarily left this
   dead because the only consumer was the removed aquarelle path; #251 re-wired it.)
 - The `centroid` (position) **drift** *is* rendered too, since **#255** (B-plan): the
-  uniform `cross_axis` scatter is kept, and each cluster's centroid shift from `t=0`
-  is added as a per-cluster delta on the **cross axis**. `animate::keyframe_cross_drift`
+  uniform `cross_axis` scatter is kept, and each cluster's centroid wobble is added as a
+  per-cluster delta on the **cross axis**. The output is a loop (`t=0 ≡ t=1`), so the
+  drift is the centroid's **detrended deviation** — its offset from the straight line
+  joining the `t=0` and `t=1` centroids — not the raw `cross(t) − cross(0)` shift. This
+  closes the loop (`drift(0) = drift(1) = 0`, no seam jump) and makes a linear one-way
+  sweep contribute nothing (only true wobble survives). The deviation is scaled by a
+  subtle gain (`animate::KEYFRAME_DRIFT_GAIN`, blink-tuned). `animate::keyframe_cross_drift`
   computes the per-cluster delta, `pack_render_data` carries it on per-orb word `off+13`
   (`cross_drift`), and `orb.wgsl` adds it as `misc.w` to the cross axis. This applies to
   **orb / glyph / image** alike. With no tracks it is `None` ⇒ byte-identical to before;
