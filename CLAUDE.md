@@ -67,14 +67,20 @@ orber/
     │       ├── animate.rs      # フレーム parameters（AnimateOptions / pack_render_data 等）
     │       ├── glyph.rs        # フォント/画像 → SDF（ttf-parser + zeno、#223）
     │       ├── gpu.rs          # GPU(WGSL, wgpu) レンダラ — 唯一のレンダラ（#207〜#225）
-    │       ├── orb.wgsl（#235 統一テンプレ: orb/glyph/image 共通） / orb_aquarelle.wgsl
+    │       ├── orb.wgsl（#235 統一テンプレ: orb/glyph/image 共通。#239 で にじみ(bleed)=空間ブラー
+    │       │              （blurred_coverage）＋ character 3 軸（bloom/halo/offset）をこの上に実装）
+    │       │              / orb_aquarelle.wgsl（旧 radial 4 層 = `--shape aquarelle` 専用、#233 で削除予定）
     │       ├── style.rs        # CSS / SVG 静的書き出し
     │       └── variations.rs   # バリエーション spec 定義
     │                           # にじみ処理は外部 crate `aquarelle = "0.2"` に分離済み（旧 src/aquarelle/ は撤去）
     ├── cli/                # orber: CLI バイナリ（image::open / ffmpeg / tempfile）
     │   ├── Cargo.toml      #   [[bin]] name = "orber", path = "src/main.rs"
     │   └── src/
-    │       ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義
+    │       ├── main.rs         # CLI パース（clap）。`Cli` / `Motion` / `Shape` 定義。
+    │       │                   #   #239 水彩 3 段ボタン: --bleed <weak|mid|strong>（=0.15/0.3/0.5、全 shape の
+    │       │                   #   にじみ＝orb.wgsl の空間ブラー）＋ --bloom/--halo/--offset <weak|mid|strong>
+    │       │                   #   （=0.3/0.6/0.9、requires=bleed）。内部 --aquarelle-bleed-mode / --aquarelle-bleed
+    │       │                   #   <float> は上級者向けに残存（--bleed と排他）。--shape aquarelle は旧 radial で別物
     │       └── video.rs        # 連番フレーム → MP4/WebM（ffmpeg 子プロセス）
     └── wasm/               # orber-wasm: ブラウザ向け wasm-bindgen ラッパー（#36）
         ├── Cargo.toml      #   crate-type = ["cdylib", "rlib"]。wasm32 専用 target dependency で
@@ -133,7 +139,8 @@ web/                        # Web フロントエンド (#37, #38)
 
 - **prototype 段階はローカル Rust バイナリ単体で完結する** — Web フロント・WASM・crate.io 公開は将来 Issue
 - **入力 → 静的 PNG が出るところまで先に通す** — 動画化はその後
-- **にじみ処理は外部 crate `aquarelle` に切り出し済み** — `Cargo.toml` で `aquarelle = "0.2"` を依存。**#235 以降、aquarelle は `OrbShape::Aquarelle` の per-orb にじみ描画にのみ使う**。`OrbShape::Glyph` / `OrbShape::Image` は #235 で orb 機構に統一され、独自の bleed pass を持たない（SDF を orb に食わせる単パス。`orb.wgsl` の SDF variant）。`OrbShape::Orb` も当然にじみを呼ばない。「にじみ」は aquarelle shape だけの領分
+- **「にじみ(bleed)」は #239 で orb.wgsl の本物の空間ブラーに作り直した（別シェーダでない方向）** — `--bleed <weak|mid|strong>` は **全 shape（orb / glyph / image）共通**で、`orb.wgsl` の `blurred_coverage`（被覆 alpha を blur 半径 ∝ bleed の disk 内で 48 タップ黄金角スパイラル＋per-pixel hash21 ディザで multi-tap 平均）で滲ませる。星は星のままぼけ、強ブラーで自然に溶ける（**距離場を円へモーフしない**）。被覆評価は variant 別の `coverage_at`（orb=円距離 / SDF=サンプル距離）に関数化し plain 1 タップとブラー multi-tap で共有。上に控えめな character 3 軸 `--bloom`/`--halo`/`--offset`（`Params.aqua_bloom`=中心の芯 BLOOM_MAX=0.45 / `aqua_halo`=外周の彩度・枠リング無し / `aqua_offset`=ブラー原点の seed 方向バイアス）を加算。**全パラメータ=0（特に bleed=0）で plain orb / glyph / image と byte 一致**（`aqua_zero_params_byte_match_plain_orb`）。**#235 由来の旧 bleed pass（aquarelle crate 経由の glyph/image にじみ）はもう無い** — `OrbShape::Glyph` / `OrbShape::Image` は #235 で orb 機構（`orb.wgsl` の SDF variant）に統一され独自の bleed pass を持たない
+- **旧 `--shape aquarelle`（`orb_aquarelle.wgsl` の radial 4 層）はまだ残存** — `Cargo.toml` で `aquarelle = "0.2"` を依存し、`OrbShape::Aquarelle` の per-orb 描画の参照アルゴリズムとして使う。#239 の orb.wgsl blur に置き換わったので **#233 統合フェーズで旧 radial shader を削除予定**（今は #239 の blur と共存。本番 Studio には旧 aquarelle shape は未公開）
 - **動画書き出しは ffmpeg 子プロセス呼び出し** — 自前エンコードはやらない
 - **動画入力対応も ffmpeg でフレーム抽出** — 抽出後は静止画パイプラインに合流させる
 - **`--seed` で再現可能** — 同じ入力 + 同じ seed で同じ出力
@@ -151,7 +158,7 @@ web/                        # Web フロントエンド (#37, #38)
 
 ## 関連プロジェクト
 
-- [aquarelle](https://github.com/kako-jun/aquarelle)（v0.2 として独立済み）— にじみエンジンを独立 crate 化したもの。orber は `aquarelle = "0.2"` を依存し、`OrbShape::Aquarelle`（per-orb の `render_aquarelle_orb`）と `OrbShape::Glyph` / `OrbShape::Image`（全体 bleed pass `render_aquarelle_bleed_pass`）の **参照アルゴリズム** として使う。実描画は GPU(WGSL) でこれらを再現する（aquarelle は tiny-skia を内部で使うため、orber へは推移依存として残る）。blueprinter からも共有依存される想定
+- [aquarelle](https://github.com/kako-jun/aquarelle)（v0.2 として独立済み）— にじみエンジンを独立 crate 化したもの。orber は `aquarelle = "0.2"` を依存し、**旧 `OrbShape::Aquarelle`（per-orb の `render_aquarelle_orb` radial）の参照アルゴリズム**として使う（#233 で削除予定）。`OrbShape::Glyph` / `OrbShape::Image` は #235 で orb 機構に統一され、もうこの crate の bleed pass は通らない。#239 の「にじみ(bleed)」は別物で、`orb.wgsl` 内の空間ブラー（この crate を経由しない）。実描画は GPU(WGSL)（aquarelle crate は tiny-skia を内部で使うため、orber へは推移依存として残る）。blueprinter からも共有依存される想定
 
 ## 技術ルール
 

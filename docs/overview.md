@@ -40,10 +40,24 @@ The CLI exposes the following flags (run `orber --help` for the authoritative li
 - `--count-preset` — `low` / `mid` / `high` shorthand (= 10 / 20 / 30). Mutually exclusive with `--count`.
 - `--direction` — conveyor flow direction: `lr` / `rl` / `tb` / `bt`
 - `--speed` — conveyor pace: `very-slow` / `slow` / `mid` / `fast` (cross counts per clip = 1 / 2 / 3 / 4)
-- `--shape` — `orb`, `aquarelle` (watercolor bleed), `glyph` (text character), or `image` (silhouette from `--image-mask`)
+- `--shape` — `orb`, `aquarelle` (legacy radial watercolor, `orb_aquarelle.wgsl`; superseded by the
+  `--bleed` button below and to be removed in #233), `glyph` (text character), or `image` (silhouette
+  from `--image-mask`). The going-forward "watercolor にじみ" is `--bleed` on any shape, not `--shape aquarelle`
 - `--glyph-char` — single character used when `--shape glyph` (default `☆`)
 - `--image-mask` — silhouette image used when `--shape image` (the *shape* source; `--input` stays the *color* source). Raster only (PNG/JPEG/…); SVG is web-only
 - `--softness` — blur/edge-softness preset: `low` / `mid` / `high` (default `mid`, existing behavior)
+- `--bleed` — watercolor にじみ as a 3-tier button: `weak` / `mid` / `strong` (#239). This is the
+  **product-facing** way to dial the watercolor bleed for **any** shape (orb / glyph / image): a real
+  spatial blur of the silhouette coverage (it does not morph the distance field to a circle). Omitted =
+  no bleed (crisp, byte-identical to plain orb / glyph / image). Numbers are intentionally hidden in the
+  product UI (internally `weak=0.15` / `mid=0.3` / `strong=0.5`). The legacy expert knobs
+  `--aquarelle-bleed-mode` / `--aquarelle-bleed <float>` remain but are mutually exclusive with `--bleed`.
+- `--bloom` / `--halo` / `--offset` — the bleed's understated *character* axes, each a `weak` / `mid` /
+  `strong` button (=`0.3` / `0.6` / `0.9`) layered on top of the bleed (#239). `--bloom` is a bright
+  central core (capped at `BLOOM_MAX = 0.45`), `--halo` is a peripheral saturation boost (color only — no
+  frame ring), `--offset` biases the blur origin toward the seed direction (an asymmetric bleed that does
+  not break the shape). Each requires `--bleed` (they do nothing without the watercolor layer, enforced by
+  `requires = bleed`).
 - `--saturation` — saturation multiplier
 - `--duration-ms` — clip duration for animated outputs
 - `--seed` — random seed for reproducibility
@@ -264,15 +278,35 @@ yields an explicit error rather than silently degrading. The default
 
 ## Relationship to aquarelle
 
-The aquarelle (watercolor bleed) shape generator now ships as its own external
+The aquarelle (watercolor bleed) shape generator ships as its own external
 crate at [`kako-jun/aquarelle`](https://github.com/kako-jun/aquarelle) and is
-pulled in via `aquarelle = "0.2"` in `Cargo.toml`. Since #235 it backs **only**
-the `OrbShape::Aquarelle` shape:
+pulled in via `aquarelle = "0.2"` in `Cargo.toml`. Two distinct "aquarelle"
+mechanisms currently **coexist** in the tree:
 
-- **`OrbShape::Aquarelle`** follows the crate's four-layer `render_aquarelle_orb`
-  model. The GPU shader (`orb_aquarelle.wgsl`) evaluates those layers analytically;
-  the ChaCha8 RNG / HSL color math is run host-side in the parameter pack so it stays
-  byte-identical to the crate, and the resulting centers / radii / colors are uploaded.
+- **The #239 watercolor (the going-forward design)** — "にじみ" is no longer a
+  separate shader. The `--bleed` button blurs the silhouette coverage **inside the
+  unified `orb.wgsl`** for any shape (orb / glyph / image): `blurred_coverage`
+  averages the per-pixel coverage alpha over a disk of radius proportional to
+  `bleed` (48-tap golden-angle spiral + per-pixel `hash21` dither), so a star stays
+  a star and dissolves naturally at high blur — **it does not morph the distance
+  field into a circle**. Coverage evaluation is factored into a per-variant
+  `coverage_at` (orb = analytic circle distance / SDF = sample distance), shared by
+  both the plain single-tap path and the blur's multi-tap path. On top of the bleed
+  sit three understated *character* axes (`Params.aqua_bloom` = bright central core,
+  capped at `BLOOM_MAX = 0.45`; `aqua_halo` = peripheral saturation boost, color only
+  with no frame ring; `aqua_offset` = seed-direction bias of the blur origin = an
+  asymmetric bleed that leaves the shape intact). With every parameter `0` (in
+  particular `bleed = 0`) the output is **byte-identical** to plain orb / glyph /
+  image (`aqua_zero_params_byte_match_plain_orb`); the existing rendering of every
+  other shape is unchanged.
+- **The legacy `OrbShape::Aquarelle` shape (`orb_aquarelle.wgsl`)** still follows the
+  crate's four-layer `render_aquarelle_orb` radial model (the GPU shader evaluates
+  those layers analytically; the ChaCha8 RNG / HSL color math is run host-side in the
+  parameter pack so it stays byte-identical to the crate, and the resulting
+  centers / radii / colors are uploaded). This radial shader is **superseded by the
+  #239 orb.wgsl blur** above and is scheduled for removal in #233 (the two coexist for
+  now; the legacy `--shape aquarelle` is not yet on the production Studio).
+
 - **`OrbShape::Glyph` and `OrbShape::Image`** no longer run an aquarelle bleed
   pass. As of #235 they are fed to the **same orb mechanism** as `OrbShape::Orb`:
   the SDF sample becomes the normalized distance `r`, which the unified shader
