@@ -95,7 +95,7 @@ is also assigned one of two visual styles (rim or soft) deterministically from t
 seed, so a single frame mixes the rim-emphasized look with plain soft gradients.
 
 `--count-preset low|mid|high` is a shorthand alternative to `--count <N>` (mapped
-to 10 / 20 / 24). The two flags are mutually exclusive — pass one or the other.
+to 10 / 20 / 25). The two flags are mutually exclusive — pass one or the other.
 
 ### Glyph shape
 
