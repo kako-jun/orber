@@ -184,15 +184,16 @@ describe('lang signal + t()', () => {
     expect(STRINGS.shapeOptionOrb.en).toBe('Orb');
   });
 
-  test('にじみ統合で bloom/halo/offset 系キーは STRINGS から消え、bleed/softness は残存 (#253)', async () => {
-    // #253 で Studio GUI の「にじみ/芯の光/縁の彩度/かたより」4 軸を単一「にじみ」ノブ
-    // （弱/中/強、「なし」廃止）に統合した。bloomLabel/haloLabel/offsetLabel と各 option、
-    // および旧 bleedOptionOff は strings.ts から削除済み。これらのキーが復活すると
-    // Studio.tsx 側で旧 4 軸 UI を生やせてしまい二重管理・退行になるため、STRINGS に
-    // 無いことを直接押さえる。逆に統合後も使う bleed/softness 系は ja/en とも残ることを担保。
+  test('にじみをぼかしへ統合し、にじみ専用キー(bleed*)も STRINGS から消える / softness は残存 (#265)', async () => {
+    // #253 で 4 軸を単一「にじみ」ノブに畳み、#265 でそのにじみ独立ノブ自体を撤去して
+    // 「ぼかし」(softness)へ統合した（にじみは softnessToBleedLevel で連動）。bloom/halo/
+    // offset 系（#253 で削除済み）に加え、にじみ専用 bleedLabel/bleedOption* も strings.ts
+    // から消した。これらのキーが復活すると Studio.tsx で旧にじみ UI を生やせてしまい
+    // 二重管理・退行になるため、STRINGS に無いことを直接押さえる。逆に統合後も使う
+    // softness（ぼかし）系は ja/en とも残ることを担保する。
     const { STRINGS } = await import('./strings');
 
-    // 削除済み: bloom / halo / offset 系 と 旧 bleedOptionOff
+    // 削除済み: bloom / halo / offset 系（#253）＋ にじみ専用 bleed*（#265）
     const removed = [
       'bloomLabel',
       'bloomOptionOff',
@@ -210,16 +211,16 @@ describe('lang signal + t()', () => {
       'offsetOptionMid',
       'offsetOptionStrong',
       'bleedOptionOff',
-    ];
-    const stillPresent = removed.filter((key) => key in STRINGS);
-    expect(stillPresent).toEqual([]);
-
-    // 残存: 統合後の bleed ノブ（弱/中/強）と softness（ぼかし）。ja/en 両方を持つこと。
-    const retained = [
       'bleedLabel',
       'bleedOptionWeak',
       'bleedOptionMid',
       'bleedOptionStrong',
+    ];
+    const stillPresent = removed.filter((key) => key in STRINGS);
+    expect(stillPresent).toEqual([]);
+
+    // 残存: にじみを駆動する softness（ぼかし）。ja/en 両方を持つこと。
+    const retained = [
       'softnessLabel',
       'softnessOptionLow',
       'softnessOptionMid',

@@ -37,7 +37,7 @@ orber --input photo.jpg --output orb.png --blur 0.9 --orb-size 1.5 --saturation 
 orber --input photo.jpg --output orb.svg
 ```
 
-Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (orb / glyph / image), the watercolor bleed axis (`--bleed`/`--bloom`/`--halo`/`--offset`, #239), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
+Static PNG, vertical-format video (`mp4` via libx264, `webm` via libvpx-vp9), static SVG, and CSS background snippets are implemented. Only `webp` is accepted by the CLI but not yet rendered — it exits with `not yet implemented`. The output format is inferred from the extension. CLI flags cover orb size, blur, conveyor `--direction` and `--speed`, orb shape (orb / glyph / image), the watercolor bleed axis (`--bleed`/`--bloom`/`--halo`/`--offset`, #239), the bleed-blur tap count (`--bleed-taps`, #265 — a quality/cost knob, defaults to a lightweight value), `--glyph-char`, `--image-mask`, `--count` (or `--count-preset`), `--softness`, saturation, and clip duration. See all flags via `orber --help`.
 
 ```bash
 orber --input photo.jpg --output star.png --shape glyph --glyph-char "☆" --softness low

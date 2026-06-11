@@ -21,9 +21,11 @@ import {
   formatRunBatchError,
   GLYPH_SDF_SIZE,
   IMAGE_MASK_TARGET_LONG_EDGE,
+  softnessToBleedLevel,
   type BaseParams,
   type BleedLevel,
   type BuildWasmParamsDeps,
+  type SoftnessLevel,
 } from './workerLogic';
 
 function baseParams(overrides: Partial<BaseParams> = {}): BaseParams {
@@ -221,14 +223,45 @@ describe('bleedDerivedParams (#253: にじみノブのロックステップ)', (
   });
 
   it('導出した 4 preset を BaseParams に展開すると buildWasmParams 経由でも同じ語のまま乗る', () => {
-    // Studio の param 組み立て（`...bleedDerivedParams(bleedPreset())`）を再現し、
-    // buildWasmParams の素通しを通っても 4 フィールドがロックステップを保つことを固定。
+    // Studio の param 組み立て（#265 で `softnessToBleedLevel(softnessPreset())` 経由）を
+    // 再現し、buildWasmParams の素通しを通っても 4 フィールドがロックステップを保つことを固定。
     const level: BleedLevel = 'mid';
     const params = buildWasmParams(baseParams({ ...bleedDerivedParams(level) }), makeDeps());
     expect(params.bleed_preset).toBe(level);
     expect(params.bloom_preset).toBe(level);
     expect(params.halo_preset).toBe(level);
     expect(params.offset_preset).toBe(level);
+  });
+});
+
+describe('softnessToBleedLevel (#265: にじみをぼかしへ統合)', () => {
+  // #265: にじみ独立ノブを撤去し、ぼかし(softness)レベルが にじみ(aqua_bleed)も
+  // 駆動する。ぼかし 3 段（low/mid/high、`''`=標準）→ にじみ 3 段（weak/mid/strong）。
+  it('ぼかしレベルを にじみレベルへ写す（弱め→弱 / 標準→中 / 強め→強）', () => {
+    expect(softnessToBleedLevel('low')).toBe('weak');
+    expect(softnessToBleedLevel('mid')).toBe('mid');
+    expect(softnessToBleedLevel('high')).toBe('strong');
+  });
+
+  it('ぼかし未指定（標準）は にじみ mid（=標準）になる＝「デフォルトは標準」を満たす', () => {
+    // Studio の softnessPreset 既定は `''`。これが にじみ mid に落ちることで、
+    // にじみだけ既定 weak だった以前の例外が消える。
+    expect(softnessToBleedLevel('')).toBe('mid');
+  });
+
+  it('全 SoftnessLevel が有効な BleedLevel を返す（にじみ常時オン＝必ず非空）', () => {
+    const levels: SoftnessLevel[] = ['', 'low', 'mid', 'high'];
+    for (const s of levels) {
+      const b = softnessToBleedLevel(s);
+      expect(['weak', 'mid', 'strong']).toContain(b);
+    }
+  });
+
+  it('ぼかし → にじみ → 4 preset まで通すと、ぼかしレベルが 4 フィールドを一括駆動する', () => {
+    // #265 の実 param 経路（softness → softnessToBleedLevel → bleedDerivedParams）を固定。
+    const d = bleedDerivedParams(softnessToBleedLevel('high'));
+    expect(d.bleed_preset).toBe('strong');
+    expect(new Set([d.bleed_preset, d.bloom_preset, d.halo_preset, d.offset_preset]).size).toBe(1);
   });
 });
 

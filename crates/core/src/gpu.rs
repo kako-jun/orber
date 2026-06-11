@@ -156,19 +156,70 @@ const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 /// shared `aquarelle::AQUA_BLEED_WGSL` fragment, substituted at the
 /// `//!ORB_AQUA_BLEED_SHARED` marker (orber#250 Phase 2). The fragment is byte-equivalent
 /// to the previous inline copy, so the rendered output is unchanged.
+/// にじみ（空間ブラー）の multi-tap 数の既定値（#265）。`aquarelle` 共有 WGSL は
+/// 静止画 PoC 前提で `AQUA_BLUR_TAPS = 48u`（コメント「重くてよい」）を採るが、orber は
+/// #253 でにじみを常時オン化し、24fps×8s×4本=768 フレームの動画とモバイル GPU に
+/// 乗せた結果、48 タップの一撃描画がモバイル GPU のウォッチドッグを超えて
+/// **デバイスロスト→タブクラッシュ**を起こした（ゲーミングスマホでも落ちた）。
+/// ぼかし（falloff）が見た目を支配し、にじみ（タップ平均の質）の寄与は小さい
+/// （kako-jun 確認）ので、タップを大幅に削って軽量化する。値は強め（最広ブラー）の
+/// blink で確定した床。CLI `--bleed-taps` で上書き可（既定はこの値）。
+const DEFAULT_AQUA_TAPS: u32 = 8;
+
+/// `aquarelle::AQUA_BLEED_WGSL` が宣言するタップ数 const の行（#265）。orber は共有
+/// crate 本体を触らず、連結後の WGSL 文字列でこの行のタップ数だけ差し替える
+/// （additive / blueprinter は 48 のまま＝爆発半径ゼロ）。crate 側で宣言が変わると
+/// この置換は黙って no-op になるので、[`substitute_aqua_taps`] が debug_assert で検出する。
+const AQUA_TAPS_DECL_48: &str = "const AQUA_BLUR_TAPS: u32 = 48u;";
+
+/// 連結済み WGSL のにじみタップ数を `taps` に差し替える（#265）。`aquarelle` を
+/// `//!ORB_AQUA_BLEED_SHARED` に展開した**後**の文字列に対して呼ぶこと（展開前は
+/// 宣言行が無い）。`taps == 48` のときは恒等（48→48）。
+fn substitute_aqua_taps(src: String, taps: u32) -> String {
+    debug_assert!(
+        src.contains(AQUA_TAPS_DECL_48),
+        "aquarelle AQUA_BLUR_TAPS declaration not found; the crate changed it — update AQUA_TAPS_DECL_48 (#265)"
+    );
+    src.replace(
+        AQUA_TAPS_DECL_48,
+        &format!("const AQUA_BLUR_TAPS: u32 = {taps}u;"),
+    )
+}
+
+/// orb variant の WGSL を `taps` タップで組む（[`orb_wgsl`] の汎用版・#265）。
+fn build_orb_wgsl(taps: u32) -> String {
+    let s = ORB_WGSL_TEMPLATE
+        .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_NONE)
+        .replace("//!ORB_LOAD", ORB_LOAD_ORB)
+        .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
+        .replace("//!ORB_COVERAGE", ORB_COVERAGE_CIRCLE)
+        .replace("//!ORB_ANGLE", ORB_ANGLE_NONE)
+        .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
+        .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom());
+    substitute_aqua_taps(s, taps)
+}
+
+/// SDF variant の WGSL を `taps` タップで組む（[`orb_sdf_wgsl`] の汎用版・#265）。
+fn build_orb_sdf_wgsl(taps: u32) -> String {
+    let s = ORB_WGSL_TEMPLATE
+        .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_SDF)
+        .replace("//!ORB_LOAD", ORB_LOAD_ORB_WITH_ROT)
+        .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
+        .replace("//!ORB_COVERAGE", ORB_COVERAGE_SDF)
+        .replace("//!ORB_ANGLE", ORB_ANGLE_SDF)
+        .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
+        .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom());
+    substitute_aqua_taps(s, taps)
+}
+
+/// 既定タップ（[`DEFAULT_AQUA_TAPS`]）で組んだ orb variant WGSL。#265 以降、本番の
+/// render パスはレンダラ構築時の `orb_shader`（`with_aqua_taps` 反映済み）を使うので、
+/// この静的版はテンプレート構造を pin するテスト専用。
+#[cfg(test)]
 fn orb_wgsl() -> &'static str {
     use std::sync::OnceLock;
     static ORB: OnceLock<String> = OnceLock::new();
-    ORB.get_or_init(|| {
-        ORB_WGSL_TEMPLATE
-            .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_NONE)
-            .replace("//!ORB_LOAD", ORB_LOAD_ORB)
-            .replace("//!ORB_HELPERS", ORB_HELPERS_NONE)
-            .replace("//!ORB_COVERAGE", ORB_COVERAGE_CIRCLE)
-            .replace("//!ORB_ANGLE", ORB_ANGLE_NONE)
-            .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
-            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
-    })
+    ORB.get_or_init(|| build_orb_wgsl(DEFAULT_AQUA_TAPS))
 }
 
 /// The SDF (glyph / image, #235) variant of [`ORB_WGSL_TEMPLATE`]. Adds the
@@ -182,19 +233,13 @@ fn orb_wgsl() -> &'static str {
 /// Like [`orb_wgsl`], the watercolor-bleed fragment comes from the shared
 /// `aquarelle::AQUA_BLEED_WGSL` const, substituted at `//!ORB_AQUA_BLEED_SHARED`
 /// (orber#250 Phase 2; byte-equivalent to the former inline copy).
+///
+/// [`orb_wgsl`] と同じく、#265 以降は静的既定タップ版＝テスト専用。
+#[cfg(test)]
 fn orb_sdf_wgsl() -> &'static str {
     use std::sync::OnceLock;
     static SDF: OnceLock<String> = OnceLock::new();
-    SDF.get_or_init(|| {
-        ORB_WGSL_TEMPLATE
-            .replace("//!ORB_EXTRA_BINDINGS", ORB_EXTRA_BINDINGS_SDF)
-            .replace("//!ORB_LOAD", ORB_LOAD_ORB_WITH_ROT)
-            .replace("//!ORB_HELPERS", ORB_HELPERS_SDF)
-            .replace("//!ORB_COVERAGE", ORB_COVERAGE_SDF)
-            .replace("//!ORB_ANGLE", ORB_ANGLE_SDF)
-            .replace("//!ORB_AQUA_BLEED_SHARED", aquarelle::AQUA_BLEED_WGSL)
-            .replace("//!ORB_AQUA_BLEED_GEOM", aqua_bleed_geom())
-    })
+    SDF.get_or_init(|| build_orb_sdf_wgsl(DEFAULT_AQUA_TAPS))
 }
 
 /// #239: the WGSL fragment substituted into `//!ORB_AQUA_BLEED_GEOM`. The bleed is
@@ -559,6 +604,16 @@ pub struct GpuRenderer {
     /// lock, exactly once per `render_packed`, before any cache Mutex, so it cannot
     /// deadlock against the inner caches.
     render_guard: std::sync::Mutex<()>,
+    /// にじみ（空間ブラー）の multi-tap 数（#265）。既定 [`DEFAULT_AQUA_TAPS`]、
+    /// [`Self::with_aqua_taps`] で上書き。シェーダ文字列は構築時に一度だけ組むので
+    /// （`orb_shader` / `orb_sdf_shader`）、毎フレームの replace コストは無い。
+    aqua_taps: u32,
+    /// orb variant の WGSL（`aqua_taps` タップで構築済み）。render パスはこの文字列を
+    /// `pipeline()` に渡す。pipeline cache はシェーダ文字列キーなので、タップ数違いは
+    /// 自然に別エントリになる。
+    orb_shader: String,
+    /// SDF variant（glyph / image）の WGSL（`aqua_taps` タップで構築済み）。
+    orb_sdf_shader: String,
 }
 
 impl GpuRenderer {
@@ -648,7 +703,29 @@ impl GpuRenderer {
             glyph_sdf_cache: std::sync::Mutex::new(HashMap::new()),
             glyph_sampler,
             render_guard: std::sync::Mutex::new(()),
+            aqua_taps: DEFAULT_AQUA_TAPS,
+            orb_shader: build_orb_wgsl(DEFAULT_AQUA_TAPS),
+            orb_sdf_shader: build_orb_sdf_wgsl(DEFAULT_AQUA_TAPS),
         }
+    }
+
+    /// にじみ（空間ブラー）の multi-tap 数を上書きする（#265・既定
+    /// [`DEFAULT_AQUA_TAPS`]）。`taps` は最低 1 にクランプ。シェーダ文字列を組み直す
+    /// ので、最初の render より前に呼ぶこと（builder スタイル）。CLI の `--bleed-taps`
+    /// がこの seam を使う。web（wasm）は既定値のまま＝モバイルでも軽い。
+    #[must_use]
+    pub fn with_aqua_taps(mut self, taps: u32) -> Self {
+        let taps = taps.max(1);
+        self.aqua_taps = taps;
+        self.orb_shader = build_orb_wgsl(taps);
+        self.orb_sdf_shader = build_orb_sdf_wgsl(taps);
+        self
+    }
+
+    /// 現在のにじみタップ数（#265）。CLI の検証 / テスト用。
+    #[must_use]
+    pub fn aqua_taps(&self) -> u32 {
+        self.aqua_taps
     }
 
     /// Name of the underlying adapter (for diagnostics / proving the GPU path ran).
@@ -1569,8 +1646,8 @@ impl GpuRenderer {
         // targets `Rgba8Unorm`. #239: the additive bleed layer stays inert when aqua
         // params are 0 (byte-identical to plain orb).
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(), true),
-            None => (orb_wgsl(), false),
+            Some(_) => (self.orb_sdf_shader.as_str(), true),
+            None => (self.orb_shader.as_str(), false),
         };
         self.pipeline(
             shader,
@@ -1628,8 +1705,8 @@ impl GpuRenderer {
         // texture / sampler and runs a different shader source). #239: the additive
         // bleed layer stays inert when aqua params are 0.
         let (shader, is_glyph) = match &glyph {
-            Some(_) => (orb_sdf_wgsl(), true),
-            None => (orb_wgsl(), false),
+            Some(_) => (self.orb_sdf_shader.as_str(), true),
+            None => (self.orb_shader.as_str(), false),
         };
         self.pipeline(shader, is_glyph, format, |cached| {
             let bind_group =
@@ -2875,6 +2952,40 @@ mod tests {
                     "HUE_PULSE_AMP * sin(TAU * (HUE_PULSE_CYCLES * t_frac + phi_opacity))"
                 ),
             "template must carry the #261 procedural hue pulse"
+        );
+    }
+
+    /// #265: the orber-local tap-count substitution must actually rewrite the shared
+    /// `aquarelle` `AQUA_BLUR_TAPS` declaration. The replace is string-coupled to the
+    /// crate's exact declaration, so a silent no-op (crate changed the line) would
+    /// drop us back to the heavy 48-tap path and re-introduce the mobile crash. Pin
+    /// that the built shaders carry the requested tap count (and the default static
+    /// carries `DEFAULT_AQUA_TAPS`), for both the orb and SDF variants.
+    #[test]
+    fn aqua_blur_taps_substitution_rewrites_shared_declaration() {
+        // The shared declaration the substitution targets must still be present in the
+        // crate fragment (this is what `substitute_aqua_taps` debug_asserts on).
+        assert!(
+            aquarelle::AQUA_BLEED_WGSL.contains(AQUA_TAPS_DECL_48),
+            "aquarelle no longer declares `{AQUA_TAPS_DECL_48}`; update AQUA_TAPS_DECL_48 (#265)"
+        );
+        for taps in [4u32, 8, 16] {
+            for src in [build_orb_wgsl(taps), build_orb_sdf_wgsl(taps)] {
+                assert!(
+                    src.contains(&format!("const AQUA_BLUR_TAPS: u32 = {taps}u;")),
+                    "built shader must carry the requested {taps} taps"
+                );
+                assert!(
+                    !src.contains(AQUA_TAPS_DECL_48),
+                    "built shader must not keep the heavy 48-tap declaration (taps={taps})"
+                );
+            }
+        }
+        // The no-arg statics ship the lightweight default.
+        let default_decl = format!("const AQUA_BLUR_TAPS: u32 = {DEFAULT_AQUA_TAPS}u;");
+        assert!(
+            orb_wgsl().contains(&default_decl) && orb_sdf_wgsl().contains(&default_decl),
+            "default statics must build with DEFAULT_AQUA_TAPS ({DEFAULT_AQUA_TAPS})"
         );
     }
 
