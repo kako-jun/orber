@@ -91,7 +91,7 @@ enum CliCountPreset {
     Low,
     /// Medium (20).
     Mid,
-    /// Many (24; #265 lowered from 30 — 多め was a bit heavy on mobile).
+    /// Many (25; #265 lowered from 30 — 多め was a bit heavy on mobile).
     High,
 }
 
@@ -100,8 +100,8 @@ impl CliCountPreset {
         match self {
             CliCountPreset::Low => 10,
             CliCountPreset::Mid => 20,
-            // #265: 30→24（モバイルで「多め」が少し重かった。にじみタップ 48→5 と併用）。
-            CliCountPreset::High => 24,
+            // #265: 30→25（モバイルで「多め」が少し重かった。にじみタップ 48→5 と併用）。
+            CliCountPreset::High => 25,
         }
     }
 }
@@ -313,7 +313,7 @@ struct Cli {
     speed: CliSpeed,
 
     /// Number of orbs visible on screen at once (1..=1024, default 20).
-    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=24).
+    /// Use `--count-preset` for a 3-tier shorthand (low=10 / mid=20 / high=25).
     /// Clusters are expanded to this count by weight-proportional color sampling
     /// and per-orb scattering on the cross axis. Higher count fills more of the
     /// frame; ~20 fills roughly 70% on the default size.
@@ -321,7 +321,7 @@ struct Cli {
     #[arg(long, default_value_t = 20, value_parser = parse_count, conflicts_with = "count_preset")]
     count: usize,
 
-    /// Coarse orb-count preset (#55): low=10 / mid=20 / high=24 (#265).
+    /// Coarse orb-count preset (#55): low=10 / mid=20 / high=25 (#265).
     /// Mutually exclusive with --count.
     #[arg(long, value_enum)]
     count_preset: Option<CliCountPreset>,
@@ -1316,8 +1316,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             cli.resolved_count(),
-            24,
-            "--count-preset high must map to 24 (#265)"
+            25,
+            "--count-preset high must map to 25 (#265)"
         );
     }
 
