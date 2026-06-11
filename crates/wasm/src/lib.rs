@@ -82,7 +82,7 @@ const MAX_ORB_COUNT: usize = 1024;
 /// ここで超過を早期エラーにし、黙って切り詰められるのを防ぐ。GUI の
 /// `random_ranges::COUNT_MAX = 50` を網羅する余裕として 64 を採る。
 /// WGSL canvas-present 経路はデータテクスチャ経路なのでこの上限を必要としないが、
-/// GUI の count 上限（high=30）を十分上回るため当面同一バリデーションで揃えておく。
+/// GUI の count 上限（high=24, #265）を十分上回るため当面同一バリデーションで揃えておく。
 /// #247: 読む経路（resolve_frame）が wasm32 / test 限定になったため同様に対象外化。
 #[cfg(any(target_arch = "wasm32", test))]
 const GL_RENDERER_MAX_ORBS: usize = 64;
@@ -123,7 +123,7 @@ pub struct WasmParams {
     pub glyph_char: String,
     /// `count` の preset 上書き。`""` で無視（spec.count を使う）。
     /// Phase B (#55) で追加。`"low" | "mid" | "high"` のいずれかなら
-    /// 10/20/30 を spec.count に上書きしてからレンダリングする。
+    /// 10/20/24 を spec.count に上書きしてからレンダリングする（#265: high 30→24）。
     #[serde(default)]
     pub count_preset: String,
     /// `speed` の preset 上書き。`""` で無視（spec.speed と GUI_VIDEO_SPEEDS を使う）。
@@ -265,14 +265,15 @@ fn parse_speed_preset(s: &str) -> Result<Option<MotionSpeed>, String> {
 
 /// Phase B (#55): count preset 文字列を絶対値に変換。`""` は `Ok(None)` で
 /// 「上書きしない（spec.count を使う）」を意味する。値は GUI 仕様に合わせて
-/// low=10 / mid=20 / high=30 で固定。
+/// low=10 / mid=20 / high=24 で固定（#265: 「多め」=30 がモバイルで少し重かった
+/// ため 30→24 に下げた。標準 20 より明確に多いが、48→5 タップ削減と併せて軽量化）。
 #[cfg(any(target_arch = "wasm32", test))]
 fn parse_count_preset(s: &str) -> Result<Option<usize>, String> {
     match s {
         "" => Ok(None),
         "low" => Ok(Some(10)),
         "mid" => Ok(Some(20)),
-        "high" => Ok(Some(30)),
+        "high" => Ok(Some(24)),
         other => Err(format!(
             "invalid count_preset: {other} (expected one of '' / low / mid / high)"
         )),
@@ -926,9 +927,9 @@ fn resolve_frame(mut p: WasmParams, n: u32, spec_idx: u32) -> Result<ResolvedFra
 
     // review S2: 旧来の固定 uniform-array レンダラの上限を超えると黙って切り詰め
     // られて視覚パリティが壊れていた。発見が遅れないよう wasm 側で早期 throw する。
-    // count_preset (high=30) は GL_RENDERER_MAX_ORBS=64 未満。将来 high を 64 超に
+    // count_preset (high=24, #265) は GL_RENDERER_MAX_ORBS=64 未満。将来 high を 64 超に
     // 上げるならここを更新する。WGSL canvas-present 経路はデータテクスチャ経路で
-    // この上限を必要としないが、GUI の count 上限 30 を十分上回るため当面同一
+    // この上限を必要としないが、GUI の count 上限 24 (#265) を十分上回るため当面同一
     // バリデーションで揃えておく。
     if n_orbs > GL_RENDERER_MAX_ORBS {
         return Err(format!(
@@ -1220,7 +1221,7 @@ mod tests {
         assert_eq!(parse_count_preset("").unwrap(), None);
         assert_eq!(parse_count_preset("low").unwrap(), Some(10));
         assert_eq!(parse_count_preset("mid").unwrap(), Some(20));
-        assert_eq!(parse_count_preset("high").unwrap(), Some(30));
+        assert_eq!(parse_count_preset("high").unwrap(), Some(24));
         assert!(parse_count_preset("xxx").is_err());
     }
 

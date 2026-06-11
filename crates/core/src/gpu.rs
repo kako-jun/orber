@@ -163,8 +163,12 @@ const ORB_WGSL_TEMPLATE: &str = include_str!("orb.wgsl");
 /// **デバイスロスト→タブクラッシュ**を起こした（ゲーミングスマホでも落ちた）。
 /// ぼかし（falloff）が見た目を支配し、にじみ（タップ平均の質）の寄与は小さい
 /// （kako-jun 確認）ので、タップを大幅に削って軽量化する。値は強め（最広ブラー）の
-/// blink で確定した床。CLI `--bleed-taps` で上書き可（既定はこの値）。
-const DEFAULT_AQUA_TAPS: u32 = 8;
+/// 数値計測で確定した床。CLI `--bleed-taps` で上書き可（既定はこの値）。
+///
+/// #265 当初 8 → kako-jun「もっと下げていい」＋個数「多め」の重さ対策で **5** に再削減。
+/// 標準 count・強めでも 48 比 目視差画素 0.45% / PSNR 52dB でほぼ識別不能、t4 で初めて
+/// 3% にザラつくのでその手前。原 48 比で約 10 倍軽い。
+const DEFAULT_AQUA_TAPS: u32 = 5;
 
 /// `aquarelle::AQUA_BLEED_WGSL` が宣言するタップ数 const の行（#265）。orber は共有
 /// crate 本体を触らず、連結後の WGSL 文字列でこの行のタップ数だけ差し替える
