@@ -88,13 +88,10 @@ export const STRINGS = {
   softnessOptionLow: { ja: '弱め', en: 'Low' },
   softnessOptionMid: { ja: '標準', en: 'Standard' },
   softnessOptionHigh: { ja: '強め', en: 'High' },
-  // #253: 単一「にじみ」ノブ（弱/中/強）。にじみは常時オン（#239 の「なし」は廃止）。
-  // レベルは内部 aqua_bleed 0.15/0.3/0.5 で、芯の光/縁の彩度/かたよりも同じレベルから
-  // 導出して一括駆動する。数字は出さない（kako-jun 確定）。en も weak/mid/strong。
-  bleedLabel: { ja: 'にじみ', en: 'Bleed' },
-  bleedOptionWeak: { ja: '弱', en: 'Weak' },
-  bleedOptionMid: { ja: '中', en: 'Mid' },
-  bleedOptionStrong: { ja: '強', en: 'Strong' },
+  // #265: にじみ独立ノブ（bleedLabel/bleedOption*）は撤去した。にじみは「ぼかし」
+  // (softness)レベルから導出して連動する（弱め→弱 / 標準→中 / 強め→強、
+  // `softnessToBleedLevel`）。にじみだけ語彙が他ノブと違っていた問題と「デフォルトが
+  // 標準であるべき」を同時に解消するため、にじみ専用の文字列はここから消した。
   wasmLoadFailed: {
     ja: 'wasm の読み込みに失敗しました',
     en: 'Failed to load wasm',

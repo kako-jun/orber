@@ -84,6 +84,31 @@ export function bleedDerivedParams(level: BleedLevel): {
   };
 }
 
+/** ぼかし(softness)ノブの 3 段。`''` は標準（=mid と同義の identity）。 */
+export type SoftnessLevel = '' | 'low' | 'mid' | 'high';
+
+/**
+ * #265: にじみ独立ノブを撤去し「ぼかし(softness)」へ統合する。ぼかしレベルが
+ * にじみ(aqua_bleed)も一括駆動する（→ `bleedDerivedParams` で bloom/halo/offset も）。
+ *
+ * にじみだけ語彙（弱/中/強・既定 weak）が他ノブ（弱め/標準/強め・既定 標準）と違って
+ * いたのを解消する: ぼかしの 3 段（low/mid/high、`''`=標準）を にじみの 3 段
+ * （weak/mid/strong）へ写す。ぼかし未指定（=標準）は にじみ mid（=標準）になり、
+ * 「デフォルトは標準であるべき」を自動的に満たす。にじみは常時オン維持（ぼかし弱でも
+ * weak=0.15、#253 の「なし」廃止と整合）。
+ */
+export function softnessToBleedLevel(softness: SoftnessLevel): BleedLevel {
+  switch (softness) {
+    case 'low':
+      return 'weak';
+    case 'high':
+      return 'strong';
+    // '' (標準) / 'mid' はどちらも標準 = にじみ mid
+    default:
+      return 'mid';
+  }
+}
+
 /** `setSource` で worker にキャッシュされる入力画像 RGB。 */
 export interface SourceCache {
   rgb: Uint8Array;

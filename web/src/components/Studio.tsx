@@ -18,8 +18,7 @@ import { t, lang } from '../lib/strings';
 // #245: worker エラー → i18n 文言のマップは workerLogic.ts に切り出し済み
 // （単体テスト用。t() は引数 DI で渡す）。
 // #253: にじみレベル型 + 4 preset 導出ヘルパも workerLogic.ts に集約（単体テスト用）。
-import { formatRunBatchError, bleedDerivedParams } from '../lib/workerLogic';
-import type { BleedLevel } from '../lib/workerLogic';
+import { formatRunBatchError, bleedDerivedParams, softnessToBleedLevel } from '../lib/workerLogic';
 
 type Aspect = 'portrait' | 'landscape';
 type Phase = 'idle' | 'decoding' | 'generating' | 'animating' | 'done' | 'error';
@@ -39,11 +38,12 @@ type ShapeChoice = 'orb' | 'glyph' | 'image';
 type CountPreset = '' | 'low' | 'mid' | 'high';
 type SpeedPreset = '' | 'slow' | 'mid' | 'fast';
 type SoftnessPreset = '' | 'low' | 'mid' | 'high';
-// #253: 単一「にじみ」ノブ。session605(#239 Phase 1) の にじみ/芯の光/縁の彩度/
-// かたより の 4 軸は出しすぎだったので 1 つに畳む。「なし」を廃止し常時オン＝
-// 弱/中/強 の 3 段のみ（初期値 weak）。このレベルが bloom/halo/offset も一括駆動
-// する（`bleedDerivedParams`）。`BleedLevel` は workerLogic.ts に集約。
-type BleedPreset = BleedLevel;
+// #265: にじみ独立ノブを撤去し「ぼかし(softness)」へ統合した。にじみだけ語彙
+// （弱/中/強・既定 weak）が他ノブ（弱め/標準/強め・既定 標準）と違うのを解消し、
+// ぼかしレベルが にじみ(aqua_bleed)+bloom/halo/offset も一括駆動する
+// （`softnessToBleedLevel` → `bleedDerivedParams`）。にじみは常時オン維持
+// （ぼかし弱でも weak=0.15、#253 整合）。デフォルト=標準（ぼかし既定が標準）。
+// 旧 #253 の単一「にじみ」ノブ（弱/中/強）はこの統合で UI から消えた。
 
 // 9 列 × 2 段の picker 配置を取るため候補リストの順序と数を整える。
 // 旧 `♦` (ダイヤ・スートマーク) はユーザー指示で除外、`◆` (黒ダイヤ) も
@@ -171,10 +171,9 @@ export default function Studio() {
   // GUI_VIDEO_SPEEDS / SoftnessPreset::Mid を温存し、Phase A の見た目を正確に再現する。
   const [countPreset, setCountPreset] = createSignal<CountPreset>('');
   const [speedPreset, setSpeedPreset] = createSignal<SpeedPreset>('');
+  // #265: ぼかし(softness)が にじみも駆動する。既定 `''`=標準。にじみ専用 signal は
+  // 撤去し、param 組み立て時に `softnessToBleedLevel(softnessPreset())` で導出する。
   const [softnessPreset, setSoftnessPreset] = createSignal<SoftnessPreset>('');
-  // #253: にじみ。常時オン＝弱/中/強の 3 段だけ（#239 の「なし」は廃止）。初期値
-  // は `'weak'`。このレベルが bloom/halo/offset も一括駆動する（`bleedDerivedParams`）。
-  const [bleedPreset, setBleedPreset] = createSignal<BleedPreset>('weak');
   const [decoded, setDecoded] = createSignal<DecodedImage | null>(null);
   const [pickedName, setPickedName] = createSignal<string>('');
   // ドロップエリアに表示するサムネイル用の object URL。差し替えで revoke する。
@@ -452,7 +451,7 @@ export default function Studio() {
       // #253: にじみ。常時オン（弱/中/強）。レベルから bleed/bloom/halo/offset の
       // 4 preset をロックステップで導出する（同じ語）。orb / glyph / image どの
       // shape でも効く。
-      ...bleedDerivedParams(bleedPreset()),
+      ...bleedDerivedParams(softnessToBleedLevel(softnessPreset())),
       // #136: glyph_rotate=false で per-orb 回転を抑止。Orb 経路では未使用。
       glyph_rotate: glyphRotate(),
     };
@@ -803,15 +802,10 @@ export default function Studio() {
     runBatchIfReady();
   };
 
+  // #265: ぼかしを選ぶと にじみ(aqua_bleed)も連動して再ガチャされる
+  // （param 組み立てで softnessToBleedLevel が導出）。にじみ専用ハンドラは撤去。
   const onSoftnessPresetClick = (next: SoftnessPreset) => {
     setSoftnessPreset(next);
-    runBatchIfReady();
-  };
-
-  // #253: にじみボタン。弱/中/強 のどれかを選ぶと即再ガチャ。にじみは常時オンで、
-  // このレベルが bloom/halo/offset も一括駆動する（param 組み立て側で導出）。
-  const onBleedPresetClick = (next: BleedPreset) => {
-    setBleedPreset(next);
     runBatchIfReady();
   };
 
@@ -921,7 +915,7 @@ export default function Studio() {
       softness_preset: softnessPreset(),
       // #253: hi-res 再描画でも UI のにじみレベルを踏襲し、4 preset を同じ語で
       // ロックステップ導出する（プレビューと DL を同形状に保つ）。
-      ...bleedDerivedParams(bleedPreset()),
+      ...bleedDerivedParams(softnessToBleedLevel(softnessPreset())),
       // #136: hi-res 再描画でも UI の glyph_rotate を踏襲。プレビューと DL の
       // 形状不変条件（同じ baseSeed + 同じ params で同じ spec が再現）を保つ。
       glyph_rotate: glyphRotate(),
@@ -990,7 +984,7 @@ export default function Studio() {
       softness_preset: softnessPreset(),
       // #253: 透過 DL もプレビューと同じにじみレベルを踏襲し、4 preset を同じ語で
       // ロックステップ導出する。
-      ...bleedDerivedParams(bleedPreset()),
+      ...bleedDerivedParams(softnessToBleedLevel(softnessPreset())),
       glyph_rotate: glyphRotate(),
     };
 
@@ -1634,41 +1628,10 @@ export default function Studio() {
           </button>
         </div>
 
-        {/* #253: にじみ。弱 / 中 / 強 の 3 セグメント（#239 の「なし」は廃止、常時
-            オン）。レベルは内部 aqua_bleed 0.15/0.3/0.5 に写像され、芯の光/縁の彩度/
-            かたよりも同じレベルから導出して一括駆動する（数字は出さない、kako-jun
-            確定）。他 3 段 row（ぼかし等）と同じ SEG_GROUP / SEG_BTN・disabled で
-            見た目・左右端を揃える。 */}
-        <label class="justify-self-end text-sm text-fgMuted">{t('bleedLabel')}:</label>
-        <div class={SEG_GROUP}>
-          <button
-            type="button"
-            aria-pressed={bleedPreset() === 'weak'}
-            onClick={() => onBleedPresetClick('weak')}
-            disabled={!decoded() || downloading()}
-            class={SEG_BTN(0, 3, bleedPreset() === 'weak')}
-          >
-            {t('bleedOptionWeak')}
-          </button>
-          <button
-            type="button"
-            aria-pressed={bleedPreset() === 'mid'}
-            onClick={() => onBleedPresetClick('mid')}
-            disabled={!decoded() || downloading()}
-            class={SEG_BTN(1, 3, bleedPreset() === 'mid')}
-          >
-            {t('bleedOptionMid')}
-          </button>
-          <button
-            type="button"
-            aria-pressed={bleedPreset() === 'strong'}
-            onClick={() => onBleedPresetClick('strong')}
-            disabled={!decoded() || downloading()}
-            class={SEG_BTN(2, 3, bleedPreset() === 'strong')}
-          >
-            {t('bleedOptionStrong')}
-          </button>
-        </div>
+        {/* #265: にじみ専用セグメントは撤去した。にじみ(aqua_bleed)は上の「ぼかし」
+            レベルから `softnessToBleedLevel` で導出して連動する（弱め→弱 / 標準→中 /
+            強め→強）。にじみだけ語彙（弱/中/強・既定 weak）が他ノブと違っていた問題を
+            解消し、ぼかし1本で柔らかさ＋にじみが標準デフォルトで駆動する。 */}
       </div>
 
       <Show when={wasmStatus() === 'error'}>

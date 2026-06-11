@@ -382,6 +382,15 @@ struct Cli {
     /// オフ）。にじみが前提なので `--bleed` 指定時のみ有効（`--bleed` 無しで渡すとエラー）。
     #[arg(long, value_enum, requires = "bleed")]
     offset: Option<CliCharacterPreset>,
+
+    /// にじみ（空間ブラー）の multi-tap 数 (#265)。品質/コストのつまみで、見た目の
+    /// 強さ（=`--bleed` の広がり）ではなく「ブラーを何点で均すか」を決める。共有
+    /// `aquarelle` は静止画 PoC 前提で 48 を採るが、orber はモバイル GPU で 48 タップの
+    /// 一撃描画がウォッチドッグを超えてクラッシュしたため、既定を大幅に下げている
+    /// （省略時はその軽量既定）。値を上げるほど滑らかだが重い。床探し（blink）用に
+    /// 任意の値を指定できる。1 以上。
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
+    bleed_taps: Option<u32>,
 }
 
 impl Cli {
@@ -526,11 +535,19 @@ struct FrameRenderer {
 impl FrameRenderer {
     /// GPU レンダラを初期化する。アダプタが取れなければ `None`（呼び出し側で error 終了）。
     /// CPU フォールバックは持たない（#225 で撲滅）。
-    fn new() -> Option<Self> {
+    ///
+    /// `aqua_taps` が `Some` ならにじみ（空間ブラー）の multi-tap 数を上書きする
+    /// （#265, CLI `--bleed-taps`）。`None` は core の軽量既定のまま。
+    fn new(aqua_taps: Option<u32>) -> Option<Self> {
         let gpu = orber_core::gpu::GpuRenderer::new()?;
+        let gpu = match aqua_taps {
+            Some(taps) => gpu.with_aqua_taps(taps),
+            None => gpu,
+        };
         eprintln!(
-            "orber: using gpu renderer (adapter: {})",
-            gpu.adapter_name()
+            "orber: using gpu renderer (adapter: {}, bleed taps: {})",
+            gpu.adapter_name(),
+            gpu.aqua_taps()
         );
         Some(FrameRenderer { gpu: Box::new(gpu) })
     }
@@ -554,8 +571,8 @@ impl FrameRenderer {
 
 /// GPU レンダラを初期化し、アダプタが取れなければ stderr に出して `Err(ExitCode)` を返す。
 /// CLI は GPU を唯一のレンダラとするため、CPU フォールバックはしない (#225)。
-fn init_renderer() -> Result<FrameRenderer, ExitCode> {
-    FrameRenderer::new().ok_or_else(|| {
+fn init_renderer(aqua_taps: Option<u32>) -> Result<FrameRenderer, ExitCode> {
+    FrameRenderer::new(aqua_taps).ok_or_else(|| {
         eprintln!(
             "orber: no GPU adapter available; orber renders only on the GPU (#225). \
              Install a working GPU driver / Vulkan ICD and retry."
@@ -729,7 +746,7 @@ fn render_video_path(cli: &Cli, output: &Path, codec: VideoCodec) -> ExitCode {
 
     // 5. 動画書き出し。進捗とフレーム数の検証は render_video が担当する。
     //    #225: フレームは GPU で描く。renderer は 1 本だけ作ってフレーム間で使い回す。
-    let renderer = match init_renderer() {
+    let renderer = match init_renderer(cli.bleed_taps) {
         Ok(r) => r,
         Err(code) => return code,
     };
@@ -808,7 +825,7 @@ fn render_png(cli: &Cli, output: &Path) -> ExitCode {
     };
     // #225: GPU を唯一のレンダラとして 1 枚描く。全 shape（Orb/Glyph/Image）に
     // 対応（count は 1024 まで data-texture 経路で GPU が直接描く）。
-    let renderer = match init_renderer() {
+    let renderer = match init_renderer(cli.bleed_taps) {
         Ok(r) => r,
         Err(code) => return code,
     };
@@ -891,7 +908,7 @@ fn render_variations(cli: &Cli, n: usize) -> ExitCode {
     warn_if_orb_pool_empty(&orb_clusters);
 
     // #225: 全 spec を GPU で描く。renderer は 1 本だけ作ってループで使い回す。
-    let renderer = match init_renderer() {
+    let renderer = match init_renderer(cli.bleed_taps) {
         Ok(r) => r,
         Err(code) => return code,
     };
