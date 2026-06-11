@@ -76,7 +76,10 @@ interface Tile {
   // 動画タイル限定: WebCodecs で生成した mp4。動画化が完了するまで undefined。
   videoBlob?: Blob;
   videoBlobUrl?: string;
-  selected: boolean;
+  // #267: 選択状態は Tile に持たせない。`<For>` は配列要素の参照同一性で DOM を
+  // マップするので、選択トグルで tile オブジェクトを差し替えると行ごと再生成され、
+  // 動画 `<video>` がリセットされて再生が止まる。選択は別 signal `selectedIdx`
+  // （index 集合）で持ち、tile 参照を不変に保つ。
 }
 
 // 縦長 / 横長どちらも 12 枚で統一する (#61)。12 は 1/2/3/4/6/12 で
@@ -186,6 +189,11 @@ export default function Studio() {
   // 'done' でも表示できるよう、専用の Show ブロックで描画する。
   const [warningMsg, setWarningMsg] = createSignal<string>('');
   const [tiles, setTiles] = createSignal<Tile[]>([]);
+  // #267: 選択タイルの index 集合。Tile に `selected` を持たせると選択トグルで
+  // tile 参照が変わり `<For>` が行を再生成して動画が止まるため、選択は tile から
+  // 切り離してここで持つ。トグルは新しい Set を作って差し替える（Solid の reactivity
+  // 用）。タイル再生成（seedSkeletons）でクリアする。
+  const [selectedIdx, setSelectedIdx] = createSignal<ReadonlySet<number>>(new Set());
   // #95 + flicker fix: 動画タイルの mp4 化進捗を tiles とは別の signal で
   // 持つ。tiles に animProgress を埋めると 1 フレームごとに setTiles で
   // タイル参照が変わり、Solid の <For> がボタン全体を unmount/remount して
@@ -337,9 +345,11 @@ export default function Studio() {
         blob: null,
         blobUrl: '',
         kind: i < stillCount ? 'still' : 'video',
-        selected: false,
       })),
     );
+    // #267: 新しい 12 枚に差し替えるので選択もクリアする（旧 index が別バリエー
+    // ションを指したままになるのを防ぐ）。
+    setSelectedIdx(new Set());
     // S1: 前回 run の stale な進捗が新タイルに表示されるのを防ぐ。
     // clearTiles 経由でない直接 runBatch 連打パスでも確実にリセット。
     setAnimProgressMap(new Map());
@@ -835,13 +845,18 @@ export default function Studio() {
     runBatchIfReady();
   };
 
+  // #267: 選択は `selectedIdx`（index 集合）だけ更新し、tile オブジェクトは
+  // 触らない。これで `<For>` が行を再生成せず、選択しても動画が再生され続ける。
   const toggleTile = (idx: number) => {
-    setTiles((prev) =>
-      prev.map((t, i) => (i === idx ? { ...t, selected: !t.selected } : t)),
-    );
+    setSelectedIdx((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
   };
 
-  const selectedCount = () => tiles().filter((t) => t.selected).length;
+  const selectedCount = () => selectedIdx().size;
 
   const triggerDownload = (blob: Blob, name: string) => {
     const url = URL.createObjectURL(blob);
@@ -1102,9 +1117,10 @@ export default function Studio() {
   };
 
   const downloadSelected = () => {
+    const sel = selectedIdx();
     const indices = tiles()
       .map((t, i) => ({ t, i }))
-      .filter(({ t }) => t.selected && t.blob)
+      .filter(({ t, i }) => sel.has(i) && t.blob)
       .map(({ i }) => i);
     void downloadIndices(indices);
   };
@@ -1888,7 +1904,7 @@ export default function Studio() {
                 <span
                   class={
                     'pointer-events-none absolute inset-0 text-fg transition-opacity duration-200 ease-out ' +
-                    (tile.selected ? 'opacity-100 orb-selected-pulse' : 'opacity-0 group-hover:opacity-30')
+                    (selectedIdx().has(i()) ? 'opacity-100 orb-selected-pulse' : 'opacity-0 group-hover:opacity-30')
                   }
                   style={{
                     filter:
